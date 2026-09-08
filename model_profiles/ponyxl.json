@@ -1,0 +1,17 @@
+{
+  "match": ["*pony*"],
+  "display_name": "Pony Diffusion XL",
+  "description": "Pony-family checkpoints use a distinctive score_9/score_8_up... quality-tag convention and a matching score_4/score_5/score_6 negative convention baked into their training captions. Common community-recommended starting point, not tuned against a specific install.",
+  "defaults": {
+    "cfg": 7.0,
+    "steps": 28,
+    "sampler_name": "dpmpp_2m_sde",
+    "scheduler": "karras",
+    "clip_skip": -2,
+    "width": 1024,
+    "height": 1024
+  },
+  "positive_prompt_prefix": "score_9, score_8_up, score_7_up, source_anime",
+  "negative_prompt_prefix": "score_6, score_5, score_4, low quality, worst quality, blurry, jpeg artifacts",
+  "loras": []
+}

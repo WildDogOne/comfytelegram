@@ -1,0 +1,17 @@
+{
+  "match": ["sd_xl_base_*", "sdxl_base_*"],
+  "display_name": "SDXL Base",
+  "description": "Stability AI's stock SDXL 1.0 base checkpoint. No special tag conventions needed; a generic negative prompt is enough. Common community-recommended starting point, not tuned against a specific install.",
+  "defaults": {
+    "cfg": 7.0,
+    "steps": 25,
+    "sampler_name": "dpmpp_2m",
+    "scheduler": "karras",
+    "clip_skip": -1,
+    "width": 1024,
+    "height": 1024
+  },
+  "positive_prompt_prefix": "",
+  "negative_prompt_prefix": "low quality, worst quality, blurry, jpeg artifacts, watermark, signature, extra limbs, deformed",
+  "loras": []
+}

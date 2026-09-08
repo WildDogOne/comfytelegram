@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# comfytelegram project-specific
+/outputs/
+/state.sqlite3
+.claude
+sample.json

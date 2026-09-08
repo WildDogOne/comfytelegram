@@ -1,0 +1,17 @@
+{
+  "match": ["animagine*"],
+  "display_name": "Animagine XL",
+  "description": "Anime-focused SDXL finetune with published recommended sampler settings (Euler a, low CFG, ~28 steps) and a masterpiece/best-quality tag convention. Common community-recommended starting point, not tuned against a specific install.",
+  "defaults": {
+    "cfg": 5.0,
+    "steps": 28,
+    "sampler_name": "euler_ancestral",
+    "scheduler": "normal",
+    "clip_skip": -1,
+    "width": 1024,
+    "height": 1024
+  },
+  "positive_prompt_prefix": "masterpiece, best quality, very aesthetic, absurdres",
+  "negative_prompt_prefix": "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality",
+  "loras": []
+}
