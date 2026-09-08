@@ -1,5 +1,6 @@
 from comfytelegram.profiles.loader import (
     OVERRIDABLE_FIELDS,
+    PROMPT_OVERRIDE_FIELDS,
     apply_profile_override,
     load_profiles,
     resolve_generation_params,
@@ -9,6 +10,7 @@ from comfytelegram.profiles.schema import LoraDefault, ModelProfile, ProfileDefa
 
 __all__ = [
     "OVERRIDABLE_FIELDS",
+    "PROMPT_OVERRIDE_FIELDS",
     "LoraDefault",
     "ModelProfile",
     "ProfileDefaults",

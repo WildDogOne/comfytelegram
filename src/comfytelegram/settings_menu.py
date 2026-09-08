@@ -32,6 +32,7 @@ from telegram.ext import ContextTypes
 from comfytelegram.auth import is_authorized, reject_if_unauthorized
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError
 from comfytelegram.profiles import (
+    PROMPT_OVERRIDE_FIELDS,
     ModelProfile,
     ProfileDefaults,
     apply_profile_override,
@@ -61,7 +62,20 @@ class EnumFieldMeta:
     kind: Literal["enum"] = "enum"
 
 
-FieldMeta = NumericFieldMeta | EnumFieldMeta
+@dataclass(frozen=True)
+class TextFieldMeta:
+    """Free-text fields that live on the `ModelProfile` itself rather than
+    `GenerationParams` (`positive_prompt_prefix`/`negative_prompt_prefix`)
+    — no stepper/presets/enum grid make sense here, just edit-in-place and
+    reset. See `PROMPT_OVERRIDE_FIELDS` in `profiles/loader.py` for how
+    these get routed onto the profile instead of `.defaults` on override."""
+
+    key: str
+    label: str
+    kind: Literal["text"] = "text"
+
+
+FieldMeta = NumericFieldMeta | EnumFieldMeta | TextFieldMeta
 
 FIELDS: list[FieldMeta] = [
     NumericFieldMeta("cfg", "CFG", step=0.5, presets=(3.0, 4.0, 5.0, 6.0, 7.0, 8.0)),
@@ -87,20 +101,48 @@ FIELDS: list[FieldMeta] = [
     NumericFieldMeta("width", "Width", step=64, presets=(512, 768, 1024, 1280), is_int=True, min_value=64),
     NumericFieldMeta("height", "Height", step=64, presets=(512, 768, 1024, 1280), is_int=True, min_value=64),
     NumericFieldMeta("batch_size", "Batch", step=1, presets=(1, 2, 3, 4), is_int=True, min_value=1),
+    TextFieldMeta("positive_prompt_prefix", "Default Positive"),
+    TextFieldMeta("negative_prompt_prefix", "Default Negative"),
 ]
 FIELDS_BY_KEY: dict[str, FieldMeta] = {f.key: f for f in FIELDS}
 
 
 def _format_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value if value else "(none)"
     if isinstance(value, float) and value == int(value):
         return str(int(value))
     return str(value)
+
+
+def _truncate(s: str, n: int = 22) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
 
 
 def _effective_params(checkpoint: str, profile: ModelProfile | None):
     """Same resolution path generation actually uses — read the numeric
     fields off the result instead of duplicating the merge/fallback logic."""
     return resolve_generation_params(checkpoint, "", profile)
+
+
+def _field_value(meta: FieldMeta, checkpoint: str, profile: ModelProfile | None) -> Any:
+    """`positive_prompt_prefix`/`negative_prompt_prefix` aren't
+    `GenerationParams` fields (see `TextFieldMeta`'s docstring) — their
+    current value has to come straight off the profile, not off
+    `_effective_params()`'s resolved output."""
+    if isinstance(meta, TextFieldMeta):
+        return getattr(profile, meta.key) if profile is not None else ""
+    return getattr(_effective_params(checkpoint, profile), meta.key)
+
+
+def _coerce_field_value(field: str, raw_value: str) -> dict[str, Any]:
+    """Turn a user-submitted string into a validated override dict for one
+    field. Numeric/enum fields go through `ProfileDefaults` for type
+    coercion and validation; prompt-prefix fields are free text, so any
+    string (including empty, to blank out a prefix) is accepted as-is."""
+    if field in PROMPT_OVERRIDE_FIELDS:
+        return {field: raw_value.strip()}
+    return ProfileDefaults.model_validate({field: raw_value}).model_dump(exclude_none=True)
 
 
 def _curate(choices: list[str], preferred: tuple[str, ...], max_items: int = 12) -> list[str]:
@@ -120,13 +162,13 @@ def _home_text(checkpoint: str, profile: ModelProfile | None) -> str:
 def _home_keyboard(
     checkpoint: str, profile: ModelProfile | None, override_fields: dict[str, Any]
 ) -> InlineKeyboardMarkup:
-    params = _effective_params(checkpoint, profile)
     rows: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
     for meta in FIELDS:
-        value = getattr(params, meta.key)
+        value = _field_value(meta, checkpoint, profile)
         marker = "★ " if meta.key in override_fields else ""
-        row.append(InlineKeyboardButton(f"{marker}{meta.label}: {_format_value(value)}", callback_data=f"st:f:{meta.key}"))
+        label = f"{marker}{meta.label}: {_truncate(_format_value(value))}"
+        row.append(InlineKeyboardButton(label, callback_data=f"st:f:{meta.key}"))
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -185,6 +227,18 @@ def _enum_submenu_keyboard(meta: EnumFieldMeta, current: Any, choices: list[str]
     return InlineKeyboardMarkup(rows)
 
 
+def _text_submenu_keyboard(meta: TextFieldMeta) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✏️ Edit", callback_data=f"st:c:{meta.key}")],
+            [
+                InlineKeyboardButton("↩ Back", callback_data="st:home"),
+                InlineKeyboardButton("🔄 Reset", callback_data=f"st:r:{meta.key}"),
+            ],
+        ]
+    )
+
+
 async def _enum_choices(client: ComfyClient, meta: EnumFieldMeta, fallback: Any) -> list[str]:
     try:
         if meta.key == "sampler_name":
@@ -214,15 +268,17 @@ async def _safe_edit_message(query, text: str, reply_markup: InlineKeyboardMarku
 async def _render_field_submenu(
     query, context: ContextTypes.DEFAULT_TYPE, checkpoint: str, profile: ModelProfile | None, meta: FieldMeta
 ) -> None:
-    params = _effective_params(checkpoint, profile)
-    value = getattr(params, meta.key)
+    value = _field_value(meta, checkpoint, profile)
     text = f"⚙️ Settings › {meta.label}"
     if isinstance(meta, NumericFieldMeta):
         keyboard = _numeric_submenu_keyboard(meta, value)
-    else:
+    elif isinstance(meta, EnumFieldMeta):
         client: ComfyClient = context.bot_data["comfy_client"]
         choices = await _enum_choices(client, meta, value)
         keyboard = _enum_submenu_keyboard(meta, value, choices)
+    else:
+        text = f"⚙️ Settings › {meta.label}\n\nCurrent: {_format_value(value)}"
+        keyboard = _text_submenu_keyboard(meta)
     await _safe_edit_message(query, text, keyboard)
 
 
@@ -344,7 +400,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if action == "v":
         raw_value = parts[3]
         try:
-            coerced = ProfileDefaults.model_validate({field: raw_value}).model_dump(exclude_none=True)
+            coerced = _coerce_field_value(field, raw_value)
         except ValidationError:
             await query.answer("Invalid value.", show_alert=True)
             return
@@ -374,7 +430,7 @@ async def handle_custom_value_message(update: Update, context: ContextTypes.DEFA
         return True
 
     try:
-        coerced = ProfileDefaults.model_validate({field: raw_value}).model_dump(exclude_none=True)
+        coerced = _coerce_field_value(field, raw_value)
     except ValidationError as exc:
         await message.reply_text(f"Invalid value: {exc.errors()[0]['msg']}")
         return True

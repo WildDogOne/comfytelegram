@@ -13,9 +13,17 @@ from pydantic import ValidationError
 from comfytelegram.profiles.schema import ModelProfile, ProfileDefaults
 from comfytelegram.workflows.builder import GenerationParams
 
-#: `ProfileDefaults`'s field names — the set of keys a stored per-chat
-#: override (or the /override command) is allowed to touch.
-OVERRIDABLE_FIELDS = set(ProfileDefaults.model_fields)
+#: `positive_prompt_prefix`/`negative_prompt_prefix` live on `ModelProfile`
+#: itself, not `ProfileDefaults` (they're not `GenerationParams` fields —
+#: see `resolve_generation_params` below), but the /settings menu lets the
+#: user override them the same way as any numeric default, so they need to
+#: be routed differently in `apply_profile_override` rather than merged
+#: straight into `.defaults`.
+PROMPT_OVERRIDE_FIELDS = {"positive_prompt_prefix", "negative_prompt_prefix"}
+
+#: The full set of keys a stored per-chat override (set via the /settings
+#: menu) is allowed to touch.
+OVERRIDABLE_FIELDS = set(ProfileDefaults.model_fields) | PROMPT_OVERRIDE_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +76,10 @@ def apply_profile_override(
     if not override_fields:
         return profile
     base = profile or ModelProfile(match=[checkpoint], display_name=checkpoint)
-    merged_defaults = base.defaults.model_copy(update=override_fields)
-    return base.model_copy(update={"defaults": merged_defaults})
+    prompt_updates = {k: v for k, v in override_fields.items() if k in PROMPT_OVERRIDE_FIELDS}
+    defaults_updates = {k: v for k, v in override_fields.items() if k not in PROMPT_OVERRIDE_FIELDS}
+    merged_defaults = base.defaults.model_copy(update=defaults_updates)
+    return base.model_copy(update={"defaults": merged_defaults, **prompt_updates})
 
 
 def _join_nonempty(parts: list[str], sep: str = ", ") -> str:
