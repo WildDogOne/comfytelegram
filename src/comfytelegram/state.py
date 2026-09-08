@@ -1,8 +1,11 @@
-"""Minimal in-memory state for the running bot process.
+"""In-memory, per-process-lifetime state: the post-processing result registry.
 
-Everything here resets on restart — acceptable for v1 per TODO.md section 7
-("lightweight solution first, avoid over-engineering"). Swap for sqlite if
-surviving restarts turns out to matter.
+Durable state (per-chat model selection, profile overrides) lives in
+`storage.py` (sqlite) instead — it needs to survive a bot restart, this
+doesn't. There would be no point persisting raw generated-image bytes
+across a restart anyway: the bot has no memory of the ComfyUI prompt_id
+that made them, so a stale "Upscale" button after a restart can only ever
+be told to generate a fresh image instead.
 """
 
 from __future__ import annotations
@@ -27,15 +30,8 @@ class PendingResult:
 
 class BotState:
     def __init__(self, *, result_ttl_seconds: float = 3600) -> None:
-        self._chat_checkpoint: dict[int, str] = {}
         self._results: dict[str, PendingResult] = {}
         self._result_ttl = result_ttl_seconds
-
-    def get_checkpoint(self, chat_id: int) -> str | None:
-        return self._chat_checkpoint.get(chat_id)
-
-    def set_checkpoint(self, chat_id: int, checkpoint: str) -> None:
-        self._chat_checkpoint[chat_id] = checkpoint
 
     def store_result(self, result: PendingResult) -> str:
         self._gc()

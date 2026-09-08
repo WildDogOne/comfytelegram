@@ -27,7 +27,9 @@ from comfytelegram.handlers import (
 )
 from comfytelegram.profiles import load_profiles
 from comfytelegram.settings import Settings, load_settings
+from comfytelegram.settings_menu import settings_callback, settings_command
 from comfytelegram.state import BotState
+from comfytelegram.storage import Storage
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,9 @@ async def _post_shutdown(application: Application) -> None:
     client: ComfyClient | None = application.bot_data.get("comfy_client")
     if client is not None:
         await client.__aexit__(None, None, None)
+    storage: Storage | None = application.bot_data.get("storage")
+    if storage is not None:
+        storage.close()
 
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -73,12 +78,15 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["settings"] = settings
     application.bot_data["profiles"] = load_profiles(settings.model_profiles_dir)
     application.bot_data["state"] = BotState()
+    application.bot_data["storage"] = Storage(settings.state_db_path)
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("model", model_command))
+    application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
     application.add_handler(CallbackQueryHandler(postprocess_callback, pattern=r"^pp:"))
+    application.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^st:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, generate_message))
     application.add_error_handler(_error_handler)
 

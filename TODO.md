@@ -93,31 +93,33 @@ history, or manually match types) — don't assume a `null` link means unused.
 - [x] Example profiles in `model_profiles/`: `furrytoonmix_illustrious.json` (values grounded in `sample.json` itself), `sdxl_base.json`, `ponyxl.json`, `animagine_xl.json` (community-recommended starting points, flagged as unverified in their `description`) — format documented in `model_profiles/README.md`
 - [x] User-editable: any `*.json` dropped into `model_profiles/` is picked up with no code change; invalid files are logged and skipped, not fatal
 
-## 4. ComfyUI integration layer (bot runtime) — HTTP/WS client done + live-verified, not wired to Telegram yet
-- [x] `src/comfytelegram/comfy_client.py` — `ComfyClient`: `queue_prompt`, `get_history`, `get_image_bytes`, `upload_image`, `list_checkpoints`/`list_loras` (via `/object_info`), `watch()` (async-generator progress stream over the websocket), `run_and_collect()` convenience wrapper
-- [x] **Verified against the real server**: `queue_prompt`/`watch`/`get_history`/`get_image_bytes`/`upload_image`/`list_checkpoints` all exercised in `scripts/smoke_test*.py` runs (see section 0 note); websocket `progress`/`executing(node=None)` event shape confirmed correct as-implemented
-- [ ] Glue function: checkpoint + user prompt + profile → `GenerationParams` (have this, via `profiles.resolve_generation_params`) → submitted prompt dict (have this, via `workflows.build_txt2img`) → not yet composed into one call the bot handler invokes (the smoke-test scripts do this inline; the bot needs its own equivalent, likely a small `generation.py` service module)
-- [ ] Error handling: translate `ComfyUIError` / connection failures into user-facing Telegram messages (not started)
-- [x] Output retrieval verified (`get_image_bytes`, via the smoke tests)
+## 4. ComfyUI integration layer (bot runtime) — done, live-verified
+- [x] `src/comfytelegram/comfy_client.py` — `ComfyClient`: `queue_prompt`, `get_history`, `get_image_bytes`, `upload_image`, `list_checkpoints`/`list_loras`/`list_samplers`/`list_schedulers` (all via `/object_info`), `watch()` (async-generator progress stream over the websocket), `run_and_collect()` convenience wrapper
+- [x] **Verified against the real server**: `queue_prompt`/`watch`/`get_history`/`get_image_bytes`/`upload_image`/`list_checkpoints` all exercised in `scripts/smoke_test*.py` runs and in the live Telegram bot (see section 0 note); websocket `progress`/`executing(node=None)` event shape confirmed correct as-implemented
+- [x] Glue module: `src/comfytelegram/generation.py` — `generate()` and `post_process()` turn (checkpoint, prompt, profile) into a submitted-and-collected result; `handlers.py` calls these directly
+- [x] Error handling: `ComfyUIError`/unexpected exceptions caught in `handlers.py` and reported back into the chat; a bot-wide `add_error_handler` in `main.py` catches anything that still slips through (added after a real bug — Telegram's sendPhoto 10MB limit rejected a 4x upscale and failed silently with no handler registered)
+- [x] Output retrieval verified (`get_image_bytes`), including the large-file fallback (`reply_document` when a result exceeds Telegram's 10MB photo limit)
 
-## 5. Telegram bot core
-- [ ] Pick library (python-telegram-bot recommended) and bootstrap bot app + config loading
-- [ ] `/start` / `/help` command
-- [ ] Model selection: `/model` command with inline-keyboard picker populated from checkpoints available on the ComfyUI instance (+ persists user's last-selected model)
-- [ ] Prompt input flow: plain text message (or `/generate <prompt>`) triggers a run using the selected model's profile defaults
-- [ ] Basic per-user/per-chat settings (current model, maybe override cfg/steps) — decide storage (in-memory vs sqlite)
-- [ ] Progress feedback while a job runs (edit message with status/progress %)
+## 5. Telegram bot core — done
+- [x] python-telegram-bot (v22, async); `src/comfytelegram/main.py` bootstraps `Application`, wires `Settings`/`Storage`/profiles/state into `bot_data`, registers handlers, runs polling
+- [x] `/start` / `/help`
+- [x] `/model` — inline-keyboard picker built from `ComfyClient.list_checkpoints()`, labeled with the matching profile's `display_name` where one exists; selection persists via `Storage`
+- [x] Plain-text message → `generate_message` handler: resolves the chat's checkpoint + profile (+ any stored override) and runs `generation.generate()`
+- [x] Per-chat settings persist across restarts — see section 7
+- [x] Progress feedback: the "Generating…" message is edited in place with step/percent, throttled to avoid Telegram's edit rate limit
 
-## 6. Generation + post-processing UX
-- [ ] On job completion, send the generated image(s) back to the user
-- [ ] Attach inline keyboard per image/result set: "Upscale", "Face detail", (stretch) "Style transfer", "Pose control"
-- [ ] Wire button callbacks → compose + run the corresponding post-processing fragment against the selected image
-- [ ] Send post-processed result as a follow-up message; consider allowing chaining (upscale → then face-detail)
-- [ ] Handle multiple images per batch cleanly (per-image button rows, track which result a callback refers to)
+## 6. Generation + post-processing UX — done
+- [x] Generated image(s) sent back per-image (not a media group, so each can carry its own buttons), with 🔍 Upscale / ✨ Face Detail inline buttons
+- [x] Button callbacks (`postprocess_callback`) run the matching post-processing graph against the selected image
+- [x] Result sent as a follow-up message; chaining works naturally since post-processed results also get their own Upscale/Face-Detail buttons
+- [x] Multi-image batches handled correctly — each image gets its own `PendingResult` entry (`state.py`) and its own keyboard
+- [ ] (Stretch, not started) Style-transfer / pose-control buttons — waiting on the IPAdapter/ControlNet builder functions from section 2
 
-## 7. State & persistence
-- [ ] Decide storage for: user model preference, in-flight job → chat/message mapping (for progress edits + button callbacks), generation history (optional)
-- [ ] Lightweight solution first (sqlite or JSON files) — avoid over-engineering
+## 7. State & persistence — done
+- [x] `src/comfytelegram/storage.py` — sqlite (`state.sqlite3`, gitignored), two tables: per-chat selected checkpoint, per-(chat, checkpoint) profile-default overrides. Deliberately primitive: stdlib `sqlite3`, no migrations/ORM. Added after the first live test surfaced that model selection was in-memory only and lost on every restart.
+- [x] In-flight job → chat/message mapping doesn't need its own storage — python-telegram-bot's `Message` object returned from `reply_text` already carries what's needed to edit it later, held as a local closure variable per request (see `generate_message`'s `status_message`)
+- [x] Post-processing result registry (`state.py`, `BotState`) stays in-memory on purpose — it holds raw generated-image bytes, which are pointless to persist across a restart (see the module's own docstring for why)
+- [x] `/settings` — an in-place, edited inline-keyboard menu for viewing/changing the per-chat profile overrides (`src/comfytelegram/settings_menu.py`), replacing an earlier `/override <field>=<value>` command that worked but wasn't user-friendly. Numeric fields get stepper + preset buttons; enum fields (sampler/scheduler) get a button grid sourced live from ComfyUI's `/object_info` so it can never offer an invalid value; both fall back to free-text "custom value" entry. Design rationale + sources are in the conversation that led here.
 
 ## 8. Config, secrets, deployment
 - [x] Telegram bot token via `.env` (template: `env.example`, `settings.py` reads it via `pydantic-settings`), never committed

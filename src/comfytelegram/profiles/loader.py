@@ -10,8 +10,12 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from comfytelegram.profiles.schema import ModelProfile
+from comfytelegram.profiles.schema import ModelProfile, ProfileDefaults
 from comfytelegram.workflows.builder import GenerationParams
+
+#: `ProfileDefaults`'s field names — the set of keys a stored per-chat
+#: override (or the /override command) is allowed to touch.
+OVERRIDABLE_FIELDS = set(ProfileDefaults.model_fields)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +51,25 @@ def resolve_profile(checkpoint_name: str, profiles: list[ModelProfile]) -> Model
         if any(fnmatch.fnmatch(needle, pattern.lower()) for pattern in profile.match):
             return profile
     return None
+
+
+def apply_profile_override(
+    profile: ModelProfile | None, checkpoint: str, override_fields: dict[str, Any]
+) -> ModelProfile | None:
+    """Layer a user's stored per-(chat, checkpoint) override (see `storage.py`,
+    already validated against `ProfileDefaults` before being persisted) on top
+    of the shipped profile for that checkpoint.
+
+    If no shipped profile matched but the user still has an override stored
+    (they set one before any `model_profiles/*.json` existed for this
+    checkpoint), synthesize a minimal profile from just the override so it
+    still applies.
+    """
+    if not override_fields:
+        return profile
+    base = profile or ModelProfile(match=[checkpoint], display_name=checkpoint)
+    merged_defaults = base.defaults.model_copy(update=override_fields)
+    return base.model_copy(update={"defaults": merged_defaults})
 
 
 def _join_nonempty(parts: list[str], sep: str = ", ") -> str:

@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from comfytelegram.profiles import load_profiles, resolve_generation_params, resolve_profile
+from comfytelegram.profiles import (
+    ModelProfile,
+    ProfileDefaults,
+    load_profiles,
+    resolve_generation_params,
+    resolve_profile,
+)
 
 PROFILES_DIR = Path(__file__).resolve().parent.parent / "model_profiles"
 
@@ -40,23 +46,37 @@ def test_resolve_profile_no_match_returns_none(profiles):
     assert resolve_profile("some_unknown_checkpoint.safetensors", profiles) is None
 
 
-def test_resolve_generation_params_applies_profile_defaults(profiles):
-    profile = resolve_profile("furrytoonmix_xlIllustriousV2.safetensors", profiles)
-    params = resolve_generation_params(
-        "furrytoonmix_xlIllustriousV2.safetensors", "a fox", profile
+def _synthetic_profile() -> ModelProfile:
+    """A profile with fixed, non-tunable values for testing merge logic —
+    deliberately not one of the shipped model_profiles/*.json files, since
+    those are meant to be user-editable and a prior version of this test
+    broke the moment their exact numbers were tuned (see git history / the
+    furrytoonmix_illustrious.json steps mismatch this test used to pin)."""
+    return ModelProfile(
+        match=["synthetic_test_ckpt*"],
+        display_name="Synthetic Test Profile",
+        defaults=ProfileDefaults(cfg=5.0, steps=40, clip_skip=-2),
+        positive_prompt_prefix="masterpiece,best quality",
+        negative_prompt_prefix="low quality",
     )
+
+
+def test_resolve_generation_params_applies_profile_defaults():
+    profile = _synthetic_profile()
+    params = resolve_generation_params("synthetic_test_ckpt.safetensors", "a fox", profile)
     assert params.cfg == 5.0
     assert params.steps == 40
     assert params.clip_skip == -2
     assert params.positive_prompt.startswith("masterpiece,best quality")
     assert params.positive_prompt.endswith("a fox")
-    assert params.loras == []  # all shipped with default_enabled: false
+    assert params.negative_prompt == "low quality"
+    assert params.loras == []
 
 
-def test_resolve_generation_params_overrides_win(profiles):
-    profile = resolve_profile("furrytoonmix_xlIllustriousV2.safetensors", profiles)
+def test_resolve_generation_params_overrides_win():
+    profile = _synthetic_profile()
     params = resolve_generation_params(
-        "furrytoonmix_xlIllustriousV2.safetensors",
+        "synthetic_test_ckpt.safetensors",
         "a fox",
         profile,
         overrides={"cfg": 9.0},

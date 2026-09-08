@@ -29,6 +29,10 @@ class Settings(BaseSettings):
         default=PROJECT_ROOT / "outputs",
         description="Where generated images are downloaded to before being sent to Telegram",
     )
+    state_db_path: Path = Field(
+        default=PROJECT_ROOT / "state.sqlite3",
+        description="SQLite file for durable per-chat state (selected model, profile overrides)",
+    )
 
     # NoDecode: pydantic-settings would otherwise try to JSON-decode this env
     # var before validation ever sees it (its default behavior for list-typed

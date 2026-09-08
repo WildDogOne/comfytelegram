@@ -94,6 +94,14 @@ class ComfyClient:
         info = await self.get_node_info("LoraLoader")
         return _enum_choices(info, "lora_name")
 
+    async def list_samplers(self) -> list[str]:
+        info = await self.get_node_info("KSampler")
+        return _enum_choices(info, "sampler_name")
+
+    async def list_schedulers(self) -> list[str]:
+        info = await self.get_node_info("KSampler")
+        return _enum_choices(info, "scheduler")
+
     async def queue_prompt(self, prompt: dict[str, Any], *, client_id: str) -> str:
         payload = {"prompt": prompt, "client_id": client_id}
         async with self.session.post(f"{self.http_base}/prompt", json=payload) as resp:

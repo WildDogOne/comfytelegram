@@ -15,11 +15,14 @@ import time
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import ContextTypes
 
+from comfytelegram.auth import is_authorized, reject_if_unauthorized
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
 from comfytelegram.generation import generate, post_process
-from comfytelegram.profiles import ModelProfile, resolve_profile
+from comfytelegram.profiles import ModelProfile, apply_profile_override, resolve_profile
 from comfytelegram.settings import Settings
+from comfytelegram.settings_menu import handle_custom_value_message
 from comfytelegram.state import BotState, PendingResult
+from comfytelegram.storage import Storage
 
 logger = logging.getLogger(__name__)
 
@@ -35,21 +38,6 @@ PROGRESS_EDIT_INTERVAL = 2.0
 # Stay under it with margin, and fall back to sendDocument (up to 50MB,
 # uncompressed) for anything bigger rather than silently failing.
 TELEGRAM_PHOTO_SIZE_LIMIT = 10_000_000
-
-
-def _is_authorized(settings: Settings, user_id: int | None) -> bool:
-    if not settings.allowed_user_ids:
-        return True
-    return user_id in settings.allowed_user_ids
-
-
-async def _reject_if_unauthorized(update: Update, settings: Settings) -> bool:
-    user = update.effective_user
-    if user is not None and _is_authorized(settings, user.id):
-        return False
-    if update.effective_message is not None:
-        await update.effective_message.reply_text("You're not authorized to use this bot.")
-    return True
 
 
 def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
@@ -84,11 +72,12 @@ async def _send_result_image(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.bot_data["settings"]
-    if await _reject_if_unauthorized(update, settings):
+    if await reject_if_unauthorized(update, settings):
         return
     await update.effective_message.reply_text(
         "Send me a prompt and I'll generate an image with ComfyUI.\n\n"
         "/model — pick a checkpoint\n"
+        "/settings — view or change generation defaults for the current model\n"
         "/help — show this message"
     )
 
@@ -99,7 +88,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.bot_data["settings"]
-    if await _reject_if_unauthorized(update, settings):
+    if await reject_if_unauthorized(update, settings):
         return
 
     client: ComfyClient = context.bot_data["comfy_client"]
@@ -132,7 +121,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
-    if update.effective_user is None or not _is_authorized(settings, update.effective_user.id):
+    if update.effective_user is None or not is_authorized(settings, update.effective_user.id):
         await query.answer("Not authorized.", show_alert=True)
         return
 
@@ -144,8 +133,8 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     checkpoint = checkpoints[index]
-    state: BotState = context.bot_data["state"]
-    state.set_checkpoint(update.effective_chat.id, checkpoint)
+    storage: Storage = context.bot_data["storage"]
+    storage.set_checkpoint(update.effective_chat.id, checkpoint)
 
     profiles: list[ModelProfile] = context.bot_data["profiles"]
     profile = resolve_profile(checkpoint, profiles)
@@ -157,7 +146,10 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.bot_data["settings"]
-    if await _reject_if_unauthorized(update, settings):
+    if await reject_if_unauthorized(update, settings):
+        return
+
+    if await handle_custom_value_message(update, context):
         return
 
     message = update.effective_message
@@ -167,10 +159,11 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     chat_id = update.effective_chat.id
     state: BotState = context.bot_data["state"]
+    storage: Storage = context.bot_data["storage"]
     client: ComfyClient = context.bot_data["comfy_client"]
     profiles: list[ModelProfile] = context.bot_data["profiles"]
 
-    checkpoint = state.get_checkpoint(chat_id)
+    checkpoint = storage.get_checkpoint(chat_id)
     if checkpoint is None:
         try:
             checkpoints = await client.list_checkpoints()
@@ -181,13 +174,15 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await message.reply_text("ComfyUI reports no checkpoints installed.")
             return
         checkpoint = checkpoints[0]
-        state.set_checkpoint(chat_id, checkpoint)
+        storage.set_checkpoint(chat_id, checkpoint)
         context.bot_data["available_checkpoints"] = checkpoints
         await message.reply_text(
             f"No model selected yet — defaulting to {checkpoint}. Use /model to change it."
         )
 
     profile = resolve_profile(checkpoint, profiles)
+    override_fields = storage.get_override(chat_id, checkpoint)
+    profile = apply_profile_override(profile, checkpoint, override_fields)
     status_message = await message.reply_text("Generating… 0%")
 
     last_edit = {"t": 0.0}
@@ -227,7 +222,7 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
-    if update.effective_user is None or not _is_authorized(settings, update.effective_user.id):
+    if update.effective_user is None or not is_authorized(settings, update.effective_user.id):
         await query.answer("Not authorized.", show_alert=True)
         return
 
