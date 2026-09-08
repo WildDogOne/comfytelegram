@@ -116,18 +116,21 @@ class Storage:
         ).fetchone()
         return json.loads(row[0]) if row else {}
 
+    def _save_override(self, chat_id: int, checkpoint: str, fields: dict[str, Any]) -> None:
+        self._conn.execute(
+            "INSERT INTO profile_override (chat_id, checkpoint, overrides_json) VALUES (?, ?, ?) "
+            "ON CONFLICT(chat_id, checkpoint) DO UPDATE SET overrides_json = excluded.overrides_json",
+            (chat_id, checkpoint, json.dumps(fields)),
+        )
+        self._conn.commit()
+
     def set_override_fields(self, chat_id: int, checkpoint: str, fields: dict[str, Any]) -> dict[str, Any]:
         """Merge `fields` (already-validated ProfileDefaults-shaped values) into
         the existing override for (chat_id, checkpoint) and persist it. Returns
         the merged result."""
         current = self.get_override(chat_id, checkpoint)
         current.update(fields)
-        self._conn.execute(
-            "INSERT INTO profile_override (chat_id, checkpoint, overrides_json) VALUES (?, ?, ?) "
-            "ON CONFLICT(chat_id, checkpoint) DO UPDATE SET overrides_json = excluded.overrides_json",
-            (chat_id, checkpoint, json.dumps(current)),
-        )
-        self._conn.commit()
+        self._save_override(chat_id, checkpoint, current)
         return current
 
     def clear_override(self, chat_id: int, checkpoint: str) -> None:
@@ -145,16 +148,9 @@ class Storage:
             return current
         del current[field]
         if current:
-            self._conn.execute(
-                "INSERT INTO profile_override (chat_id, checkpoint, overrides_json) VALUES (?, ?, ?) "
-                "ON CONFLICT(chat_id, checkpoint) DO UPDATE SET overrides_json = excluded.overrides_json",
-                (chat_id, checkpoint, json.dumps(current)),
-            )
+            self._save_override(chat_id, checkpoint, current)
         else:
-            self._conn.execute(
-                "DELETE FROM profile_override WHERE chat_id = ? AND checkpoint = ?", (chat_id, checkpoint)
-            )
-        self._conn.commit()
+            self.clear_override(chat_id, checkpoint)
         return current
 
     def store_pending_result(
@@ -166,7 +162,7 @@ class Storage:
         handlers.py's (de)serialization helpers) needed to build the next
         graph, whether that's an upscale/face-detail pass or a fresh
         "🔁 Regenerate" run."""
-        self._prune_pending_results()
+        self._prune("pending_result")
         self._conn.execute(
             "INSERT OR REPLACE INTO pending_result "
             "(result_id, chat_id, file_id, filename, base_params_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -189,9 +185,13 @@ class Storage:
             "base_params": json.loads(base_params_json),
         }
 
-    def _prune_pending_results(self, ttl_seconds: float = PENDING_RESULT_TTL_SECONDS) -> None:
+    def _prune(self, table: str, ttl_seconds: float = PENDING_RESULT_TTL_SECONDS) -> None:
+        """Delete rows older than `ttl_seconds` from `table` — both
+        `pending_result` and `generation_snapshot` are TTL-pruned key→blob
+        tables with an identical `created_at` column, so this one method
+        backs both."""
         cutoff = time.time() - ttl_seconds
-        self._conn.execute("DELETE FROM pending_result WHERE created_at < ?", (cutoff,))
+        self._conn.execute(f"DELETE FROM {table} WHERE created_at < ?", (cutoff,))
         self._conn.commit()
 
     def save_character(
@@ -260,7 +260,7 @@ class Storage:
         the same per-result-id pattern `pending_result` uses, so an older
         message's button can't be shadowed by a newer generation in the
         same chat."""
-        self._prune_generation_snapshots()
+        self._prune("generation_snapshot")
         self._conn.execute(
             "INSERT OR REPLACE INTO generation_snapshot (snapshot_id, chat_id, params_json, created_at) "
             "VALUES (?, ?, ?, ?)",
@@ -276,11 +276,6 @@ class Storage:
             return None
         chat_id, params_json = row
         return {"chat_id": chat_id, "params": json.loads(params_json)}
-
-    def _prune_generation_snapshots(self, ttl_seconds: float = PENDING_RESULT_TTL_SECONDS) -> None:
-        cutoff = time.time() - ttl_seconds
-        self._conn.execute("DELETE FROM generation_snapshot WHERE created_at < ?", (cutoff,))
-        self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()

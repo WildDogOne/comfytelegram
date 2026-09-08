@@ -22,14 +22,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import ValidationError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
-from comfytelegram.auth import is_authorized, reject_if_unauthorized
+from comfytelegram.auth import reject_if_unauthorized, reject_if_unauthorized_callback
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError
 from comfytelegram.profiles import (
     PROMPT_OVERRIDE_FIELDS,
@@ -51,7 +51,6 @@ class NumericFieldMeta:
     presets: tuple[float, ...]
     is_int: bool = False
     min_value: float | None = None
-    kind: Literal["numeric"] = "numeric"
 
 
 @dataclass(frozen=True)
@@ -59,7 +58,6 @@ class EnumFieldMeta:
     key: str
     label: str
     preferred: tuple[str, ...] = dataclass_field(default_factory=tuple)
-    kind: Literal["enum"] = "enum"
 
 
 @dataclass(frozen=True)
@@ -72,7 +70,6 @@ class TextFieldMeta:
 
     key: str
     label: str
-    kind: Literal["text"] = "text"
 
 
 FieldMeta = NumericFieldMeta | EnumFieldMeta | TextFieldMeta
@@ -119,20 +116,33 @@ def _truncate(s: str, n: int = 22) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def _chunk(buttons: list[InlineKeyboardButton], size: int) -> list[list[InlineKeyboardButton]]:
+    """Split a flat button list into fixed-size rows for a keyboard grid —
+    shared by the home/numeric-preset/enum-choice keyboards below, which
+    only differ in row width."""
+    return [buttons[i : i + size] for i in range(0, len(buttons), size)]
+
+
 def _effective_params(checkpoint: str, profile: ModelProfile | None):
     """Same resolution path generation actually uses — read the numeric
     fields off the result instead of duplicating the merge/fallback logic."""
     return resolve_generation_params(checkpoint, "", profile)
 
 
-def _field_value(meta: FieldMeta, checkpoint: str, profile: ModelProfile | None) -> Any:
+def _field_value(
+    meta: FieldMeta, checkpoint: str, profile: ModelProfile | None, effective: Any = None
+) -> Any:
     """`positive_prompt_prefix`/`negative_prompt_prefix` aren't
     `GenerationParams` fields (see `TextFieldMeta`'s docstring) — their
     current value has to come straight off the profile, not off
-    `_effective_params()`'s resolved output."""
+    `_effective_params()`'s resolved output. `effective` lets a caller that's
+    already resolved it once (e.g. `_home_keyboard`, looping over all
+    `FIELDS`) pass it in instead of re-resolving per field."""
     if isinstance(meta, TextFieldMeta):
         return getattr(profile, meta.key) if profile is not None else ""
-    return getattr(_effective_params(checkpoint, profile), meta.key)
+    if effective is None:
+        effective = _effective_params(checkpoint, profile)
+    return getattr(effective, meta.key)
 
 
 def _coerce_field_value(field: str, raw_value: str) -> dict[str, Any]:
@@ -162,68 +172,58 @@ def _home_text(checkpoint: str, profile: ModelProfile | None) -> str:
 def _home_keyboard(
     checkpoint: str, profile: ModelProfile | None, override_fields: dict[str, Any]
 ) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
+    effective = _effective_params(checkpoint, profile)
+    buttons = []
     for meta in FIELDS:
-        value = _field_value(meta, checkpoint, profile)
+        value = _field_value(meta, checkpoint, profile, effective)
         marker = "★ " if meta.key in override_fields else ""
         label = f"{marker}{meta.label}: {_truncate(_format_value(value))}"
-        row.append(InlineKeyboardButton(label, callback_data=f"st:f:{meta.key}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
+        buttons.append(InlineKeyboardButton(label, callback_data=f"st:f:{meta.key}"))
+    rows = _chunk(buttons, 2)
     rows.append([InlineKeyboardButton("🔄 Reset all to model defaults", callback_data="st:ra")])
     rows.append([InlineKeyboardButton("✖ Close", callback_data="st:close")])
     return InlineKeyboardMarkup(rows)
 
 
+def _nav_row(meta: FieldMeta) -> list[InlineKeyboardButton]:
+    """The "↩ Back / 🔄 Reset" row every field submenu ends with."""
+    return [
+        InlineKeyboardButton("↩ Back", callback_data="st:home"),
+        InlineKeyboardButton("🔄 Reset", callback_data=f"st:r:{meta.key}"),
+    ]
+
+
 def _numeric_submenu_keyboard(meta: NumericFieldMeta, value: Any) -> InlineKeyboardMarkup:
     step = int(meta.step) if meta.is_int else meta.step
-    rows: list[list[InlineKeyboardButton]] = [
+    preset_buttons = [
+        InlineKeyboardButton(_format_value(preset), callback_data=f"st:v:{meta.key}:{preset}")
+        for preset in meta.presets
+    ]
+    rows = [
         [
             InlineKeyboardButton("➖", callback_data=f"st:d:{meta.key}:{-step}"),
             InlineKeyboardButton(_format_value(value), callback_data="st:noop"),
             InlineKeyboardButton("➕", callback_data=f"st:d:{meta.key}:{step}"),
-        ]
+        ],
+        *_chunk(preset_buttons, 3),
+        [InlineKeyboardButton("✏️ Custom value", callback_data=f"st:c:{meta.key}")],
+        _nav_row(meta),
     ]
-    preset_row: list[InlineKeyboardButton] = []
-    for preset in meta.presets:
-        preset_row.append(InlineKeyboardButton(_format_value(preset), callback_data=f"st:v:{meta.key}:{preset}"))
-        if len(preset_row) == 3:
-            rows.append(preset_row)
-            preset_row = []
-    if preset_row:
-        rows.append(preset_row)
-    rows.append([InlineKeyboardButton("✏️ Custom value", callback_data=f"st:c:{meta.key}")])
-    rows.append(
-        [
-            InlineKeyboardButton("↩ Back", callback_data="st:home"),
-            InlineKeyboardButton("🔄 Reset", callback_data=f"st:r:{meta.key}"),
-        ]
-    )
     return InlineKeyboardMarkup(rows)
 
 
 def _enum_submenu_keyboard(meta: EnumFieldMeta, current: Any, choices: list[str]) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
-    for choice in _curate(choices, meta.preferred):
-        marker = "• " if choice == current else ""
-        row.append(InlineKeyboardButton(f"{marker}{choice}", callback_data=f"st:v:{meta.key}:{choice}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([InlineKeyboardButton("✏️ Custom value", callback_data=f"st:c:{meta.key}")])
-    rows.append(
-        [
-            InlineKeyboardButton("↩ Back", callback_data="st:home"),
-            InlineKeyboardButton("🔄 Reset", callback_data=f"st:r:{meta.key}"),
-        ]
-    )
+    choice_buttons = [
+        InlineKeyboardButton(
+            f"{'• ' if choice == current else ''}{choice}", callback_data=f"st:v:{meta.key}:{choice}"
+        )
+        for choice in _curate(choices, meta.preferred)
+    ]
+    rows = [
+        *_chunk(choice_buttons, 2),
+        [InlineKeyboardButton("✏️ Custom value", callback_data=f"st:c:{meta.key}")],
+        _nav_row(meta),
+    ]
     return InlineKeyboardMarkup(rows)
 
 
@@ -292,6 +292,20 @@ def _resolve_effective_profile(
     return apply_profile_override(base_profile, checkpoint, override_fields), override_fields
 
 
+async def _show_home(query, context: ContextTypes.DEFAULT_TYPE, chat_id: int, checkpoint: str) -> None:
+    profile, override_fields = _resolve_effective_profile(context, chat_id, checkpoint)
+    await _safe_edit_message(
+        query, _home_text(checkpoint, profile), _home_keyboard(checkpoint, profile, override_fields)
+    )
+
+
+async def _show_field(
+    query, context: ContextTypes.DEFAULT_TYPE, chat_id: int, checkpoint: str, meta: FieldMeta
+) -> None:
+    profile, _ = _resolve_effective_profile(context, chat_id, checkpoint)
+    await _render_field_submenu(query, context, checkpoint, profile, meta)
+
+
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
@@ -313,8 +327,8 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
-    if update.effective_user is None or not is_authorized(settings, update.effective_user.id):
-        await query.answer("Not authorized.", show_alert=True)
+    user_id = update.effective_user.id if update.effective_user else None
+    if await reject_if_unauthorized_callback(query, user_id, settings):
         return
 
     chat_id = update.effective_chat.id
@@ -338,19 +352,13 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if action == "home":
         await query.answer()
-        profile, override_fields = _resolve_effective_profile(context, chat_id, checkpoint)
-        await _safe_edit_message(
-            query, _home_text(checkpoint, profile), _home_keyboard(checkpoint, profile, override_fields)
-        )
+        await _show_home(query, context, chat_id, checkpoint)
         return
 
     if action == "ra":
         storage.clear_override(chat_id, checkpoint)
         await query.answer("Reset to model defaults.")
-        profile, override_fields = _resolve_effective_profile(context, chat_id, checkpoint)
-        await _safe_edit_message(
-            query, _home_text(checkpoint, profile), _home_keyboard(checkpoint, profile, override_fields)
-        )
+        await _show_home(query, context, chat_id, checkpoint)
         return
 
     field = parts[2]
@@ -361,15 +369,13 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if action == "f":
         await query.answer()
-        profile, _ = _resolve_effective_profile(context, chat_id, checkpoint)
-        await _render_field_submenu(query, context, checkpoint, profile, meta)
+        await _show_field(query, context, chat_id, checkpoint, meta)
         return
 
     if action == "r":
         storage.clear_override_field(chat_id, checkpoint, field)
         await query.answer(f"Reset {meta.label}.")
-        profile, _ = _resolve_effective_profile(context, chat_id, checkpoint)
-        await _render_field_submenu(query, context, checkpoint, profile, meta)
+        await _show_field(query, context, chat_id, checkpoint, meta)
         return
 
     if action == "c":
@@ -393,8 +399,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             new_value = max(meta.min_value, new_value)
         storage.set_override_fields(chat_id, checkpoint, {field: new_value})
         await query.answer(f"{meta.label} set to {_format_value(new_value)}")
-        profile, _ = _resolve_effective_profile(context, chat_id, checkpoint)
-        await _render_field_submenu(query, context, checkpoint, profile, meta)
+        await _show_field(query, context, chat_id, checkpoint, meta)
         return
 
     if action == "v":
@@ -406,8 +411,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             return
         storage.set_override_fields(chat_id, checkpoint, coerced)
         await query.answer(f"{meta.label} set to {_format_value(coerced[field])}")
-        profile, _ = _resolve_effective_profile(context, chat_id, checkpoint)
-        await _render_field_submenu(query, context, checkpoint, profile, meta)
+        await _show_field(query, context, chat_id, checkpoint, meta)
         return
 
     await query.answer("Unknown action.", show_alert=True)

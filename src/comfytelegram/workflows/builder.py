@@ -24,6 +24,10 @@ from typing import Any
 NodeRef = tuple[str, int]
 
 
+def _resolve_seed(seed: int | None) -> int:
+    return seed if seed is not None else random.randint(0, 2**32 - 1)
+
+
 class PromptGraph:
     """A mutable ComfyUI API-format prompt being assembled node by node."""
 
@@ -76,7 +80,7 @@ class GenerationParams:
     filename_prefix: str = "comfytelegram"
 
     def resolved_seed(self) -> int:
-        return self.seed if self.seed is not None else random.randint(0, 2**32 - 1)
+        return _resolve_seed(self.seed)
 
 
 def _apply_loras(
@@ -103,31 +107,7 @@ def build_txt2img(params: GenerationParams) -> tuple[dict[str, Any], str]:
     """Build the base generation graph. Returns (prompt_dict, save_image_node_id)."""
     g = PromptGraph()
 
-    ckpt = g.add("CheckpointLoaderSimple", {"ckpt_name": params.checkpoint}, title="Checkpoint")
-    model_ref: NodeRef = (ckpt, 0)
-    clip_ref: NodeRef = (ckpt, 1)
-    vae_ref: NodeRef = (ckpt, 2)
-
-    model_ref, clip_ref = _apply_loras(g, model_ref, clip_ref, params.loras)
-
-    if params.clip_skip != -1:
-        clip_skip_node = g.add(
-            "CLIPSetLastLayer",
-            {"clip": list(clip_ref), "stop_at_clip_layer": params.clip_skip},
-            title="Clip Skip",
-        )
-        clip_ref = (clip_skip_node, 0)
-
-    positive = g.add(
-        "CLIPTextEncode",
-        {"clip": list(clip_ref), "text": params.positive_prompt},
-        title="Prompt Positive",
-    )
-    negative = g.add(
-        "CLIPTextEncode",
-        {"clip": list(clip_ref), "text": params.negative_prompt},
-        title="Prompt Negative",
-    )
+    model_ref, _clip_ref, vae_ref, positive, negative = _build_model_clip_vae(g, params)
 
     latent = g.add(
         "EmptyLatentImage",
@@ -185,9 +165,11 @@ class PostProcessBaseParams:
 
 
 def _build_model_clip_vae(
-    g: PromptGraph, base: PostProcessBaseParams
+    g: PromptGraph, base: GenerationParams | PostProcessBaseParams
 ) -> tuple[NodeRef, NodeRef, NodeRef, str, str]:
-    """Shared checkpoint+LoRA+clip-skip+prompt wiring for post-processing graphs.
+    """Shared checkpoint+LoRA+clip-skip+prompt wiring, used by `build_txt2img`
+    and both post-processing graph builders below — `GenerationParams` and
+    `PostProcessBaseParams` both carry the five fields this needs.
 
     Returns (model_ref, clip_ref, vae_ref, positive_node_id, negative_node_id).
     """
@@ -264,7 +246,7 @@ def build_upscale(
             "vae": list(vae_ref),
             "upscale_model": [upscale_model, 0],
             "upscale_by": params.upscale_by,
-            "seed": params.seed if params.seed is not None else random.randint(0, 2**32 - 1),
+            "seed": _resolve_seed(params.seed),
             "steps": params.steps,
             "cfg": params.cfg,
             "sampler_name": params.sampler_name,
@@ -348,7 +330,7 @@ def build_face_detailer(
             "guide_size": params.guide_size,
             "guide_size_for": True,
             "max_size": params.max_size,
-            "seed": params.seed if params.seed is not None else random.randint(0, 2**32 - 1),
+            "seed": _resolve_seed(params.seed),
             "steps": params.steps,
             "cfg": params.cfg,
             "sampler_name": params.sampler_name,

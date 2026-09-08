@@ -8,6 +8,7 @@ do the equivalent inline for quick manual checks against a live server.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -82,11 +83,12 @@ async def _run_graph(
     if not images:
         raise ComfyUIError(f"Job {prompt_id} produced no images at save node {save_node_id}")
 
-    results = []
-    for img in images:
-        data = await client.get_image_bytes(img["filename"], img["subfolder"], img["type"])
-        results.append((data, img["filename"]))
-    return results
+    # Independent /view downloads — run them concurrently instead of one
+    # round-trip at a time (matters most for a multi-image batch_size).
+    data_list = await asyncio.gather(
+        *(client.get_image_bytes(img["filename"], img["subfolder"], img["type"]) for img in images)
+    )
+    return list(zip(data_list, (img["filename"] for img in images)))
 
 
 async def generate(

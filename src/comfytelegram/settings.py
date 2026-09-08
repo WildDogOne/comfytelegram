@@ -25,10 +25,6 @@ class Settings(BaseSettings):
         default=PROJECT_ROOT / "model_profiles",
         description="Directory of per-checkpoint default-settings JSON files",
     )
-    output_dir: Path = Field(
-        default=PROJECT_ROOT / "outputs",
-        description="Where generated images are downloaded to before being sent to Telegram",
-    )
     state_db_path: Path = Field(
         default=PROJECT_ROOT / "state.sqlite3",
         description="SQLite file for durable per-chat state (selected model, profile overrides)",

@@ -10,7 +10,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from comfytelegram.profiles.schema import ModelProfile, ProfileDefaults
+from comfytelegram.profiles.schema import ModelProfile
 from comfytelegram.workflows.builder import GenerationParams
 
 #: `positive_prompt_prefix`/`negative_prompt_prefix` live on `ModelProfile`
@@ -20,10 +20,6 @@ from comfytelegram.workflows.builder import GenerationParams
 #: be routed differently in `apply_profile_override` rather than merged
 #: straight into `.defaults`.
 PROMPT_OVERRIDE_FIELDS = {"positive_prompt_prefix", "negative_prompt_prefix"}
-
-#: The full set of keys a stored per-chat override (set via the /settings
-#: menu) is allowed to touch.
-OVERRIDABLE_FIELDS = set(ProfileDefaults.model_fields) | PROMPT_OVERRIDE_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +78,9 @@ def apply_profile_override(
     return base.model_copy(update={"defaults": merged_defaults, **prompt_updates})
 
 
-def _join_nonempty(parts: list[str], sep: str = ", ") -> str:
+def join_nonempty(parts: list[str], sep: str = ", ") -> str:
+    """Join the non-empty strings in `parts` — shared by prompt assembly here
+    and in handlers.py's character-prompt folding."""
     return sep.join(p for p in parts if p)
 
 
@@ -106,7 +104,7 @@ def resolve_generation_params(
     overrides = dict(overrides or {})
 
     if profile is not None:
-        positive_prompt = _join_nonempty([profile.positive_prompt_prefix, user_prompt])
+        positive_prompt = join_nonempty([profile.positive_prompt_prefix, user_prompt])
         negative_prompt = profile.negative_prompt_prefix
         loras = [lora.to_spec() for lora in profile.loras if lora.default_enabled]
         field_defaults = profile.defaults.model_dump(exclude_none=True)
@@ -116,7 +114,7 @@ def resolve_generation_params(
         loras = []
         field_defaults = {}
 
-    negative_prompt = _join_nonempty([negative_prompt, extra_negative_prompt])
+    negative_prompt = join_nonempty([negative_prompt, extra_negative_prompt])
 
     kwargs: dict[str, Any] = {
         "checkpoint": checkpoint,

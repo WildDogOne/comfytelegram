@@ -13,21 +13,29 @@ import logging
 import re
 import time
 import uuid
-from typing import Any
+from collections.abc import Awaitable
+from typing import Any, TypeVar
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import ContextTypes
 
-from comfytelegram.auth import is_authorized, reject_if_unauthorized
+from comfytelegram.auth import reject_if_unauthorized, reject_if_unauthorized_callback
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
 from comfytelegram.generation import GeneratedImage, generate, post_process, regenerate, repeat
-from comfytelegram.profiles import ModelProfile, apply_profile_override, resolve_profile
+from comfytelegram.profiles import (
+    ModelProfile,
+    apply_profile_override,
+    join_nonempty,
+    resolve_profile,
+)
 from comfytelegram.settings import Settings
 from comfytelegram.settings_menu import _safe_edit_message, handle_custom_value_message
 from comfytelegram.storage import Storage
 from comfytelegram.workflows import GenerationParams, LoraSpec
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 POSTPROCESS_KEYBOARD_LABELS = {"upscale": "🔍 Upscale 4x", "face": "✨ Face Detail"}
 REGENERATE_CALLBACK_KIND = "regen"
@@ -172,6 +180,26 @@ def _make_progress_callback(status_message: Message):
     return on_progress
 
 
+async def _run_reporting_errors(
+    status_message: Message, label: str, log_label: str, awaitable: Awaitable[T]
+) -> T | None:
+    """Run `awaitable`, reporting a `ComfyUIError` or any other exception back
+    into `status_message` instead of letting it propagate — shared by every
+    generation/post-processing entry point below. `label` is the user-facing
+    verb ("Generation", "Upscaling", ...); `log_label` is what goes in the
+    server log. Returns None on failure (already reported); callers should
+    treat that as "stop here"."""
+    try:
+        return await awaitable
+    except ComfyUIError as exc:
+        await status_message.edit_text(f"{label} failed: {exc}")
+        return None
+    except Exception:
+        logger.exception("Unexpected error during %s", log_label)
+        await status_message.edit_text(f"{label} failed with an unexpected error.")
+        return None
+
+
 async def _send_and_store_result(
     message: Message, chat_id: int, storage: Storage, img: GeneratedImage
 ) -> None:
@@ -183,6 +211,21 @@ async def _send_and_store_result(
     storage.store_pending_result(
         result_id, chat_id, _extract_file_id(sent), img.filename, _serialize_generation_params(img.full_params)
     )
+
+
+async def _deliver_generation_result(
+    status_message: Message, reply_target: Message, chat_id: int, storage: Storage, images: list[GeneratedImage]
+) -> None:
+    """Shared tail of `generate_message`/`again_callback` once a batch of
+    images has been produced: mint a fresh generation snapshot for the next
+    "Generate Again" tap, update the status message, then send + register
+    each image. `reply_target` is the message new image replies attach to
+    (the original prompt message, or the callback query's own message)."""
+    snapshot_id = uuid.uuid4().hex[:12]
+    storage.store_generation_snapshot(snapshot_id, chat_id, _serialize_generation_params(images[0].full_params))
+    await status_message.edit_text(f"Done — {len(images)} image(s).", reply_markup=_again_keyboard(snapshot_id))
+    for img in images:
+        await _send_and_store_result(reply_target, chat_id, storage, img)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -238,8 +281,8 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
-    if update.effective_user is None or not is_authorized(settings, update.effective_user.id):
-        await query.answer("Not authorized.", show_alert=True)
+    user_id = update.effective_user.id if update.effective_user else None
+    if await reject_if_unauthorized_callback(query, user_id, settings):
         return
 
     checkpoints: list[str] = context.bot_data.get("available_checkpoints", [])
@@ -261,13 +304,7 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.edit_message_text(f"Model set to: {label}")
 
 
-def _join_nonempty(parts: list[str], sep: str = ", ") -> str:
-    return sep.join(p for p in parts if p)
-
-
-def _characters_keyboard(chat_id: int, storage: Storage) -> InlineKeyboardMarkup:
-    characters = storage.list_characters(chat_id)
-    active = storage.get_active_character_name(chat_id)
+def _characters_keyboard(characters: list[dict[str, Any]], active: str | None) -> InlineKeyboardMarkup:
     rows = []
     for char in characters:
         label = f"✅ {char['name']}" if char["name"] == active else char["name"]
@@ -338,14 +375,14 @@ async def characters_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     active = storage.get_active_character_name(chat_id)
     header = f"Active character: {active}" if active else "No character active — tap one to use it."
-    await update.effective_message.reply_text(header, reply_markup=_characters_keyboard(chat_id, storage))
+    await update.effective_message.reply_text(header, reply_markup=_characters_keyboard(characters, active))
 
 
 async def character_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
-    if update.effective_user is None or not is_authorized(settings, update.effective_user.id):
-        await query.answer("Not authorized.", show_alert=True)
+    user_id = update.effective_user.id if update.effective_user else None
+    if await reject_if_unauthorized_callback(query, user_id, settings):
         return
 
     chat_id = update.effective_chat.id
@@ -357,7 +394,9 @@ async def character_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         storage.clear_active_character(chat_id)
         await query.answer("Active character cleared.")
         await _safe_edit_message(
-            query, "No character active — tap one to use it.", _characters_keyboard(chat_id, storage)
+            query,
+            "No character active — tap one to use it.",
+            _characters_keyboard(storage.list_characters(chat_id), None),
         )
         return
 
@@ -369,7 +408,7 @@ async def character_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     storage.set_active_character(chat_id, name)
     await query.answer(f"Activated '{name}'.")
     await _safe_edit_message(
-        query, f"Active character: {name}", _characters_keyboard(chat_id, storage)
+        query, f"Active character: {name}", _characters_keyboard(storage.list_characters(chat_id), name)
     )
 
 
@@ -414,41 +453,35 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     active_character_name = storage.get_active_character_name(chat_id)
     character = storage.get_character(chat_id, active_character_name) if active_character_name else None
-    effective_prompt = _join_nonempty([character["positive_prompt"], prompt_text]) if character else prompt_text
+    effective_prompt = join_nonempty([character["positive_prompt"], prompt_text]) if character else prompt_text
     extra_negative = character["negative_prompt"] if character else ""
 
     status_message = await message.reply_text("Generating… 0%")
 
-    try:
-        images = await generate(
+    images = await _run_reporting_errors(
+        status_message,
+        "Generation",
+        "generation",
+        generate(
             client,
             checkpoint,
             effective_prompt,
             profile,
             extra_negative_prompt=extra_negative,
             on_progress=_make_progress_callback(status_message),
-        )
-    except ComfyUIError as exc:
-        await status_message.edit_text(f"Generation failed: {exc}")
-        return
-    except Exception:
-        logger.exception("Unexpected error during generation")
-        await status_message.edit_text("Generation failed with an unexpected error.")
+        ),
+    )
+    if images is None:
         return
 
-    snapshot_id = uuid.uuid4().hex[:12]
-    storage.store_generation_snapshot(snapshot_id, chat_id, _serialize_generation_params(images[0].full_params))
-    await status_message.edit_text(f"Done — {len(images)} image(s).", reply_markup=_again_keyboard(snapshot_id))
-
-    for img in images:
-        await _send_and_store_result(message, chat_id, storage, img)
+    await _deliver_generation_result(status_message, message, chat_id, storage, images)
 
 
 async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
-    if update.effective_user is None or not is_authorized(settings, update.effective_user.id):
-        await query.answer("Not authorized.", show_alert=True)
+    user_id = update.effective_user.id if update.effective_user else None
+    if await reject_if_unauthorized_callback(query, user_id, settings):
         return
 
     _, kind, result_id = query.data.split(":", 2)
@@ -464,14 +497,10 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if kind == REGENERATE_CALLBACK_KIND:
         status_message = await query.message.reply_text("Regenerating…")
-        try:
-            result = await regenerate(client, full_params)
-        except ComfyUIError as exc:
-            await status_message.edit_text(f"Regeneration failed: {exc}")
-            return
-        except Exception:
-            logger.exception("Unexpected error during regeneration")
-            await status_message.edit_text("Regeneration failed with an unexpected error.")
+        result = await _run_reporting_errors(
+            status_message, "Regeneration", "regeneration", regenerate(client, full_params)
+        )
+        if result is None:
             return
         await status_message.delete()
         await _send_and_store_result(query.message, pending["chat_id"], storage, result)
@@ -480,16 +509,13 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     label = "Upscaling" if kind == "upscale" else "Refining face"
     status_message = await query.message.reply_text(f"{label}…")
 
-    try:
+    async def _download_and_post_process() -> GeneratedImage:
         tg_file = await context.bot.get_file(pending["file_id"])
         source_bytes = bytes(await tg_file.download_as_bytearray())
-        result = await post_process(client, kind, source_bytes, pending["filename"], full_params)
-    except ComfyUIError as exc:
-        await status_message.edit_text(f"{label} failed: {exc}")
-        return
-    except Exception:
-        logger.exception("Unexpected error during post-processing")
-        await status_message.edit_text(f"{label} failed with an unexpected error.")
+        return await post_process(client, kind, source_bytes, pending["filename"], full_params)
+
+    result = await _run_reporting_errors(status_message, label, "post-processing", _download_and_post_process())
+    if result is None:
         return
 
     await status_message.delete()
@@ -505,8 +531,8 @@ async def again_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     button can't be hijacked by a newer generation elsewhere in the chat."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
-    if update.effective_user is None or not is_authorized(settings, update.effective_user.id):
-        await query.answer("Not authorized.", show_alert=True)
+    user_id = update.effective_user.id if update.effective_user else None
+    if await reject_if_unauthorized_callback(query, user_id, settings):
         return
 
     _, snapshot_id = query.data.split(":", 1)
@@ -522,21 +548,13 @@ async def again_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     full_params = _deserialize_generation_params(snapshot["params"])
 
     status_message = await query.message.reply_text("Generating… 0%")
-    try:
-        images = await repeat(client, full_params, on_progress=_make_progress_callback(status_message))
-    except ComfyUIError as exc:
-        await status_message.edit_text(f"Generation failed: {exc}")
-        return
-    except Exception:
-        logger.exception("Unexpected error during repeat generation")
-        await status_message.edit_text("Generation failed with an unexpected error.")
-        return
-
-    new_snapshot_id = uuid.uuid4().hex[:12]
-    storage.store_generation_snapshot(
-        new_snapshot_id, chat_id, _serialize_generation_params(images[0].full_params)
+    images = await _run_reporting_errors(
+        status_message,
+        "Generation",
+        "repeat generation",
+        repeat(client, full_params, on_progress=_make_progress_callback(status_message)),
     )
-    await status_message.edit_text(f"Done — {len(images)} image(s).", reply_markup=_again_keyboard(new_snapshot_id))
+    if images is None:
+        return
 
-    for img in images:
-        await _send_and_store_result(query.message, chat_id, storage, img)
+    await _deliver_generation_result(status_message, query.message, chat_id, storage, images)

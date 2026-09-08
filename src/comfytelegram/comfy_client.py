@@ -8,7 +8,6 @@ since the bot needs to handle many concurrent users itself.
 from __future__ import annotations
 
 import json
-import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,20 +27,6 @@ class JobProgress:
     value: int | None
     max: int | None
     done: bool = False
-
-
-@dataclass
-class JobResult:
-    prompt_id: str
-    outputs: dict[str, Any]
-    """Raw `outputs` mapping from history[prompt_id]['outputs'], keyed by node id."""
-
-    def image_refs(self) -> list[dict[str, str]]:
-        """Flatten every {filename, subfolder, type} image reference across all output nodes."""
-        refs: list[dict[str, str]] = []
-        for node_output in self.outputs.values():
-            refs.extend(node_output.get("images", []) or [])
-        return refs
 
 
 class ComfyClient:
@@ -189,26 +174,6 @@ class ComfyClient:
                     return
                 elif etype == "execution_error" and data.get("prompt_id") == prompt_id:
                     raise ComfyUIError(f"Execution error: {data}")
-
-    async def run_and_collect(self, prompt: dict[str, Any]) -> JobResult:
-        """Submit a prompt, wait for it to finish, and return its outputs.
-
-        Convenience wrapper for callers that don't need live progress updates
-        (the bot's own job runner should use `queue_prompt` + `watch` directly
-        so it can push progress edits back to Telegram).
-        """
-        client_id = str(uuid.uuid4())
-        prompt_id = await self.queue_prompt(prompt, client_id=client_id)
-        async for progress in self.watch(prompt_id, client_id=client_id):
-            if progress.done:
-                break
-        history = await self.get_history(prompt_id)
-        if history is None:
-            raise ComfyUIError(f"No history entry for prompt {prompt_id} after completion")
-        status = history.get("status", {})
-        if status.get("status_str") == "error":
-            raise ComfyUIError(f"Job {prompt_id} failed: {status}")
-        return JobResult(prompt_id=prompt_id, outputs=history.get("outputs", {}))
 
 
 def _enum_choices(node_info: dict[str, Any], input_name: str) -> list[str]:
