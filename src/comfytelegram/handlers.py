@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import time
 import uuid
 from typing import Any
@@ -22,13 +23,25 @@ from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
 from comfytelegram.generation import GeneratedImage, generate, post_process
 from comfytelegram.profiles import ModelProfile, apply_profile_override, resolve_profile
 from comfytelegram.settings import Settings
-from comfytelegram.settings_menu import handle_custom_value_message
+from comfytelegram.settings_menu import _safe_edit_message, handle_custom_value_message
 from comfytelegram.storage import Storage
 from comfytelegram.workflows import LoraSpec, PostProcessBaseParams
 
 logger = logging.getLogger(__name__)
 
 POSTPROCESS_KEYBOARD_LABELS = {"upscale": "🔍 Upscale 4x", "face": "✨ Face Detail"}
+
+CHARACTER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+CHARACTER_HELP = (
+    "Save a reusable character design so you don't have to retype its "
+    "description every time:\n"
+    "/character save <name> | <positive prompt> [| <negative prompt>]\n"
+    "/character delete <name>\n"
+    "/characters — list saved characters and activate one\n\n"
+    "While a character is active, its prompt is folded into every image "
+    "you generate until you switch or clear it."
+)
 
 # Minimum interval between progress-message edits, to stay well under
 # Telegram's per-chat edit rate limit — a 40-step job would otherwise fire
@@ -125,6 +138,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Send me a prompt and I'll generate an image with ComfyUI.\n\n"
         "/model — pick a checkpoint\n"
         "/settings — view or change generation defaults for the current model\n"
+        "/character save <name> | <prompt> — save a reusable character design\n"
+        "/characters — list saved characters and activate one\n"
         "/help — show this message"
     )
 
@@ -191,6 +206,118 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.edit_message_text(f"Model set to: {label}")
 
 
+def _join_nonempty(parts: list[str], sep: str = ", ") -> str:
+    return sep.join(p for p in parts if p)
+
+
+def _characters_keyboard(chat_id: int, storage: Storage) -> InlineKeyboardMarkup:
+    characters = storage.list_characters(chat_id)
+    active = storage.get_active_character_name(chat_id)
+    rows = []
+    for char in characters:
+        label = f"✅ {char['name']}" if char["name"] == active else char["name"]
+        rows.append([InlineKeyboardButton(label, callback_data=f"char:activate:{char['name']}")])
+    if active is not None:
+        rows.append([InlineKeyboardButton("❌ Clear active character", callback_data="char:clear")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def character_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.bot_data["settings"]
+    if await reject_if_unauthorized(update, settings):
+        return
+
+    message = update.effective_message
+    storage: Storage = context.bot_data["storage"]
+    chat_id = update.effective_chat.id
+
+    raw = (message.text or "").split(maxsplit=1)
+    rest = raw[1] if len(raw) > 1 else ""
+
+    if rest.startswith("save"):
+        body = rest[len("save") :].strip()
+        parts = [p.strip() for p in body.split("|")]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            await message.reply_text(
+                "Usage: /character save <name> | <positive prompt> [| <negative prompt>]"
+            )
+            return
+        name = parts[0]
+        if not CHARACTER_NAME_RE.match(name):
+            await message.reply_text(
+                "Character names can only use letters, digits, '-' and '_' (max 32 chars)."
+            )
+            return
+        positive_prompt = parts[1]
+        negative_prompt = parts[2] if len(parts) > 2 else ""
+        storage.save_character(chat_id, name, positive_prompt, negative_prompt)
+        await message.reply_text(f"Saved character '{name}'. Activate it with /characters.")
+        return
+
+    if rest.startswith("delete"):
+        name = rest[len("delete") :].strip()
+        if not name:
+            await message.reply_text("Usage: /character delete <name>")
+            return
+        if storage.get_character(chat_id, name) is None:
+            await message.reply_text(f"No saved character named '{name}'.")
+            return
+        storage.delete_character(chat_id, name)
+        await message.reply_text(f"Deleted character '{name}'.")
+        return
+
+    await message.reply_text(CHARACTER_HELP)
+
+
+async def characters_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.bot_data["settings"]
+    if await reject_if_unauthorized(update, settings):
+        return
+
+    chat_id = update.effective_chat.id
+    storage: Storage = context.bot_data["storage"]
+    characters = storage.list_characters(chat_id)
+    if not characters:
+        await update.effective_message.reply_text("No saved characters yet.\n\n" + CHARACTER_HELP)
+        return
+
+    active = storage.get_active_character_name(chat_id)
+    header = f"Active character: {active}" if active else "No character active — tap one to use it."
+    await update.effective_message.reply_text(header, reply_markup=_characters_keyboard(chat_id, storage))
+
+
+async def character_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    settings: Settings = context.bot_data["settings"]
+    if update.effective_user is None or not is_authorized(settings, update.effective_user.id):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+
+    chat_id = update.effective_chat.id
+    storage: Storage = context.bot_data["storage"]
+    parts = query.data.split(":", 2)
+    action = parts[1]
+
+    if action == "clear":
+        storage.clear_active_character(chat_id)
+        await query.answer("Active character cleared.")
+        await _safe_edit_message(
+            query, "No character active — tap one to use it.", _characters_keyboard(chat_id, storage)
+        )
+        return
+
+    name = parts[2]
+    if storage.get_character(chat_id, name) is None:
+        await query.answer("That character no longer exists — refresh with /characters.", show_alert=True)
+        return
+
+    storage.set_active_character(chat_id, name)
+    await query.answer(f"Activated '{name}'.")
+    await _safe_edit_message(
+        query, f"Active character: {name}", _characters_keyboard(chat_id, storage)
+    )
+
+
 async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
@@ -229,6 +356,12 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     profile = resolve_profile(checkpoint, profiles)
     override_fields = storage.get_override(chat_id, checkpoint)
     profile = apply_profile_override(profile, checkpoint, override_fields)
+
+    active_character_name = storage.get_active_character_name(chat_id)
+    character = storage.get_character(chat_id, active_character_name) if active_character_name else None
+    effective_prompt = _join_nonempty([character["positive_prompt"], prompt_text]) if character else prompt_text
+    extra_negative = character["negative_prompt"] if character else ""
+
     status_message = await message.reply_text("Generating… 0%")
 
     last_edit = {"t": 0.0}
@@ -247,7 +380,9 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             logger.debug("Progress edit skipped (rate-limited or unchanged)", exc_info=True)
 
     try:
-        images = await generate(client, checkpoint, prompt_text, profile, on_progress=on_progress)
+        images = await generate(
+            client, checkpoint, effective_prompt, profile, extra_negative_prompt=extra_negative, on_progress=on_progress
+        )
     except ComfyUIError as exc:
         await status_message.edit_text(f"Generation failed: {exc}")
         return

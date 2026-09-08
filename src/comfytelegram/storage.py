@@ -1,6 +1,8 @@
 """SQLite-backed persistent state: per-chat model selection, per-chat/
-per-checkpoint profile-default overrides, and the post-processing result
-registry (which image a "🔍 Upscale" button refers to).
+per-checkpoint profile-default overrides, the post-processing result
+registry (which image a "🔍 Upscale" button refers to), and saved
+character designs (reusable prompt snippets the user can activate per
+chat instead of retyping a subject description every time).
 
 That last one used to live only in an in-memory dict (`state.py`, now
 removed) with the reasoning "there's no point persisting raw image bytes
@@ -50,6 +52,20 @@ CREATE TABLE IF NOT EXISTS pending_result (
     filename TEXT NOT NULL,
     base_params_json TEXT NOT NULL,
     created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS character (
+    chat_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    positive_prompt TEXT NOT NULL,
+    negative_prompt TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    PRIMARY KEY (chat_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS active_character (
+    chat_id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL
 );
 """
 
@@ -162,6 +178,64 @@ class Storage:
     def _prune_pending_results(self, ttl_seconds: float = PENDING_RESULT_TTL_SECONDS) -> None:
         cutoff = time.time() - ttl_seconds
         self._conn.execute("DELETE FROM pending_result WHERE created_at < ?", (cutoff,))
+        self._conn.commit()
+
+    def save_character(
+        self, chat_id: int, name: str, positive_prompt: str, negative_prompt: str = ""
+    ) -> None:
+        """Create or overwrite a saved character design for this chat."""
+        self._conn.execute(
+            "INSERT INTO character (chat_id, name, positive_prompt, negative_prompt, created_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(chat_id, name) DO UPDATE SET "
+            "positive_prompt = excluded.positive_prompt, negative_prompt = excluded.negative_prompt",
+            (chat_id, name, positive_prompt, negative_prompt, time.time()),
+        )
+        self._conn.commit()
+
+    def get_character(self, chat_id: int, name: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT positive_prompt, negative_prompt FROM character WHERE chat_id = ? AND name = ?",
+            (chat_id, name),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"name": name, "positive_prompt": row[0], "negative_prompt": row[1]}
+
+    def list_characters(self, chat_id: int) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT name, positive_prompt, negative_prompt FROM character "
+            "WHERE chat_id = ? ORDER BY name COLLATE NOCASE",
+            (chat_id,),
+        ).fetchall()
+        return [
+            {"name": name, "positive_prompt": positive, "negative_prompt": negative}
+            for name, positive, negative in rows
+        ]
+
+    def delete_character(self, chat_id: int, name: str) -> None:
+        self._conn.execute("DELETE FROM character WHERE chat_id = ? AND name = ?", (chat_id, name))
+        active = self.get_active_character_name(chat_id)
+        if active == name:
+            self.clear_active_character(chat_id)
+        self._conn.commit()
+
+    def get_active_character_name(self, chat_id: int) -> str | None:
+        row = self._conn.execute(
+            "SELECT name FROM active_character WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def set_active_character(self, chat_id: int, name: str) -> None:
+        self._conn.execute(
+            "INSERT INTO active_character (chat_id, name) VALUES (?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET name = excluded.name",
+            (chat_id, name),
+        )
+        self._conn.commit()
+
+    def clear_active_character(self, chat_id: int) -> None:
+        self._conn.execute("DELETE FROM active_character WHERE chat_id = ?", (chat_id,))
         self._conn.commit()
 
     def close(self) -> None:

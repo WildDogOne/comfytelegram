@@ -80,10 +80,20 @@ async def generate(
     user_prompt: str,
     profile: ModelProfile | None,
     *,
+    extra_negative_prompt: str = "",
     on_progress: ProgressCallback | None = None,
 ) -> list[GeneratedImage]:
-    """Resolve profile defaults, build the base txt2img graph, run it."""
-    params = resolve_generation_params(checkpoint, user_prompt, profile)
+    """Resolve profile defaults, build the base txt2img graph, run it.
+
+    `user_prompt` should already have any active character's positive
+    prompt folded in by the caller (see `handlers.py`'s `generate_message`)
+    since it's just free text; `extra_negative_prompt` carries that same
+    character's negative prompt through separately, since profile
+    resolution owns the negative prompt entirely otherwise.
+    """
+    params = resolve_generation_params(
+        checkpoint, user_prompt, profile, extra_negative_prompt=extra_negative_prompt
+    )
     prompt_graph, save_node_id = build_txt2img(params)
     logger.info("Submitting txt2img: checkpoint=%s cfg=%s steps=%s", checkpoint, params.cfg, params.steps)
 

@@ -18,6 +18,9 @@ from telegram.ext import (
 
 from comfytelegram.comfy_client import ComfyClient
 from comfytelegram.handlers import (
+    character_callback,
+    character_command,
+    characters_command,
     generate_message,
     help_command,
     model_callback,
@@ -82,9 +85,12 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("model", model_command))
     application.add_handler(CommandHandler("settings", settings_command))
+    application.add_handler(CommandHandler("character", character_command))
+    application.add_handler(CommandHandler("characters", characters_command))
     application.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
     application.add_handler(CallbackQueryHandler(postprocess_callback, pattern=r"^pp:"))
     application.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^st:"))
+    application.add_handler(CallbackQueryHandler(character_callback, pattern=r"^char:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, generate_message))
     application.add_error_handler(_error_handler)
 

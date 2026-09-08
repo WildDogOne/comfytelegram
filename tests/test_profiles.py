@@ -89,3 +89,21 @@ def test_resolve_generation_params_without_profile_uses_raw_prompt():
     assert params.positive_prompt == "a fox"
     assert params.negative_prompt == ""
     assert params.loras == []
+
+
+def test_resolve_generation_params_appends_extra_negative():
+    profile = _synthetic_profile()
+    params = resolve_generation_params(
+        "synthetic_test_ckpt.safetensors",
+        "a fox",
+        profile,
+        extra_negative_prompt="extra limbs, blurry",
+    )
+    assert params.negative_prompt == "low quality, extra limbs, blurry"
+
+
+def test_resolve_generation_params_extra_negative_without_profile():
+    params = resolve_generation_params(
+        "unknown.safetensors", "a fox", None, extra_negative_prompt="blurry"
+    )
+    assert params.negative_prompt == "blurry"

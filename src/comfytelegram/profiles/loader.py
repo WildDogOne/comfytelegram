@@ -82,10 +82,16 @@ def resolve_generation_params(
     profile: ModelProfile | None,
     *,
     overrides: dict[str, Any] | None = None,
+    extra_negative_prompt: str = "",
 ) -> GenerationParams:
     """Combine a model profile's defaults with the user's prompt and any explicit
     overrides (highest priority, e.g. a user-set /cfg or /steps command) into a
     ready-to-build GenerationParams.
+
+    `extra_negative_prompt` is appended after the profile's own negative
+    prefix — e.g. an active saved character's negative prompt (see
+    `storage.py`'s `character` table), which isn't part of the model
+    profile at all.
     """
     overrides = dict(overrides or {})
 
@@ -99,6 +105,8 @@ def resolve_generation_params(
         negative_prompt = ""
         loras = []
         field_defaults = {}
+
+    negative_prompt = _join_nonempty([negative_prompt, extra_negative_prompt])
 
     kwargs: dict[str, Any] = {
         "checkpoint": checkpoint,
