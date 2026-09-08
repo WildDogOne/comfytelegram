@@ -11,13 +11,14 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
 from comfytelegram.profiles import ModelProfile, resolve_generation_params
 from comfytelegram.workflows import (
     FaceDetailerParams,
+    GenerationParams,
     PostProcessBaseParams,
     UpscaleParams,
     build_face_detailer,
@@ -34,7 +35,21 @@ ProgressCallback = Callable[[JobProgress], Awaitable[None]]
 class GeneratedImage:
     data: bytes
     filename: str
-    base_params: PostProcessBaseParams
+    #: The fully-resolved settings this image (or the base generation it was
+    #: post-processed from) was made with. Carried forward through
+    #: post-processing so a "🔁 Regenerate" button works on any result, not
+    #: just fresh generations — see `regenerate()` below.
+    full_params: GenerationParams
+
+
+def _to_post_process_base(params: GenerationParams) -> PostProcessBaseParams:
+    return PostProcessBaseParams(
+        checkpoint=params.checkpoint,
+        positive_prompt=params.positive_prompt,
+        negative_prompt=params.negative_prompt,
+        loras=params.loras,
+        clip_skip=params.clip_skip,
+    )
 
 
 async def _run_graph(
@@ -97,16 +112,8 @@ async def generate(
     prompt_graph, save_node_id = build_txt2img(params)
     logger.info("Submitting txt2img: checkpoint=%s cfg=%s steps=%s", checkpoint, params.cfg, params.steps)
 
-    base_params = PostProcessBaseParams(
-        checkpoint=params.checkpoint,
-        positive_prompt=params.positive_prompt,
-        negative_prompt=params.negative_prompt,
-        loras=params.loras,
-        clip_skip=params.clip_skip,
-    )
-
     raw = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
-    return [GeneratedImage(data=data, filename=name, base_params=base_params) for data, name in raw]
+    return [GeneratedImage(data=data, filename=name, full_params=params) for data, name in raw]
 
 
 async def post_process(
@@ -114,11 +121,12 @@ async def post_process(
     kind: Literal["upscale", "face"],
     source_image: bytes,
     source_filename: str,
-    base_params: PostProcessBaseParams,
+    full_params: GenerationParams,
     *,
     on_progress: ProgressCallback | None = None,
 ) -> GeneratedImage:
     """Upload a previously-generated image and run one post-processing stage on it."""
+    base_params = _to_post_process_base(full_params)
     upload = await client.upload_image(source_image, filename=source_filename)
     uploaded_name = upload["name"]
 
@@ -132,4 +140,24 @@ async def post_process(
     logger.info("Submitting post-process (%s) on %s", kind, uploaded_name)
     raw = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
     data, filename = raw[0]
-    return GeneratedImage(data=data, filename=filename, base_params=base_params)
+    return GeneratedImage(data=data, filename=filename, full_params=full_params)
+
+
+async def regenerate(
+    client: ComfyClient,
+    full_params: GenerationParams,
+    *,
+    on_progress: ProgressCallback | None = None,
+) -> GeneratedImage:
+    """Re-run the base txt2img generation with the same resolved settings —
+    backs the "🔁 Regenerate" button. Always forces a fresh random seed
+    (rather than trusting whatever `full_params.seed` happens to hold) so
+    the result is a new variation, not a byte-identical repeat.
+    """
+    fresh_params = replace(full_params, seed=None)
+    prompt_graph, save_node_id = build_txt2img(fresh_params)
+    logger.info("Regenerating: checkpoint=%s cfg=%s steps=%s", fresh_params.checkpoint, fresh_params.cfg, fresh_params.steps)
+
+    raw = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
+    data, filename = raw[0]
+    return GeneratedImage(data=data, filename=filename, full_params=fresh_params)

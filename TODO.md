@@ -113,6 +113,7 @@ history, or manually match types) — don't assume a `null` link means unused.
 - [x] Button callbacks (`postprocess_callback`) run the matching post-processing graph against the selected image
 - [x] Result sent as a follow-up message; chaining works naturally since post-processed results also get their own Upscale/Face-Detail buttons
 - [x] Multi-image batches handled correctly — each image gets its own pending-result row (see section 7) and its own keyboard
+- [x] "🔁 Regenerate" button on every image (fresh generations and post-processed results alike) — re-runs the original base txt2img generation with the same resolved settings but a forced-fresh random seed (`generation.regenerate()`), giving a new variation on demand. Needed widening what a `pending_result` row stores from just the post-processing subset of fields to the full resolved `GenerationParams`; old rows written before this change still deserialize fine (missing fields fall back to `GenerationParams`' own generic defaults) via `handlers._deserialize_generation_params`.
 - [ ] (Stretch, not started) Style-transfer / pose-control buttons — waiting on the IPAdapter/ControlNet builder functions from section 2
 
 ## 7. State & persistence — done

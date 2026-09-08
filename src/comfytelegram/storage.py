@@ -148,10 +148,12 @@ class Storage:
     def store_pending_result(
         self, result_id: str, chat_id: int, file_id: str, filename: str, base_params: dict[str, Any]
     ) -> None:
-        """Record what a post-processing button (result_id) refers to: the
-        Telegram file_id to re-download the source image from, and the
-        generation params (already a plain dict — see handlers.py's
-        (de)serialization helpers) needed to build the next graph."""
+        """Record what a post-processing/regenerate button (result_id) refers
+        to: the Telegram file_id to re-download the source image from, and
+        the full resolved generation params (already a plain dict — see
+        handlers.py's (de)serialization helpers) needed to build the next
+        graph, whether that's an upscale/face-detail pass or a fresh
+        "🔁 Regenerate" run."""
         self._prune_pending_results()
         self._conn.execute(
             "INSERT OR REPLACE INTO pending_result "

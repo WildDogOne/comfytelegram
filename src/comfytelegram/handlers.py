@@ -20,16 +20,17 @@ from telegram.ext import ContextTypes
 
 from comfytelegram.auth import is_authorized, reject_if_unauthorized
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
-from comfytelegram.generation import GeneratedImage, generate, post_process
+from comfytelegram.generation import GeneratedImage, generate, post_process, regenerate
 from comfytelegram.profiles import ModelProfile, apply_profile_override, resolve_profile
 from comfytelegram.settings import Settings
 from comfytelegram.settings_menu import _safe_edit_message, handle_custom_value_message
 from comfytelegram.storage import Storage
-from comfytelegram.workflows import LoraSpec, PostProcessBaseParams
+from comfytelegram.workflows import GenerationParams, LoraSpec
 
 logger = logging.getLogger(__name__)
 
 POSTPROCESS_KEYBOARD_LABELS = {"upscale": "🔍 Upscale 4x", "face": "✨ Face Detail"}
+REGENERATE_CALLBACK_KIND = "regen"
 
 CHARACTER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
@@ -61,7 +62,8 @@ def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(label, callback_data=f"pp:{kind}:{result_id}")
                 for kind, label in POSTPROCESS_KEYBOARD_LABELS.items()
-            ]
+            ],
+            [InlineKeyboardButton("🔁 Regenerate", callback_data=f"pp:{REGENERATE_CALLBACK_KIND}:{result_id}")],
         ]
     )
 
@@ -94,11 +96,18 @@ def _extract_file_id(sent_message: Message) -> str:
     raise ValueError("Sent message has neither a photo nor a document to read a file_id from")
 
 
-def _serialize_base_params(params: PostProcessBaseParams) -> dict[str, Any]:
+def _serialize_generation_params(params: GenerationParams) -> dict[str, Any]:
     return {
         "checkpoint": params.checkpoint,
         "positive_prompt": params.positive_prompt,
         "negative_prompt": params.negative_prompt,
+        "steps": params.steps,
+        "cfg": params.cfg,
+        "sampler_name": params.sampler_name,
+        "scheduler": params.scheduler,
+        "width": params.width,
+        "height": params.height,
+        "batch_size": params.batch_size,
         "clip_skip": params.clip_skip,
         "loras": [
             {"name": lora.name, "strength_model": lora.strength_model, "strength_clip": lora.strength_clip}
@@ -107,12 +116,24 @@ def _serialize_base_params(params: PostProcessBaseParams) -> dict[str, Any]:
     }
 
 
-def _deserialize_base_params(data: dict[str, Any]) -> PostProcessBaseParams:
-    return PostProcessBaseParams(
+def _deserialize_generation_params(data: dict[str, Any]) -> GenerationParams:
+    """`.get(..., <field default>)` on everything but checkpoint/prompts lets
+    this still read pending_result rows written before the "🔁 Regenerate"
+    button existed (when only the post-processing subset of fields was
+    stored) — those rows just fall back to GenerationParams' own generic
+    defaults for steps/cfg/etc. instead of the exact original values."""
+    return GenerationParams(
         checkpoint=data["checkpoint"],
         positive_prompt=data["positive_prompt"],
         negative_prompt=data["negative_prompt"],
-        clip_skip=data["clip_skip"],
+        steps=data.get("steps", 30),
+        cfg=data.get("cfg", 7.0),
+        sampler_name=data.get("sampler_name", "euler"),
+        scheduler=data.get("scheduler", "normal"),
+        width=data.get("width", 1024),
+        height=data.get("height", 1024),
+        batch_size=data.get("batch_size", 1),
+        clip_skip=data.get("clip_skip", -1),
         loras=[LoraSpec(**lora) for lora in data.get("loras", [])],
     )
 
@@ -126,7 +147,7 @@ async def _send_and_store_result(
     result_id = uuid.uuid4().hex[:12]
     sent = await _send_result_image(message, img.data, img.filename, _post_process_keyboard(result_id))
     storage.store_pending_result(
-        result_id, chat_id, _extract_file_id(sent), img.filename, _serialize_base_params(img.base_params)
+        result_id, chat_id, _extract_file_id(sent), img.filename, _serialize_generation_params(img.full_params)
     )
 
 
@@ -413,14 +434,30 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await query.answer()
     client: ComfyClient = context.bot_data["comfy_client"]
+    full_params = _deserialize_generation_params(pending["base_params"])
+
+    if kind == REGENERATE_CALLBACK_KIND:
+        status_message = await query.message.reply_text("Regenerating…")
+        try:
+            result = await regenerate(client, full_params)
+        except ComfyUIError as exc:
+            await status_message.edit_text(f"Regeneration failed: {exc}")
+            return
+        except Exception:
+            logger.exception("Unexpected error during regeneration")
+            await status_message.edit_text("Regeneration failed with an unexpected error.")
+            return
+        await status_message.delete()
+        await _send_and_store_result(query.message, pending["chat_id"], storage, result)
+        return
+
     label = "Upscaling" if kind == "upscale" else "Refining face"
     status_message = await query.message.reply_text(f"{label}…")
 
     try:
         tg_file = await context.bot.get_file(pending["file_id"])
         source_bytes = bytes(await tg_file.download_as_bytearray())
-        base_params = _deserialize_base_params(pending["base_params"])
-        result = await post_process(client, kind, source_bytes, pending["filename"], base_params)
+        result = await post_process(client, kind, source_bytes, pending["filename"], full_params)
     except ComfyUIError as exc:
         await status_message.edit_text(f"{label} failed: {exc}")
         return
