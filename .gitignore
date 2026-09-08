@@ -222,3 +222,4 @@ __marimo__/
 /state.sqlite3
 .claude
 sample.json
+.idea
