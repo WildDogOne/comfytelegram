@@ -20,7 +20,7 @@ from telegram.ext import ContextTypes
 
 from comfytelegram.auth import is_authorized, reject_if_unauthorized
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
-from comfytelegram.generation import GeneratedImage, generate, post_process, regenerate
+from comfytelegram.generation import GeneratedImage, generate, post_process, regenerate, repeat
 from comfytelegram.profiles import ModelProfile, apply_profile_override, resolve_profile
 from comfytelegram.settings import Settings
 from comfytelegram.settings_menu import _safe_edit_message, handle_custom_value_message
@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 POSTPROCESS_KEYBOARD_LABELS = {"upscale": "🔍 Upscale 4x", "face": "✨ Face Detail"}
 REGENERATE_CALLBACK_KIND = "regen"
+AGAIN_CALLBACK_DATA = "again"
 
 CHARACTER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
@@ -66,6 +67,13 @@ def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🔁 Regenerate", callback_data=f"pp:{REGENERATE_CALLBACK_KIND}:{result_id}")],
         ]
     )
+
+
+def _again_keyboard() -> InlineKeyboardMarkup:
+    """Attached to the "Done" status message of every base generation — lets
+    the user crank out another batch of the same prompt with one tap instead
+    of retyping it or hunting down a specific image's own Regenerate button."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Generate Again", callback_data=AGAIN_CALLBACK_DATA)]])
 
 
 async def _send_result_image(
@@ -136,6 +144,27 @@ def _deserialize_generation_params(data: dict[str, Any]) -> GenerationParams:
         clip_skip=data.get("clip_skip", -1),
         loras=[LoraSpec(**lora) for lora in data.get("loras", [])],
     )
+
+
+def _make_progress_callback(status_message: Message, label: str = "Generating"):
+    """Shared throttled progress-edit closure for `generate_message` and
+    `again_callback` — see PROGRESS_EDIT_INTERVAL above."""
+    last_edit = {"t": 0.0}
+
+    async def on_progress(progress: JobProgress) -> None:
+        if progress.done or progress.value is None or progress.max is None:
+            return
+        now = time.monotonic()
+        if now - last_edit["t"] < PROGRESS_EDIT_INTERVAL:
+            return
+        last_edit["t"] = now
+        pct = int(100 * progress.value / progress.max) if progress.max else 0
+        try:
+            await status_message.edit_text(f"{label}… {pct}% (step {progress.value}/{progress.max})")
+        except Exception:
+            logger.debug("Progress edit skipped (rate-limited or unchanged)", exc_info=True)
+
+    return on_progress
 
 
 async def _send_and_store_result(
@@ -385,24 +414,14 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     status_message = await message.reply_text("Generating… 0%")
 
-    last_edit = {"t": 0.0}
-
-    async def on_progress(progress: JobProgress) -> None:
-        if progress.done or progress.value is None or progress.max is None:
-            return
-        now = time.monotonic()
-        if now - last_edit["t"] < PROGRESS_EDIT_INTERVAL:
-            return
-        last_edit["t"] = now
-        pct = int(100 * progress.value / progress.max) if progress.max else 0
-        try:
-            await status_message.edit_text(f"Generating… {pct}% (step {progress.value}/{progress.max})")
-        except Exception:
-            logger.debug("Progress edit skipped (rate-limited or unchanged)", exc_info=True)
-
     try:
         images = await generate(
-            client, checkpoint, effective_prompt, profile, extra_negative_prompt=extra_negative, on_progress=on_progress
+            client,
+            checkpoint,
+            effective_prompt,
+            profile,
+            extra_negative_prompt=extra_negative,
+            on_progress=_make_progress_callback(status_message),
         )
     except ComfyUIError as exc:
         await status_message.edit_text(f"Generation failed: {exc}")
@@ -412,7 +431,8 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await status_message.edit_text("Generation failed with an unexpected error.")
         return
 
-    await status_message.edit_text(f"Done — {len(images)} image(s).")
+    storage.set_last_generation(chat_id, _serialize_generation_params(images[0].full_params))
+    await status_message.edit_text(f"Done — {len(images)} image(s).", reply_markup=_again_keyboard())
 
     for img in images:
         await _send_and_store_result(message, chat_id, storage, img)
@@ -468,3 +488,43 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await status_message.delete()
     await _send_and_store_result(query.message, pending["chat_id"], storage, result)
+
+
+async def again_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Backs the "🔁 Generate Again" button — re-runs the last base
+    generation for this chat (same resolved settings, fresh seed) without
+    needing to retype the prompt or find a specific image's own Regenerate
+    button. Meant for quickly building up a bigger batch of variations."""
+    query = update.callback_query
+    settings: Settings = context.bot_data["settings"]
+    if update.effective_user is None or not is_authorized(settings, update.effective_user.id):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+
+    chat_id = update.effective_chat.id
+    storage: Storage = context.bot_data["storage"]
+    last = storage.get_last_generation(chat_id)
+    if last is None:
+        await query.answer("Nothing to repeat yet — send a prompt first.", show_alert=True)
+        return
+
+    await query.answer()
+    client: ComfyClient = context.bot_data["comfy_client"]
+    full_params = _deserialize_generation_params(last)
+
+    status_message = await query.message.reply_text("Generating… 0%")
+    try:
+        images = await repeat(client, full_params, on_progress=_make_progress_callback(status_message))
+    except ComfyUIError as exc:
+        await status_message.edit_text(f"Generation failed: {exc}")
+        return
+    except Exception:
+        logger.exception("Unexpected error during repeat generation")
+        await status_message.edit_text("Generation failed with an unexpected error.")
+        return
+
+    storage.set_last_generation(chat_id, _serialize_generation_params(images[0].full_params))
+    await status_message.edit_text(f"Done — {len(images)} image(s).", reply_markup=_again_keyboard())
+
+    for img in images:
+        await _send_and_store_result(query.message, chat_id, storage, img)

@@ -1,8 +1,10 @@
 """SQLite-backed persistent state: per-chat model selection, per-chat/
 per-checkpoint profile-default overrides, the post-processing result
-registry (which image a "🔍 Upscale" button refers to), and saved
+registry (which image a "🔍 Upscale" button refers to), saved
 character designs (reusable prompt snippets the user can activate per
-chat instead of retyping a subject description every time).
+chat instead of retyping a subject description every time), and the
+last-resolved-generation record that backs the chat-wide
+"🔁 Generate Again" button.
 
 That last one used to live only in an in-memory dict (`state.py`, now
 removed) with the reasoning "there's no point persisting raw image bytes
@@ -66,6 +68,11 @@ CREATE TABLE IF NOT EXISTS character (
 CREATE TABLE IF NOT EXISTS active_character (
     chat_id INTEGER PRIMARY KEY,
     name TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS last_generation (
+    chat_id INTEGER PRIMARY KEY,
+    params_json TEXT NOT NULL
 );
 """
 
@@ -239,6 +246,24 @@ class Storage:
     def clear_active_character(self, chat_id: int) -> None:
         self._conn.execute("DELETE FROM active_character WHERE chat_id = ?", (chat_id,))
         self._conn.commit()
+
+    def set_last_generation(self, chat_id: int, params: dict[str, Any]) -> None:
+        """Remember the resolved generation params (same shape as
+        `pending_result.base_params_json` — see handlers.py's serialize
+        helper) for the "🔁 Generate Again" button: a chat-wide "run that
+        prompt once more" that doesn't require picking any specific image."""
+        self._conn.execute(
+            "INSERT INTO last_generation (chat_id, params_json) VALUES (?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET params_json = excluded.params_json",
+            (chat_id, json.dumps(params)),
+        )
+        self._conn.commit()
+
+    def get_last_generation(self, chat_id: int) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT params_json FROM last_generation WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        return json.loads(row[0]) if row else None
 
     def close(self) -> None:
         self._conn.close()

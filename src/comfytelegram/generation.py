@@ -143,6 +143,26 @@ async def post_process(
     return GeneratedImage(data=data, filename=filename, full_params=full_params)
 
 
+async def repeat(
+    client: ComfyClient,
+    full_params: GenerationParams,
+    *,
+    on_progress: ProgressCallback | None = None,
+) -> list[GeneratedImage]:
+    """Re-run an entire base txt2img request — all `batch_size` images — with
+    the same resolved settings but a forced-fresh seed. Backs the chat-level
+    "🔁 Generate Again" button, for quickly cranking out more variations of
+    the same prompt without retyping it or picking a specific image (compare
+    `regenerate()` below, which is scoped to one image and always returns
+    exactly one)."""
+    fresh_params = replace(full_params, seed=None)
+    prompt_graph, save_node_id = build_txt2img(fresh_params)
+    logger.info("Repeating: checkpoint=%s cfg=%s steps=%s", fresh_params.checkpoint, fresh_params.cfg, fresh_params.steps)
+
+    raw = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
+    return [GeneratedImage(data=data, filename=name, full_params=fresh_params) for data, name in raw]
+
+
 async def regenerate(
     client: ComfyClient,
     full_params: GenerationParams,
@@ -150,14 +170,8 @@ async def regenerate(
     on_progress: ProgressCallback | None = None,
 ) -> GeneratedImage:
     """Re-run the base txt2img generation with the same resolved settings —
-    backs the "🔁 Regenerate" button. Always forces a fresh random seed
-    (rather than trusting whatever `full_params.seed` happens to hold) so
-    the result is a new variation, not a byte-identical repeat.
-    """
-    fresh_params = replace(full_params, seed=None)
-    prompt_graph, save_node_id = build_txt2img(fresh_params)
-    logger.info("Regenerating: checkpoint=%s cfg=%s steps=%s", fresh_params.checkpoint, fresh_params.cfg, fresh_params.steps)
-
-    raw = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
-    data, filename = raw[0]
-    return GeneratedImage(data=data, filename=filename, full_params=fresh_params)
+    backs the per-image "🔁 Regenerate" button. Only the first image is kept
+    even if the original `batch_size` was >1, since regenerating one image
+    shouldn't silently multiply into a whole new batch."""
+    images = await repeat(client, full_params, on_progress=on_progress)
+    return images[0]
