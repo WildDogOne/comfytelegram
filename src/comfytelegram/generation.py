@@ -1,9 +1,9 @@
 """Glue between a bot-level request, the model-profile system, and ComfyUI.
 
-This is the piece TODO.md section 4 flagged as missing: turning
-(checkpoint, user prompt, profile) into a submitted-and-collected result,
-independent of Telegram. `handlers.py` calls into this; `scripts/smoke_test*.py`
-do the equivalent inline for quick manual checks against a live server.
+Turns (checkpoint, user prompt, profile) into a submitted-and-collected
+result, independent of Telegram. `handlers.py` calls into this;
+`scripts/smoke_test*.py` do the equivalent inline for quick manual checks
+against a live server.
 """
 
 from __future__ import annotations

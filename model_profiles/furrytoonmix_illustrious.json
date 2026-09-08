@@ -1,7 +1,7 @@
 {
   "match": ["furrytoonmix_*"],
   "display_name": "FurryToonMix XL (Illustrious)",
-  "description": "Grounded in the user's own hand-built sample.json workflow: shared CFG/Steps primitives feeding the sampler were 5/40, CLIPSetLastLayer was fixed at -2, and the quality/negative tag fragments below are the ones actually wired into the positive/negative CLIPTextEncode nodes. The three character/style LoRAs from that workflow were all disabled there, so they're listed here but off by default until per-request LoRA toggling exists (TODO.md section 6).",
+  "description": "Grounded in the user's own hand-built sample.json workflow: shared CFG/Steps primitives feeding the sampler were 5/40, CLIPSetLastLayer was fixed at -2, and the quality/negative tag fragments below are the ones actually wired into the positive/negative CLIPTextEncode nodes. The three character/style LoRAs from that workflow were all disabled there, so they're listed here but off by default until per-request LoRA toggling exists.",
   "defaults": {
     "cfg": 5.0,
     "steps": 30,

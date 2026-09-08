@@ -40,8 +40,8 @@ Files starting with `_` are ignored (reserved for docs/schema files).
 ```
 
 `furrytoonmix_illustrious.json` is grounded in the actual working values
-from the hand-built `sample.json` workflow at the project root (see
-TODO.md section 0). The other three are common community-recommended
-starting points for those model families, not values verified against a
-specific checkpoint on this install — tune them once you've run a few
-generations.
+from the hand-built `sample.json` workflow at the project root (see the
+main [README](../README.md#background-the-reference-workflow)). The other
+three are common community-recommended starting points for those model
+families, not values verified against a specific checkpoint on this
+install — tune them once you've run a few generations.

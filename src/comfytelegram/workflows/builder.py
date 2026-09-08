@@ -6,9 +6,10 @@ post-processing stage) which is a natural fit for a small Python graph
 builder rather than static template JSON with placeholders.
 
 Node wiring and default parameter values here mirror the hand-built
-`sample.json` workflow at the project root (see TODO.md section 0 for the
-full inventory), so a request built here should behave like a manual run
-of that workflow once a checkpoint/LoRA/model-file name is substituted in.
+`sample.json` workflow at the project root (see the main README's
+"Background: the reference workflow" section for the node-by-node summary),
+so a request built here should behave like a manual run of that workflow
+once a checkpoint/LoRA/model-file name is substituted in.
 One deliberate deviation: `sample.json` saves via WAS Suite's "Image Save"
 node; these graphs use the core `SaveImage` node instead, so the bot only
 depends on custom node packs that actually add capability (LoRA/upscale/
