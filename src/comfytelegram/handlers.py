@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 POSTPROCESS_KEYBOARD_LABELS = {"upscale": "🔍 Upscale 4x", "face": "✨ Face Detail"}
 REGENERATE_CALLBACK_KIND = "regen"
-AGAIN_CALLBACK_DATA = "again"
+AGAIN_CALLBACK_PREFIX = "again:"
 
 CHARACTER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
@@ -69,11 +69,16 @@ def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
     )
 
 
-def _again_keyboard() -> InlineKeyboardMarkup:
+def _again_keyboard(snapshot_id: str) -> InlineKeyboardMarkup:
     """Attached to the "Done" status message of every base generation — lets
     the user crank out another batch of the same prompt with one tap instead
-    of retyping it or hunting down a specific image's own Regenerate button."""
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Generate Again", callback_data=AGAIN_CALLBACK_DATA)]])
+    of retyping it or hunting down a specific image's own Regenerate button.
+    Scoped to `snapshot_id` (see storage.py's `generation_snapshot`) so this
+    specific message always repeats the generation it was created from, even
+    if a newer one has since happened in the same chat."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔁 Generate Again", callback_data=f"{AGAIN_CALLBACK_PREFIX}{snapshot_id}")]]
+    )
 
 
 async def _send_result_image(
@@ -146,7 +151,7 @@ def _deserialize_generation_params(data: dict[str, Any]) -> GenerationParams:
     )
 
 
-def _make_progress_callback(status_message: Message, label: str = "Generating"):
+def _make_progress_callback(status_message: Message):
     """Shared throttled progress-edit closure for `generate_message` and
     `again_callback` — see PROGRESS_EDIT_INTERVAL above."""
     last_edit = {"t": 0.0}
@@ -160,7 +165,7 @@ def _make_progress_callback(status_message: Message, label: str = "Generating"):
         last_edit["t"] = now
         pct = int(100 * progress.value / progress.max) if progress.max else 0
         try:
-            await status_message.edit_text(f"{label}… {pct}% (step {progress.value}/{progress.max})")
+            await status_message.edit_text(f"Generating… {pct}% (step {progress.value}/{progress.max})")
         except Exception:
             logger.debug("Progress edit skipped (rate-limited or unchanged)", exc_info=True)
 
@@ -431,8 +436,9 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await status_message.edit_text("Generation failed with an unexpected error.")
         return
 
-    storage.set_last_generation(chat_id, _serialize_generation_params(images[0].full_params))
-    await status_message.edit_text(f"Done — {len(images)} image(s).", reply_markup=_again_keyboard())
+    snapshot_id = uuid.uuid4().hex[:12]
+    storage.store_generation_snapshot(snapshot_id, chat_id, _serialize_generation_params(images[0].full_params))
+    await status_message.edit_text(f"Done — {len(images)} image(s).", reply_markup=_again_keyboard(snapshot_id))
 
     for img in images:
         await _send_and_store_result(message, chat_id, storage, img)
@@ -491,26 +497,29 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def again_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Backs the "🔁 Generate Again" button — re-runs the last base
-    generation for this chat (same resolved settings, fresh seed) without
-    needing to retype the prompt or find a specific image's own Regenerate
-    button. Meant for quickly building up a bigger batch of variations."""
+    """Backs the "🔁 Generate Again" button — re-runs the base generation
+    that *this specific message's* button was created from (same resolved
+    settings, fresh seed), scoped by the snapshot_id embedded in
+    callback_data (see storage.py's `generation_snapshot`) rather than
+    "whatever this chat most recently generated", so an older message's
+    button can't be hijacked by a newer generation elsewhere in the chat."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     if update.effective_user is None or not is_authorized(settings, update.effective_user.id):
         await query.answer("Not authorized.", show_alert=True)
         return
 
-    chat_id = update.effective_chat.id
+    _, snapshot_id = query.data.split(":", 1)
     storage: Storage = context.bot_data["storage"]
-    last = storage.get_last_generation(chat_id)
-    if last is None:
-        await query.answer("Nothing to repeat yet — send a prompt first.", show_alert=True)
+    snapshot = storage.get_generation_snapshot(snapshot_id)
+    if snapshot is None:
+        await query.answer("That result has expired — generate a new image.", show_alert=True)
         return
 
     await query.answer()
+    chat_id = snapshot["chat_id"]
     client: ComfyClient = context.bot_data["comfy_client"]
-    full_params = _deserialize_generation_params(last)
+    full_params = _deserialize_generation_params(snapshot["params"])
 
     status_message = await query.message.reply_text("Generating… 0%")
     try:
@@ -523,8 +532,11 @@ async def again_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await status_message.edit_text("Generation failed with an unexpected error.")
         return
 
-    storage.set_last_generation(chat_id, _serialize_generation_params(images[0].full_params))
-    await status_message.edit_text(f"Done — {len(images)} image(s).", reply_markup=_again_keyboard())
+    new_snapshot_id = uuid.uuid4().hex[:12]
+    storage.store_generation_snapshot(
+        new_snapshot_id, chat_id, _serialize_generation_params(images[0].full_params)
+    )
+    await status_message.edit_text(f"Done — {len(images)} image(s).", reply_markup=_again_keyboard(new_snapshot_id))
 
     for img in images:
         await _send_and_store_result(query.message, chat_id, storage, img)

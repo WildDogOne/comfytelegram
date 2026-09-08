@@ -3,8 +3,11 @@ per-checkpoint profile-default overrides, the post-processing result
 registry (which image a "🔍 Upscale" button refers to), saved
 character designs (reusable prompt snippets the user can activate per
 chat instead of retyping a subject description every time), and the
-last-resolved-generation record that backs the chat-wide
-"🔁 Generate Again" button.
+per-message generation-snapshot registry that backs each "🔁 Generate
+Again" button (keyed like `pending_result`, by an id embedded in that
+specific message's callback_data, not by chat_id — so an older message's
+button always repeats *its own* generation, not whatever the chat most
+recently generated).
 
 That last one used to live only in an in-memory dict (`state.py`, now
 removed) with the reasoning "there's no point persisting raw image bytes
@@ -70,9 +73,11 @@ CREATE TABLE IF NOT EXISTS active_character (
     name TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS last_generation (
-    chat_id INTEGER PRIMARY KEY,
-    params_json TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS generation_snapshot (
+    snapshot_id TEXT PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    params_json TEXT NOT NULL,
+    created_at REAL NOT NULL
 );
 """
 
@@ -247,23 +252,35 @@ class Storage:
         self._conn.execute("DELETE FROM active_character WHERE chat_id = ?", (chat_id,))
         self._conn.commit()
 
-    def set_last_generation(self, chat_id: int, params: dict[str, Any]) -> None:
-        """Remember the resolved generation params (same shape as
+    def store_generation_snapshot(self, snapshot_id: str, chat_id: int, params: dict[str, Any]) -> None:
+        """Record the resolved generation params (same shape as
         `pending_result.base_params_json` — see handlers.py's serialize
-        helper) for the "🔁 Generate Again" button: a chat-wide "run that
-        prompt once more" that doesn't require picking any specific image."""
+        helper) that one message's own "🔁 Generate Again" button should
+        repeat, keyed by an id embedded in that button's callback_data —
+        the same per-result-id pattern `pending_result` uses, so an older
+        message's button can't be shadowed by a newer generation in the
+        same chat."""
+        self._prune_generation_snapshots()
         self._conn.execute(
-            "INSERT INTO last_generation (chat_id, params_json) VALUES (?, ?) "
-            "ON CONFLICT(chat_id) DO UPDATE SET params_json = excluded.params_json",
-            (chat_id, json.dumps(params)),
+            "INSERT OR REPLACE INTO generation_snapshot (snapshot_id, chat_id, params_json, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (snapshot_id, chat_id, json.dumps(params), time.time()),
         )
         self._conn.commit()
 
-    def get_last_generation(self, chat_id: int) -> dict[str, Any] | None:
+    def get_generation_snapshot(self, snapshot_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
-            "SELECT params_json FROM last_generation WHERE chat_id = ?", (chat_id,)
+            "SELECT chat_id, params_json FROM generation_snapshot WHERE snapshot_id = ?", (snapshot_id,)
         ).fetchone()
-        return json.loads(row[0]) if row else None
+        if row is None:
+            return None
+        chat_id, params_json = row
+        return {"chat_id": chat_id, "params": json.loads(params_json)}
+
+    def _prune_generation_snapshots(self, ttl_seconds: float = PENDING_RESULT_TTL_SECONDS) -> None:
+        cutoff = time.time() - ttl_seconds
+        self._conn.execute("DELETE FROM generation_snapshot WHERE created_at < ?", (cutoff,))
+        self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
