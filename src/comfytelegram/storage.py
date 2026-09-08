@@ -1,23 +1,34 @@
-"""SQLite-backed persistent state: per-chat model selection and per-chat,
-per-checkpoint profile-default overrides.
+"""SQLite-backed persistent state: per-chat model selection, per-chat/
+per-checkpoint profile-default overrides, and the post-processing result
+registry (which image a "🔍 Upscale" button refers to).
 
-This replaces what used to live only in the in-memory `BotState` (see
-`state.py`) — that dict was lost on every restart, which is exactly the gap
-reported after the first live test. `BotState` still exists for genuinely
-ephemeral things (the post-processing result registry — there's no point
-persisting raw image bytes across a restart when the bot has no memory of
-the ComfyUI prompt_id that made them anyway).
+That last one used to live only in an in-memory dict (`state.py`, now
+removed) with the reasoning "there's no point persisting raw image bytes
+across a restart, the bot has no memory of the prompt_id that made them
+anyway" — which missed the obvious fix: we don't need to persist the bytes
+at all. Telegram already stores the file once it's been sent; the message
+we get back carries a `file_id` that's valid indefinitely and can be
+re-downloaded on demand via `bot.get_file()`. So what actually needs to
+survive a restart is tiny — a `file_id` plus the generation params needed
+to build the next stage's graph — and it fits the same sqlite file as
+everything else here.
 
-Deliberately "primitive" per the request that prompted this: stdlib sqlite3,
-two small tables, no migrations framework, no ORM.
+Deliberately "primitive": stdlib sqlite3, small tables, no migrations
+framework, no ORM.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
+
+#: How long a post-processing button stays valid before its row is pruned.
+#: Generous on purpose — the whole point is surviving restarts and letting
+#: people come back to an old result later, not a tight session window.
+PENDING_RESULT_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS chat_checkpoint (
@@ -30,6 +41,15 @@ CREATE TABLE IF NOT EXISTS profile_override (
     checkpoint TEXT NOT NULL,
     overrides_json TEXT NOT NULL,
     PRIMARY KEY (chat_id, checkpoint)
+);
+
+CREATE TABLE IF NOT EXISTS pending_result (
+    result_id TEXT PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    file_id TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    base_params_json TEXT NOT NULL,
+    created_at REAL NOT NULL
 );
 """
 
@@ -108,6 +128,41 @@ class Storage:
             )
         self._conn.commit()
         return current
+
+    def store_pending_result(
+        self, result_id: str, chat_id: int, file_id: str, filename: str, base_params: dict[str, Any]
+    ) -> None:
+        """Record what a post-processing button (result_id) refers to: the
+        Telegram file_id to re-download the source image from, and the
+        generation params (already a plain dict — see handlers.py's
+        (de)serialization helpers) needed to build the next graph."""
+        self._prune_pending_results()
+        self._conn.execute(
+            "INSERT OR REPLACE INTO pending_result "
+            "(result_id, chat_id, file_id, filename, base_params_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (result_id, chat_id, file_id, filename, json.dumps(base_params), time.time()),
+        )
+        self._conn.commit()
+
+    def get_pending_result(self, result_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT chat_id, file_id, filename, base_params_json FROM pending_result WHERE result_id = ?",
+            (result_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        chat_id, file_id, filename, base_params_json = row
+        return {
+            "chat_id": chat_id,
+            "file_id": file_id,
+            "filename": filename,
+            "base_params": json.loads(base_params_json),
+        }
+
+    def _prune_pending_results(self, ttl_seconds: float = PENDING_RESULT_TTL_SECONDS) -> None:
+        cutoff = time.time() - ttl_seconds
+        self._conn.execute("DELETE FROM pending_result WHERE created_at < ?", (cutoff,))
+        self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()

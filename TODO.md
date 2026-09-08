@@ -112,13 +112,13 @@ history, or manually match types) — don't assume a `null` link means unused.
 - [x] Generated image(s) sent back per-image (not a media group, so each can carry its own buttons), with 🔍 Upscale / ✨ Face Detail inline buttons
 - [x] Button callbacks (`postprocess_callback`) run the matching post-processing graph against the selected image
 - [x] Result sent as a follow-up message; chaining works naturally since post-processed results also get their own Upscale/Face-Detail buttons
-- [x] Multi-image batches handled correctly — each image gets its own `PendingResult` entry (`state.py`) and its own keyboard
+- [x] Multi-image batches handled correctly — each image gets its own pending-result row (see section 7) and its own keyboard
 - [ ] (Stretch, not started) Style-transfer / pose-control buttons — waiting on the IPAdapter/ControlNet builder functions from section 2
 
 ## 7. State & persistence — done
 - [x] `src/comfytelegram/storage.py` — sqlite (`state.sqlite3`, gitignored), two tables: per-chat selected checkpoint, per-(chat, checkpoint) profile-default overrides. Deliberately primitive: stdlib `sqlite3`, no migrations/ORM. Added after the first live test surfaced that model selection was in-memory only and lost on every restart.
 - [x] In-flight job → chat/message mapping doesn't need its own storage — python-telegram-bot's `Message` object returned from `reply_text` already carries what's needed to edit it later, held as a local closure variable per request (see `generate_message`'s `status_message`)
-- [x] Post-processing result registry (`state.py`, `BotState`) stays in-memory on purpose — it holds raw generated-image bytes, which are pointless to persist across a restart (see the module's own docstring for why)
+- [x] **Fixed:** post-processing buttons ("🔍 Upscale") used to live only in an in-memory registry (`state.py`, since deleted) with the reasoning "no point persisting bytes you can't reproduce" — which missed that Telegram already stores the sent file. Now `storage.py`'s `pending_result` table keeps just the Telegram `file_id` (re-downloadable indefinitely via `bot.get_file`) plus the generation params, so a bot restart no longer breaks old "Upscale"/"Face Detail" buttons. 30-day TTL, pruned opportunistically on writes. (Buttons sent *before* this fix still can't recover — their metadata genuinely never got persisted; only new results benefit.)
 - [x] `/settings` — an in-place, edited inline-keyboard menu for viewing/changing the per-chat profile overrides (`src/comfytelegram/settings_menu.py`), replacing an earlier `/override <field>=<value>` command that worked but wasn't user-friendly. Numeric fields get stepper + preset buttons; enum fields (sampler/scheduler) get a button grid sourced live from ComfyUI's `/object_info` so it can never offer an invalid value; both fall back to free-text "custom value" entry. Design rationale + sources are in the conversation that led here.
 
 ## 8. Config, secrets, deployment

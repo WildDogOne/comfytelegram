@@ -2,7 +2,7 @@
 requests, and the inline-keyboard callbacks for model selection and
 post-processing.
 
-Shared objects (settings, the ComfyUI client, loaded profiles, bot state)
+Shared objects (settings, the ComfyUI client, loaded profiles, storage)
 live in `context.bot_data`, populated once at startup in `main.py`.
 """
 
@@ -11,18 +11,20 @@ from __future__ import annotations
 import io
 import logging
 import time
+import uuid
+from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import ContextTypes
 
 from comfytelegram.auth import is_authorized, reject_if_unauthorized
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
-from comfytelegram.generation import generate, post_process
+from comfytelegram.generation import GeneratedImage, generate, post_process
 from comfytelegram.profiles import ModelProfile, apply_profile_override, resolve_profile
 from comfytelegram.settings import Settings
 from comfytelegram.settings_menu import handle_custom_value_message
-from comfytelegram.state import BotState, PendingResult
 from comfytelegram.storage import Storage
+from comfytelegram.workflows import LoraSpec, PostProcessBaseParams
 
 logger = logging.getLogger(__name__)
 
@@ -56,17 +58,62 @@ async def _send_result_image(
     data: bytes,
     filename: str,
     reply_markup: InlineKeyboardMarkup,
-) -> None:
+) -> Message:
     """Send a generated image, falling back to a document when it's too big
-    for Telegram's photo path (see TELEGRAM_PHOTO_SIZE_LIMIT above)."""
+    for Telegram's photo path (see TELEGRAM_PHOTO_SIZE_LIMIT above). Returns
+    the sent message — callers need it to read back the file_id Telegram
+    assigned, for `_store_pending_result`."""
     if len(data) <= TELEGRAM_PHOTO_SIZE_LIMIT:
-        await message.reply_photo(photo=io.BytesIO(data), reply_markup=reply_markup)
-        return
-    await message.reply_document(
+        return await message.reply_photo(photo=io.BytesIO(data), reply_markup=reply_markup)
+    return await message.reply_document(
         document=io.BytesIO(data),
         filename=filename,
         caption="Sent as a file — too large for Telegram's photo size limit (10MB).",
         reply_markup=reply_markup,
+    )
+
+
+def _extract_file_id(sent_message: Message) -> str:
+    if sent_message.photo:
+        return sent_message.photo[-1].file_id  # largest resolution
+    if sent_message.document:
+        return sent_message.document.file_id
+    raise ValueError("Sent message has neither a photo nor a document to read a file_id from")
+
+
+def _serialize_base_params(params: PostProcessBaseParams) -> dict[str, Any]:
+    return {
+        "checkpoint": params.checkpoint,
+        "positive_prompt": params.positive_prompt,
+        "negative_prompt": params.negative_prompt,
+        "clip_skip": params.clip_skip,
+        "loras": [
+            {"name": lora.name, "strength_model": lora.strength_model, "strength_clip": lora.strength_clip}
+            for lora in params.loras
+        ],
+    }
+
+
+def _deserialize_base_params(data: dict[str, Any]) -> PostProcessBaseParams:
+    return PostProcessBaseParams(
+        checkpoint=data["checkpoint"],
+        positive_prompt=data["positive_prompt"],
+        negative_prompt=data["negative_prompt"],
+        clip_skip=data["clip_skip"],
+        loras=[LoraSpec(**lora) for lora in data.get("loras", [])],
+    )
+
+
+async def _send_and_store_result(
+    message: Message, chat_id: int, storage: Storage, img: GeneratedImage
+) -> None:
+    """Send a generated image with its post-processing keyboard, then persist
+    what those buttons need (a re-downloadable file_id + the params to build
+    the next graph) so they still work after a bot restart — see storage.py."""
+    result_id = uuid.uuid4().hex[:12]
+    sent = await _send_result_image(message, img.data, img.filename, _post_process_keyboard(result_id))
+    storage.store_pending_result(
+        result_id, chat_id, _extract_file_id(sent), img.filename, _serialize_base_params(img.base_params)
     )
 
 
@@ -158,7 +205,6 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     chat_id = update.effective_chat.id
-    state: BotState = context.bot_data["state"]
     storage: Storage = context.bot_data["storage"]
     client: ComfyClient = context.bot_data["comfy_client"]
     profiles: list[ModelProfile] = context.bot_data["profiles"]
@@ -213,10 +259,7 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await status_message.edit_text(f"Done — {len(images)} image(s).")
 
     for img in images:
-        result_id = state.store_result(
-            PendingResult(image_bytes=img.data, filename=img.filename, base_params=img.base_params)
-        )
-        await _send_result_image(message, img.data, img.filename, _post_process_keyboard(result_id))
+        await _send_and_store_result(message, chat_id, storage, img)
 
 
 async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -227,8 +270,8 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     _, kind, result_id = query.data.split(":", 2)
-    state: BotState = context.bot_data["state"]
-    pending = state.get_result(result_id)
+    storage: Storage = context.bot_data["storage"]
+    pending = storage.get_pending_result(result_id)
     if pending is None:
         await query.answer("That result has expired — generate a new image.", show_alert=True)
         return
@@ -239,7 +282,10 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     status_message = await query.message.reply_text(f"{label}…")
 
     try:
-        result = await post_process(client, kind, pending.image_bytes, pending.filename, pending.base_params)
+        tg_file = await context.bot.get_file(pending["file_id"])
+        source_bytes = bytes(await tg_file.download_as_bytearray())
+        base_params = _deserialize_base_params(pending["base_params"])
+        result = await post_process(client, kind, source_bytes, pending["filename"], base_params)
     except ComfyUIError as exc:
         await status_message.edit_text(f"{label} failed: {exc}")
         return
@@ -249,9 +295,4 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     await status_message.delete()
-    new_result_id = state.store_result(
-        PendingResult(image_bytes=result.data, filename=result.filename, base_params=result.base_params)
-    )
-    await _send_result_image(
-        query.message, result.data, result.filename, _post_process_keyboard(new_result_id)
-    )
+    await _send_and_store_result(query.message, pending["chat_id"], storage, result)

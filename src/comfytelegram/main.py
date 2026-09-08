@@ -28,7 +28,6 @@ from comfytelegram.handlers import (
 from comfytelegram.profiles import load_profiles
 from comfytelegram.settings import Settings, load_settings
 from comfytelegram.settings_menu import settings_callback, settings_command
-from comfytelegram.state import BotState
 from comfytelegram.storage import Storage
 
 logger = logging.getLogger(__name__)
@@ -77,7 +76,6 @@ def build_application(settings: Settings) -> Application:
     )
     application.bot_data["settings"] = settings
     application.bot_data["profiles"] = load_profiles(settings.model_profiles_dir)
-    application.bot_data["state"] = BotState()
     application.bot_data["storage"] = Storage(settings.state_db_path)
 
     application.add_handler(CommandHandler("start", start))
