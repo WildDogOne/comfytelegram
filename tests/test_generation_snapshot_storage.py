@@ -64,6 +64,9 @@ def test_generation_snapshot_pruned_after_ttl(storage: Storage):
         (time.time() - 999999999, "old"),
     )
     storage._conn.commit()
+    # force the next store to actually run a prune sweep, bypassing
+    # PRUNE_INTERVAL_SECONDS' cadence gate (see storage.py's `_prune`)
+    storage._last_prune.clear()
 
     # storing a new snapshot triggers pruning of expired rows
     storage.store_generation_snapshot("new", 1, {})

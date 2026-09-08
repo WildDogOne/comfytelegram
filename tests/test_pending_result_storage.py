@@ -56,9 +56,31 @@ def test_pending_result_pruned_after_ttl(storage: Storage):
         (time.time() - 999999999, "old"),
     )
     storage._conn.commit()
+    # force the next store to actually run a prune sweep, bypassing
+    # PRUNE_INTERVAL_SECONDS' cadence gate (see storage.py's `_prune`)
+    storage._last_prune.clear()
 
     # storing a new result triggers pruning of expired rows
     storage.store_pending_result("new", 1, "FILE_ID2", "out2.png", {})
 
     assert storage.get_pending_result("old") is None
+    assert storage.get_pending_result("new") is not None
+
+
+def test_pending_result_prune_is_rate_limited(storage: Storage):
+    """A prune sweep shouldn't re-run on every single store — see
+    PRUNE_INTERVAL_SECONDS. A stale row should survive a store that
+    immediately follows a just-ran sweep."""
+    storage.store_pending_result("old", 1, "FILE_ID", "out.png", {})  # first sweep runs (cache was empty)
+    storage._conn.execute(
+        "UPDATE pending_result SET created_at = ? WHERE result_id = ?",
+        (time.time() - 999999999, "old"),
+    )
+    storage._conn.commit()
+
+    # this store happens well within PRUNE_INTERVAL_SECONDS of the first —
+    # no sweep should run, so "old" survives for now
+    storage.store_pending_result("new", 1, "FILE_ID2", "out2.png", {})
+
+    assert storage.get_pending_result("old") is not None
     assert storage.get_pending_result("new") is not None

@@ -21,7 +21,12 @@ to build the next stage's graph — and it fits the same sqlite file as
 everything else here.
 
 Deliberately "primitive": stdlib sqlite3, small tables, no migrations
-framework, no ORM.
+framework, no ORM. Every mutating method wraps its statement(s) in
+`with self._conn:` rather than a manual `.commit()` — sqlite3's connection
+context manager commits on a clean exit and rolls back on an exception, so
+a method that writes two tables (e.g. `delete_character` clearing the
+active-character row too) can't leave the first write dangling uncommitted
+if the second one raises.
 """
 
 from __future__ import annotations
@@ -36,6 +41,14 @@ from typing import Any
 #: Generous on purpose — the whole point is surviving restarts and letting
 #: people come back to an old result later, not a tight session window.
 PENDING_RESULT_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days
+
+#: Minimum time between prune sweeps of a given table. `_prune` runs on
+#: every `store_pending_result`/`store_generation_snapshot` call (the hot
+#: path — once per generated/post-processed image), so gating it to at most
+#: once per interval avoids a full-table DELETE scan on every single write.
+#: Harmless against the 30-day TTL above: a row lingers at most an hour past
+#: its actual expiry before a sweep catches it.
+PRUNE_INTERVAL_SECONDS = 60 * 60  # 1 hour
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS chat_checkpoint (
@@ -92,8 +105,9 @@ class Storage:
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
+        self._conn.executescript(_SCHEMA)  # already commits internally
+        #: Last `_prune()` sweep time per table — see PRUNE_INTERVAL_SECONDS.
+        self._last_prune: dict[str, float] = {}
 
     def get_checkpoint(self, chat_id: int) -> str | None:
         row = self._conn.execute(
@@ -102,12 +116,12 @@ class Storage:
         return row[0] if row else None
 
     def set_checkpoint(self, chat_id: int, checkpoint: str) -> None:
-        self._conn.execute(
-            "INSERT INTO chat_checkpoint (chat_id, checkpoint) VALUES (?, ?) "
-            "ON CONFLICT(chat_id) DO UPDATE SET checkpoint = excluded.checkpoint",
-            (chat_id, checkpoint),
-        )
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO chat_checkpoint (chat_id, checkpoint) VALUES (?, ?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET checkpoint = excluded.checkpoint",
+                (chat_id, checkpoint),
+            )
 
     def get_override(self, chat_id: int, checkpoint: str) -> dict[str, Any]:
         row = self._conn.execute(
@@ -117,12 +131,12 @@ class Storage:
         return json.loads(row[0]) if row else {}
 
     def _save_override(self, chat_id: int, checkpoint: str, fields: dict[str, Any]) -> None:
-        self._conn.execute(
-            "INSERT INTO profile_override (chat_id, checkpoint, overrides_json) VALUES (?, ?, ?) "
-            "ON CONFLICT(chat_id, checkpoint) DO UPDATE SET overrides_json = excluded.overrides_json",
-            (chat_id, checkpoint, json.dumps(fields)),
-        )
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO profile_override (chat_id, checkpoint, overrides_json) VALUES (?, ?, ?) "
+                "ON CONFLICT(chat_id, checkpoint) DO UPDATE SET overrides_json = excluded.overrides_json",
+                (chat_id, checkpoint, json.dumps(fields)),
+            )
 
     def set_override_fields(self, chat_id: int, checkpoint: str, fields: dict[str, Any]) -> dict[str, Any]:
         """Merge `fields` (already-validated ProfileDefaults-shaped values) into
@@ -135,10 +149,10 @@ class Storage:
 
     def clear_override(self, chat_id: int, checkpoint: str) -> None:
         """Remove every overridden field for (chat_id, checkpoint) — "reset all"."""
-        self._conn.execute(
-            "DELETE FROM profile_override WHERE chat_id = ? AND checkpoint = ?", (chat_id, checkpoint)
-        )
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM profile_override WHERE chat_id = ? AND checkpoint = ?", (chat_id, checkpoint)
+            )
 
     def clear_override_field(self, chat_id: int, checkpoint: str, field: str) -> dict[str, Any]:
         """Remove a single field from the override, keeping the rest. Returns
@@ -163,12 +177,12 @@ class Storage:
         graph, whether that's an upscale/face-detail pass or a fresh
         "🔁 Regenerate" run."""
         self._prune("pending_result")
-        self._conn.execute(
-            "INSERT OR REPLACE INTO pending_result "
-            "(result_id, chat_id, file_id, filename, base_params_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (result_id, chat_id, file_id, filename, json.dumps(base_params), time.time()),
-        )
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO pending_result "
+                "(result_id, chat_id, file_id, filename, base_params_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (result_id, chat_id, file_id, filename, json.dumps(base_params), time.time()),
+            )
 
     def get_pending_result(self, result_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
@@ -189,23 +203,28 @@ class Storage:
         """Delete rows older than `ttl_seconds` from `table` — both
         `pending_result` and `generation_snapshot` are TTL-pruned key→blob
         tables with an identical `created_at` column, so this one method
-        backs both."""
-        cutoff = time.time() - ttl_seconds
-        self._conn.execute(f"DELETE FROM {table} WHERE created_at < ?", (cutoff,))
-        self._conn.commit()
+        backs both. Gated to at most once per PRUNE_INTERVAL_SECONDS per
+        table (see its docstring)."""
+        now = time.time()
+        if now - self._last_prune.get(table, 0.0) < PRUNE_INTERVAL_SECONDS:
+            return
+        self._last_prune[table] = now
+        cutoff = now - ttl_seconds
+        with self._conn:
+            self._conn.execute(f"DELETE FROM {table} WHERE created_at < ?", (cutoff,))
 
     def save_character(
         self, chat_id: int, name: str, positive_prompt: str, negative_prompt: str = ""
     ) -> None:
         """Create or overwrite a saved character design for this chat."""
-        self._conn.execute(
-            "INSERT INTO character (chat_id, name, positive_prompt, negative_prompt, created_at) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(chat_id, name) DO UPDATE SET "
-            "positive_prompt = excluded.positive_prompt, negative_prompt = excluded.negative_prompt",
-            (chat_id, name, positive_prompt, negative_prompt, time.time()),
-        )
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO character (chat_id, name, positive_prompt, negative_prompt, created_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(chat_id, name) DO UPDATE SET "
+                "positive_prompt = excluded.positive_prompt, negative_prompt = excluded.negative_prompt",
+                (chat_id, name, positive_prompt, negative_prompt, time.time()),
+            )
 
     def get_character(self, chat_id: int, name: str) -> dict[str, Any] | None:
         row = self._conn.execute(
@@ -228,11 +247,11 @@ class Storage:
         ]
 
     def delete_character(self, chat_id: int, name: str) -> None:
-        self._conn.execute("DELETE FROM character WHERE chat_id = ? AND name = ?", (chat_id, name))
-        active = self.get_active_character_name(chat_id)
-        if active == name:
-            self.clear_active_character(chat_id)
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute("DELETE FROM character WHERE chat_id = ? AND name = ?", (chat_id, name))
+            active = self.get_active_character_name(chat_id)
+            if active == name:
+                self.clear_active_character(chat_id)
 
     def get_active_character_name(self, chat_id: int) -> str | None:
         row = self._conn.execute(
@@ -241,16 +260,16 @@ class Storage:
         return row[0] if row else None
 
     def set_active_character(self, chat_id: int, name: str) -> None:
-        self._conn.execute(
-            "INSERT INTO active_character (chat_id, name) VALUES (?, ?) "
-            "ON CONFLICT(chat_id) DO UPDATE SET name = excluded.name",
-            (chat_id, name),
-        )
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO active_character (chat_id, name) VALUES (?, ?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET name = excluded.name",
+                (chat_id, name),
+            )
 
     def clear_active_character(self, chat_id: int) -> None:
-        self._conn.execute("DELETE FROM active_character WHERE chat_id = ?", (chat_id,))
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute("DELETE FROM active_character WHERE chat_id = ?", (chat_id,))
 
     def store_generation_snapshot(self, snapshot_id: str, chat_id: int, params: dict[str, Any]) -> None:
         """Record the resolved generation params (same shape as
@@ -261,12 +280,12 @@ class Storage:
         message's button can't be shadowed by a newer generation in the
         same chat."""
         self._prune("generation_snapshot")
-        self._conn.execute(
-            "INSERT OR REPLACE INTO generation_snapshot (snapshot_id, chat_id, params_json, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (snapshot_id, chat_id, json.dumps(params), time.time()),
-        )
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO generation_snapshot (snapshot_id, chat_id, params_json, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (snapshot_id, chat_id, json.dumps(params), time.time()),
+            )
 
     def get_generation_snapshot(self, snapshot_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(

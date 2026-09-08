@@ -8,6 +8,7 @@ live in `context.bot_data`, populated once at startup in `main.py`.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import re
@@ -220,12 +221,18 @@ async def _deliver_generation_result(
     images has been produced: mint a fresh generation snapshot for the next
     "Generate Again" tap, update the status message, then send + register
     each image. `reply_target` is the message new image replies attach to
-    (the original prompt message, or the callback query's own message)."""
+    (the original prompt message, or the callback query's own message).
+
+    Images are sent concurrently rather than one at a time — each is an
+    independent Telegram call, so a batch shouldn't pay for N sequential
+    round-trips. The one tradeoff: for batch_size > 1, the order images
+    land in the chat is whatever order their `sendPhoto` calls happen to
+    complete in, not necessarily the batch's original order.
+    """
     snapshot_id = uuid.uuid4().hex[:12]
     storage.store_generation_snapshot(snapshot_id, chat_id, _serialize_generation_params(images[0].full_params))
     await status_message.edit_text(f"Done — {len(images)} image(s).", reply_markup=_again_keyboard(snapshot_id))
-    for img in images:
-        await _send_and_store_result(reply_target, chat_id, storage, img)
+    await asyncio.gather(*(_send_and_store_result(reply_target, chat_id, storage, img) for img in images))
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
