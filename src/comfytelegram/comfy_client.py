@@ -22,6 +22,10 @@ class ComfyUIError(RuntimeError):
 
 @dataclass
 class JobProgress:
+    """One event from `ComfyClient.watch()`: either a step update
+    (`node_id`/`value`/`max` set) or the terminal `done=True` event, which
+    carries no node/value info."""
+
     prompt_id: str
     node_id: str | None
     value: int | None
@@ -40,54 +44,76 @@ class ComfyClient:
         *,
         session: aiohttp.ClientSession | None = None,
     ):
+        """`session`, if given, is used as-is and never closed by
+        `__aexit__` — the caller owns its lifecycle. Otherwise a session is
+        opened on `__aenter__` and closed on `__aexit__`."""
         self.http_base = http_base.rstrip("/")
         self.ws_base = ws_base.rstrip("/")
         self._session = session
         self._owns_session = session is None
 
     async def __aenter__(self) -> Self:
+        """Open an owned `aiohttp.ClientSession` if none was passed in."""
         if self._session is None:
             self._session = aiohttp.ClientSession()
         return self
 
     async def __aexit__(self, *exc: object) -> None:
+        """Close the session, but only if this client opened it itself."""
         if self._owns_session and self._session is not None:
             await self._session.close()
 
     @property
     def session(self) -> aiohttp.ClientSession:
+        """The active `aiohttp.ClientSession`. Raises if used outside the
+        `async with` context (or before a passed-in session was set)."""
         if self._session is None:
             raise RuntimeError("ComfyClient must be used as an async context manager")
         return self._session
 
     async def get_object_info(self) -> dict[str, Any]:
+        """`GET /object_info` — every node type ComfyUI has registered,
+        keyed by class name, with each input's accepted values/types."""
         async with self.session.get(f"{self.http_base}/object_info") as resp:
             resp.raise_for_status()
             return await resp.json()
 
     async def get_node_info(self, class_type: str) -> dict[str, Any]:
+        """`GET /object_info/<class_type>` — one node type's info, unwrapped
+        from the `{class_type: {...}}` envelope the endpoint returns."""
         async with self.session.get(f"{self.http_base}/object_info/{class_type}") as resp:
             resp.raise_for_status()
             data = await resp.json()
             return data[class_type]
 
     async def list_checkpoints(self) -> list[str]:
+        """Checkpoint filenames ComfyUI has installed (from
+        `CheckpointLoaderSimple`'s `ckpt_name` enum)."""
         info = await self.get_node_info("CheckpointLoaderSimple")
         return _enum_choices(info, "ckpt_name")
 
     async def list_loras(self) -> list[str]:
+        """LoRA filenames ComfyUI has installed (from `LoraLoader`'s
+        `lora_name` enum)."""
         info = await self.get_node_info("LoraLoader")
         return _enum_choices(info, "lora_name")
 
     async def list_samplers(self) -> list[str]:
+        """Sampler names ComfyUI supports (from `KSampler`'s `sampler_name`
+        enum)."""
         info = await self.get_node_info("KSampler")
         return _enum_choices(info, "sampler_name")
 
     async def list_schedulers(self) -> list[str]:
+        """Scheduler names ComfyUI supports (from `KSampler`'s `scheduler`
+        enum)."""
         info = await self.get_node_info("KSampler")
         return _enum_choices(info, "scheduler")
 
     async def queue_prompt(self, prompt: dict[str, Any], *, client_id: str) -> str:
+        """`POST /prompt` — submit an API-format graph for execution.
+        Returns the assigned `prompt_id`; raises `ComfyUIError` if ComfyUI
+        rejects it (e.g. `required_input_missing`)."""
         payload = {"prompt": prompt, "client_id": client_id}
         async with self.session.post(f"{self.http_base}/prompt", json=payload) as resp:
             data = await resp.json()
@@ -96,12 +122,18 @@ class ComfyClient:
             return data["prompt_id"]
 
     async def get_history(self, prompt_id: str) -> dict[str, Any] | None:
+        """`GET /history/<prompt_id>` — that job's status/outputs, or None
+        if ComfyUI has no history entry for it (not yet finished, or an
+        unknown id)."""
         async with self.session.get(f"{self.http_base}/history/{prompt_id}") as resp:
             resp.raise_for_status()
             data = await resp.json()
             return data.get(prompt_id)
 
     async def get_image_bytes(self, filename: str, subfolder: str, folder_type: str) -> bytes:
+        """`GET /view` — download one output image's raw bytes, addressed
+        by the `{filename, subfolder, type}` triple a history entry's
+        `outputs` reports."""
         params = {"filename": filename, "subfolder": subfolder, "type": folder_type}
         async with self.session.get(f"{self.http_base}/view", params=params) as resp:
             resp.raise_for_status()
@@ -177,6 +209,10 @@ class ComfyClient:
 
 
 def _enum_choices(node_info: dict[str, Any], input_name: str) -> list[str]:
+    """Pull the enum choice list for one required input out of a
+    `/object_info` node entry — ComfyUI represents an enum input as
+    `[[choice, ...], {...}]`, so this is `[0]` of that pair. Returns `[]`
+    if `input_name` isn't a required input or isn't enum-shaped."""
     required = node_info.get("input", {}).get("required", {})
     spec = required.get(input_name)
     if not spec or not isinstance(spec[0], list):

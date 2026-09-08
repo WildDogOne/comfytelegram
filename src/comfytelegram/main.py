@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 
 
 async def _post_init(application: Application) -> None:
+    """python-telegram-bot startup hook: open the `ComfyClient` (needs a
+    running event loop, so it can't be built at `build_application` time)
+    and stash it in `bot_data` alongside the other shared singletons."""
     settings: Settings = application.bot_data["settings"]
     client = ComfyClient(settings.comfyui_http_base, settings.comfyui_ws_base)
     await client.__aenter__()
@@ -47,6 +50,8 @@ async def _post_init(application: Application) -> None:
 
 
 async def _post_shutdown(application: Application) -> None:
+    """python-telegram-bot shutdown hook: close the ComfyUI HTTP session and
+    the sqlite connection cleanly."""
     client: ComfyClient | None = application.bot_data.get("comfy_client")
     if client is not None:
         await client.__aexit__(None, None, None)
@@ -72,6 +77,9 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def build_application(settings: Settings) -> Application:
+    """Construct the python-telegram-bot `Application`: load profiles, open
+    `Storage`, register every command/callback/message handler, but don't
+    start polling (see `run()`)."""
     application = (
         ApplicationBuilder()
         .token(settings.telegram_bot_token)
@@ -101,6 +109,8 @@ def build_application(settings: Settings) -> Application:
 
 
 def run() -> None:
+    """Entry point (`comfytelegram` console script): load settings, build
+    the application, and poll Telegram for updates until interrupted."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     settings = load_settings()
     application = build_application(settings)

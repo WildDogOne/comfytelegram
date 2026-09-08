@@ -67,6 +67,9 @@ TELEGRAM_PHOTO_SIZE_LIMIT = 10_000_000
 
 
 def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
+    """The keyboard attached to a generated/post-processed image: one
+    button per `POSTPROCESS_KEYBOARD_LABELS` entry plus Regenerate, all
+    scoped to `result_id` (see `storage.py`'s `pending_result`)."""
     return InlineKeyboardMarkup(
         [
             [
@@ -111,6 +114,9 @@ async def _send_result_image(
 
 
 def _extract_file_id(sent_message: Message) -> str:
+    """The Telegram `file_id` of whichever attachment `_send_result_image`
+    actually sent (a photo, preferring its largest size, or a document for
+    oversized images). Raises if `sent_message` has neither."""
     if sent_message.photo:
         return sent_message.photo[-1].file_id  # largest resolution
     if sent_message.document:
@@ -119,6 +125,10 @@ def _extract_file_id(sent_message: Message) -> str:
 
 
 def _serialize_generation_params(params: GenerationParams) -> dict[str, Any]:
+    """Flatten a `GenerationParams` into a plain JSON-able dict for
+    `Storage` (deliberately drops `seed` and `filename_prefix` — see
+    `test_serialization_omits_seed_so_regenerate_gets_a_fresh_roll`).
+    Inverse of `_deserialize_generation_params`."""
     return {
         "checkpoint": params.checkpoint,
         "positive_prompt": params.positive_prompt,
@@ -166,6 +176,9 @@ def _make_progress_callback(status_message: Message):
     last_edit = {"t": 0.0}
 
     async def on_progress(progress: JobProgress) -> None:
+        """Edit `status_message` with the current step/percent, throttled
+        to at most once per `PROGRESS_EDIT_INTERVAL`; silently skipped once
+        `progress.done` or before the first real progress event arrives."""
         if progress.done or progress.value is None or progress.max is None:
             return
         now = time.monotonic()
@@ -236,6 +249,7 @@ async def _deliver_generation_result(
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/start` — send the command summary."""
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
         return
@@ -250,10 +264,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/help` — alias for `/start`."""
     await start(update, context)
 
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/model` — list checkpoints ComfyUI has installed as an inline
+    keyboard (labeled with the matching profile's `display_name` where one
+    exists), for `model_callback` to act on."""
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
         return
@@ -286,6 +304,10 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle a `model:<index>` tap from `model_command`'s keyboard: persist
+    the chosen checkpoint as this chat's selection. The index is stale (and
+    rejected) if `context.bot_data["available_checkpoints"]` has since
+    changed — e.g. from a newer `/model` call in another chat."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
@@ -312,6 +334,8 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def _characters_keyboard(characters: list[dict[str, Any]], active: str | None) -> InlineKeyboardMarkup:
+    """One button per saved character (✅-marked if it's `active`), plus a
+    "Clear active character" row when one is active."""
     rows = []
     for char in characters:
         label = f"✅ {char['name']}" if char["name"] == active else char["name"]
@@ -322,6 +346,9 @@ def _characters_keyboard(characters: list[dict[str, Any]], active: str | None) -
 
 
 async def character_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/character save <name> | <positive> [| <negative>]` or
+    `/character delete <name>` — manage this chat's saved characters; any
+    other/missing subcommand just shows `CHARACTER_HELP`."""
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
         return
@@ -369,6 +396,8 @@ async def character_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def characters_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/characters` — list this chat's saved characters as an inline
+    keyboard to activate one, for `character_callback` to act on."""
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
         return
@@ -386,6 +415,9 @@ async def characters_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def character_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle a `char:clear` or `char:activate:<name>` tap from
+    `characters_command`'s keyboard: clear or set this chat's active
+    character."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
@@ -420,6 +452,13 @@ async def character_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle a plain-text message as a generation prompt: resolve this
+    chat's checkpoint/profile/override/active-character, run `generate()`
+    with live progress, then deliver the result. Defaults to ComfyUI's
+    first available checkpoint (and remembers it) if none is selected yet.
+    A pending "custom value" `/settings` entry (see
+    `handle_custom_value_message`) takes priority over treating the text as
+    a prompt."""
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
         return
@@ -485,6 +524,11 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle a `pp:<kind>:<result_id>` tap from `_post_process_keyboard`:
+    `kind` is `"regen"` (re-run the base generation, same settings, fresh
+    seed) or `"upscale"`/`"face"` (download the source image and run that
+    post-processing stage on it). Alerts instead if `result_id` has expired
+    (see `PENDING_RESULT_TTL_SECONDS`)."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
@@ -517,6 +561,8 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     status_message = await query.message.reply_text(f"{label}…")
 
     async def _download_and_post_process() -> GeneratedImage:
+        """Bundle the file download and the post-process call into one
+        awaitable so `_run_reporting_errors` covers both."""
         tg_file = await context.bot.get_file(pending["file_id"])
         source_bytes = bytes(await tg_file.download_as_bytearray())
         return await post_process(client, kind, source_bytes, pending["filename"], full_params)

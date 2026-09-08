@@ -26,6 +26,9 @@ NodeRef = tuple[str, int]
 
 
 def _resolve_seed(seed: int | None) -> int:
+    """`seed` unchanged if given, otherwise a fresh random one — shared by
+    `GenerationParams.resolved_seed()` and the upscale/face-detail builders'
+    own seed handling below."""
     return seed if seed is not None else random.randint(0, 2**32 - 1)
 
 
@@ -33,10 +36,13 @@ class PromptGraph:
     """A mutable ComfyUI API-format prompt being assembled node by node."""
 
     def __init__(self) -> None:
+        """Start empty; node ids are assigned sequentially from `add()`."""
         self._nodes: dict[str, dict[str, Any]] = {}
         self._next_id = 1
 
     def add(self, class_type: str, inputs: dict[str, Any], *, title: str | None = None) -> str:
+        """Append one node and return its freshly-assigned id, for wiring
+        into later nodes' `inputs` as `[node_id, output_index]`."""
         node_id = str(self._next_id)
         self._next_id += 1
         node: dict[str, Any] = {"class_type": class_type, "inputs": inputs}
@@ -46,11 +52,16 @@ class PromptGraph:
         return node_id
 
     def as_prompt(self) -> dict[str, Any]:
+        """The assembled graph in ComfyUI's API format, ready for
+        `ComfyClient.queue_prompt()`."""
         return self._nodes
 
 
 @dataclass
 class LoraSpec:
+    """One LoRA to chain into the model/clip pipeline, and at what
+    strength."""
+
     name: str
     strength_model: float = 1.0
     strength_clip: float = 1.0
@@ -81,12 +92,15 @@ class GenerationParams:
     filename_prefix: str = "comfytelegram"
 
     def resolved_seed(self) -> int:
+        """This request's seed, or a freshly-rolled random one if unset."""
         return _resolve_seed(self.seed)
 
 
 def _apply_loras(
     g: PromptGraph, model_ref: NodeRef, clip_ref: NodeRef, loras: list[LoraSpec]
 ) -> tuple[NodeRef, NodeRef]:
+    """Chain zero or more `LoraLoader` nodes onto `model_ref`/`clip_ref`, in
+    list order. Returns the refs unchanged if `loras` is empty."""
     for lora in loras:
         node_id = g.add(
             "LoraLoader",
@@ -227,8 +241,10 @@ def build_upscale(
     base: PostProcessBaseParams,
     params: UpscaleParams,
 ) -> tuple[dict[str, Any], str]:
-    """`source_filename` must already exist in ComfyUI's `input` directory
-    (upload it first via `ComfyClient.upload_image`)."""
+    """Build the 4x UltimateSDUpscale post-processing graph. Returns
+    (prompt_dict, save_image_node_id). `source_filename` must already exist
+    in ComfyUI's `input` directory (upload it first via
+    `ComfyClient.upload_image`)."""
     g = PromptGraph()
 
     load = g.add("LoadImage", {"image": source_filename}, title="Source Image")
@@ -304,8 +320,10 @@ def build_face_detailer(
     base: PostProcessBaseParams,
     params: FaceDetailerParams,
 ) -> tuple[dict[str, Any], str]:
-    """`source_filename` must already exist in ComfyUI's `input` directory
-    (upload it first via `ComfyClient.upload_image`)."""
+    """Build the Impact Pack FaceDetailer post-processing graph. Returns
+    (prompt_dict, save_image_node_id). `source_filename` must already exist
+    in ComfyUI's `input` directory (upload it first via
+    `ComfyClient.upload_image`)."""
     g = PromptGraph()
 
     load = g.add("LoadImage", {"image": source_filename}, title="Source Image")

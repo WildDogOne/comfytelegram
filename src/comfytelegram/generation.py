@@ -34,6 +34,8 @@ ProgressCallback = Callable[[JobProgress], Awaitable[None]]
 
 @dataclass
 class GeneratedImage:
+    """One image out of ComfyUI, plus the resolved settings that made it."""
+
     data: bytes
     filename: str
     #: The fully-resolved settings this image (or the base generation it was
@@ -44,6 +46,8 @@ class GeneratedImage:
 
 
 def _to_post_process_base(params: GenerationParams) -> PostProcessBaseParams:
+    """Narrow a full `GenerationParams` down to the checkpoint/prompt/LoRA/
+    clip-skip subset `build_upscale`/`build_face_detailer` need."""
     return PostProcessBaseParams(
         checkpoint=params.checkpoint,
         positive_prompt=params.positive_prompt,

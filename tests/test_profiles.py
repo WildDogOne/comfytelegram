@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from comfytelegram.profiles import (
+    LoraDefault,
     ModelProfile,
     ProfileDefaults,
     load_profiles,
@@ -107,3 +108,24 @@ def test_resolve_generation_params_extra_negative_without_profile():
         "unknown.safetensors", "a fox", None, extra_negative_prompt="blurry"
     )
     assert params.negative_prompt == "blurry"
+
+
+def test_lora_default_to_spec_drops_default_enabled_flag():
+    lora = LoraDefault(name="a.safetensors", strength_model=0.8, strength_clip=0.9, default_enabled=False)
+    spec = lora.to_spec()
+    assert spec.name == "a.safetensors"
+    assert spec.strength_model == 0.8
+    assert spec.strength_clip == 0.9
+
+
+def test_resolve_generation_params_only_applies_default_enabled_loras():
+    profile = ModelProfile(
+        match=["*ckpt*"],
+        display_name="X",
+        loras=[
+            LoraDefault(name="on.safetensors", default_enabled=True),
+            LoraDefault(name="off.safetensors", default_enabled=False),
+        ],
+    )
+    params = resolve_generation_params("ckpt.safetensors", "a fox", profile)
+    assert [lora.name for lora in params.loras] == ["on.safetensors"]

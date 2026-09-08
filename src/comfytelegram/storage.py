@@ -103,6 +103,8 @@ class Storage:
     runs all handlers on a single event loop thread."""
 
     def __init__(self, db_path: Path) -> None:
+        """Open (creating if needed) the sqlite file at `db_path`, creating
+        parent directories too, and apply `_SCHEMA`."""
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.executescript(_SCHEMA)  # already commits internally
@@ -110,12 +112,16 @@ class Storage:
         self._last_prune: dict[str, float] = {}
 
     def get_checkpoint(self, chat_id: int) -> str | None:
+        """The checkpoint filename this chat last selected via `/model`, or
+        None if it's never picked one."""
         row = self._conn.execute(
             "SELECT checkpoint FROM chat_checkpoint WHERE chat_id = ?", (chat_id,)
         ).fetchone()
         return row[0] if row else None
 
     def set_checkpoint(self, chat_id: int, checkpoint: str) -> None:
+        """Persist this chat's selected checkpoint, replacing any prior
+        selection."""
         with self._conn:
             self._conn.execute(
                 "INSERT INTO chat_checkpoint (chat_id, checkpoint) VALUES (?, ?) "
@@ -124,6 +130,8 @@ class Storage:
             )
 
     def get_override(self, chat_id: int, checkpoint: str) -> dict[str, Any]:
+        """The stored `/settings` override fields for (chat_id, checkpoint),
+        or `{}` if none are set."""
         row = self._conn.execute(
             "SELECT overrides_json FROM profile_override WHERE chat_id = ? AND checkpoint = ?",
             (chat_id, checkpoint),
@@ -131,6 +139,9 @@ class Storage:
         return json.loads(row[0]) if row else {}
 
     def _save_override(self, chat_id: int, checkpoint: str, fields: dict[str, Any]) -> None:
+        """Replace the stored override row for (chat_id, checkpoint) with
+        exactly `fields` (the caller has already merged in whatever should
+        be kept — see `set_override_fields`/`clear_override_field`)."""
         with self._conn:
             self._conn.execute(
                 "INSERT INTO profile_override (chat_id, checkpoint, overrides_json) VALUES (?, ?, ?) "
@@ -185,6 +196,8 @@ class Storage:
             )
 
     def get_pending_result(self, result_id: str) -> dict[str, Any] | None:
+        """The row `store_pending_result` wrote for `result_id`, or None if
+        it doesn't exist (never stored, or pruned past its TTL)."""
         row = self._conn.execute(
             "SELECT chat_id, file_id, filename, base_params_json FROM pending_result WHERE result_id = ?",
             (result_id,),
@@ -227,6 +240,8 @@ class Storage:
             )
 
     def get_character(self, chat_id: int, name: str) -> dict[str, Any] | None:
+        """One saved character for this chat by name, or None if it doesn't
+        exist."""
         row = self._conn.execute(
             "SELECT positive_prompt, negative_prompt FROM character WHERE chat_id = ? AND name = ?",
             (chat_id, name),
@@ -236,6 +251,8 @@ class Storage:
         return {"name": name, "positive_prompt": row[0], "negative_prompt": row[1]}
 
     def list_characters(self, chat_id: int) -> list[dict[str, Any]]:
+        """Every saved character for this chat, alphabetical
+        (case-insensitive) by name."""
         rows = self._conn.execute(
             "SELECT name, positive_prompt, negative_prompt FROM character "
             "WHERE chat_id = ? ORDER BY name COLLATE NOCASE",
@@ -247,6 +264,9 @@ class Storage:
         ]
 
     def delete_character(self, chat_id: int, name: str) -> None:
+        """Delete a saved character. If it was this chat's active
+        character, clears that activation too (rather than leaving it
+        pointing at a name that no longer exists)."""
         with self._conn:
             self._conn.execute("DELETE FROM character WHERE chat_id = ? AND name = ?", (chat_id, name))
             active = self.get_active_character_name(chat_id)
@@ -254,12 +274,16 @@ class Storage:
                 self.clear_active_character(chat_id)
 
     def get_active_character_name(self, chat_id: int) -> str | None:
+        """The name of this chat's currently-active character, or None if
+        none is active."""
         row = self._conn.execute(
             "SELECT name FROM active_character WHERE chat_id = ?", (chat_id,)
         ).fetchone()
         return row[0] if row else None
 
     def set_active_character(self, chat_id: int, name: str) -> None:
+        """Mark `name` as this chat's active character, replacing whichever
+        one (if any) was active before."""
         with self._conn:
             self._conn.execute(
                 "INSERT INTO active_character (chat_id, name) VALUES (?, ?) "
@@ -268,6 +292,7 @@ class Storage:
             )
 
     def clear_active_character(self, chat_id: int) -> None:
+        """Deactivate this chat's active character, if any."""
         with self._conn:
             self._conn.execute("DELETE FROM active_character WHERE chat_id = ?", (chat_id,))
 
@@ -288,6 +313,8 @@ class Storage:
             )
 
     def get_generation_snapshot(self, snapshot_id: str) -> dict[str, Any] | None:
+        """The row `store_generation_snapshot` wrote for `snapshot_id`, or
+        None if it doesn't exist (never stored, or pruned past its TTL)."""
         row = self._conn.execute(
             "SELECT chat_id, params_json FROM generation_snapshot WHERE snapshot_id = ?", (snapshot_id,)
         ).fetchone()
@@ -297,4 +324,5 @@ class Storage:
         return {"chat_id": chat_id, "params": json.loads(params_json)}
 
     def close(self) -> None:
+        """Close the underlying sqlite connection."""
         self._conn.close()

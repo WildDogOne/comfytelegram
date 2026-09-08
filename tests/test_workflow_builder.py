@@ -4,6 +4,7 @@ from comfytelegram.workflows.builder import (
     LoraSpec,
     PostProcessBaseParams,
     UpscaleParams,
+    _resolve_seed,
     build_face_detailer,
     build_txt2img,
     build_upscale,
@@ -77,6 +78,38 @@ def test_resolved_seed_is_random_when_unset():
     # not asserting inequality (a 1/2^32 flake is possible but absurd) — just that it's an int in range
     assert isinstance(seed_a, int) and 0 <= seed_a < 2**32
     assert isinstance(seed_b, int) and 0 <= seed_b < 2**32
+
+
+def test_resolve_seed_returns_given_seed_unchanged():
+    assert _resolve_seed(12345) == 12345
+    assert _resolve_seed(0) == 0
+
+
+def test_resolve_seed_generates_random_int_when_none():
+    seed = _resolve_seed(None)
+    assert isinstance(seed, int) and 0 <= seed < 2**32
+
+
+def test_build_upscale_honors_explicit_seed():
+    base = PostProcessBaseParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+    )
+    prompt, _save_id = build_upscale("uploaded.png", base, UpscaleParams(seed=777))
+    upscale_node = next(n for n in prompt.values() if n["class_type"] == "UltimateSDUpscale")
+    assert upscale_node["inputs"]["seed"] == 777
+
+
+def test_build_face_detailer_honors_explicit_seed():
+    base = PostProcessBaseParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+    )
+    prompt, _save_id = build_face_detailer("uploaded.png", base, FaceDetailerParams(seed=888))
+    detailer = next(n for n in prompt.values() if n["class_type"] == "FaceDetailer")
+    assert detailer["inputs"]["seed"] == 888
 
 
 def test_build_upscale_wires_source_image_and_saves():

@@ -13,6 +13,10 @@ PROJECT_ROOT = PACKAGE_DIR.parent.parent
 
 
 class Settings(BaseSettings):
+    """Bot-wide runtime config, populated from environment variables / `.env`
+    (see `env.example` for the template). Field names map to env vars
+    case-insensitively, e.g. `TELEGRAM_BOT_TOKEN` -> `telegram_bot_token`."""
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="", extra="ignore")
 
     telegram_bot_token: str = Field(..., description="Token from @BotFather")
@@ -41,20 +45,29 @@ class Settings(BaseSettings):
     @field_validator("allowed_user_ids", mode="before")
     @classmethod
     def _parse_comma_separated_ids(cls, value: object) -> object:
+        """Parse the env var's `"123,456"` form into `[123, 456]`; empty
+        segments are dropped, so a trailing comma or blank string is
+        harmless. Non-string values (e.g. already a list) pass through
+        unchanged."""
         if isinstance(value, str):
             return [int(part) for part in value.split(",") if part.strip()]
         return value
 
     @property
     def comfyui_http_base(self) -> str:
+        """HTTP base URL for the configured ComfyUI instance, e.g.
+        `http://127.0.0.1:8188`."""
         scheme = "https" if self.comfyui_use_tls else "http"
         return f"{scheme}://{self.comfyui_host}:{self.comfyui_port}"
 
     @property
     def comfyui_ws_base(self) -> str:
+        """WebSocket base URL for the configured ComfyUI instance, e.g.
+        `ws://127.0.0.1:8188`."""
         scheme = "wss" if self.comfyui_use_tls else "ws"
         return f"{scheme}://{self.comfyui_host}:{self.comfyui_port}"
 
 
 def load_settings() -> Settings:
+    """Construct `Settings` from environment variables / `.env`."""
     return Settings()

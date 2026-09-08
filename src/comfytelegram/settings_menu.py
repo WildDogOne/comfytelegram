@@ -45,6 +45,10 @@ from comfytelegram.storage import Storage
 
 @dataclass(frozen=True)
 class NumericFieldMeta:
+    """A `GenerationParams` numeric field editable from `/settings`: stepper
+    buttons of `step` size plus quick `presets`, optionally int-rounded
+    and/or floored at `min_value`."""
+
     key: str
     label: str
     step: float
@@ -55,6 +59,11 @@ class NumericFieldMeta:
 
 @dataclass(frozen=True)
 class EnumFieldMeta:
+    """A `GenerationParams` field whose valid values come from ComfyUI's
+    live `/object_info` (sampler/scheduler) — `preferred` names, if given,
+    are shown first/exclusively when enough of them are actually present
+    server-side (see `_curate`)."""
+
     key: str
     label: str
     preferred: tuple[str, ...] = dataclass_field(default_factory=tuple)
@@ -105,6 +114,9 @@ FIELDS_BY_KEY: dict[str, FieldMeta] = {f.key: f for f in FIELDS}
 
 
 def _format_value(value: Any) -> str:
+    """Render a field's current value for display on a button: `"(none)"`
+    for an empty string, whole floats without a trailing `.0`, everything
+    else via `str()`."""
     if isinstance(value, str):
         return value if value else "(none)"
     if isinstance(value, float) and value == int(value):
@@ -113,6 +125,8 @@ def _format_value(value: Any) -> str:
 
 
 def _truncate(s: str, n: int = 22) -> str:
+    """Shorten `s` to at most `n` characters, replacing the tail with `…`
+    if it was longer — keeps home-screen button labels from overflowing."""
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
@@ -156,6 +170,10 @@ def _coerce_field_value(field: str, raw_value: str) -> dict[str, Any]:
 
 
 def _curate(choices: list[str], preferred: tuple[str, ...], max_items: int = 12) -> list[str]:
+    """Narrow `choices` (ComfyUI's live enum list) down to `preferred`
+    names actually present, in `preferred`'s order — unless fewer than 4 of
+    them are actually present, in which case curation isn't trustworthy and
+    the raw list is shown instead (capped to `max_items`)."""
     if not preferred:
         return choices[:max_items]
     curated = [c for c in preferred if c in choices]
@@ -165,6 +183,7 @@ def _curate(choices: list[str], preferred: tuple[str, ...], max_items: int = 12)
 
 
 def _home_text(checkpoint: str, profile: ModelProfile | None) -> str:
+    """The `/settings` home screen's header text."""
     label = profile.display_name if profile else checkpoint
     return f"⚙️ Settings · {label}"
 
@@ -172,6 +191,8 @@ def _home_text(checkpoint: str, profile: ModelProfile | None) -> str:
 def _home_keyboard(
     checkpoint: str, profile: ModelProfile | None, override_fields: dict[str, Any]
 ) -> InlineKeyboardMarkup:
+    """The `/settings` home screen: one button per `FIELDS` entry showing
+    its current value (★-marked if overridden), plus Reset-all and Close."""
     effective = _effective_params(checkpoint, profile)
     buttons = []
     for meta in FIELDS:
@@ -194,6 +215,8 @@ def _nav_row(meta: FieldMeta) -> list[InlineKeyboardButton]:
 
 
 def _numeric_submenu_keyboard(meta: NumericFieldMeta, value: Any) -> InlineKeyboardMarkup:
+    """A numeric field's submenu: -/current/+ stepper row, preset-value
+    rows, then Custom value and the Back/Reset nav row."""
     step = int(meta.step) if meta.is_int else meta.step
     preset_buttons = [
         InlineKeyboardButton(_format_value(preset), callback_data=f"st:v:{meta.key}:{preset}")
@@ -213,6 +236,8 @@ def _numeric_submenu_keyboard(meta: NumericFieldMeta, value: Any) -> InlineKeybo
 
 
 def _enum_submenu_keyboard(meta: EnumFieldMeta, current: Any, choices: list[str]) -> InlineKeyboardMarkup:
+    """An enum field's submenu: a grid of `choices` (curated via `_curate`,
+    current value •-marked), then Custom value and the Back/Reset nav row."""
     choice_buttons = [
         InlineKeyboardButton(
             f"{'• ' if choice == current else ''}{choice}", callback_data=f"st:v:{meta.key}:{choice}"
@@ -228,6 +253,8 @@ def _enum_submenu_keyboard(meta: EnumFieldMeta, current: Any, choices: list[str]
 
 
 def _text_submenu_keyboard(meta: TextFieldMeta) -> InlineKeyboardMarkup:
+    """A text field's submenu: just Edit plus the Back/Reset nav row (no
+    stepper/preset/enum grid applies here)."""
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("✏️ Edit", callback_data=f"st:c:{meta.key}")],
@@ -240,6 +267,10 @@ def _text_submenu_keyboard(meta: TextFieldMeta) -> InlineKeyboardMarkup:
 
 
 async def _enum_choices(client: ComfyClient, meta: EnumFieldMeta, fallback: Any) -> list[str]:
+    """Live sampler/scheduler choices from ComfyUI for `meta`. If ComfyUI
+    can't be reached, falls back to a single-item list of the field's
+    current value (so the menu still shows *something* selectable) or `[]`
+    if there isn't one."""
     try:
         if meta.key == "sampler_name":
             return await client.list_samplers()
@@ -268,6 +299,9 @@ async def _safe_edit_message(query, text: str, reply_markup: InlineKeyboardMarku
 async def _render_field_submenu(
     query, context: ContextTypes.DEFAULT_TYPE, checkpoint: str, profile: ModelProfile | None, meta: FieldMeta
 ) -> None:
+    """Edit `query`'s message in place to show `meta`'s field submenu —
+    numeric/enum/text keyboard depending on `meta`'s type (enum choices are
+    fetched live from ComfyUI)."""
     value = _field_value(meta, checkpoint, profile)
     text = f"⚙️ Settings › {meta.label}"
     if isinstance(meta, NumericFieldMeta):
@@ -285,6 +319,10 @@ async def _render_field_submenu(
 def _resolve_effective_profile(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, checkpoint: str
 ) -> tuple[ModelProfile | None, dict[str, Any]]:
+    """The shipped profile for `checkpoint` with this chat's stored
+    `/settings` overrides layered on top, plus those raw override fields
+    (the caller needs both — the merged profile to render values, the raw
+    fields to know which ones to ★-mark as overridden)."""
     storage: Storage = context.bot_data["storage"]
     profiles: list[ModelProfile] = context.bot_data["profiles"]
     base_profile = resolve_profile(checkpoint, profiles)
@@ -293,6 +331,8 @@ def _resolve_effective_profile(
 
 
 async def _show_home(query, context: ContextTypes.DEFAULT_TYPE, chat_id: int, checkpoint: str) -> None:
+    """Re-resolve the effective profile and edit `query`'s message in place
+    to show the `/settings` home screen."""
     profile, override_fields = _resolve_effective_profile(context, chat_id, checkpoint)
     await _safe_edit_message(
         query, _home_text(checkpoint, profile), _home_keyboard(checkpoint, profile, override_fields)
@@ -302,11 +342,15 @@ async def _show_home(query, context: ContextTypes.DEFAULT_TYPE, chat_id: int, ch
 async def _show_field(
     query, context: ContextTypes.DEFAULT_TYPE, chat_id: int, checkpoint: str, meta: FieldMeta
 ) -> None:
+    """Re-resolve the effective profile and edit `query`'s message in place
+    to show `meta`'s field submenu."""
     profile, _ = _resolve_effective_profile(context, chat_id, checkpoint)
     await _render_field_submenu(query, context, checkpoint, profile, meta)
 
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/settings` — send the home screen for the chat's currently-selected
+    checkpoint, or tell the user to `/model` first if none is selected."""
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
         return
@@ -325,6 +369,11 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dispatch a `st:<action>[:<field>[:<arg>]]` callback: navigate
+    home/into a field (`home`/`f`), reset all or one field
+    (`ra`/`r`), start custom-value entry (`c`), step or set a numeric
+    value (`d`/`v`), close the menu, or no-op on the disabled current-value
+    button."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None

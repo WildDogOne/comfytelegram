@@ -15,6 +15,9 @@ from comfytelegram.workflows.builder import LoraSpec
 
 
 class LoraDefault(BaseModel):
+    """One LoRA a model profile knows about — not necessarily applied to
+    every request; see `default_enabled`."""
+
     name: str = Field(..., description="LoRA filename as ComfyUI's LoraLoader knows it")
     strength_model: float = 1.0
     strength_clip: float = 1.0
@@ -23,6 +26,8 @@ class LoraDefault(BaseModel):
     )
 
     def to_spec(self) -> LoraSpec:
+        """Drop `default_enabled` (a profile-resolution-only concern) to get
+        the `LoraSpec` `workflows.builder` actually wires into the graph."""
         return LoraSpec(
             name=self.name, strength_model=self.strength_model, strength_clip=self.strength_clip
         )
@@ -42,6 +47,11 @@ class ProfileDefaults(BaseModel):
 
 
 class ModelProfile(BaseModel):
+    """One profile: which checkpoints it applies to (`match`), plus the
+    generation defaults, prompt prefixes, and LoRAs to apply for them. See
+    `model_profiles/README.md` for the on-disk JSON format and worked
+    examples."""
+
     match: list[str] = Field(
         ...,
         min_length=1,
