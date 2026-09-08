@@ -1,0 +1,37 @@
+services:
+  bot:
+    build: .
+    container_name: comfytelegram
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      STATE_DB_PATH: /app/state.sqlite3
+      OUTPUT_DIR: /app/outputs
+    volumes:
+      # Bind-mounted straight to the repo paths on the host, so the sqlite
+      # file and generated images are the same files `uv run comfytelegram`
+      # would produce outside Docker — inspect/back them up directly, no
+      # volume commands needed.
+      #
+      # Docker bind-mounts a *missing* file as an empty directory instead of
+      # creating a file, which breaks sqlite3.connect() — run
+      # `touch state.sqlite3` on the host once before the first `up` if it
+      # doesn't already exist.
+      - ./state.sqlite3:/app/state.sqlite3
+      - ./outputs:/app/outputs
+      # Edit profiles on the host without rebuilding the image. Drop this
+      # if you're fine with whatever was baked in at build time.
+      - ./model_profiles:/app/model_profiles:ro
+    # ComfyUI is assumed to be running directly on this host (the .env
+    # default COMFYUI_HOST=127.0.0.1 matches this repo's own working setup,
+    # per TODO.md's dev-environment note). host networking is Linux-only —
+    # see the alternative below for macOS/Windows.
+    network_mode: host
+
+    # macOS/Windows (Docker Desktop) alternative — `network_mode: host` is
+    # not supported there. Comment out `network_mode: host` above, uncomment
+    # this, and set COMFYUI_HOST=host.docker.internal in .env instead of
+    # 127.0.0.1:
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
