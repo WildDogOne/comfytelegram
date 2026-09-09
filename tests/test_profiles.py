@@ -35,6 +35,13 @@ def test_resolve_profile_matches_furrytoonmix(profiles):
     profile = resolve_profile("furrytoonmix_xlIllustriousV2.safetensors", profiles)
     assert profile is not None
     assert profile.display_name == "FurryToonMix XL (Illustrious)"
+    assert profile.prompt_style == "tags"
+
+
+def test_sdxl_base_defaults_to_natural_prompt_style(profiles):
+    profile = resolve_profile("sd_xl_base_1.0.safetensors", profiles)
+    assert profile is not None
+    assert profile.prompt_style == "natural"
 
 
 def test_resolve_profile_matches_pony_case_insensitively(profiles):

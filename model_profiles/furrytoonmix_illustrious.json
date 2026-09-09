@@ -9,6 +9,7 @@
     "scheduler": "normal",
     "clip_skip": -2
   },
+  "prompt_style": "tags",
   "positive_prompt_prefix": "masterpiece,best quality,amazing quality,very aesthetic,newest,(5 fingers:1.05), furry, anthro, fingers, detailed background",
   "negative_prompt_prefix": "embedding:negativeXL_D, embedding:PonyXL_NegScore, low-res, worst quality, low quality, normal quality, jpeg artifacts, poorly drawn, ugly, disgusting, blurry, score_4, derpibooru_p_low, lowres, muscular, (hands:1), bulge, peace, simple background",
   "loras": [

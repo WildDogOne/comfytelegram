@@ -16,8 +16,13 @@ CLI at runtime.
   automatically. See [`model_profiles/`](model_profiles/).
 - **Post-processing, one tap away** — every generated image gets 🔍 Upscale
   (UltimateSDUpscale, 4x) and ✨ Face Detail (Impact Pack FaceDetailer)
-  buttons, plus 🔁 Regenerate (same settings, fresh seed) and a 🔁 Generate
-  Again button on the whole batch.
+  buttons, plus 🔬 Analyze & Regenerate (guess a new prompt from the image
+  itself, then generate from that) and a 🔁 Generate Again button on the
+  whole batch.
+- **Image-to-prompt analysis** — 🔬 Analyze & Regenerate picks a WD14
+  tagger (booru-tag checkpoints) or a Qwen-VL caption via a local Ollama
+  server (natural-language checkpoints) per the tapped image's model
+  profile. See [Image analysis](#image-analysis) below.
 - **`/settings`** — an in-place inline-keyboard menu to view and override a
   model's generation defaults per chat (steppers + presets for numeric
   fields, a live-populated grid for sampler/scheduler, free text for prompt
@@ -26,8 +31,8 @@ CLI at runtime.
   reusable prompt snippet; `/characters` activates one so it's folded into
   every generation until you switch or clear it.
 - **Survives restarts** — selected model, settings overrides, saved
-  characters, and every post-processing/regenerate button all persist in a
-  local SQLite file, not memory.
+  characters, and every post-processing button all persist in a local
+  SQLite file, not memory.
 
 ## Requirements
 
@@ -57,6 +62,11 @@ uv run comfytelegram
 | `COMFYUI_HOST` | no | `127.0.0.1` | host ComfyUI is reachable at |
 | `COMFYUI_PORT` | no | `8188` | ComfyUI's HTTP/WS port |
 | `COMFYUI_USE_TLS` | no | `false` | use `https`/`wss` instead of `http`/`ws` |
+| `OLLAMA_HOST` / `OLLAMA_PORT` | no | `127.0.0.1` / `11434` | Ollama server for 🔬 Analyze & Regenerate's natural-language captioning |
+| `OLLAMA_VISION_MODEL` | no | `qwen3.5:4b` | vision-capable Ollama model tag to caption with (`ollama pull` it first) — kept small by default since it has to coexist in VRAM with whatever checkpoint ComfyUI keeps resident |
+| `WD14_MODEL_REPO` | no | `SmilingWolf/wd-vit-tagger-v3` | Hugging Face repo the WD14 tagger files come from (see [Image analysis](#image-analysis)) |
+| `WD14_MODEL_DIR` | no | `models/wd14` | local directory holding `model.onnx` + `selected_tags.csv` |
+| `WD14_TAG_THRESHOLD` | no | `0.35` | minimum WD14 tag confidence to include in a derived prompt |
 | `ALLOWED_USER_IDS` | no | (empty = anyone) | comma-separated Telegram numeric user IDs allowed to use the bot |
 
 (The settings file is named `settings.py` rather than `config.py`, and the
@@ -78,14 +88,17 @@ touch state.sqlite3   # only needed once, before the very first run
 docker compose up -d --build
 ```
 
-The container uses host networking by default (so `COMFYUI_HOST=127.0.0.1`
-in `.env` reaches ComfyUI running directly on the same host, matching the
-non-Docker setup above) — Linux-only. On macOS/Windows, switch to the
-`extra_hosts`/`host.docker.internal` alternative commented in
-`docker-compose.yml`. The sqlite state file and `model_profiles/` are bind
--mounted from the repo, so they're the same files a bare `uv run
-comfytelegram` would use — no Docker volume commands needed to inspect or
-back them up.
+The container uses host networking by default (so `COMFYUI_HOST=127.0.0.1`/
+`OLLAMA_HOST=127.0.0.1` in `.env` reach ComfyUI/Ollama running directly on
+the same host, matching the non-Docker setup above) — Linux-only. On
+macOS/Windows, switch to the `extra_hosts`/`host.docker.internal`
+alternative commented in `docker-compose.yml` (set both `COMFYUI_HOST` and
+`OLLAMA_HOST` to `host.docker.internal` in that case). The sqlite state
+file, `model_profiles/`, and `models/wd14/` are bind-mounted from the repo,
+so they're the same files a bare `uv run comfytelegram` would use — no
+Docker volume commands needed to inspect or back them up, and no image
+rebuild needed to pick up a WD14 model you stage later (see
+[Image analysis](#image-analysis)).
 
 ## Using the bot
 
@@ -104,11 +117,37 @@ Every generated image comes with inline buttons:
 - **🔍 Upscale 4x** / **✨ Face Detail** — run that post-processing stage on
   this specific image and send the result (itself with its own buttons, so
   passes can be chained).
-- **🔁 Regenerate** — re-run *this image's* generation with the same
-  resolved settings but a fresh random seed.
+- **🔬 Analyze & Regenerate** — analyze *this image* (WD14 tags or a
+  Qwen-VL caption, depending on the checkpoint's model profile), then
+  generate a fresh image from that derived prompt against the same
+  checkpoint/settings.
 - **🔁 Generate Again** (on the "Done" status message) — re-run the *whole*
   last batch with a fresh seed, for quickly building up more variations
   without retyping the prompt.
+
+## Image analysis
+
+🔬 Analyze & Regenerate picks its analyzer per checkpoint, from that
+checkpoint's model profile `prompt_style` field (see
+[`model_profiles/`](model_profiles/)):
+
+- **`"tags"`** — for booru/danbooru-tag-trained checkpoints (Pony,
+  Illustrious/FurryToonMix, Animagine merges), run locally through a WD14
+  tagger ONNX model via `onnxruntime`. **The model files are not
+  downloaded automatically** — Hugging Face serves them (`model.onnx`,
+  ~370MB) from an LFS/Xet-backed CDN on a different hostname than
+  `huggingface.co` itself, which some restricted-egress hosts allow while
+  blocking. Download both files from a machine with normal internet
+  access and place them in `WD14_MODEL_DIR`:
+  ```bash
+  curl -L -o model.onnx https://huggingface.co/SmilingWolf/wd-vit-tagger-v3/resolve/main/model.onnx
+  curl -L -o selected_tags.csv https://huggingface.co/SmilingWolf/wd-vit-tagger-v3/resolve/main/selected_tags.csv
+  ```
+- **`"natural"`** (the default) — for checkpoints that expect prose-style
+  prompts, caption the image via a vision-capable model on a local Ollama
+  server (`OLLAMA_VISION_MODEL`, e.g. Qwen-VL). Needs `ollama pull
+  <model>` done ahead of time and Ollama reachable at `OLLAMA_HOST`/
+  `OLLAMA_PORT`.
 
 ## Model profiles
 
@@ -157,18 +196,22 @@ shared singletons (`Settings`, `ComfyClient`, loaded `ModelProfile`s,
   `model_profiles/` and layers profile defaults → user prompt → any
   per-chat override into a ready-to-build `GenerationParams`.
 - **`generation.py`** — Telegram-independent glue: `generate()`,
-  `post_process()`, `regenerate()`, `repeat()` turn (checkpoint, prompt,
-  profile) into a submitted-and-collected result. `handlers.py` calls these
-  directly; `scripts/smoke_test*.py` do the equivalent inline for manual
-  checks.
+  `post_process()`, `repeat()` turn (checkpoint, prompt, profile) into a
+  submitted-and-collected result. `handlers.py` calls these directly;
+  `scripts/smoke_test*.py` do the equivalent inline for manual checks.
+- **`analysis.py`** — Telegram-independent image-to-prompt analysis backing
+  🔬 Analyze & Regenerate: `analyze_tags()` (WD14 tagger via `onnxruntime`)
+  and `analyze_caption()` (Qwen-VL via a local Ollama server), dispatched
+  by `analyze_image()` based on a checkpoint's model profile
+  `prompt_style`. See [Image analysis](#image-analysis) above.
 - **`handlers.py`** — all Telegram-facing commands and callbacks.
 - **`settings_menu.py`** — the `/settings` in-place inline-keyboard UI.
   Enum fields build their button grid from ComfyUI's live `/object_info`,
   so the menu can never offer a value the server would reject.
 - **`storage.py`** — durable per-chat state in SQLite (stdlib `sqlite3`,
   deliberately no ORM/migrations framework): selected checkpoint, profile
-  overrides, saved characters, and a post-processing/regenerate result
-  registry. That registry stores only a Telegram `file_id`
+  overrides, saved characters, and a post-processing result registry. That
+  registry stores only a Telegram `file_id`
   (re-downloadable indefinitely via `bot.get_file()`) plus the resolved
   generation params — not raw image bytes — which is why buttons keep
   working after a bot restart.

@@ -20,9 +20,10 @@ from typing import Any, TypeVar
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import ContextTypes
 
+from comfytelegram.analysis import analyze_image
 from comfytelegram.auth import reject_if_unauthorized, reject_if_unauthorized_callback
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
-from comfytelegram.generation import GeneratedImage, generate, post_process, regenerate, repeat
+from comfytelegram.generation import GeneratedImage, generate, post_process, repeat
 from comfytelegram.profiles import (
     ModelProfile,
     apply_profile_override,
@@ -39,7 +40,7 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 POSTPROCESS_KEYBOARD_LABELS = {"upscale": "🔍 Upscale 4x", "face": "✨ Face Detail"}
-REGENERATE_CALLBACK_KIND = "regen"
+ANALYZE_CALLBACK_KIND = "analyze"
 AGAIN_CALLBACK_PREFIX = "again:"
 
 CHARACTER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
@@ -68,15 +69,19 @@ TELEGRAM_PHOTO_SIZE_LIMIT = 10_000_000
 
 def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
     """The keyboard attached to a generated/post-processed image: one
-    button per `POSTPROCESS_KEYBOARD_LABELS` entry plus Regenerate, all
-    scoped to `result_id` (see `storage.py`'s `pending_result`)."""
+    button per `POSTPROCESS_KEYBOARD_LABELS` entry plus Analyze & Regenerate,
+    all scoped to `result_id` (see `storage.py`'s `pending_result`)."""
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(label, callback_data=f"pp:{kind}:{result_id}")
                 for kind, label in POSTPROCESS_KEYBOARD_LABELS.items()
             ],
-            [InlineKeyboardButton("🔁 Regenerate", callback_data=f"pp:{REGENERATE_CALLBACK_KIND}:{result_id}")],
+            [
+                InlineKeyboardButton(
+                    "🔬 Analyze & Regenerate", callback_data=f"pp:{ANALYZE_CALLBACK_KIND}:{result_id}"
+                )
+            ],
         ]
     )
 
@@ -525,10 +530,11 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle a `pp:<kind>:<result_id>` tap from `_post_process_keyboard`:
-    `kind` is `"regen"` (re-run the base generation, same settings, fresh
-    seed) or `"upscale"`/`"face"` (download the source image and run that
-    post-processing stage on it). Alerts instead if `result_id` has expired
-    (see `PENDING_RESULT_TTL_SECONDS`)."""
+    `kind` is `"analyze"` (analyze the image into a fresh prompt, then
+    generate from that — see `ANALYZE_CALLBACK_KIND`) or `"upscale"`/`"face"`
+    (download the source image and run that post-processing stage on it).
+    Alerts instead if `result_id` has expired (see
+    `PENDING_RESULT_TTL_SECONDS`)."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
@@ -546,15 +552,33 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     client: ComfyClient = context.bot_data["comfy_client"]
     full_params = _deserialize_generation_params(pending["base_params"])
 
-    if kind == REGENERATE_CALLBACK_KIND:
-        status_message = await query.message.reply_text("Regenerating…")
-        result = await _run_reporting_errors(
-            status_message, "Regeneration", "regeneration", regenerate(client, full_params)
+    if kind == ANALYZE_CALLBACK_KIND:
+        status_message = await query.message.reply_text("Analyzing image…")
+
+        checkpoint = full_params.checkpoint
+        chat_id = pending["chat_id"]
+        profiles: list[ModelProfile] = context.bot_data["profiles"]
+        profile = resolve_profile(checkpoint, profiles)
+        profile = apply_profile_override(profile, checkpoint, storage.get_override(chat_id, checkpoint))
+        style = profile.prompt_style if profile else "natural"
+
+        async def _analyze_and_generate() -> list[GeneratedImage]:
+            """Bundle the download, analysis, and generation into one
+            awaitable so `_run_reporting_errors` covers all three stages."""
+            tg_file = await context.bot.get_file(pending["file_id"])
+            source_bytes = bytes(await tg_file.download_as_bytearray())
+            derived_prompt = await analyze_image(source_bytes, style, settings)
+            await status_message.edit_text("Generating… 0%")
+            return await generate(
+                client, checkpoint, derived_prompt, profile, on_progress=_make_progress_callback(status_message)
+            )
+
+        images = await _run_reporting_errors(
+            status_message, "Analysis", "analyze-and-regenerate", _analyze_and_generate()
         )
-        if result is None:
+        if images is None:
             return
-        await status_message.delete()
-        await _send_and_store_result(query.message, pending["chat_id"], storage, result)
+        await _deliver_generation_result(status_message, query.message, chat_id, storage, images)
         return
 
     label = "Upscaling" if kind == "upscale" else "Refining face"

@@ -220,6 +220,7 @@ __marimo__/
 # comfytelegram project-specific
 /outputs/
 /state.sqlite3
+/models/
 .claude
 sample.json
 .idea

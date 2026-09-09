@@ -11,6 +11,7 @@
     "width": 1024,
     "height": 1024
   },
+  "prompt_style": "tags",
   "positive_prompt_prefix": "score_9, score_8_up, score_7_up, source_anime",
   "negative_prompt_prefix": "score_6, score_5, score_4, low quality, worst quality, blurry, jpeg artifacts",
   "loras": []

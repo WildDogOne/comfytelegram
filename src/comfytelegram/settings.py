@@ -25,6 +25,30 @@ class Settings(BaseSettings):
     comfyui_port: int = Field(8188, description="ComfyUI HTTP/WS port")
     comfyui_use_tls: bool = Field(False, description="Use https/wss instead of http/ws")
 
+    ollama_host: str = Field("127.0.0.1", description="Host running Ollama (for Qwen-VL image analysis)")
+    ollama_port: int = Field(11434, description="Ollama HTTP port")
+    ollama_vision_model: str = Field(
+        "qwen3.5:4b",
+        description=(
+            "Ollama model tag to use for natural-language image captioning. Kept small "
+            "by default since it has to coexist in VRAM with whatever checkpoint ComfyUI "
+            "is keeping resident — bump to a bigger vision model (e.g. qwen3.6:27b) only "
+            "if the GPU running this has VRAM to spare."
+        ),
+    )
+
+    wd14_model_repo: str = Field(
+        "SmilingWolf/wd-vit-tagger-v3",
+        description="Hugging Face repo providing the WD14 tagger's model.onnx + selected_tags.csv",
+    )
+    wd14_model_dir: Path = Field(
+        default=PROJECT_ROOT / "models" / "wd14",
+        description="Local cache directory for the downloaded WD14 tagger files",
+    )
+    wd14_tag_threshold: float = Field(
+        0.35, description="Minimum WD14 tag confidence to include in a derived prompt"
+    )
+
     model_profiles_dir: Path = Field(
         default=PROJECT_ROOT / "model_profiles",
         description="Directory of per-checkpoint default-settings JSON files",
@@ -66,6 +90,12 @@ class Settings(BaseSettings):
         `ws://127.0.0.1:8188`."""
         scheme = "wss" if self.comfyui_use_tls else "ws"
         return f"{scheme}://{self.comfyui_host}:{self.comfyui_port}"
+
+    @property
+    def ollama_http_base(self) -> str:
+        """HTTP base URL for the configured Ollama instance, e.g.
+        `http://127.0.0.1:11434`."""
+        return f"http://{self.ollama_host}:{self.ollama_port}"
 
 
 def load_settings() -> Settings:

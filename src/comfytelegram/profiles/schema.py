@@ -9,6 +9,8 @@ for the on-disk format and `model_profiles/*.json` for worked examples.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from comfytelegram.workflows.builder import LoraSpec
@@ -73,3 +75,12 @@ class ModelProfile(BaseModel):
     )
 
     loras: list[LoraDefault] = Field(default_factory=list)
+
+    prompt_style: Literal["tags", "natural"] = Field(
+        "natural",
+        description=(
+            "Which image analyzer the '🔬 Analyze & Regenerate' button uses for this "
+            "checkpoint: 'tags' for booru/danbooru-tag-trained checkpoints (WD14 tagger), "
+            "'natural' for checkpoints that expect prose-style prompts (Qwen-VL captioning)."
+        ),
+    )

@@ -23,15 +23,25 @@ services:
       # Edit profiles on the host without rebuilding the image. Drop this
       # if you're fine with whatever was baked in at build time.
       - ./model_profiles:/app/model_profiles:ro
-    # ComfyUI is assumed to be running directly on this host (the .env
-    # default COMFYUI_HOST=127.0.0.1 matches this repo's own working setup —
-    # see the main README's Setup section). host networking is Linux-only —
-    # see the alternative below for macOS/Windows.
+      # The WD14 tagger's model.onnx + selected_tags.csv (~370MB), used by
+      # the "🔬 Analyze & Regenerate" button for checkpoints whose model
+      # profile sets "prompt_style": "tags". These are deliberately *not*
+      # baked into the image (large, HF-hosted binary, gitignored on the
+      # host too — see README's "Image analysis" section for how to fetch
+      # them) — just bind-mount the same directory `uv run comfytelegram`
+      # would read outside Docker.
+      - ./models/wd14:/app/models/wd14:ro
+    # ComfyUI (and, if you're using the "🔬 Analyze & Regenerate" button's
+    # natural-language path, Ollama) are assumed to be running directly on
+    # this host (the .env defaults COMFYUI_HOST=127.0.0.1/OLLAMA_HOST=
+    # 127.0.0.1 match this repo's own working setup — see the main README's
+    # Setup section). host networking is Linux-only — see the alternative
+    # below for macOS/Windows.
     network_mode: host
 
     # macOS/Windows (Docker Desktop) alternative — `network_mode: host` is
     # not supported there. Comment out `network_mode: host` above, uncomment
-    # this, and set COMFYUI_HOST=host.docker.internal in .env instead of
-    # 127.0.0.1:
+    # this, and set COMFYUI_HOST=host.docker.internal and (if used)
+    # OLLAMA_HOST=host.docker.internal in .env instead of 127.0.0.1:
     # extra_hosts:
     #   - "host.docker.internal:host-gateway"
