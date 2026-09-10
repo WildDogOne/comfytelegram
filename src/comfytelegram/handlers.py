@@ -17,7 +17,14 @@ import uuid
 from collections.abc import Awaitable
 from typing import Any, TypeVar
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.ext import ContextTypes
 
 from comfytelegram.analysis import analyze_caption, analyze_image, analyze_tags
@@ -891,6 +898,16 @@ async def stream_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+#: A persistent custom keyboard (replaces the device's own keyboard, not an
+#: inline button on one message) installed for the whole chat while a stream
+#: runs — tapping it just sends the text "/stop" as an ordinary message,
+#: which `stop_command`'s existing CommandHandler picks up like any other
+#: typed "/stop". Unlike an inline button, this stays reachable at the
+#: bottom of the screen no matter how many images have since scrolled past
+#: the original status message.
+_STOP_STREAM_KEYBOARD = ReplyKeyboardMarkup([["/stop"]], resize_keyboard=True)
+
+
 async def _run_stream(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, message: Message, prompt_text: str
 ) -> None:
@@ -931,7 +948,9 @@ async def _run_stream(
         extra_negative = character["negative_prompt"] if character else ""
 
         status_message = await message.reply_text(
-            f"🔁 Streaming started (up to {STREAM_HARD_LIMIT} images) — send /stop to end it early."
+            f"🔁 Streaming started (up to {STREAM_HARD_LIMIT} images) — "
+            "tap /stop below (or send it) to end early.",
+            reply_markup=_STOP_STREAM_KEYBOARD,
         )
 
         for i in range(STREAM_HARD_LIMIT):
@@ -948,33 +967,45 @@ async def _run_stream(
                 ),
             )
             await _send_and_store_result(message, chat_id, storage, images[0])
-        await status_message.edit_text(
-            f"Stream finished — hit the {STREAM_HARD_LIMIT}-image limit."
+        await _finish_stream(
+            status_message, f"Stream finished — hit the {STREAM_HARD_LIMIT}-image limit."
         )
     except asyncio.CancelledError:
-        if status_message is not None:
-            await status_message.edit_text(f"Stream stopped after {count} image(s).")
+        await _finish_stream(status_message, f"Stream stopped after {count} image(s).")
         raise
     except ComfyUIError as exc:
-        if status_message is not None:
-            await status_message.edit_text(
-                f"Stream stopped after {count} image(s) — generation failed: {exc}"
-            )
+        await _finish_stream(
+            status_message, f"Stream stopped after {count} image(s) — generation failed: {exc}"
+        )
     except Exception:
         logger.exception("Unexpected error during stream")
-        if status_message is not None:
-            await status_message.edit_text(
-                f"Stream stopped after {count} image(s) — unexpected error."
-            )
+        await _finish_stream(
+            status_message, f"Stream stopped after {count} image(s) — unexpected error."
+        )
     finally:
         context.bot_data.get("active_streams", {}).pop(chat_id, None)
 
 
+async def _finish_stream(status_message: Message | None, text: str) -> None:
+    """Report a stream's terminal state and tear down its keyboard. Sent as
+    a *new* message replying to `status_message` rather than an edit to it,
+    because `editMessageText` can only ever set an inline keyboard — the
+    only way to actually remove the `_STOP_STREAM_KEYBOARD` custom keyboard
+    `_run_stream` installed at the start is `ReplyKeyboardRemove` on a newly
+    sent message. A no-op if the stream never got far enough to create a
+    status message (e.g. no checkpoint available)."""
+    if status_message is None:
+        return
+    await status_message.reply_text(text, reply_markup=ReplyKeyboardRemove())
+
+
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/stop` — cancel this chat's running "/stream", if any. The actual
-    "Stream stopped after N image(s)" confirmation comes from `_run_stream`
-    catching the resulting `CancelledError` and editing its own status
-    message; this just acknowledges the request."""
+    """`/stop` — cancel this chat's running "/stream", if any (typed
+    directly, or sent by tapping the "/stop" button `_STOP_STREAM_KEYBOARD`
+    installs for the duration of a stream). The actual "Stream stopped
+    after N image(s)" confirmation comes from `_run_stream` catching the
+    resulting `CancelledError` and reporting via `_finish_stream`; this just
+    acknowledges the request."""
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
         return
