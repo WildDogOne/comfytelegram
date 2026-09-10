@@ -22,7 +22,6 @@ from telegram import (
     InlineKeyboardMarkup,
     Message,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     Update,
 )
 from telegram.ext import ContextTypes
@@ -79,6 +78,26 @@ PROGRESS_EDIT_INTERVAL = 2.0
 # Stay under it with margin, and fall back to sendDocument (up to 50MB,
 # uncompressed) for anything bigger rather than silently failing.
 TELEGRAM_PHOTO_SIZE_LIMIT = 10_000_000
+
+#: Persistent custom keyboard (replaces the device's own keyboard for the
+#: whole chat, not an inline button on one message — see `_STREAMING_KEYBOARD`
+#: below for why that distinction matters) listing every top-level command.
+#: Installed on `/start` and restored by `_finish_stream` once a `/stream`
+#: run ends, so the chat always shows *either* this or `_STREAMING_KEYBOARD`,
+#: never both and never neither.
+_MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [["/model", "/settings"], ["/characters", "/stream"], ["/help"]],
+    resize_keyboard=True,
+)
+
+#: Swapped in for the duration of a "/stream" run (see `_run_stream`) — while
+#: streaming, commands like /model or /settings would just add confusion (or
+#: race the stream's own checkpoint/profile resolution), so the keyboard is
+#: pared down to the one action that's actually valid: stopping it. Tapping
+#: it just sends the text "/stop" as an ordinary message, which
+#: `stop_command`'s existing CommandHandler picks up like any other typed
+#: "/stop".
+_STREAMING_KEYBOARD = ReplyKeyboardMarkup([["/stop"]], resize_keyboard=True)
 
 
 def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
@@ -333,7 +352,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"/stream <prompt> — generate single images back-to-back (up to {STREAM_HARD_LIMIT}) "
         "until /stop, sending each one immediately\n"
         "/stop — stop a running /stream\n"
-        "/help — show this message"
+        "/help — show this message",
+        reply_markup=_MAIN_KEYBOARD,
     )
 
 
@@ -898,16 +918,6 @@ async def stream_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
-#: A persistent custom keyboard (replaces the device's own keyboard, not an
-#: inline button on one message) installed for the whole chat while a stream
-#: runs — tapping it just sends the text "/stop" as an ordinary message,
-#: which `stop_command`'s existing CommandHandler picks up like any other
-#: typed "/stop". Unlike an inline button, this stays reachable at the
-#: bottom of the screen no matter how many images have since scrolled past
-#: the original status message.
-_STOP_STREAM_KEYBOARD = ReplyKeyboardMarkup([["/stop"]], resize_keyboard=True)
-
-
 async def _run_stream(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, message: Message, prompt_text: str
 ) -> None:
@@ -950,7 +960,7 @@ async def _run_stream(
         status_message = await message.reply_text(
             f"🔁 Streaming started (up to {STREAM_HARD_LIMIT} images) — "
             "tap /stop below (or send it) to end early.",
-            reply_markup=_STOP_STREAM_KEYBOARD,
+            reply_markup=_STREAMING_KEYBOARD,
         )
 
         for i in range(STREAM_HARD_LIMIT):
@@ -987,21 +997,22 @@ async def _run_stream(
 
 
 async def _finish_stream(status_message: Message | None, text: str) -> None:
-    """Report a stream's terminal state and tear down its keyboard. Sent as
-    a *new* message replying to `status_message` rather than an edit to it,
-    because `editMessageText` can only ever set an inline keyboard — the
-    only way to actually remove the `_STOP_STREAM_KEYBOARD` custom keyboard
-    `_run_stream` installed at the start is `ReplyKeyboardRemove` on a newly
-    sent message. A no-op if the stream never got far enough to create a
-    status message (e.g. no checkpoint available)."""
+    """Report a stream's terminal state and swap `_STREAMING_KEYBOARD` back
+    for `_MAIN_KEYBOARD`. Sent as a *new* message replying to
+    `status_message` rather than an edit to it, because `editMessageText`
+    can only ever set an inline keyboard — changing (or removing) a custom
+    reply keyboard requires a newly sent message. A no-op if the stream
+    never got far enough to create a status message (e.g. no checkpoint
+    available), since `_STREAMING_KEYBOARD` was never installed in that
+    case either."""
     if status_message is None:
         return
-    await status_message.reply_text(text, reply_markup=ReplyKeyboardRemove())
+    await status_message.reply_text(text, reply_markup=_MAIN_KEYBOARD)
 
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/stop` — cancel this chat's running "/stream", if any (typed
-    directly, or sent by tapping the "/stop" button `_STOP_STREAM_KEYBOARD`
+    directly, or sent by tapping the "/stop" button `_STREAMING_KEYBOARD`
     installs for the duration of a stream). The actual "Stream stopped
     after N image(s)" confirmation comes from `_run_stream` catching the
     resulting `CancelledError` and reporting via `_finish_stream`; this just

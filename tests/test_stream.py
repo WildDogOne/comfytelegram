@@ -1,9 +1,9 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from telegram import ReplyKeyboardRemove
 
 from comfytelegram.handlers import (
+    _MAIN_KEYBOARD,
     _finish_stream,
     _resolve_checkpoint_or_default,
     stop_command,
@@ -151,7 +151,7 @@ async def test_finish_stream_is_a_noop_without_a_status_message():
 
 
 @pytest.mark.asyncio
-async def test_finish_stream_replies_and_removes_the_keyboard():
+async def test_finish_stream_replies_and_restores_the_main_keyboard():
     status_message = AsyncMock()
 
     await _finish_stream(status_message, "Stream finished — hit the 100-image limit.")
@@ -159,5 +159,5 @@ async def test_finish_stream_replies_and_removes_the_keyboard():
     status_message.reply_text.assert_awaited_once()
     args, kwargs = status_message.reply_text.await_args
     assert args[0] == "Stream finished — hit the 100-image limit."
-    assert isinstance(kwargs["reply_markup"], ReplyKeyboardRemove)
+    assert kwargs["reply_markup"] is _MAIN_KEYBOARD
     status_message.edit_text.assert_not_called()

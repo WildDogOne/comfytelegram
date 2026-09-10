@@ -4,12 +4,14 @@ import pytest
 
 from comfytelegram.comfy_client import ComfyUIError
 from comfytelegram.handlers import (
+    _MAIN_KEYBOARD,
     _again_keyboard,
     _characters_keyboard,
     _extract_file_id,
     _generate_from_prompt_keyboard,
     _post_process_keyboard,
     _run_reporting_errors,
+    start,
 )
 
 
@@ -65,6 +67,21 @@ def test_extract_file_id_raises_without_photo_or_document():
     sent = MagicMock(photo=[], document=None)
     with pytest.raises(ValueError):
         _extract_file_id(sent)
+
+
+@pytest.mark.asyncio
+async def test_start_installs_the_main_keyboard():
+    message = AsyncMock()
+    update = MagicMock()
+    update.effective_message = message
+    context = MagicMock()
+    context.bot_data = {"settings": MagicMock(allowed_user_ids=None)}
+
+    await start(update, context)
+
+    message.reply_text.assert_awaited_once()
+    _, kwargs = message.reply_text.await_args
+    assert kwargs["reply_markup"] is _MAIN_KEYBOARD
 
 
 @pytest.mark.asyncio

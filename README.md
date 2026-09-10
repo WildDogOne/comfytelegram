@@ -35,10 +35,14 @@ CLI at runtime.
   every generation until you switch or clear it.
 - **`/stream <prompt>`** — generate single images back-to-back from the
   same prompt (batch size forced to 1 regardless of the checkpoint's own
-  default), sending each one immediately. Replaces your on-screen keyboard
-  with a single `/stop` button (a persistent reply keyboard, not a button on
-  one message, so it's still one tap away no matter how many images have
-  since scrolled past) until `/stop` or a 100-image hard limit ends it.
+  default), sending each one immediately, until `/stop` or a 100-image hard
+  limit ends it.
+- **Context-aware command keyboard** — `/start` installs a persistent reply
+  keyboard (not a button on one message, so it's still one tap away no
+  matter how many images have since scrolled past) listing every top-level
+  command. While a `/stream` is running it's swapped for a one-button
+  `/stop` keyboard — no point offering `/model`/`/settings`/etc. mid-stream —
+  then swapped back once the stream ends.
 - **Survives restarts** — selected model, settings overrides, saved
   characters, and every post-processing button all persist in a local
   SQLite file, not memory. (A running `/stream` doesn't — it's a live
@@ -120,7 +124,7 @@ rebuild needed to pick up a WD14 model you stage later (see
 | `/character save <name> \| <positive> [\| <negative>]` | Save a reusable prompt snippet |
 | `/character delete <name>` | Delete one |
 | `/characters` | List saved characters and activate one |
-| `/stream <prompt>` | Generate single images from `<prompt>` back-to-back (up to 100), sending each immediately — swaps your keyboard for a one-tap `/stop` button for the duration |
+| `/stream <prompt>` | Generate single images from `<prompt>` back-to-back (up to 100), sending each immediately — swaps the command keyboard for a one-tap `/stop` button for the duration |
 | `/stop` | Stop a running `/stream` |
 | `/start`, `/help` | Show the command summary |
 
