@@ -33,9 +33,14 @@ CLI at runtime.
 - **Saved characters** — `/character save <name> | <prompt>` stores a
   reusable prompt snippet; `/characters` activates one so it's folded into
   every generation until you switch or clear it.
+- **`/stream <prompt>`** — generate single images back-to-back from the
+  same prompt (batch size forced to 1 regardless of the checkpoint's own
+  default), sending each one immediately, until `/stop` or a 100-image hard
+  limit.
 - **Survives restarts** — selected model, settings overrides, saved
   characters, and every post-processing button all persist in a local
-  SQLite file, not memory.
+  SQLite file, not memory. (A running `/stream` doesn't — it's a live
+  background task, so it stops if the bot restarts.)
 
 ## Requirements
 
@@ -113,6 +118,8 @@ rebuild needed to pick up a WD14 model you stage later (see
 | `/character save <name> \| <positive> [\| <negative>]` | Save a reusable prompt snippet |
 | `/character delete <name>` | Delete one |
 | `/characters` | List saved characters and activate one |
+| `/stream <prompt>` | Generate single images from `<prompt>` back-to-back (up to 100), sending each immediately |
+| `/stop` | Stop a running `/stream` |
 | `/start`, `/help` | Show the command summary |
 
 Every generated image comes with inline buttons:

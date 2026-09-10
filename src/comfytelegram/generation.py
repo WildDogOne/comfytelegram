@@ -13,7 +13,7 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import Any, Literal
 
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
 from comfytelegram.profiles import ModelProfile, resolve_generation_params
@@ -102,6 +102,7 @@ async def generate(
     profile: ModelProfile | None,
     *,
     extra_negative_prompt: str = "",
+    overrides: dict[str, Any] | None = None,
     on_progress: ProgressCallback | None = None,
 ) -> list[GeneratedImage]:
     """Resolve profile defaults, build the base txt2img graph, run it.
@@ -110,13 +111,23 @@ async def generate(
     prompt folded in by the caller (see `handlers.py`'s `generate_message`)
     since it's just free text; `extra_negative_prompt` carries that same
     character's negative prompt through separately, since profile
-    resolution owns the negative prompt entirely otherwise.
+    resolution owns the negative prompt entirely otherwise. `overrides`
+    wins over both the profile and its own defaults (see
+    `resolve_generation_params`) — used by "/stream" to force
+    `batch_size=1` per request without touching the chat's persisted
+    `/settings` override.
     """
     params = resolve_generation_params(
-        checkpoint, user_prompt, profile, extra_negative_prompt=extra_negative_prompt
+        checkpoint,
+        user_prompt,
+        profile,
+        overrides=overrides,
+        extra_negative_prompt=extra_negative_prompt,
     )
     prompt_graph, save_node_id = build_txt2img(params)
-    logger.info("Submitting txt2img: checkpoint=%s cfg=%s steps=%s", checkpoint, params.cfg, params.steps)
+    logger.info(
+        "Submitting txt2img: checkpoint=%s cfg=%s steps=%s", checkpoint, params.cfg, params.steps
+    )
 
     raw = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
     return [GeneratedImage(data=data, filename=name, full_params=params) for data, name in raw]
@@ -139,7 +150,9 @@ async def post_process(
     if kind == "upscale":
         prompt_graph, save_node_id = build_upscale(uploaded_name, base_params, UpscaleParams())
     elif kind == "face":
-        prompt_graph, save_node_id = build_face_detailer(uploaded_name, base_params, FaceDetailerParams())
+        prompt_graph, save_node_id = build_face_detailer(
+            uploaded_name, base_params, FaceDetailerParams()
+        )
     else:
         raise ValueError(f"Unknown post-processing kind: {kind}")
 
@@ -161,7 +174,14 @@ async def repeat(
     the same prompt without retyping it or picking a specific image."""
     fresh_params = replace(full_params, seed=None)
     prompt_graph, save_node_id = build_txt2img(fresh_params)
-    logger.info("Repeating: checkpoint=%s cfg=%s steps=%s", fresh_params.checkpoint, fresh_params.cfg, fresh_params.steps)
+    logger.info(
+        "Repeating: checkpoint=%s cfg=%s steps=%s",
+        fresh_params.checkpoint,
+        fresh_params.cfg,
+        fresh_params.steps,
+    )
 
     raw = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
-    return [GeneratedImage(data=data, filename=name, full_params=fresh_params) for data, name in raw]
+    return [
+        GeneratedImage(data=data, filename=name, full_params=fresh_params) for data, name in raw
+    ]

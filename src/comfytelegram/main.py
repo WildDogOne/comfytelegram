@@ -31,6 +31,8 @@ from comfytelegram.handlers import (
     model_command,
     postprocess_callback,
     start,
+    stop_command,
+    stream_command,
 )
 from comfytelegram.profiles import load_profiles
 from comfytelegram.settings import Settings, load_settings
@@ -52,8 +54,12 @@ async def _post_init(application: Application) -> None:
 
 
 async def _post_shutdown(application: Application) -> None:
-    """python-telegram-bot shutdown hook: close the ComfyUI HTTP session and
-    the sqlite connection cleanly."""
+    """python-telegram-bot shutdown hook: cancel any still-running "/stream"
+    tasks (so they don't linger as unawaited tasks after the event loop
+    they belong to closes), then close the ComfyUI HTTP session and the
+    sqlite connection cleanly."""
+    for task in application.bot_data.get("active_streams", {}).values():
+        task.cancel()
     client: ComfyClient | None = application.bot_data.get("comfy_client")
     if client is not None:
         await client.__aexit__(None, None, None)
@@ -72,7 +78,8 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
     if isinstance(update, Update) and update.effective_chat is not None:
         try:
             await context.bot.send_message(
-                update.effective_chat.id, "Something went wrong handling that — check the bot's logs."
+                update.effective_chat.id,
+                "Something went wrong handling that — check the bot's logs.",
             )
         except Exception:
             logger.exception("Failed to notify the chat about the error")
@@ -99,11 +106,17 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CommandHandler("character", character_command))
     application.add_handler(CommandHandler("characters", characters_command))
+    application.add_handler(CommandHandler("stream", stream_command))
+    application.add_handler(CommandHandler("stop", stop_command))
     application.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
     application.add_handler(CallbackQueryHandler(postprocess_callback, pattern=r"^pp:"))
-    application.add_handler(CallbackQueryHandler(again_callback, pattern=rf"^{AGAIN_CALLBACK_PREFIX}"))
     application.add_handler(
-        CallbackQueryHandler(generate_from_prompt_callback, pattern=rf"^{GENERATE_FROM_PROMPT_CALLBACK_PREFIX}")
+        CallbackQueryHandler(again_callback, pattern=rf"^{AGAIN_CALLBACK_PREFIX}")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            generate_from_prompt_callback, pattern=rf"^{GENERATE_FROM_PROMPT_CALLBACK_PREFIX}"
+        )
     )
     application.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^st:"))
     application.add_handler(CallbackQueryHandler(character_callback, pattern=r"^char:"))
@@ -116,7 +129,9 @@ def build_application(settings: Settings) -> Application:
 def run() -> None:
     """Entry point (`comfytelegram` console script): load settings, build
     the application, and poll Telegram for updates until interrupted."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
     settings = load_settings()
     application = build_application(settings)
     logger.info("Starting comfytelegram bot")
