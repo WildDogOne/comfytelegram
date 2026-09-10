@@ -20,9 +20,11 @@ from comfytelegram.profiles import ModelProfile, resolve_generation_params
 from comfytelegram.workflows import (
     FaceDetailerParams,
     GenerationParams,
+    HandDetailerParams,
     PostProcessBaseParams,
     UpscaleParams,
     build_face_detailer,
+    build_hand_detailer,
     build_txt2img,
     build_upscale,
 )
@@ -135,7 +137,7 @@ async def generate(
 
 async def post_process(
     client: ComfyClient,
-    kind: Literal["upscale", "face"],
+    kind: Literal["upscale", "face", "hand"],
     source_image: bytes,
     source_filename: str,
     full_params: GenerationParams,
@@ -152,6 +154,10 @@ async def post_process(
     elif kind == "face":
         prompt_graph, save_node_id = build_face_detailer(
             uploaded_name, base_params, FaceDetailerParams()
+        )
+    elif kind == "hand":
+        prompt_graph, save_node_id = build_hand_detailer(
+            uploaded_name, base_params, HandDetailerParams()
         )
     else:
         raise ValueError(f"Unknown post-processing kind: {kind}")

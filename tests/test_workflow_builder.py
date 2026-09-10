@@ -1,11 +1,13 @@
 from comfytelegram.workflows.builder import (
     FaceDetailerParams,
     GenerationParams,
+    HandDetailerParams,
     LoraSpec,
     PostProcessBaseParams,
     UpscaleParams,
     _resolve_seed,
     build_face_detailer,
+    build_hand_detailer,
     build_txt2img,
     build_upscale,
 )
@@ -139,6 +141,34 @@ def test_build_face_detailer_wires_detector_and_sam():
         negative_prompt="low quality",
     )
     prompt, save_id = build_face_detailer("uploaded.png", base, FaceDetailerParams())
+
+    detailer = next(n for n in prompt.values() if n["class_type"] == "FaceDetailer")
+    assert "bbox_detector" in detailer["inputs"]
+    assert "sam_model_opt" in detailer["inputs"]
+    assert prompt[save_id]["class_type"] == "SaveImage"
+
+
+def test_build_hand_detailer_honors_explicit_seed():
+    base = PostProcessBaseParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+    )
+    prompt, _save_id = build_hand_detailer("uploaded.png", base, HandDetailerParams(seed=888))
+    detailer = next(n for n in prompt.values() if n["class_type"] == "FaceDetailer")
+    assert detailer["inputs"]["seed"] == 888
+
+
+def test_build_hand_detailer_wires_detector_and_sam_with_hand_bbox_model():
+    base = PostProcessBaseParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+    )
+    prompt, save_id = build_hand_detailer("uploaded.png", base, HandDetailerParams())
+
+    detector = next(n for n in prompt.values() if n["class_type"] == "UltralyticsDetectorProvider")
+    assert detector["inputs"]["model_name"] == "bbox/hand_yolov8s.pt"
 
     detailer = next(n for n in prompt.values() if n["class_type"] == "FaceDetailer")
     assert "bbox_detector" in detailer["inputs"]

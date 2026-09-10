@@ -3,7 +3,8 @@
 A Telegram bot front-end for a local [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
 installation. Send it a prompt, pick a checkpoint, and it drives ComfyUI over
 HTTP + WebSocket to generate images — with per-model default settings,
-one-tap upscale/face-detail post-processing, and an in-chat settings menu.
+one-tap upscale/face-detail/hand-detail post-processing, and an in-chat
+settings menu.
 It talks to ComfyUI's own API directly; it does not shell out to the `comfy`
 CLI at runtime.
 
@@ -18,10 +19,13 @@ CLI at runtime.
   steps, sampler, clip skip, prompt prefixes, default LoRAs) applied
   automatically. See [`model_profiles/`](model_profiles/).
 - **Post-processing, one tap away** — every generated image gets 🔍 Upscale
-  (UltimateSDUpscale, 4x) and ✨ Face Detail (Impact Pack FaceDetailer)
-  buttons, plus 🏷️ Analyze (run *both* the WD14 tagger and a Qwen-VL
-  caption, each sent as its own message with its own 🎨 Generate button, for
-  comparing them side by side) and 🔬 Analyze & Regenerate (the checkpoint's
+  (UltimateSDUpscale, 4x), ✨ Face Detail, and 🖐️ Hand Detail buttons (the
+  latter two both Impact Pack's `FaceDetailer` node — it's a generic
+  detect/crop/inpaint node despite the name, so hand-detailing is the same
+  graph with a hand-trained bbox detector swapped in), plus 🏷️ Analyze (run
+  *both* the WD14 tagger and a Qwen-VL caption, each sent as its own message
+  with its own 🎨 Generate button, for comparing them side by side) and 🔬
+  Analyze & Regenerate (the checkpoint's
   configured analyzer only, then generate from it) and a 🔁 Generate Again
   button on the whole batch.
 - **Image-to-prompt analysis** — 🔬 Analyze & Regenerate picks a single
@@ -64,8 +68,12 @@ CLI at runtime.
 - A running ComfyUI instance reachable over HTTP/WebSocket, with these
   custom node packs installed (beyond ComfyUI's own core nodes):
   - [`ComfyUI-Impact-Pack`](https://github.com/ltdrdata/ComfyUI-Impact-Pack)
-    + `ComfyUI-Impact-Subpack` — face detection/detailing (`FaceDetailer`,
-    `UltralyticsDetectorProvider`, `SAMLoader`)
+    + `ComfyUI-Impact-Subpack` — face/hand detection/detailing
+    (`FaceDetailer`, `UltralyticsDetectorProvider`, `SAMLoader`); hand
+    detailing additionally needs a hand-trained bbox model staged under
+    ComfyUI's `models/ultralytics/bbox/` (e.g. `hand_yolov8s.pt`) — not
+    bundled with Impact Pack itself, same manual-staging caveat as the WD14
+    tagger files (see [Image analysis](#image-analysis))
   - [`ComfyUI_UltimateSDUpscale`](https://github.com/ssitu/ComfyUI_UltimateSDUpscale) —
     the 4x upscale pass
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
@@ -141,9 +149,9 @@ rebuild needed to pick up a WD14 model you stage later (see
 
 Every generated image comes with inline buttons:
 
-- **🔍 Upscale 4x** / **✨ Face Detail** — run that post-processing stage on
-  this specific image and send the result (itself with its own buttons, so
-  passes can be chained).
+- **🔍 Upscale 4x** / **✨ Face Detail** / **🖐️ Hand Detail** — run that
+  post-processing stage on this specific image and send the result (itself
+  with its own buttons, so passes can be chained).
 - **🏷️ Analyze** — analyze *this image* with **both** the WD14 tagger and a
   Qwen-VL caption (regardless of the checkpoint's `prompt_style`), replying
   with two separate messages — one per analyzer — each carrying its own
@@ -217,12 +225,15 @@ shared singletons (`Settings`, `ComfyClient`, loaded `ModelProfile`s,
   API (`/prompt`, `/history`, `/view`, `/object_info`, `/ws`). No knowledge
   of Telegram or prompts/profiles.
 - **`workflows/builder.py`** — `PromptGraph`, a small imperative builder for
-  ComfyUI API-format node graphs. Builds three graphs: `build_txt2img`,
-  `build_upscale` (UltimateSDUpscale), `build_face_detailer` (Impact Pack
-  FaceDetailer). Post-processing graphs are freshly submitted (`LoadImage`
-  from an uploaded source) rather than chained onto the original sampler
-  run, so any single image from a batch can be picked for refinement
-  independent of seed/batch state.
+  ComfyUI API-format node graphs. Builds four graphs: `build_txt2img`,
+  `build_upscale` (UltimateSDUpscale), `build_face_detailer` and
+  `build_hand_detailer` (both Impact Pack's `FaceDetailer` node — it's a
+  generic detect/crop/inpaint/composite node regardless of name, so the two
+  share a `_build_detailer` graph builder and differ only in which
+  bbox-detector model gets wired in). Post-processing graphs are freshly
+  submitted (`LoadImage` from an uploaded source) rather than chained onto
+  the original sampler run, so any single image from a batch can be picked
+  for refinement independent of seed/batch state.
 - **`profiles/`** — the `ModelProfile` pydantic schema plus a loader that
   glob-matches a checkpoint filename against every `*.json` in
   `model_profiles/` and layers profile defaults → user prompt → any

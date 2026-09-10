@@ -45,7 +45,16 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-POSTPROCESS_KEYBOARD_LABELS = {"upscale": "🔍 Upscale 4x", "face": "✨ Face Detail"}
+POSTPROCESS_KEYBOARD_LABELS = {
+    "upscale": "🔍 Upscale 4x",
+    "face": "✨ Face Detail",
+    "hand": "🖐️ Hand Detail",
+}
+POSTPROCESS_STATUS_LABELS = {
+    "upscale": "Upscaling",
+    "face": "Refining face",
+    "hand": "Refining hand",
+}
 ANALYZE_CALLBACK_KIND = "analyze"
 ANALYZE_ONLY_CALLBACK_KIND = "analyze_only"
 AGAIN_CALLBACK_PREFIX = "again:"
@@ -806,7 +815,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     Qwen-VL caption — and reply with both, no generation, no
     `prompt_style` dispatch; see `ANALYZE_ONLY_CALLBACK_KIND`), `"analyze"`
     (the checkpoint's configured single analyzer, then generate from that
-    prompt — see `ANALYZE_CALLBACK_KIND`), or `"upscale"`/`"face"`
+    prompt — see `ANALYZE_CALLBACK_KIND`), or `"upscale"`/`"face"`/`"hand"`
     (download the source image and run that post-processing stage on it).
     Alerts instead if `result_id` has expired (see
     `PENDING_RESULT_TTL_SECONDS`)."""
@@ -890,7 +899,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await _deliver_generation_result(status_message, query.message, chat_id, storage, images)
         return
 
-    label = "Upscaling" if kind == "upscale" else "Refining face"
+    label = POSTPROCESS_STATUS_LABELS.get(kind, kind.title())
     status_message = await query.message.reply_text(f"{label}…")
 
     async def _download_and_post_process() -> GeneratedImage:

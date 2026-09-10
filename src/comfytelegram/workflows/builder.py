@@ -315,21 +315,55 @@ class FaceDetailerParams:
     filename_prefix: str = "comfytelegram_face"
 
 
-def build_face_detailer(
+@dataclass
+class HandDetailerParams:
+    """Same shape as `FaceDetailerParams`; defaults tuned for hands instead
+    of faces — a hand-trained bbox model, and a higher denoise since extra-
+    or missing-finger deformities need more correction latitude than face
+    blemishes do, plus a wider crop factor since a hand's bounding box is
+    usually smaller relative to the frame than a face's."""
+
+    bbox_model: str = "bbox/hand_yolov8s.pt"
+    sam_model: str = "sam_vit_b_01ec64.pth"
+    guide_size: int = 512
+    max_size: int = 1024
+    steps: int = 25
+    cfg: float = 5.0
+    sampler_name: str = "euler_ancestral"
+    scheduler: str = "normal"
+    denoise: float = 0.5
+    feather: int = 10
+    bbox_threshold: float = 0.5
+    bbox_dilation: int = 20
+    bbox_crop_factor: float = 3.5
+    seed: int | None = None
+    filename_prefix: str = "comfytelegram_hand"
+
+
+def _build_detailer(
     source_filename: str,
     base: PostProcessBaseParams,
-    params: FaceDetailerParams,
+    params: FaceDetailerParams | HandDetailerParams,
+    *,
+    label: str,
 ) -> tuple[dict[str, Any], str]:
-    """Build the Impact Pack FaceDetailer post-processing graph. Returns
-    (prompt_dict, save_image_node_id). `source_filename` must already exist
-    in ComfyUI's `input` directory (upload it first via
+    """Shared graph shape behind `build_face_detailer` and
+    `build_hand_detailer` — Impact Pack's `FaceDetailer` node is really a
+    generic detect-crop-inpaint-composite node despite the name, so hand-
+    detailing is the same graph with a hand-trained `bbox_detector` model
+    swapped in (see `HandDetailerParams`). `label` ("Face"/"Hand") only
+    affects node titles shown in the ComfyUI UI, not graph behavior.
+    Returns (prompt_dict, save_image_node_id). `source_filename` must
+    already exist in ComfyUI's `input` directory (upload it first via
     `ComfyClient.upload_image`)."""
     g = PromptGraph()
 
     load = g.add("LoadImage", {"image": source_filename}, title="Source Image")
     model_ref, clip_ref, vae_ref, positive, negative = _build_model_clip_vae(g, base)
     bbox_detector = g.add(
-        "UltralyticsDetectorProvider", {"model_name": params.bbox_model}, title="Face Detector"
+        "UltralyticsDetectorProvider",
+        {"model_name": params.bbox_model},
+        title=f"{label} Detector",
     )
     sam_model = g.add(
         "SAMLoader", {"model_name": params.sam_model, "device_mode": "AUTO"}, title="SAM Model"
@@ -375,7 +409,7 @@ def build_face_detailer(
             "tiled_encode": False,
             "tiled_decode": False,
         },
-        title="Face Detailer",
+        title=f"{label} Detailer",
     )
 
     save = g.add(
@@ -384,3 +418,24 @@ def build_face_detailer(
         title="Save Image",
     )
     return g.as_prompt(), save
+
+
+def build_face_detailer(
+    source_filename: str,
+    base: PostProcessBaseParams,
+    params: FaceDetailerParams,
+) -> tuple[dict[str, Any], str]:
+    """Build the Impact Pack FaceDetailer post-processing graph, targeting
+    faces. See `_build_detailer` for the shared graph shape."""
+    return _build_detailer(source_filename, base, params, label="Face")
+
+
+def build_hand_detailer(
+    source_filename: str,
+    base: PostProcessBaseParams,
+    params: HandDetailerParams,
+) -> tuple[dict[str, Any], str]:
+    """Build the same Impact Pack detailer graph as `build_face_detailer`,
+    but with a hand-trained bbox model — see `_build_detailer` and
+    `HandDetailerParams`."""
+    return _build_detailer(source_filename, base, params, label="Hand")

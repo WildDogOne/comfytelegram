@@ -65,6 +65,7 @@ def test_post_process_keyboard_scopes_every_button_to_result_id():
     callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
     assert "pp:upscale:abc123" in callback_data
     assert "pp:face:abc123" in callback_data
+    assert "pp:hand:abc123" in callback_data
     assert "pp:analyze_only:abc123" in callback_data
     assert "pp:analyze:abc123" in callback_data
 
