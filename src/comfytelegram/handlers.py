@@ -50,6 +50,7 @@ ANALYZE_CALLBACK_KIND = "analyze"
 ANALYZE_ONLY_CALLBACK_KIND = "analyze_only"
 AGAIN_CALLBACK_PREFIX = "again:"
 GENERATE_FROM_PROMPT_CALLBACK_PREFIX = "genp:"
+STREAM_CANCEL_CALLBACK_DATA = "stream:cancel"
 
 #: Hard ceiling on how many images a single "/stream" run can produce, even
 #: if nobody sends "/stop" — a safety net against an unattended chat quietly
@@ -139,6 +140,16 @@ def _again_keyboard(snapshot_id: str) -> InlineKeyboardMarkup:
                 )
             ]
         ]
+    )
+
+
+def _stream_prompt_cancel_keyboard() -> InlineKeyboardMarkup:
+    """Attached to the "What should the stream generate?" follow-up prompt
+    (see `stream_command`'s promptless branch) — lets someone who tapped the
+    bare "/stream" keyboard button by mistake back out without having to
+    send a throwaway prompt just to get past it."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Cancel", callback_data=STREAM_CANCEL_CALLBACK_DATA)]]
     )
 
 
@@ -349,8 +360,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/settings — view or change generation defaults for the current model\n"
         "/character save <name> | <prompt> — save a reusable character design\n"
         "/characters — list saved characters and activate one\n"
-        f"/stream <prompt> — generate single images back-to-back (up to {STREAM_HARD_LIMIT}) "
-        "until /stop, sending each one immediately\n"
+        f"/stream [prompt] — generate single images back-to-back (up to {STREAM_HARD_LIMIT}) "
+        "until /stop, sending each one immediately; omit the prompt and I'll ask for it\n"
         "/stop — stop a running /stream\n"
         "/help — show this message",
         reply_markup=_MAIN_KEYBOARD,
@@ -601,6 +612,9 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if await handle_custom_value_message(update, context):
+        return
+
+    if await _consume_awaiting_stream_prompt(update, context):
         return
 
     message = update.effective_message
@@ -881,14 +895,24 @@ async def generate_from_prompt_callback(update: Update, context: ContextTypes.DE
 
 
 async def stream_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/stream <prompt>` — repeatedly generate a single image (batch_size
+    """`/stream [prompt]` — repeatedly generate a single image (batch_size
     forced to 1 regardless of the checkpoint's own default) from `prompt`
     and send each one immediately as it finishes, until either "/stop"
     cancels it or `STREAM_HARD_LIMIT` is reached. One stream per chat at a
     time; the running task lives in `context.bot_data["active_streams"]`
     keyed by chat_id — in-memory only, since a live asyncio task can't
     survive a bot restart anyway, unlike the sqlite-backed button
-    registries in storage.py."""
+    registries in storage.py.
+
+    With no prompt — notably, tapping the bare "/stream" button on
+    `_MAIN_KEYBOARD` always sends exactly that, since a reply-keyboard
+    button can only ever send fixed text, unlike an inline keyboard's
+    `switch_inline_query` — this instead sets `context.chat_data`'s
+    `awaiting_stream_prompt` flag and asks for the prompt as a follow-up
+    message (with a "❌ Cancel" button to back out — see
+    `_stream_prompt_cancel_keyboard`/`stream_cancel_callback`), consumed by
+    `_consume_awaiting_stream_prompt` (mirrors settings_menu's
+    "awaiting_field" custom-value capture)."""
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
         return
@@ -897,14 +921,23 @@ async def stream_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     parts = (message.text or "").split(maxsplit=1)
     prompt_text = parts[1].strip() if len(parts) > 1 else ""
     if not prompt_text:
+        context.chat_data["awaiting_stream_prompt"] = True
         await message.reply_text(
-            f"Usage: /stream <prompt> — generates single images from this prompt "
-            f"back-to-back (up to {STREAM_HARD_LIMIT}) until /stop. Each image is "
-            "sent as soon as it's ready."
+            "What should the stream generate? Send the prompt as your next "
+            "message (or type /stream <prompt> directly next time).",
+            reply_markup=_stream_prompt_cancel_keyboard(),
         )
         return
 
-    chat_id = update.effective_chat.id
+    await _start_stream(context, update.effective_chat.id, message, prompt_text)
+
+
+async def _start_stream(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, message: Message, prompt_text: str
+) -> None:
+    """Reserve `active_streams[chat_id]` and launch `_run_stream` — shared by
+    `stream_command` (prompt given inline) and `_consume_awaiting_stream_prompt`
+    (prompt given as a follow-up message)."""
     active_streams: dict[int, asyncio.Task] = context.bot_data.setdefault("active_streams", {})
     if chat_id in active_streams and not active_streams[chat_id].done():
         await message.reply_text("A stream is already running in this chat — /stop it first.")
@@ -916,6 +949,49 @@ async def stream_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     active_streams[chat_id] = asyncio.create_task(
         _run_stream(context, chat_id, message, prompt_text)
     )
+
+
+async def _consume_awaiting_stream_prompt(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """If this chat is mid-"send the /stream prompt" entry (see
+    `stream_command`), consume the incoming text as that prompt and start
+    the stream, returning True. Otherwise return False so the caller (
+    `generate_message`) treats the text as a normal generation prompt
+    instead."""
+    if not context.chat_data.pop("awaiting_stream_prompt", False):
+        return False
+
+    message = update.effective_message
+    prompt_text = (message.text or "").strip()
+    if not prompt_text:
+        await message.reply_text("Cancelled — no prompt received.")
+        return True
+
+    await _start_stream(context, update.effective_chat.id, message, prompt_text)
+    return True
+
+
+async def stream_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the "❌ Cancel" tap on the "What should the stream generate?"
+    follow-up prompt (see `stream_command`'s promptless branch and
+    `_stream_prompt_cancel_keyboard`): clears `awaiting_stream_prompt` so
+    the next text message goes back to being treated as a normal
+    generation prompt, and edits the button away so a stale tap (the
+    prompt was already sent and consumed, or a previous cancel already
+    fired) can't be replayed."""
+    query = update.callback_query
+    settings: Settings = context.bot_data["settings"]
+    user_id = update.effective_user.id if update.effective_user else None
+    if await reject_if_unauthorized_callback(query, user_id, settings):
+        return
+
+    if not context.chat_data.pop("awaiting_stream_prompt", False):
+        await query.answer("Nothing to cancel.")
+        return
+
+    await query.answer("Cancelled.")
+    await _safe_edit_message(query, "Cancelled — no stream started.", InlineKeyboardMarkup([]))
 
 
 async def _run_stream(

@@ -20,6 +20,7 @@ from comfytelegram.comfy_client import ComfyClient
 from comfytelegram.handlers import (
     AGAIN_CALLBACK_PREFIX,
     GENERATE_FROM_PROMPT_CALLBACK_PREFIX,
+    STREAM_CANCEL_CALLBACK_DATA,
     again_callback,
     character_callback,
     character_command,
@@ -32,6 +33,7 @@ from comfytelegram.handlers import (
     postprocess_callback,
     start,
     stop_command,
+    stream_cancel_callback,
     stream_command,
 )
 from comfytelegram.profiles import load_profiles
@@ -120,6 +122,9 @@ def build_application(settings: Settings) -> Application:
     )
     application.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^st:"))
     application.add_handler(CallbackQueryHandler(character_callback, pattern=r"^char:"))
+    application.add_handler(
+        CallbackQueryHandler(stream_cancel_callback, pattern=rf"^{STREAM_CANCEL_CALLBACK_DATA}$")
+    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, generate_message))
     application.add_error_handler(_error_handler)
 
