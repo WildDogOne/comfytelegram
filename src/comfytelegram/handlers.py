@@ -568,6 +568,10 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             tg_file = await context.bot.get_file(pending["file_id"])
             source_bytes = bytes(await tg_file.download_as_bytearray())
             derived_prompt = await analyze_image(source_bytes, style, settings)
+            # Sent as its own message, once, right as analysis finishes —
+            # not as a caption on each generated image, which would repeat
+            # the same prompt once per image in a batch.
+            await query.message.reply_text(derived_prompt)
             await status_message.edit_text("Generating… 0%")
             return await generate(
                 client, checkpoint, derived_prompt, profile, on_progress=_make_progress_callback(status_message)

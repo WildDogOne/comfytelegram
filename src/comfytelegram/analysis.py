@@ -59,6 +59,39 @@ _KAOMOJI = frozenset(
     }
 )
 
+# General-category tags that describe the *source post*, not the image's
+# content — watermarks, artist/uploader attribution, on-image text in some
+# language, site usernames, framing artifacts. wd-vit-tagger-v3's general
+# vocabulary is trained on the raw Danbooru tag distribution, so these show
+# up constantly (e.g. "signature" tags ~240k training images) but feeding
+# them into a regeneration prompt just asks the diffusion model to render a
+# watermark/signature/username into the new image. Curated by hand against
+# this repo's actual selected_tags.csv rather than filtered by category,
+# since this model's export only ships general/character/rating categories
+# (no separate "meta" category to key off of).
+_NOISE_TAGS = frozenset(
+    {
+        # watermarks / logos / framing
+        "watermark", "sample_watermark", "signature", "dated", "logo",
+        "patreon_logo", "pixiv_logo", "border", "letterboxed",
+        # attribution
+        "artist_name", "character_name", "copyright_name", "web_address",
+        "company_name", "pixiv_id",
+        # site usernames
+        "twitter_username", "patreon_username", "weibo_username",
+        "fanbox_username", "deviantart_username", "instagram_username",
+        "pixiv_username", "facebook_username", "tumblr_username",
+        "gumroad_username",
+        # on-image text
+        "english_text", "chinese_text", "korean_text", "text_focus",
+        "engrish_text", "romaji_text", "text_background", "russian_text",
+        "mixed-language_text", "simplified_chinese_text", "german_text",
+        "french_text", "wall_of_text", "thai_text", "traditional_chinese_text",
+        "colored_text", "spanish_text", "text_messaging", "censored_text",
+        "italian_text",
+    }
+)
+
 _OLLAMA_VISION_PROMPT = (
     "Describe this image as a concise, comma-separated Stable Diffusion prompt: "
     "subject, appearance, pose, clothing, setting, lighting, art style. Output "
@@ -73,11 +106,13 @@ def _format_tag(name: str) -> str:
 def select_tags(tags: list[tuple[str, int, float]], threshold: float) -> str:
     """Pick WD14 tags at or above `threshold`, formatted as a comma-separated
     prompt fragment: character tags (category 4) first, then general tags
-    (category 0), each sorted by descending confidence. Pure function (no
-    model/session involved) so it's unit-testable without the ~370MB ONNX
-    file — see `_run_wd14` for the part that actually needs it."""
+    (category 0, minus `_NOISE_TAGS`), each sorted by descending confidence.
+    Pure function (no model/session involved) so it's unit-testable without
+    the ~370MB ONNX file — see `_run_wd14` for the part that actually needs
+    it."""
     general = sorted(
-        (t for t in tags if t[1] == _CATEGORY_GENERAL and t[2] >= threshold), key=lambda t: -t[2]
+        (t for t in tags if t[1] == _CATEGORY_GENERAL and t[2] >= threshold and t[0] not in _NOISE_TAGS),
+        key=lambda t: -t[2],
     )
     character = sorted(
         (t for t in tags if t[1] == _CATEGORY_CHARACTER and t[2] >= threshold), key=lambda t: -t[2]
