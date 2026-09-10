@@ -20,7 +20,7 @@ from typing import Any, TypeVar
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import ContextTypes
 
-from comfytelegram.analysis import analyze_image
+from comfytelegram.analysis import analyze_caption, analyze_image, analyze_tags
 from comfytelegram.auth import reject_if_unauthorized, reject_if_unauthorized_callback
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
 from comfytelegram.generation import GeneratedImage, generate, post_process, repeat
@@ -41,6 +41,7 @@ T = TypeVar("T")
 
 POSTPROCESS_KEYBOARD_LABELS = {"upscale": "🔍 Upscale 4x", "face": "✨ Face Detail"}
 ANALYZE_CALLBACK_KIND = "analyze"
+ANALYZE_ONLY_CALLBACK_KIND = "analyze_only"
 AGAIN_CALLBACK_PREFIX = "again:"
 
 CHARACTER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
@@ -69,8 +70,9 @@ TELEGRAM_PHOTO_SIZE_LIMIT = 10_000_000
 
 def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
     """The keyboard attached to a generated/post-processed image: one
-    button per `POSTPROCESS_KEYBOARD_LABELS` entry plus Analyze & Regenerate,
-    all scoped to `result_id` (see `storage.py`'s `pending_result`)."""
+    button per `POSTPROCESS_KEYBOARD_LABELS` entry plus Analyze (prompt
+    only) and Analyze & Regenerate, all scoped to `result_id` (see
+    `storage.py`'s `pending_result`)."""
     return InlineKeyboardMarkup(
         [
             [
@@ -79,8 +81,11 @@ def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    "🏷️ Analyze", callback_data=f"pp:{ANALYZE_ONLY_CALLBACK_KIND}:{result_id}"
+                ),
+                InlineKeyboardButton(
                     "🔬 Analyze & Regenerate", callback_data=f"pp:{ANALYZE_CALLBACK_KIND}:{result_id}"
-                )
+                ),
             ],
         ]
     )
@@ -530,8 +535,11 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle a `pp:<kind>:<result_id>` tap from `_post_process_keyboard`:
-    `kind` is `"analyze"` (analyze the image into a fresh prompt, then
-    generate from that — see `ANALYZE_CALLBACK_KIND`) or `"upscale"`/`"face"`
+    `kind` is `"analyze_only"` (run *both* analyzers — WD14 tags and
+    Qwen-VL caption — and reply with both, no generation, no
+    `prompt_style` dispatch; see `ANALYZE_ONLY_CALLBACK_KIND`), `"analyze"`
+    (the checkpoint's configured single analyzer, then generate from that
+    prompt — see `ANALYZE_CALLBACK_KIND`), or `"upscale"`/`"face"`
     (download the source image and run that post-processing stage on it).
     Alerts instead if `result_id` has expired (see
     `PENDING_RESULT_TTL_SECONDS`)."""
@@ -551,6 +559,40 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     client: ComfyClient = context.bot_data["comfy_client"]
     full_params = _deserialize_generation_params(pending["base_params"])
+
+    if kind == ANALYZE_ONLY_CALLBACK_KIND:
+        status_message = await query.message.reply_text("Analyzing image…")
+
+        async def _run_analyzer(label: str, awaitable: Awaitable[str]) -> str:
+            """Isolate one analyzer's failure (e.g. WD14 files not staged,
+            Ollama unreachable) from the other, so a side-by-side comparison
+            still shows whichever one actually worked."""
+            try:
+                return await awaitable
+            except Exception as exc:
+                logger.exception("%s analyzer failed", label)
+                return f"(failed: {exc})"
+
+        async def _analyze_both() -> tuple[str, str]:
+            """Runs both analyzers regardless of the checkpoint's configured
+            `prompt_style` — unlike Analyze & Regenerate below, which must
+            commit to one prompt to actually generate from, this button is
+            for comparing WD14 tags against a Qwen-VL caption side by side."""
+            tg_file = await context.bot.get_file(pending["file_id"])
+            source_bytes = bytes(await tg_file.download_as_bytearray())
+            tags, caption = await asyncio.gather(
+                _run_analyzer("WD14", analyze_tags(source_bytes, settings)),
+                _run_analyzer("Qwen-VL", analyze_caption(source_bytes, settings)),
+            )
+            return tags, caption
+
+        result = await _run_reporting_errors(status_message, "Analysis", "analyze-only", _analyze_both())
+        if result is None:
+            return
+        tags, caption = result
+        await status_message.delete()
+        await query.message.reply_text(f"🏷️ WD14 tags:\n{tags}\n\n💬 Qwen-VL caption:\n{caption}")
+        return
 
     if kind == ANALYZE_CALLBACK_KIND:
         status_message = await query.message.reply_text("Analyzing image…")
