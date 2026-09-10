@@ -10,6 +10,9 @@ CLI at runtime.
 ## Features
 
 - **Text-to-image generation** — send any plain-text message as a prompt.
+  Prefix any word with `-` to send it as a negative instead (e.g. `1girl,
+  outdoors, -blurry, -watermark`), stacked on top of the checkpoint's own
+  default negative prompt and any active character's.
 - **Switchable models with smart defaults** — `/model` lists checkpoints
   ComfyUI has installed; each can have a matching *model profile* (cfg,
   steps, sampler, clip skip, prompt prefixes, default LoRAs) applied
@@ -26,6 +29,10 @@ CLI at runtime.
   Qwen-VL caption via a local Ollama server (natural-language checkpoints).
   🏷️ Analyze runs both regardless of checkpoint, for comparing them. See
   [Image analysis](#image-analysis) below.
+- **Upload a photo for analysis** — send the bot any photo (not one of its
+  own generated images — those use the 🏷️ Analyze button instead) and it
+  runs the same side-by-side WD14/Qwen-VL analysis, each reply with its own
+  🎨 Generate button.
 - **`/settings`** — an in-place inline-keyboard menu to view and override a
   model's generation defaults per chat (steppers + presets for numeric
   fields, a live-populated grid for sampler/scheduler, free text for prompt
@@ -121,7 +128,8 @@ rebuild needed to pick up a WD14 model you stage later (see
 
 | Command | Effect |
 |---|---|
-| *(plain text)* | Generate an image with the current model/settings |
+| *(plain text)* | Generate an image with the current model/settings — prefix any word with `-` (e.g. `-blurry`) to send it as a negative instead of a positive |
+| *(photo upload)* | Analyze the photo with both WD14 tags and a Qwen-VL caption, each with its own 🎨 Generate button |
 | `/model` | Pick a checkpoint (inline keyboard, populated live from ComfyUI) |
 | `/settings` | View/change cfg, steps, sampler, scheduler, clip skip, width, height, batch size, and prompt prefixes for the current model, per chat |
 | `/character save <name> \| <positive> [\| <negative>]` | Save a reusable prompt snippet |

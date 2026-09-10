@@ -30,6 +30,7 @@ from comfytelegram.handlers import (
     help_command,
     model_callback,
     model_command,
+    photo_message,
     postprocess_callback,
     start,
     stop_command,
@@ -125,6 +126,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(
         CallbackQueryHandler(stream_cancel_callback, pattern=rf"^{STREAM_CANCEL_CALLBACK_DATA}$")
     )
+    application.add_handler(MessageHandler(filters.PHOTO, photo_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, generate_message))
     application.add_error_handler(_error_handler)
 

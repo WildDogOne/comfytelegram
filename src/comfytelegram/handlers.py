@@ -318,6 +318,56 @@ async def _send_and_store_result(
     )
 
 
+async def _run_analyzer(label: str, awaitable: Awaitable[str]) -> str | None:
+    """Isolate one analyzer's failure (e.g. WD14 files not staged, Ollama
+    unreachable) from the other, so a side-by-side comparison still shows
+    whichever one actually worked. None means it failed — the caller skips
+    the "🎨 Generate" button in that case, since there's no usable prompt to
+    generate from. Shared by `postprocess_callback`'s "analyze_only" branch
+    and `photo_message`."""
+    try:
+        return await awaitable
+    except Exception:
+        logger.exception("%s analyzer failed", label)
+        return None
+
+
+async def _analyze_both(source_bytes: bytes, settings: Settings) -> tuple[str | None, str | None]:
+    """Run both analyzers regardless of any checkpoint's configured
+    `prompt_style` — unlike Analyze & Regenerate, which must commit to one
+    prompt to actually generate from, this is for comparing WD14 tags
+    against a Qwen-VL caption side by side. Shared by `postprocess_callback`
+    and `photo_message`."""
+    tags, caption = await asyncio.gather(
+        _run_analyzer("WD14", analyze_tags(source_bytes, settings)),
+        _run_analyzer("Qwen-VL", analyze_caption(source_bytes, settings)),
+    )
+    return tags, caption
+
+
+async def _send_derived_prompt(
+    reply_target: Message,
+    storage: Storage,
+    chat_id: int,
+    checkpoint: str,
+    label: str,
+    prompt: str | None,
+) -> None:
+    """One standalone message per analyzer, each with its own "🎨 Generate"
+    button scoped to that specific prompt (see storage.py's
+    `derived_prompt`) — not a shared button on a combined message, since
+    the two prompts are independent and the user may only want to act on
+    one of them. Shared by `postprocess_callback` and `photo_message`."""
+    if prompt is None:
+        await reply_target.reply_text(f"{label}: failed — see server log.")
+        return
+    prompt_id = uuid.uuid4().hex[:12]
+    storage.store_derived_prompt(prompt_id, chat_id, checkpoint, prompt)
+    await reply_target.reply_text(
+        f"{label}:\n{prompt}", reply_markup=_generate_from_prompt_keyboard(prompt_id)
+    )
+
+
 async def _deliver_generation_result(
     status_message: Message,
     reply_target: Message,
@@ -355,7 +405,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await reject_if_unauthorized(update, settings):
         return
     await update.effective_message.reply_text(
-        "Send me a prompt and I'll generate an image with ComfyUI.\n\n"
+        "Send me a prompt and I'll generate an image with ComfyUI, or a "
+        "photo and I'll analyze it into a prompt. Prefix any word with - to "
+        'send it as a negative instead, e.g. "1girl, outdoors, -blurry, '
+        '-watermark".\n\n'
         "/model — pick a checkpoint\n"
         "/settings — view or change generation defaults for the current model\n"
         "/character save <name> | <prompt> — save a reusable character design\n"
@@ -599,6 +652,48 @@ async def _resolve_checkpoint_or_default(
     return checkpoint
 
 
+#: Matches a "-token" where the "-" sits at the very start of the prompt or
+#: right after whitespace/a comma — i.e. a delimiter, not a mid-word hyphen
+#: like "well-lit" (the char before "-" there is "l", so the lookbehind
+#: fails and it's left alone). The token itself stops at the next comma or
+#: whitespace, so both tag-style ("1girl, -watermark, -blurry") and
+#: space-separated ("a cat -blurry -watermark") prompts work the same way.
+_NEGATIVE_TOKEN_RE = re.compile(r"(?<![^\s,])-([^\s,]+)")
+
+
+def _split_negative_prompt(text: str) -> tuple[str, str]:
+    """Pull "-token" negatives out of a raw user prompt (see
+    `_NEGATIVE_TOKEN_RE`), returning `(positive, negative)`. Used so a
+    message like "1girl, outdoors, -blurry, -watermark" generates with
+    "blurry, watermark" appended to the negative prompt instead of ending up
+    literally in the positive one."""
+    negatives = [match.group(1) for match in _NEGATIVE_TOKEN_RE.finditer(text)]
+    remainder = _NEGATIVE_TOKEN_RE.sub("", text)
+    positive_parts = [part.strip() for part in remainder.split(",")]
+    positive = join_nonempty(positive_parts)
+    positive = re.sub(r"\s{2,}", " ", positive).strip()
+    return positive, join_nonempty(negatives)
+
+
+def _resolve_effective_prompt(
+    prompt_text: str, character: dict[str, str] | None
+) -> tuple[str, str]:
+    """Combine a raw prompt message with the active character (if any) into
+    `(effective_prompt, extra_negative_prompt)` for `generate()`: splits off
+    any "-token" negatives (see `_split_negative_prompt`), folds the
+    character's own saved positive/negative prompt in around them, and
+    leaves profile-level negative defaults for `generate()`/`resolve_generation_params`
+    to layer underneath."""
+    positive, negative = _split_negative_prompt(prompt_text)
+    effective_prompt = (
+        join_nonempty([character["positive_prompt"], positive]) if character else positive
+    )
+    extra_negative = (
+        join_nonempty([character["negative_prompt"], negative]) if character else negative
+    )
+    return effective_prompt, extra_negative
+
+
 async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle a plain-text message as a generation prompt: resolve this
     chat's checkpoint/profile/override/active-character, run `generate()`
@@ -639,10 +734,7 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     character = (
         storage.get_character(chat_id, active_character_name) if active_character_name else None
     )
-    effective_prompt = (
-        join_nonempty([character["positive_prompt"], prompt_text]) if character else prompt_text
-    )
-    extra_negative = character["negative_prompt"] if character else ""
+    effective_prompt, extra_negative = _resolve_effective_prompt(prompt_text, character)
 
     status_message = await message.reply_text("Generating… 0%")
 
@@ -663,6 +755,49 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     await _deliver_generation_result(status_message, message, chat_id, storage, images)
+
+
+async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle a directly-uploaded photo — as opposed to one of the bot's own
+    generated images, which get analyzed via `_post_process_keyboard`'s
+    "🏷️ Analyze" button instead — by running it through both analyzers and
+    replying with each, the same side-by-side WD14-tags/Qwen-VL-caption
+    treatment as `postprocess_callback`'s `ANALYZE_ONLY_CALLBACK_KIND`
+    branch, including a "🎨 Generate" button on each so the derived prompt
+    can be used right away. Resolves this chat's checkpoint the same way
+    `generate_message` does (falling back to ComfyUI's first available one)
+    only to scope that button's eventual profile/style — the analysis
+    itself doesn't depend on it."""
+    settings: Settings = context.bot_data["settings"]
+    if await reject_if_unauthorized(update, settings):
+        return
+
+    message = update.effective_message
+    chat_id = update.effective_chat.id
+    storage: Storage = context.bot_data["storage"]
+    client: ComfyClient = context.bot_data["comfy_client"]
+
+    checkpoint = await _resolve_checkpoint_or_default(message, chat_id, storage, client, context)
+    if checkpoint is None:
+        return
+
+    status_message = await message.reply_text("Analyzing image…")
+
+    async def _download_and_analyze_both() -> tuple[str | None, str | None]:
+        tg_file = await context.bot.get_file(message.photo[-1].file_id)
+        source_bytes = bytes(await tg_file.download_as_bytearray())
+        return await _analyze_both(source_bytes, settings)
+
+    result = await _run_reporting_errors(
+        status_message, "Analysis", "uploaded-image analyze", _download_and_analyze_both()
+    )
+    if result is None:
+        return
+    tags, caption = result
+    await status_message.delete()
+
+    await _send_derived_prompt(message, storage, chat_id, checkpoint, "🏷️ WD14 tags", tags)
+    await _send_derived_prompt(message, storage, chat_id, checkpoint, "💬 Qwen-VL caption", caption)
 
 
 async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -697,56 +832,23 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         checkpoint = full_params.checkpoint
         chat_id = pending["chat_id"]
 
-        async def _run_analyzer(label: str, awaitable: Awaitable[str]) -> str | None:
-            """Isolate one analyzer's failure (e.g. WD14 files not staged,
-            Ollama unreachable) from the other, so a side-by-side comparison
-            still shows whichever one actually worked. None means it
-            failed — the caller skips the "🎨 Generate" button in that
-            case, since there's no usable prompt to generate from."""
-            try:
-                return await awaitable
-            except Exception:
-                logger.exception("%s analyzer failed", label)
-                return None
-
-        async def _analyze_both() -> tuple[str | None, str | None]:
-            """Runs both analyzers regardless of the checkpoint's configured
-            `prompt_style` — unlike Analyze & Regenerate below, which must
-            commit to one prompt to actually generate from, this button is
-            for comparing WD14 tags against a Qwen-VL caption side by side."""
+        async def _download_and_analyze_both() -> tuple[str | None, str | None]:
             tg_file = await context.bot.get_file(pending["file_id"])
             source_bytes = bytes(await tg_file.download_as_bytearray())
-            tags, caption = await asyncio.gather(
-                _run_analyzer("WD14", analyze_tags(source_bytes, settings)),
-                _run_analyzer("Qwen-VL", analyze_caption(source_bytes, settings)),
-            )
-            return tags, caption
+            return await _analyze_both(source_bytes, settings)
 
         result = await _run_reporting_errors(
-            status_message, "Analysis", "analyze-only", _analyze_both()
+            status_message, "Analysis", "analyze-only", _download_and_analyze_both()
         )
         if result is None:
             return
         tags, caption = result
         await status_message.delete()
 
-        async def _send_derived_prompt(label: str, prompt: str | None) -> None:
-            """One standalone message per analyzer, each with its own
-            "🎨 Generate" button scoped to that specific prompt (see
-            storage.py's `derived_prompt`) — not a shared button on a
-            combined message, since the two prompts are independent and the
-            user may only want to act on one of them."""
-            if prompt is None:
-                await query.message.reply_text(f"{label}: failed — see server log.")
-                return
-            prompt_id = uuid.uuid4().hex[:12]
-            storage.store_derived_prompt(prompt_id, chat_id, checkpoint, prompt)
-            await query.message.reply_text(
-                f"{label}:\n{prompt}", reply_markup=_generate_from_prompt_keyboard(prompt_id)
-            )
-
-        await _send_derived_prompt("🏷️ WD14 tags", tags)
-        await _send_derived_prompt("💬 Qwen-VL caption", caption)
+        await _send_derived_prompt(query.message, storage, chat_id, checkpoint, "🏷️ WD14 tags", tags)
+        await _send_derived_prompt(
+            query.message, storage, chat_id, checkpoint, "💬 Qwen-VL caption", caption
+        )
         return
 
     if kind == ANALYZE_CALLBACK_KIND:
@@ -1028,10 +1130,7 @@ async def _run_stream(
         character = (
             storage.get_character(chat_id, active_character_name) if active_character_name else None
         )
-        effective_prompt = (
-            join_nonempty([character["positive_prompt"], prompt_text]) if character else prompt_text
-        )
-        extra_negative = character["negative_prompt"] if character else ""
+        effective_prompt, extra_negative = _resolve_effective_prompt(prompt_text, character)
 
         status_message = await message.reply_text(
             f"🔁 Streaming started (up to {STREAM_HARD_LIMIT} images) — "

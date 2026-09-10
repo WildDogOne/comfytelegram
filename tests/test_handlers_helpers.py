@@ -10,9 +10,54 @@ from comfytelegram.handlers import (
     _extract_file_id,
     _generate_from_prompt_keyboard,
     _post_process_keyboard,
+    _resolve_effective_prompt,
     _run_reporting_errors,
+    _split_negative_prompt,
     start,
 )
+
+
+def test_split_negative_prompt_pulls_out_comma_separated_tags():
+    positive, negative = _split_negative_prompt("1girl, outdoors, -blurry, -watermark")
+    assert positive == "1girl, outdoors"
+    assert negative == "blurry, watermark"
+
+
+def test_split_negative_prompt_handles_space_separated_tokens():
+    positive, negative = _split_negative_prompt("a cute cat -blurry -watermark")
+    assert positive == "a cute cat"
+    assert negative == "blurry, watermark"
+
+
+def test_split_negative_prompt_leaves_mid_word_hyphens_alone():
+    positive, negative = _split_negative_prompt("a well-lit room")
+    assert positive == "a well-lit room"
+    assert negative == ""
+
+
+def test_split_negative_prompt_handles_leading_negative_token():
+    positive, negative = _split_negative_prompt("-lonely, a cat")
+    assert positive == "a cat"
+    assert negative == "lonely"
+
+
+def test_split_negative_prompt_with_no_negatives_is_unchanged():
+    positive, negative = _split_negative_prompt("a cat in a garden")
+    assert positive == "a cat in a garden"
+    assert negative == ""
+
+
+def test_resolve_effective_prompt_without_a_character():
+    effective_prompt, extra_negative = _resolve_effective_prompt("1girl, -blurry", None)
+    assert effective_prompt == "1girl"
+    assert extra_negative == "blurry"
+
+
+def test_resolve_effective_prompt_folds_in_the_active_character():
+    character = {"positive_prompt": "aria, red hair", "negative_prompt": "bad anatomy"}
+    effective_prompt, extra_negative = _resolve_effective_prompt("outdoors, -blurry", character)
+    assert effective_prompt == "aria, red hair, outdoors"
+    assert extra_negative == "bad anatomy, blurry"
 
 
 def test_post_process_keyboard_scopes_every_button_to_result_id():
