@@ -43,6 +43,7 @@ POSTPROCESS_KEYBOARD_LABELS = {"upscale": "🔍 Upscale 4x", "face": "✨ Face D
 ANALYZE_CALLBACK_KIND = "analyze"
 ANALYZE_ONLY_CALLBACK_KIND = "analyze_only"
 AGAIN_CALLBACK_PREFIX = "again:"
+GENERATE_FROM_PROMPT_CALLBACK_PREFIX = "genp:"
 
 CHARACTER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
@@ -100,6 +101,16 @@ def _again_keyboard(snapshot_id: str) -> InlineKeyboardMarkup:
     if a newer one has since happened in the same chat."""
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("🔁 Generate Again", callback_data=f"{AGAIN_CALLBACK_PREFIX}{snapshot_id}")]]
+    )
+
+
+def _generate_from_prompt_keyboard(prompt_id: str) -> InlineKeyboardMarkup:
+    """Attached to each of "🏷️ Analyze"'s two standalone prompt messages —
+    lets the user generate from *that specific* derived prompt (WD14 tags or
+    Qwen-VL caption) without retyping it. Scoped to `prompt_id` (see
+    storage.py's `derived_prompt`)."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🎨 Generate", callback_data=f"{GENERATE_FROM_PROMPT_CALLBACK_PREFIX}{prompt_id}")]]
     )
 
 
@@ -562,18 +573,22 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if kind == ANALYZE_ONLY_CALLBACK_KIND:
         status_message = await query.message.reply_text("Analyzing image…")
+        checkpoint = full_params.checkpoint
+        chat_id = pending["chat_id"]
 
-        async def _run_analyzer(label: str, awaitable: Awaitable[str]) -> str:
+        async def _run_analyzer(label: str, awaitable: Awaitable[str]) -> str | None:
             """Isolate one analyzer's failure (e.g. WD14 files not staged,
             Ollama unreachable) from the other, so a side-by-side comparison
-            still shows whichever one actually worked."""
+            still shows whichever one actually worked. None means it
+            failed — the caller skips the "🎨 Generate" button in that
+            case, since there's no usable prompt to generate from."""
             try:
                 return await awaitable
-            except Exception as exc:
+            except Exception:
                 logger.exception("%s analyzer failed", label)
-                return f"(failed: {exc})"
+                return None
 
-        async def _analyze_both() -> tuple[str, str]:
+        async def _analyze_both() -> tuple[str | None, str | None]:
             """Runs both analyzers regardless of the checkpoint's configured
             `prompt_style` — unlike Analyze & Regenerate below, which must
             commit to one prompt to actually generate from, this button is
@@ -591,7 +606,24 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         tags, caption = result
         await status_message.delete()
-        await query.message.reply_text(f"🏷️ WD14 tags:\n{tags}\n\n💬 Qwen-VL caption:\n{caption}")
+
+        async def _send_derived_prompt(label: str, prompt: str | None) -> None:
+            """One standalone message per analyzer, each with its own
+            "🎨 Generate" button scoped to that specific prompt (see
+            storage.py's `derived_prompt`) — not a shared button on a
+            combined message, since the two prompts are independent and the
+            user may only want to act on one of them."""
+            if prompt is None:
+                await query.message.reply_text(f"{label}: failed — see server log.")
+                return
+            prompt_id = uuid.uuid4().hex[:12]
+            storage.store_derived_prompt(prompt_id, chat_id, checkpoint, prompt)
+            await query.message.reply_text(
+                f"{label}:\n{prompt}", reply_markup=_generate_from_prompt_keyboard(prompt_id)
+            )
+
+        await _send_derived_prompt("🏷️ WD14 tags", tags)
+        await _send_derived_prompt("💬 Qwen-VL caption", caption)
         return
 
     if kind == ANALYZE_CALLBACK_KIND:
@@ -676,6 +708,48 @@ async def again_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "Generation",
         "repeat generation",
         repeat(client, full_params, on_progress=_make_progress_callback(status_message)),
+    )
+    if images is None:
+        return
+
+    await _deliver_generation_result(status_message, query.message, chat_id, storage, images)
+
+
+async def generate_from_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Backs the "🎨 Generate" button attached to one of "🏷️ Analyze"'s two
+    standalone prompt messages — generates from *that specific* derived
+    prompt (WD14 tags or Qwen-VL caption), scoped by the prompt_id embedded
+    in callback_data (see storage.py's `derived_prompt`). Uses the chat's
+    current `/settings` override for the checkpoint the source image was
+    generated with, same as Analyze & Regenerate, rather than any stale
+    params from that original generation."""
+    query = update.callback_query
+    settings: Settings = context.bot_data["settings"]
+    user_id = update.effective_user.id if update.effective_user else None
+    if await reject_if_unauthorized_callback(query, user_id, settings):
+        return
+
+    _, prompt_id = query.data.split(":", 1)
+    storage: Storage = context.bot_data["storage"]
+    stored = storage.get_derived_prompt(prompt_id)
+    if stored is None:
+        await query.answer("That prompt has expired — analyze the image again.", show_alert=True)
+        return
+
+    await query.answer()
+    chat_id = stored["chat_id"]
+    checkpoint = stored["checkpoint"]
+    client: ComfyClient = context.bot_data["comfy_client"]
+    profiles: list[ModelProfile] = context.bot_data["profiles"]
+    profile = resolve_profile(checkpoint, profiles)
+    profile = apply_profile_override(profile, checkpoint, storage.get_override(chat_id, checkpoint))
+
+    status_message = await query.message.reply_text("Generating… 0%")
+    images = await _run_reporting_errors(
+        status_message,
+        "Generation",
+        "generate-from-prompt",
+        generate(client, checkpoint, stored["prompt"], profile, on_progress=_make_progress_callback(status_message)),
     )
     if images is None:
         return

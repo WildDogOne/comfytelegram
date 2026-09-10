@@ -17,9 +17,10 @@ CLI at runtime.
 - **Post-processing, one tap away** — every generated image gets 🔍 Upscale
   (UltimateSDUpscale, 4x) and ✨ Face Detail (Impact Pack FaceDetailer)
   buttons, plus 🏷️ Analyze (run *both* the WD14 tagger and a Qwen-VL
-  caption, side by side, for comparison) and 🔬 Analyze & Regenerate
-  (the checkpoint's configured analyzer only, then generate from it) and a
-  🔁 Generate Again button on the whole batch.
+  caption, each sent as its own message with its own 🎨 Generate button, for
+  comparing them side by side) and 🔬 Analyze & Regenerate (the checkpoint's
+  configured analyzer only, then generate from it) and a 🔁 Generate Again
+  button on the whole batch.
 - **Image-to-prompt analysis** — 🔬 Analyze & Regenerate picks a single
   analyzer per checkpoint — a WD14 tagger (booru-tag checkpoints) or a
   Qwen-VL caption via a local Ollama server (natural-language checkpoints).
@@ -120,11 +121,13 @@ Every generated image comes with inline buttons:
   this specific image and send the result (itself with its own buttons, so
   passes can be chained).
 - **🏷️ Analyze** — analyze *this image* with **both** the WD14 tagger and a
-  Qwen-VL caption (regardless of the checkpoint's `prompt_style`) and reply
-  with both as plain text, labeled, for comparison — no generation.
+  Qwen-VL caption (regardless of the checkpoint's `prompt_style`), replying
+  with two separate messages — one per analyzer — each carrying its own
+  **🎨 Generate** button to start a fresh generation from exactly that
+  prompt, so you can compare them and pick one manually.
 - **🔬 Analyze & Regenerate** — analyze with whichever single analyzer the
   checkpoint's model profile configures, then generate a fresh image from
-  that derived prompt against the same checkpoint/settings.
+  that derived prompt automatically, against the same checkpoint/settings.
 - **🔁 Generate Again** (on the "Done" status message) — re-run the *whole*
   last batch with a fresh seed, for quickly building up more variations
   without retyping the prompt.

@@ -7,6 +7,7 @@ from comfytelegram.handlers import (
     _again_keyboard,
     _characters_keyboard,
     _extract_file_id,
+    _generate_from_prompt_keyboard,
     _post_process_keyboard,
     _run_reporting_errors,
 )
@@ -25,6 +26,12 @@ def test_again_keyboard_scopes_button_to_snapshot_id():
     keyboard = _again_keyboard("snap123")
     button = keyboard.inline_keyboard[0][0]
     assert button.callback_data == "again:snap123"
+
+
+def test_generate_from_prompt_keyboard_scopes_button_to_prompt_id():
+    keyboard = _generate_from_prompt_keyboard("prompt123")
+    button = keyboard.inline_keyboard[0][0]
+    assert button.callback_data == "genp:prompt123"
 
 
 def test_characters_keyboard_marks_active_character():

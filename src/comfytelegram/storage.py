@@ -2,12 +2,14 @@
 per-checkpoint profile-default overrides, the post-processing result
 registry (which image a "🔍 Upscale" button refers to), saved
 character designs (reusable prompt snippets the user can activate per
-chat instead of retyping a subject description every time), and the
+chat instead of retyping a subject description every time), the
 per-message generation-snapshot registry that backs each "🔁 Generate
 Again" button (keyed like `pending_result`, by an id embedded in that
 specific message's callback_data, not by chat_id — so an older message's
 button always repeats *its own* generation, not whatever the chat most
-recently generated).
+recently generated), and the derived-prompt registry that backs each
+"🎨 Generate" button under a "🏷️ Analyze" result (which specific analyzer
+output — WD14 tags or Qwen-VL caption — that button should generate from).
 
 That last one used to live only in an in-memory dict (`state.py`, now
 removed) with the reasoning "there's no point persisting raw image bytes
@@ -90,6 +92,14 @@ CREATE TABLE IF NOT EXISTS generation_snapshot (
     snapshot_id TEXT PRIMARY KEY,
     chat_id INTEGER NOT NULL,
     params_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS derived_prompt (
+    prompt_id TEXT PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    checkpoint TEXT NOT NULL,
+    prompt TEXT NOT NULL,
     created_at REAL NOT NULL
 );
 """
@@ -322,6 +332,31 @@ class Storage:
             return None
         chat_id, params_json = row
         return {"chat_id": chat_id, "params": json.loads(params_json)}
+
+    def store_derived_prompt(self, prompt_id: str, chat_id: int, checkpoint: str, prompt: str) -> None:
+        """Record one analyzer's output from the "🏷️ Analyze" button (WD14
+        tags or a Qwen-VL caption) so its own "🎨 Generate" button can start
+        a fresh generation from exactly that prompt later, keyed by an id
+        embedded in that button's callback_data — same per-message pattern
+        as `pending_result`/`generation_snapshot`."""
+        self._prune("derived_prompt")
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO derived_prompt (prompt_id, chat_id, checkpoint, prompt, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (prompt_id, chat_id, checkpoint, prompt, time.time()),
+            )
+
+    def get_derived_prompt(self, prompt_id: str) -> dict[str, Any] | None:
+        """The row `store_derived_prompt` wrote for `prompt_id`, or None if
+        it doesn't exist (never stored, or pruned past its TTL)."""
+        row = self._conn.execute(
+            "SELECT chat_id, checkpoint, prompt FROM derived_prompt WHERE prompt_id = ?", (prompt_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        chat_id, checkpoint, prompt = row
+        return {"chat_id": chat_id, "checkpoint": checkpoint, "prompt": prompt}
 
     def close(self) -> None:
         """Close the underlying sqlite connection."""
