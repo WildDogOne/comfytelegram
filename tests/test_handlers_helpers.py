@@ -68,6 +68,7 @@ def test_post_process_keyboard_scopes_every_button_to_result_id():
     assert "pp:hand:abc123" in callback_data
     assert "pp:analyze_only:abc123" in callback_data
     assert "pp:analyze:abc123" in callback_data
+    assert "pp:deep_analyze:abc123" in callback_data
 
 
 def test_again_keyboard_scopes_button_to_snapshot_id():

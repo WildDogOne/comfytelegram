@@ -40,7 +40,8 @@ async def test_photo_message_sends_both_derived_prompts_with_generate_buttons():
     with (
         patch("comfytelegram.handlers.analyze_tags", new=AsyncMock(return_value="1girl, outdoors")),
         patch(
-            "comfytelegram.handlers.analyze_caption", new=AsyncMock(return_value="a girl outside")
+            "comfytelegram.handlers.analyze_caption_deep",
+            new=AsyncMock(return_value="a girl outside"),
         ),
     ):
         await photo_message(update, context)
@@ -51,7 +52,7 @@ async def test_photo_message_sends_both_derived_prompts_with_generate_buttons():
 
     texts = [call.args[0] for call in message.reply_text.await_args_list]
     assert any(t.startswith("🏷️ WD14 tags:\n1girl, outdoors") for t in texts)
-    assert any(t.startswith("💬 Qwen-VL caption:\na girl outside") for t in texts)
+    assert any(t.startswith("💬 Qwen-VL caption (deep):\na girl outside") for t in texts)
 
 
 @pytest.mark.asyncio
@@ -65,7 +66,8 @@ async def test_photo_message_reports_one_analyzer_failing_without_blocking_the_o
     with (
         patch("comfytelegram.handlers.analyze_tags", new=_boom),
         patch(
-            "comfytelegram.handlers.analyze_caption", new=AsyncMock(return_value="a girl outside")
+            "comfytelegram.handlers.analyze_caption_deep",
+            new=AsyncMock(return_value="a girl outside"),
         ),
     ):
         await photo_message(update, context)
@@ -75,7 +77,7 @@ async def test_photo_message_reports_one_analyzer_failing_without_blocking_the_o
 
     texts = [call.args[0] for call in message.reply_text.await_args_list]
     assert any("🏷️ WD14 tags: failed" in t for t in texts)
-    assert any(t.startswith("💬 Qwen-VL caption:\na girl outside") for t in texts)
+    assert any(t.startswith("💬 Qwen-VL caption (deep):\na girl outside") for t in texts)
 
 
 @pytest.mark.asyncio

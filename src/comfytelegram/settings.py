@@ -36,6 +36,17 @@ class Settings(BaseSettings):
             "if the GPU running this has VRAM to spare."
         ),
     )
+    ollama_deep_vision_model: str = Field(
+        "qwen3.8:latest",
+        description=(
+            "Ollama model tag for deep image analysis — a bigger, slower vision model "
+            "than ollama_vision_model, for when the quick caption isn't detailed enough. "
+            "Used unconditionally for directly-uploaded photos (not on any interactive "
+            'generation path) and opt-in via the "🔎 Deep Analyze" button on the bot\'s '
+            "own generated images. Not part of generation's quick-model dispatch, so "
+            "it's fine for this to be too large to keep resident alongside a checkpoint."
+        ),
+    )
 
     wd14_model_repo: str = Field(
         "SmilingWolf/wd-vit-tagger-v3",

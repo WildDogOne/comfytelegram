@@ -9,7 +9,18 @@ Two independent analyzers, chosen per-checkpoint by a model profile's
 - "natural": Qwen-VL, called through a local Ollama server — for
   checkpoints (e.g. stock SDXL) that expect natural-language prompts.
 
-Both take raw image bytes and return a single string meant to be fed
+A third analyzer — `analyze_caption_deep` — runs a bigger, slower vision
+model (`Settings.ollama_deep_vision_model`) through the same Ollama server.
+It's not part of `analyze_image`'s `prompt_style` dispatch (which still
+picks between `analyze_tags`/`analyze_caption` for generation) and stays
+opt-in via the "🔎 Deep Analyze" button for the bot's own generated images
+(`handlers.postprocess_callback`'s `DEEP_ANALYZE_CALLBACK_KIND` branch),
+since those sit on an interactive path where the quick default's speed
+matters. Directly-uploaded photos (`handlers.photo_message`) aren't on that
+path, so they use it unconditionally instead of the quick model — see
+`handlers._analyze_both_deep`.
+
+Both/all take raw image bytes and return a single string meant to be fed
 straight into `generate()` as the new `user_prompt` — the checkpoint's
 profile still supplies its own quality-tag prefix/negative/LoRAs on top,
 exactly as it would for a normal typed prompt.
@@ -207,12 +218,13 @@ async def analyze_tags(image_bytes: bytes, settings: Settings) -> str:
     return await asyncio.to_thread(_run_wd14, image_bytes, settings)
 
 
-async def analyze_caption(image_bytes: bytes, settings: Settings) -> str:
-    """Caption the image via a local Ollama server running a vision-capable
-    model (Qwen-VL by default — see Settings.ollama_vision_model), for
-    checkpoints that expect natural-language prompts rather than tags."""
+async def _caption_via_ollama(image_bytes: bytes, model: str, settings: Settings) -> str:
+    """Caption the image via a local Ollama server running `model` — shared
+    by `analyze_caption` (the quick default) and `analyze_caption_deep` (the
+    opt-in "🔎 Deep Analyze" button's bigger, slower model); only the model
+    tag differs."""
     payload = {
-        "model": settings.ollama_vision_model,
+        "model": model,
         "messages": [
             {
                 "role": "user",
@@ -241,6 +253,26 @@ async def analyze_caption(image_bytes: bytes, settings: Settings) -> str:
         resp.raise_for_status()
         data = await resp.json()
     return data["message"]["content"].strip()
+
+
+async def analyze_caption(image_bytes: bytes, settings: Settings) -> str:
+    """Caption the image via a local Ollama server running a vision-capable
+    model (Qwen-VL by default — see Settings.ollama_vision_model), for
+    checkpoints that expect natural-language prompts rather than tags."""
+    return await _caption_via_ollama(image_bytes, settings.ollama_vision_model, settings)
+
+
+async def analyze_caption_deep(image_bytes: bytes, settings: Settings) -> str:
+    """Caption the image via Ollama running the bigger, slower model
+    configured at `Settings.ollama_deep_vision_model`, for when the quick
+    `analyze_caption` model's description isn't detailed enough. Not wired
+    into `analyze_image`'s `prompt_style` dispatch (generation always uses
+    the quick model). Used unconditionally for directly-uploaded photos
+    (`handlers.photo_message` isn't on an interactive generation path), and
+    opt-in via the "🔎 Deep Analyze" button for the bot's own generated
+    images (`handlers.postprocess_callback`'s `DEEP_ANALYZE_CALLBACK_KIND`
+    branch), where the quick default's speed matters more."""
+    return await _caption_via_ollama(image_bytes, settings.ollama_deep_vision_model, settings)
 
 
 async def analyze_image(image_bytes: bytes, style: Literal["tags", "natural"], settings: Settings) -> str:

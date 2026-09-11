@@ -26,7 +26,12 @@ from telegram import (
 )
 from telegram.ext import ContextTypes
 
-from comfytelegram.analysis import analyze_caption, analyze_image, analyze_tags
+from comfytelegram.analysis import (
+    analyze_caption,
+    analyze_caption_deep,
+    analyze_image,
+    analyze_tags,
+)
 from comfytelegram.auth import reject_if_unauthorized, reject_if_unauthorized_callback
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
 from comfytelegram.generation import GeneratedImage, generate, post_process, repeat
@@ -57,6 +62,7 @@ POSTPROCESS_STATUS_LABELS = {
 }
 ANALYZE_CALLBACK_KIND = "analyze"
 ANALYZE_ONLY_CALLBACK_KIND = "analyze_only"
+DEEP_ANALYZE_CALLBACK_KIND = "deep_analyze"
 AGAIN_CALLBACK_PREFIX = "again:"
 GENERATE_FROM_PROMPT_CALLBACK_PREFIX = "genp:"
 STREAM_CANCEL_CALLBACK_DATA = "stream:cancel"
@@ -113,7 +119,8 @@ _STREAMING_KEYBOARD = ReplyKeyboardMarkup([["/stop"]], resize_keyboard=True)
 def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
     """The keyboard attached to a generated/post-processed image: one
     button per `POSTPROCESS_KEYBOARD_LABELS` entry plus Analyze (prompt
-    only) and Analyze & Regenerate, all scoped to `result_id` (see
+    only), Analyze & Regenerate, and Deep Analyze (prompt only, via the
+    bigger `analyze_caption_deep` model), all scoped to `result_id` (see
     `storage.py`'s `pending_result`)."""
     return InlineKeyboardMarkup(
         [
@@ -129,6 +136,11 @@ def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
                     "🔬 Analyze & Regenerate",
                     callback_data=f"pp:{ANALYZE_CALLBACK_KIND}:{result_id}",
                 ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔎 Deep Analyze", callback_data=f"pp:{DEEP_ANALYZE_CALLBACK_KIND}:{result_id}"
+                )
             ],
         ]
     )
@@ -355,11 +367,30 @@ async def _analyze_both(source_bytes: bytes, settings: Settings) -> tuple[str | 
     """Run both analyzers regardless of any checkpoint's configured
     `prompt_style` — unlike Analyze & Regenerate, which must commit to one
     prompt to actually generate from, this is for comparing WD14 tags
-    against a Qwen-VL caption side by side. Shared by `postprocess_callback`
-    and `photo_message`."""
+    against a Qwen-VL caption side by side. Used by `postprocess_callback`'s
+    "🏷️ Analyze" branch (for the bot's own generated images, where the quick
+    model is the default and `DEEP_ANALYZE_CALLBACK_KIND` is an opt-in
+    extra) — `photo_message` uses `_analyze_both_deep` instead, see there
+    for why."""
     tags, caption = await asyncio.gather(
         _run_analyzer("WD14", analyze_tags(source_bytes, settings)),
         _run_analyzer("Qwen-VL", analyze_caption(source_bytes, settings)),
+    )
+    return tags, caption
+
+
+async def _analyze_both_deep(
+    source_bytes: bytes, settings: Settings
+) -> tuple[str | None, str | None]:
+    """Same WD14-tags/Qwen-VL-caption pairing as `_analyze_both`, but the
+    caption side always uses the bigger `analyze_caption_deep` model.
+    `photo_message`'s directly-uploaded photos aren't on the interactive
+    generation critical path the way a checkpoint pick or a "🔬 Analyze &
+    Regenerate" tap is, so there's no reason to default to the cheap model
+    there and make the user ask twice for the better one."""
+    tags, caption = await asyncio.gather(
+        _run_analyzer("WD14", analyze_tags(source_bytes, settings)),
+        _run_analyzer("Qwen-VL (deep)", analyze_caption_deep(source_bytes, settings)),
     )
     return tags, caption
 
@@ -780,13 +811,16 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Handle a directly-uploaded photo — as opposed to one of the bot's own
     generated images, which get analyzed via `_post_process_keyboard`'s
     "🏷️ Analyze" button instead — by running it through both analyzers and
-    replying with each, the same side-by-side WD14-tags/Qwen-VL-caption
-    treatment as `postprocess_callback`'s `ANALYZE_ONLY_CALLBACK_KIND`
-    branch, including a "🎨 Generate" button on each so the derived prompt
-    can be used right away. Resolves this chat's checkpoint the same way
-    `generate_message` does (falling back to ComfyUI's first available one)
-    only to scope that button's eventual profile/style — the analysis
-    itself doesn't depend on it."""
+    replying with each, including a "🎨 Generate" button on each so the
+    derived prompt can be used right away. The caption side always uses the
+    bigger `analyze_caption_deep` model (`_analyze_both_deep`, not the
+    `_analyze_both`/`ANALYZE_ONLY_CALLBACK_KIND` cheap default that
+    `postprocess_callback` uses for generated images) — an uploaded photo
+    isn't on any interactive generation critical path, so there's no reason
+    to default to the cheap model here. Resolves this chat's checkpoint the
+    same way `generate_message` does (falling back to ComfyUI's first
+    available one) only to scope that button's eventual profile/style — the
+    analysis itself doesn't depend on it."""
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
         return
@@ -805,7 +839,7 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     async def _download_and_analyze_both() -> tuple[str | None, str | None]:
         tg_file = await context.bot.get_file(message.photo[-1].file_id)
         source_bytes = bytes(await tg_file.download_as_bytearray())
-        return await _analyze_both(source_bytes, settings)
+        return await _analyze_both_deep(source_bytes, settings)
 
     result = await _run_reporting_errors(
         status_message, "Analysis", "uploaded-image analyze", _download_and_analyze_both()
@@ -816,7 +850,9 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await status_message.delete()
 
     await _send_derived_prompt(message, storage, chat_id, checkpoint, "🏷️ WD14 tags", tags)
-    await _send_derived_prompt(message, storage, chat_id, checkpoint, "💬 Qwen-VL caption", caption)
+    await _send_derived_prompt(
+        message, storage, chat_id, checkpoint, "💬 Qwen-VL caption (deep)", caption
+    )
 
 
 async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -907,6 +943,28 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         if images is None:
             return
         await _deliver_generation_result(status_message, query.message, chat_id, storage, images)
+        return
+
+    if kind == DEEP_ANALYZE_CALLBACK_KIND:
+        status_message = await query.message.reply_text("Deep analyzing image…")
+        checkpoint = full_params.checkpoint
+        chat_id = pending["chat_id"]
+
+        async def _download_and_analyze_deep() -> str:
+            tg_file = await context.bot.get_file(pending["file_id"])
+            source_bytes = bytes(await tg_file.download_as_bytearray())
+            return await analyze_caption_deep(source_bytes, settings)
+
+        caption = await _run_reporting_errors(
+            status_message, "Deep analysis", "deep-analyze", _download_and_analyze_deep()
+        )
+        if caption is None:
+            return
+        await status_message.delete()
+
+        await _send_derived_prompt(
+            query.message, storage, chat_id, checkpoint, "🔎 Deep caption", caption
+        )
         return
 
     label = POSTPROCESS_STATUS_LABELS.get(kind, kind.title())
