@@ -17,7 +17,10 @@ CLI at runtime.
 - **Switchable models with smart defaults** — `/model` lists checkpoints
   ComfyUI has installed; each can have a matching *model profile* (cfg,
   steps, sampler, clip skip, prompt prefixes, default LoRAs) applied
-  automatically. See [`model_profiles/`](model_profiles/).
+  automatically. Most checkpoints are a single file loaded the normal way,
+  but split-file architectures (separate UNET/text-encoder/VAE, e.g. Anima)
+  are supported too via a profile's `loader: "split"` — see
+  [`model_profiles/`](model_profiles/).
 - **Post-processing, one tap away** — every generated image gets 🔍 Upscale
   (UltimateSDUpscale, 4x), ✨ Face Detail, and 🖐️ Hand Detail buttons (the
   latter two both Impact Pack's `FaceDetailer` node — it's a generic
@@ -233,7 +236,11 @@ shared singletons (`Settings`, `ComfyClient`, loaded `ModelProfile`s,
   bbox-detector model gets wired in). Post-processing graphs are freshly
   submitted (`LoadImage` from an uploaded source) rather than chained onto
   the original sampler run, so any single image from a batch can be picked
-  for refinement independent of seed/batch state.
+  for refinement independent of seed/batch state. The checkpoint/clip/vae
+  wiring these all share (`_build_model_clip_vae`) branches on a profile's
+  `loader` field: `"checkpoint"` (the default, single `CheckpointLoaderSimple`
+  node) or `"split"`, for architectures shipped as separate UNET/text-encoder/
+  VAE files (currently Anima) — see [`model_profiles/`](model_profiles/).
 - **`profiles/`** — the `ModelProfile` pydantic schema plus a loader that
   glob-matches a checkpoint filename against every `*.json` in
   `model_profiles/` and layers profile defaults → user prompt → any

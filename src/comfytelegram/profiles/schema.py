@@ -84,3 +84,30 @@ class ModelProfile(BaseModel):
             "'natural' for checkpoints that expect prose-style prompts (Qwen-VL captioning)."
         ),
     )
+
+    loader: Literal["checkpoint", "split"] = Field(
+        "checkpoint",
+        description=(
+            "'checkpoint' (the default) loads a single-file model through "
+            "CheckpointLoaderSimple, matched by 'match' the normal way. 'split' is for "
+            "architectures shipped as separate UNET/text-encoder/VAE files — e.g. Anima, "
+            "loaded through UNETLoader+CLIPLoader+VAELoader instead — where 'match' targets "
+            "the UNET filename and clip_name/vae_name/model_sampling_shift below supply the "
+            "rest of the graph."
+        ),
+    )
+    clip_name: str = Field(
+        "", description="loader='split' only: CLIPLoader's text-encoder filename"
+    )
+    clip_type: str = Field(
+        "stable_diffusion", description="loader='split' only: CLIPLoader's `type` input"
+    )
+    vae_name: str = Field("", description="loader='split' only: VAELoader's filename")
+    model_sampling_shift: float | None = Field(
+        None,
+        description=(
+            "loader='split' only: shift for a ModelSamplingAuraFlow node inserted after "
+            "the UNET load (Anima's AuraFlow-style sampling). Leave unset for split "
+            "architectures that don't need it."
+        ),
+    )

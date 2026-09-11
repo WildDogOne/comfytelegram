@@ -235,6 +235,11 @@ def _serialize_generation_params(params: GenerationParams) -> dict[str, Any]:
             }
             for lora in params.loras
         ],
+        "loader": params.loader,
+        "clip_name": params.clip_name,
+        "clip_type": params.clip_type,
+        "vae_name": params.vae_name,
+        "model_sampling_shift": params.model_sampling_shift,
     }
 
 
@@ -257,6 +262,11 @@ def _deserialize_generation_params(data: dict[str, Any]) -> GenerationParams:
         batch_size=data.get("batch_size", 1),
         clip_skip=data.get("clip_skip", -1),
         loras=[LoraSpec(**lora) for lora in data.get("loras", [])],
+        loader=data.get("loader", "checkpoint"),
+        clip_name=data.get("clip_name", ""),
+        clip_type=data.get("clip_type", "stable_diffusion"),
+        vae_name=data.get("vae_name", ""),
+        model_sampling_shift=data.get("model_sampling_shift"),
     )
 
 

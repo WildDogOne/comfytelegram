@@ -73,6 +73,62 @@ def test_build_txt2img_with_loras_and_clip_skip_chains_correctly():
         assert node["inputs"]["clip"] == [clip_skip_id, 0]
 
 
+def test_build_txt2img_split_loader_wires_unet_clip_vae_and_sampling_shift():
+    params = GenerationParams(
+        checkpoint="anima-aesthetic-v1.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+        loader="split",
+        clip_name="qwen_3_06b_base.safetensors",
+        clip_type="stable_diffusion",
+        vae_name="qwen_image_vae.safetensors",
+        model_sampling_shift=3.0,
+    )
+    prompt, save_id = build_txt2img(params)
+
+    types = _class_types(prompt)
+    assert "CheckpointLoaderSimple" not in types
+    assert types.count("UNETLoader") == 1
+    assert types.count("CLIPLoader") == 1
+    assert types.count("VAELoader") == 1
+    assert types.count("ModelSamplingAuraFlow") == 1
+
+    unet = next(n for n in prompt.values() if n["class_type"] == "UNETLoader")
+    assert unet["inputs"]["unet_name"] == "anima-aesthetic-v1.safetensors"
+
+    clip = next(n for n in prompt.values() if n["class_type"] == "CLIPLoader")
+    assert clip["inputs"]["clip_name"] == "qwen_3_06b_base.safetensors"
+    assert clip["inputs"]["type"] == "stable_diffusion"
+
+    vae = next(n for n in prompt.values() if n["class_type"] == "VAELoader")
+    assert vae["inputs"]["vae_name"] == "qwen_image_vae.safetensors"
+
+    unet_id = next(nid for nid, n in prompt.items() if n["class_type"] == "UNETLoader")
+    sampling = next(n for n in prompt.values() if n["class_type"] == "ModelSamplingAuraFlow")
+    assert sampling["inputs"]["model"] == [unet_id, 0]
+    assert sampling["inputs"]["shift"] == 3.0
+
+    sampling_id = next(
+        nid for nid, n in prompt.items() if n["class_type"] == "ModelSamplingAuraFlow"
+    )
+    ksampler = next(n for n in prompt.values() if n["class_type"] == "KSampler")
+    assert ksampler["inputs"]["model"] == [sampling_id, 0]
+    assert prompt[save_id]["class_type"] == "SaveImage"
+
+
+def test_build_txt2img_split_loader_without_shift_skips_sampling_node():
+    params = GenerationParams(
+        checkpoint="anima-aesthetic-v1.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+        loader="split",
+        clip_name="qwen_3_06b_base.safetensors",
+        vae_name="qwen_image_vae.safetensors",
+    )
+    prompt, _save_id = build_txt2img(params)
+    assert "ModelSamplingAuraFlow" not in _class_types(prompt)
+
+
 def test_resolved_seed_is_random_when_unset():
     params = GenerationParams(checkpoint="x.safetensors", positive_prompt="p", negative_prompt="n")
     seed_a = params.resolved_seed()

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 NodeRef = tuple[str, int]
 
@@ -90,6 +90,21 @@ class GenerationParams:
     clip_skip: int = -1
     loras: list[LoraSpec] = field(default_factory=list)
     filename_prefix: str = "comfytelegram"
+    #: "checkpoint" (default) loads `checkpoint` through a single
+    #: `CheckpointLoaderSimple` node. "split" instead loads `checkpoint` as
+    #: a `UNETLoader` filename plus `clip_name`/`vae_name` through their own
+    #: loader nodes — the architecture models like Anima ship as (see
+    #: `ModelProfile.loader` for where this gets set from a profile).
+    loader: Literal["checkpoint", "split"] = "checkpoint"
+    #: split-loader only: `CLIPLoader`'s filename and `type` value.
+    clip_name: str = ""
+    clip_type: str = "stable_diffusion"
+    #: split-loader only: `VAELoader`'s filename.
+    vae_name: str = ""
+    #: split-loader only: shift for a `ModelSamplingAuraFlow` node inserted
+    #: after the UNET load (Anima's AuraFlow-style sampling); `None` skips
+    #: that node entirely for split architectures that don't need it.
+    model_sampling_shift: float | None = None
 
     def resolved_seed(self) -> int:
         """This request's seed, or a freshly-rolled random one if unset."""
@@ -177,6 +192,11 @@ class PostProcessBaseParams:
     negative_prompt: str
     loras: list[LoraSpec] = field(default_factory=list)
     clip_skip: int = -1
+    loader: Literal["checkpoint", "split"] = "checkpoint"
+    clip_name: str = ""
+    clip_type: str = "stable_diffusion"
+    vae_name: str = ""
+    model_sampling_shift: float | None = None
 
 
 def _build_model_clip_vae(
@@ -184,14 +204,37 @@ def _build_model_clip_vae(
 ) -> tuple[NodeRef, NodeRef, NodeRef, str, str]:
     """Shared checkpoint+LoRA+clip-skip+prompt wiring, used by `build_txt2img`
     and both post-processing graph builders below — `GenerationParams` and
-    `PostProcessBaseParams` both carry the five fields this needs.
+    `PostProcessBaseParams` both carry the fields this needs.
+
+    `base.loader == "checkpoint"` (the default) loads everything through one
+    `CheckpointLoaderSimple` node. `"split"` instead loads `base.checkpoint`
+    as a `UNETLoader` filename plus `base.clip_name`/`base.vae_name` through
+    their own loader nodes, then wraps the model in a `ModelSamplingAuraFlow`
+    node if `base.model_sampling_shift` is set — the shape Anima-family
+    models need (see `ModelProfile.loader`'s docstring for why).
 
     Returns (model_ref, clip_ref, vae_ref, positive_node_id, negative_node_id).
     """
-    ckpt = g.add("CheckpointLoaderSimple", {"ckpt_name": base.checkpoint}, title="Checkpoint")
-    model_ref: NodeRef = (ckpt, 0)
-    clip_ref: NodeRef = (ckpt, 1)
-    vae_ref: NodeRef = (ckpt, 2)
+    if base.loader == "split":
+        unet = g.add(
+            "UNETLoader",
+            {"unet_name": base.checkpoint, "weight_dtype": "default"},
+            title="UNET",
+        )
+        model_ref: NodeRef = (unet, 0)
+        clip = g.add(
+            "CLIPLoader",
+            {"clip_name": base.clip_name, "type": base.clip_type, "device": "default"},
+            title="Text Encoder",
+        )
+        clip_ref: NodeRef = (clip, 0)
+        vae = g.add("VAELoader", {"vae_name": base.vae_name}, title="VAE")
+        vae_ref: NodeRef = (vae, 0)
+    else:
+        ckpt = g.add("CheckpointLoaderSimple", {"ckpt_name": base.checkpoint}, title="Checkpoint")
+        model_ref = (ckpt, 0)
+        clip_ref = (ckpt, 1)
+        vae_ref = (ckpt, 2)
 
     model_ref, clip_ref = _apply_loras(g, model_ref, clip_ref, base.loras)
 
@@ -202,6 +245,14 @@ def _build_model_clip_vae(
             title="Clip Skip",
         )
         clip_ref = (clip_skip_node, 0)
+
+    if base.loader == "split" and base.model_sampling_shift is not None:
+        sampling_node = g.add(
+            "ModelSamplingAuraFlow",
+            {"model": list(model_ref), "shift": base.model_sampling_shift},
+            title="Model Sampling (AuraFlow)",
+        )
+        model_ref = (sampling_node, 0)
 
     positive = g.add(
         "CLIPTextEncode",

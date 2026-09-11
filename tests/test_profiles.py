@@ -28,6 +28,8 @@ def test_all_shipped_profiles_load(profiles):
         "SDXL Base",
         "Pony Diffusion XL",
         "Animagine XL",
+        "Anima Aesthetic",
+        "Anima Turbo",
     }
 
 
@@ -97,6 +99,32 @@ def test_resolve_generation_params_without_profile_uses_raw_prompt():
     assert params.positive_prompt == "a fox"
     assert params.negative_prompt == ""
     assert params.loras == []
+
+
+def test_resolve_generation_params_defaults_to_checkpoint_loader_without_profile():
+    params = resolve_generation_params("unknown.safetensors", "a fox", None)
+    assert params.loader == "checkpoint"
+    assert params.clip_name == ""
+    assert params.vae_name == ""
+    assert params.model_sampling_shift is None
+
+
+def test_resolve_generation_params_carries_split_loader_fields_from_profile():
+    profile = ModelProfile(
+        match=["anima*"],
+        display_name="Anima Test",
+        loader="split",
+        clip_name="qwen_3_06b_base.safetensors",
+        clip_type="stable_diffusion",
+        vae_name="qwen_image_vae.safetensors",
+        model_sampling_shift=3.0,
+    )
+    params = resolve_generation_params("anima-aesthetic-v1.safetensors", "a fox", profile)
+    assert params.loader == "split"
+    assert params.clip_name == "qwen_3_06b_base.safetensors"
+    assert params.clip_type == "stable_diffusion"
+    assert params.vae_name == "qwen_image_vae.safetensors"
+    assert params.model_sampling_shift == 3.0
 
 
 def test_resolve_generation_params_appends_extra_negative():

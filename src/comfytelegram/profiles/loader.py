@@ -108,11 +108,23 @@ def resolve_generation_params(
         negative_prompt = profile.negative_prompt_prefix
         loras = [lora.to_spec() for lora in profile.loras if lora.default_enabled]
         field_defaults = profile.defaults.model_dump(exclude_none=True)
+        # Architecture facts about the checkpoint, not a tunable generation
+        # default — same reasoning as PROMPT_OVERRIDE_FIELDS living outside
+        # `.defaults` — so these come straight off the profile rather than
+        # through `field_defaults`/ProfileDefaults.
+        architecture_fields: dict[str, Any] = {
+            "loader": profile.loader,
+            "clip_name": profile.clip_name,
+            "clip_type": profile.clip_type,
+            "vae_name": profile.vae_name,
+            "model_sampling_shift": profile.model_sampling_shift,
+        }
     else:
         positive_prompt = user_prompt
         negative_prompt = ""
         loras = []
         field_defaults = {}
+        architecture_fields = {}
 
     negative_prompt = join_nonempty([negative_prompt, extra_negative_prompt])
 
@@ -121,6 +133,7 @@ def resolve_generation_params(
         "positive_prompt": positive_prompt,
         "negative_prompt": negative_prompt,
         "loras": loras,
+        **architecture_fields,
         **field_defaults,
     }
     kwargs.update(overrides)

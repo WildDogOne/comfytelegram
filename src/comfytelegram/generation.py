@@ -49,13 +49,22 @@ class GeneratedImage:
 
 def _to_post_process_base(params: GenerationParams) -> PostProcessBaseParams:
     """Narrow a full `GenerationParams` down to the checkpoint/prompt/LoRA/
-    clip-skip subset `build_upscale`/`build_face_detailer` need."""
+    clip-skip/loader subset `build_upscale`/`build_face_detailer`/
+    `build_hand_detailer` need. Carrying the loader fields through matters
+    for split-architecture checkpoints (e.g. Anima) — without them a
+    post-processing pass would default back to `loader="checkpoint"` and
+    try to load the UNET filename through `CheckpointLoaderSimple`."""
     return PostProcessBaseParams(
         checkpoint=params.checkpoint,
         positive_prompt=params.positive_prompt,
         negative_prompt=params.negative_prompt,
         loras=params.loras,
         clip_skip=params.clip_skip,
+        loader=params.loader,
+        clip_name=params.clip_name,
+        clip_type=params.clip_type,
+        vae_name=params.vae_name,
+        model_sampling_shift=params.model_sampling_shift,
     )
 
 

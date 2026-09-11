@@ -67,6 +67,30 @@ def test_to_post_process_base_carries_only_the_relevant_fields():
     assert not hasattr(base, "cfg")
 
 
+def test_to_post_process_base_carries_split_loader_fields():
+    """Without this, a post-processing pass on a split-architecture (e.g.
+    Anima) generation would silently fall back to loader="checkpoint" and
+    try to load the UNET filename through CheckpointLoaderSimple."""
+    params = GenerationParams(
+        checkpoint="anima-aesthetic-v1.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+        loader="split",
+        clip_name="qwen_3_06b_base.safetensors",
+        clip_type="stable_diffusion",
+        vae_name="qwen_image_vae.safetensors",
+        model_sampling_shift=3.0,
+    )
+
+    base = _to_post_process_base(params)
+
+    assert base.loader == "split"
+    assert base.clip_name == "qwen_3_06b_base.safetensors"
+    assert base.clip_type == "stable_diffusion"
+    assert base.vae_name == "qwen_image_vae.safetensors"
+    assert base.model_sampling_shift == 3.0
+
+
 @pytest.mark.asyncio
 async def test_generate_overrides_force_batch_size_regardless_of_profile_default():
     """ "/stream" passes `overrides={"batch_size": 1}` to force single-image

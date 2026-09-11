@@ -87,10 +87,15 @@ class ComfyClient:
             return data[class_type]
 
     async def list_checkpoints(self) -> list[str]:
-        """Checkpoint filenames ComfyUI has installed (from
-        `CheckpointLoaderSimple`'s `ckpt_name` enum)."""
-        info = await self.get_node_info("CheckpointLoaderSimple")
-        return _enum_choices(info, "ckpt_name")
+        """Checkpoint filenames ComfyUI has installed: single-file
+        checkpoints (`CheckpointLoaderSimple`'s `ckpt_name` enum) plus
+        split-loader UNET files (`UNETLoader`'s `unet_name` enum — the
+        architecture models like Anima ship as; see `ModelProfile.loader`).
+        Both are offered from the same `/model` list; which loader a given
+        entry actually needs is decided later by profile resolution."""
+        ckpt_info = await self.get_node_info("CheckpointLoaderSimple")
+        unet_info = await self.get_node_info("UNETLoader")
+        return _enum_choices(ckpt_info, "ckpt_name") + _enum_choices(unet_info, "unet_name")
 
     async def list_loras(self) -> list[str]:
         """LoRA filenames ComfyUI has installed (from `LoraLoader`'s
