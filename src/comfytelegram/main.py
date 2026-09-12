@@ -97,6 +97,7 @@ def build_application(settings: Settings) -> Application:
         .token(settings.telegram_bot_token)
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
+        .concurrent_updates(True)
         .build()
     )
     application.bot_data["settings"] = settings
