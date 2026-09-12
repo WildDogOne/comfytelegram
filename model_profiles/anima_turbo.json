@@ -1,0 +1,22 @@
+{
+  "match": ["anima*turbo*"],
+  "display_name": "Anima Turbo",
+  "description": "Anima's distilled few-step checkpoint — same split UNET/CLIP/VAE loading as Anima Aesthetic (see anima_aesthetic.json), but tuned for CFG 1 and ~8-12 steps. Slightly behind Anima Aesthetic in quality but much faster. clip_name/vae_name below are already verified present on this install; 'match' won't hit anything until an anima*turbo* UNET file is staged under models/diffusion_models/ — rename this profile's match or the staged file so they agree once you add it.",
+  "loader": "split",
+  "clip_name": "qwen_3_06b_base.safetensors",
+  "clip_type": "stable_diffusion",
+  "vae_name": "qwen_image_vae.safetensors",
+  "model_sampling_shift": 3.0,
+  "defaults": {
+    "cfg": 1.0,
+    "steps": 10,
+    "sampler_name": "er_sde",
+    "scheduler": "simple",
+    "width": 1024,
+    "height": 1280
+  },
+  "prompt_style": "tags",
+  "positive_prompt_prefix": "masterpiece, best quality",
+  "negative_prompt_prefix": "worst quality, low quality",
+  "loras": []
+}
