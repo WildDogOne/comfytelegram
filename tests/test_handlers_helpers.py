@@ -78,9 +78,23 @@ def test_again_keyboard_scopes_button_to_snapshot_id():
 
 
 def test_generate_from_prompt_keyboard_scopes_button_to_prompt_id():
-    keyboard = _generate_from_prompt_keyboard("prompt123")
-    button = keyboard.inline_keyboard[0][0]
-    assert button.callback_data == "genp:prompt123"
+    keyboard = _generate_from_prompt_keyboard("prompt123", "1girl, outdoors")
+    generate_button, copy_button = keyboard.inline_keyboard[0]
+    assert generate_button.callback_data == "genp:prompt123"
+    assert copy_button.copy_text.text == "1girl, outdoors"
+
+
+def test_generate_from_prompt_keyboard_omits_copy_button_past_telegram_limit():
+    keyboard = _generate_from_prompt_keyboard("prompt123", "x" * 257)
+    (row,) = keyboard.inline_keyboard
+    assert len(row) == 1
+    assert row[0].callback_data == "genp:prompt123"
+
+
+def test_generate_from_prompt_keyboard_includes_copy_button_at_telegram_limit():
+    keyboard = _generate_from_prompt_keyboard("prompt123", "x" * 256)
+    _generate_button, copy_button = keyboard.inline_keyboard[0]
+    assert copy_button.copy_text.text == "x" * 256
 
 
 def test_characters_keyboard_marks_active_character():

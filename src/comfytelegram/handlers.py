@@ -18,12 +18,14 @@ from collections.abc import Awaitable
 from typing import Any, TypeVar
 
 from telegram import (
+    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
     ReplyKeyboardMarkup,
     Update,
 )
+from telegram.constants import InlineKeyboardButtonLimit
 from telegram.ext import ContextTypes
 
 from comfytelegram.analysis import (
@@ -174,21 +176,29 @@ def _stream_prompt_cancel_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _generate_from_prompt_keyboard(prompt_id: str) -> InlineKeyboardMarkup:
-    """Attached to each of "🏷️ Analyze"'s two standalone prompt messages —
-    lets the user generate from *that specific* derived prompt (WD14 tags or
-    Qwen-VL caption) without retyping it. Scoped to `prompt_id` (see
-    storage.py's `derived_prompt`)."""
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "🎨 Generate",
-                    callback_data=f"{GENERATE_FROM_PROMPT_CALLBACK_PREFIX}{prompt_id}",
-                )
-            ]
-        ]
-    )
+def _generate_from_prompt_keyboard(prompt_id: str, prompt: str) -> InlineKeyboardMarkup:
+    """Attached to each of "🏷️ Analyze"'s standalone prompt messages: a
+    "🎨 Generate" button that generates from *that specific* derived prompt
+    (WD14 tags or a Qwen-VL caption) without retyping it, scoped to
+    `prompt_id` (see storage.py's `derived_prompt`), plus — only when the
+    prompt fits — a "📋 Copy" button (Telegram's native copy-to-clipboard
+    `CopyTextButton`, no callback round-trip needed) for pasting the raw
+    prompt text elsewhere. Telegram hard-caps `copy_text` at
+    `MAX_COPY_TEXT` (256 chars) with no partial-copy fallback, and a WD14
+    tag list or a deep caption routinely runs past that — silently copying
+    a truncated prefix would hand back a *wrong*, not just shorter, prompt,
+    so the button is omitted entirely rather than lie about what got
+    copied. The full prompt is still visible in the message text (Telegram
+    lets you select/copy that manually) and reusable in full via "🎨
+    Generate" (through `derived_prompt`, no length limit)."""
+    buttons = [
+        InlineKeyboardButton(
+            "🎨 Generate", callback_data=f"{GENERATE_FROM_PROMPT_CALLBACK_PREFIX}{prompt_id}"
+        )
+    ]
+    if len(prompt) <= InlineKeyboardButtonLimit.MAX_COPY_TEXT:
+        buttons.append(InlineKeyboardButton("📋 Copy", copy_text=CopyTextButton(prompt)))
+    return InlineKeyboardMarkup([buttons])
 
 
 async def _send_result_image(
@@ -403,8 +413,8 @@ async def _send_derived_prompt(
     label: str,
     prompt: str | None,
 ) -> None:
-    """One standalone message per analyzer, each with its own "🎨 Generate"
-    button scoped to that specific prompt (see storage.py's
+    """One standalone message per analyzer, each with its own "🎨 Generate"/
+    "📋 Copy" buttons scoped to that specific prompt (see storage.py's
     `derived_prompt`) — not a shared button on a combined message, since
     the two prompts are independent and the user may only want to act on
     one of them. Shared by `postprocess_callback` and `photo_message`."""
@@ -414,7 +424,7 @@ async def _send_derived_prompt(
     prompt_id = uuid.uuid4().hex[:12]
     storage.store_derived_prompt(prompt_id, chat_id, checkpoint, prompt)
     await reply_target.reply_text(
-        f"{label}:\n{prompt}", reply_markup=_generate_from_prompt_keyboard(prompt_id)
+        f"{label}:\n{prompt}", reply_markup=_generate_from_prompt_keyboard(prompt_id, prompt)
     )
 
 
