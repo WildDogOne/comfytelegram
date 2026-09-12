@@ -47,6 +47,26 @@ def test_split_negative_prompt_with_no_negatives_is_unchanged():
     assert negative == ""
 
 
+def test_split_negative_prompt_handles_a_dash_block_separator():
+    positive, negative = _split_negative_prompt(
+        "1girl, outdoors\n---\nblurry, watermark, bad anatomy"
+    )
+    assert positive == "1girl, outdoors"
+    assert negative == "blurry, watermark, bad anatomy"
+
+
+def test_split_negative_prompt_block_separator_normalizes_newline_separated_tags():
+    positive, negative = _split_negative_prompt("1girl\noutdoors\n---\nblurry\nwatermark")
+    assert positive == "1girl, outdoors"
+    assert negative == "blurry, watermark"
+
+
+def test_split_negative_prompt_block_separator_ignores_mid_word_hyphens():
+    positive, negative = _split_negative_prompt("a well-lit room\n---\nblurry")
+    assert positive == "a well-lit room"
+    assert negative == "blurry"
+
+
 def test_resolve_effective_prompt_without_a_character():
     effective_prompt, extra_negative = _resolve_effective_prompt("1girl, -blurry", None)
     assert effective_prompt == "1girl"

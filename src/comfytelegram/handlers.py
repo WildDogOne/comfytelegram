@@ -720,13 +720,37 @@ async def _resolve_checkpoint_or_default(
 #: space-separated ("a cat -blurry -watermark") prompts work the same way.
 _NEGATIVE_TOKEN_RE = re.compile(r"(?<![^\s,])-([^\s,]+)")
 
+#: A line of 3+ dashes on its own (whitespace either side ignored) splits a
+#: prompt message into a positive block above and a negative block below —
+#: an alternative to prefixing every single negative tag with "-", which
+#: gets tedious for a whole block of them. Requires the dashes to have the
+#: line to themselves so it can't misfire on a mid-word hyphen or an
+#: em/en-dash used as punctuation.
+_NEGATIVE_BLOCK_SEP_RE = re.compile(r"^[ \t]*-{3,}[ \t]*$", re.MULTILINE)
+
+
+def _normalize_prompt_block(text: str) -> str:
+    """Turn one side of a `_NEGATIVE_BLOCK_SEP_RE`-split prompt — tags spread
+    across commas, newlines, or both — into a single comma-joined string."""
+    parts = [part.strip() for part in re.split(r"[,\n]", text)]
+    return join_nonempty(parts)
+
 
 def _split_negative_prompt(text: str) -> tuple[str, str]:
-    """Pull "-token" negatives out of a raw user prompt (see
-    `_NEGATIVE_TOKEN_RE`), returning `(positive, negative)`. Used so a
-    message like "1girl, outdoors, -blurry, -watermark" generates with
-    "blurry, watermark" appended to the negative prompt instead of ending up
-    literally in the positive one."""
+    """Split a raw prompt message into `(positive, negative)`. A "---" line
+    (see `_NEGATIVE_BLOCK_SEP_RE`) takes priority — everything above it is
+    positive, everything below is negative, letting a whole block of
+    negative tags be written plainly instead of "-prefixed" one by one.
+    Without one, falls back to pulling out individual "-token" negatives
+    (see `_NEGATIVE_TOKEN_RE`), so "1girl, outdoors, -blurry, -watermark"
+    still generates with "blurry, watermark" appended to the negative
+    prompt instead of ending up literally in the positive one."""
+    block_match = _NEGATIVE_BLOCK_SEP_RE.search(text)
+    if block_match:
+        positive = _normalize_prompt_block(text[: block_match.start()])
+        negative = _normalize_prompt_block(text[block_match.end() :])
+        return positive, negative
+
     negatives = [match.group(1) for match in _NEGATIVE_TOKEN_RE.finditer(text)]
     remainder = _NEGATIVE_TOKEN_RE.sub("", text)
     positive_parts = [part.strip() for part in remainder.split(",")]
@@ -739,8 +763,9 @@ def _resolve_effective_prompt(
     prompt_text: str, character: dict[str, str] | None
 ) -> tuple[str, str]:
     """Combine a raw prompt message with the active character (if any) into
-    `(effective_prompt, extra_negative_prompt)` for `generate()`: splits off
-    any "-token" negatives (see `_split_negative_prompt`), folds the
+    `(effective_prompt, extra_negative_prompt)` for `generate()`: splits the
+    message into positive/negative (a "---" block separator, or else
+    "-token" negatives — see `_split_negative_prompt`), folds the
     character's own saved positive/negative prompt in around them, and
     leaves profile-level negative defaults for `generate()`/`resolve_generation_params`
     to layer underneath."""
