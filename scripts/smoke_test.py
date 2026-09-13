@@ -63,15 +63,16 @@ async def main() -> None:
 
         t0 = time.monotonic()
         client_id = "smoke-test"
-        prompt_id = await client.queue_prompt(prompt_graph, client_id=client_id)
-        print(f"Queued prompt_id={prompt_id}")
+        async with client.connect_events(client_id=client_id) as events:
+            prompt_id = await client.queue_prompt(prompt_graph, client_id=client_id)
+            print(f"Queued prompt_id={prompt_id}")
 
-        async for progress in client.watch(prompt_id, client_id=client_id):
-            if progress.done:
-                print(f"Done in {time.monotonic() - t0:.1f}s")
-                break
-            if progress.value is not None:
-                print(f"  node={progress.node_id} step {progress.value}/{progress.max}")
+            async for progress in events.watch(prompt_id):
+                if progress.done:
+                    print(f"Done in {time.monotonic() - t0:.1f}s")
+                    break
+                if progress.value is not None:
+                    print(f"  node={progress.node_id} step {progress.value}/{progress.max}")
 
         history = await client.get_history(prompt_id)
         if history is None:

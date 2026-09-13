@@ -1,3 +1,4 @@
+import sqlite3
 import time
 from pathlib import Path
 
@@ -25,6 +26,24 @@ def test_derived_prompt_roundtrip(storage: Storage):
     assert result["prompt"] == "fox, forest, solo"
 
 
+def test_derived_prompt_stores_negative_prompt(storage: Storage):
+    storage.store_derived_prompt(
+        "abc123", 42, "ckpt.safetensors", "fox, forest, solo", "blurry, watermark"
+    )
+
+    result = storage.get_derived_prompt("abc123")
+    assert result is not None
+    assert result["negative_prompt"] == "blurry, watermark"
+
+
+def test_derived_prompt_defaults_to_empty_negative_prompt(storage: Storage):
+    storage.store_derived_prompt("abc123", 42, "ckpt.safetensors", "fox, forest, solo")
+
+    result = storage.get_derived_prompt("abc123")
+    assert result is not None
+    assert result["negative_prompt"] == ""
+
+
 def test_derived_prompt_scoped_per_message_not_chat(storage: Storage):
     """The "🏷️ Analyze" button writes two rows per tap (WD14 tags and a
     Qwen-VL caption) — each must stay independently addressable by its own
@@ -47,6 +66,40 @@ def test_derived_prompt_survives_reopen(tmp_path: Path):
     assert result is not None
     assert result["prompt"] == "fox, forest, solo"
     s2.close()
+
+
+def test_storage_adds_negative_prompt_column_to_a_pre_existing_table(tmp_path: Path):
+    """A real deployed state.sqlite3 predating this column would otherwise
+    hit "table derived_prompt has no column named negative_prompt" on the
+    very first store — see `Storage._add_column_if_missing`."""
+    db_path = tmp_path / "state.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE derived_prompt (
+            prompt_id TEXT PRIMARY KEY,
+            chat_id INTEGER NOT NULL,
+            checkpoint TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            created_at REAL NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO derived_prompt (prompt_id, chat_id, checkpoint, prompt, created_at) "
+        "VALUES ('old', 1, 'ckpt.safetensors', 'fox', ?)",
+        (time.time(),),
+    )
+    conn.commit()
+    conn.close()
+
+    storage = Storage(db_path)
+    try:
+        assert storage.get_derived_prompt("old")["negative_prompt"] == ""
+        storage.store_derived_prompt("new", 1, "ckpt.safetensors", "wolf", "blurry")
+        assert storage.get_derived_prompt("new")["negative_prompt"] == "blurry"
+    finally:
+        storage.close()
 
 
 def test_derived_prompt_pruned_after_ttl(storage: Storage):

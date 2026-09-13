@@ -20,10 +20,17 @@ matters. Directly-uploaded photos (`handlers.photo_message`) aren't on that
 path, so they use it unconditionally instead of the quick model — see
 `handlers._analyze_both_deep`.
 
-Both/all take raw image bytes and return a single string meant to be fed
-straight into `generate()` as the new `user_prompt` — the checkpoint's
-profile still supplies its own quality-tag prefix/negative/LoRAs on top,
-exactly as it would for a normal typed prompt.
+`analyze_tags` returns a single tag-string prompt fragment; `analyze_caption`/
+`analyze_caption_deep` return `(positive, negative)` — the Qwen-VL prompt
+asks for a suggested negative (visible flaws/defects) alongside the
+description, parsed out by `_parse_caption_response`. `analyze_image`, the
+`prompt_style`-dispatching entry point `generate()`-bound flows use, always
+returns just a positive-prompt string: it discards any suggested negative
+rather than feed it into generation, since that's a bigger behavior change
+than the "🏷️ Analyze"/"🔎 Deep Analyze" standalone displays (see
+`handlers._analyze_both`/`_analyze_both_deep`) were meant for. Those two are
+the only places a suggested negative prompt is shown to the user or stored
+for its own "🎨 Generate" button.
 
 The WD14 model files (model.onnx + selected_tags.csv) are *not* downloaded
 automatically. Hugging Face serves large model files from an LFS/Xet CDN on
@@ -42,6 +49,7 @@ import csv
 import functools
 import io
 import logging
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -105,9 +113,43 @@ _NOISE_TAGS = frozenset(
 
 _OLLAMA_VISION_PROMPT = (
     "Describe this image as a concise, comma-separated Stable Diffusion prompt: "
-    "subject, appearance, pose, clothing, setting, lighting, art style. Output "
-    "only the prompt text, no commentary or preamble."
+    "subject, appearance, pose, clothing, setting, lighting, art style. Then write a "
+    "negative prompt for regenerating an image like this one: comma-separated things "
+    "that must NOT appear, combining generic quality failures (e.g. blurry, lowres, "
+    "bad anatomy, extra fingers, watermark, text) with whatever specifically clashes "
+    "with this image's own subject and style (e.g. photorealistic and 3d render for a "
+    "flat cel-shaded drawing, or cluttered background for a plain one). Always fill in "
+    "both lines. Output only these two lines, no commentary or preamble:\n"
+    "POSITIVE: <prompt>\n"
+    "NEGATIVE: <negative prompt>"
 )
+
+_POSITIVE_LINE_RE = re.compile(r"^POSITIVE:\s*(.*)$", re.IGNORECASE | re.MULTILINE)
+_NEGATIVE_LINE_RE = re.compile(r"^NEGATIVE:\s*(.*)$", re.IGNORECASE | re.MULTILINE)
+
+
+def _parse_caption_response(text: str) -> tuple[str, str]:
+    """Split a `_OLLAMA_VISION_PROMPT`-formatted response into
+    `(positive, negative)`. Smaller/quantized models are less reliable
+    instruction-followers than the prompt's format asks for, so if there's
+    no recognizable "POSITIVE:" line, the whole response is treated as the
+    positive prompt with no negative rather than dropped — logged as a
+    warning (with the raw response) since it means this model isn't
+    actually producing a usable negative prompt at all."""
+    positive_match = _POSITIVE_LINE_RE.search(text)
+    if positive_match is None:
+        logger.warning(
+            "Ollama caption response didn't follow the POSITIVE:/NEGATIVE: format "
+            "the prompt asked for — treating the whole response as the positive "
+            "prompt with no negative. Raw response: %r",
+            text,
+        )
+        return text.strip(), ""
+    negative_match = _NEGATIVE_LINE_RE.search(text)
+    negative = negative_match.group(1).strip() if negative_match else ""
+    if not negative:
+        logger.info("Ollama caption response had an empty/missing negative: %r", text)
+    return positive_match.group(1).strip(), negative
 
 
 def _format_tag(name: str) -> str:
@@ -255,14 +297,19 @@ async def _caption_via_ollama(image_bytes: bytes, model: str, settings: Settings
     return data["message"]["content"].strip()
 
 
-async def analyze_caption(image_bytes: bytes, settings: Settings) -> str:
+async def analyze_caption(image_bytes: bytes, settings: Settings) -> tuple[str, str]:
     """Caption the image via a local Ollama server running a vision-capable
     model (Qwen-VL by default — see Settings.ollama_vision_model), for
-    checkpoints that expect natural-language prompts rather than tags."""
-    return await _caption_via_ollama(image_bytes, settings.ollama_vision_model, settings)
+    checkpoints that expect natural-language prompts rather than tags.
+    Returns `(positive, negative)` — see `_parse_caption_response`; `negative`
+    is only ever surfaced by the standalone "🏷️ Analyze" display
+    (`handlers._analyze_both`), not by `analyze_image`'s regenerate dispatch
+    below, which discards it."""
+    raw = await _caption_via_ollama(image_bytes, settings.ollama_vision_model, settings)
+    return _parse_caption_response(raw)
 
 
-async def analyze_caption_deep(image_bytes: bytes, settings: Settings) -> str:
+async def analyze_caption_deep(image_bytes: bytes, settings: Settings) -> tuple[str, str]:
     """Caption the image via Ollama running the bigger, slower model
     configured at `Settings.ollama_deep_vision_model`, for when the quick
     `analyze_caption` model's description isn't detailed enough. Not wired
@@ -271,13 +318,21 @@ async def analyze_caption_deep(image_bytes: bytes, settings: Settings) -> str:
     (`handlers.photo_message` isn't on an interactive generation path), and
     opt-in via the "🔎 Deep Analyze" button for the bot's own generated
     images (`handlers.postprocess_callback`'s `DEEP_ANALYZE_CALLBACK_KIND`
-    branch), where the quick default's speed matters more."""
-    return await _caption_via_ollama(image_bytes, settings.ollama_deep_vision_model, settings)
+    branch), where the quick default's speed matters more. Returns
+    `(positive, negative)`, same as `analyze_caption`."""
+    raw = await _caption_via_ollama(image_bytes, settings.ollama_deep_vision_model, settings)
+    return _parse_caption_response(raw)
 
 
 async def analyze_image(image_bytes: bytes, style: Literal["tags", "natural"], settings: Settings) -> str:
     """Dispatch to the analyzer matching a checkpoint's `prompt_style` (see
-    `ModelProfile.prompt_style` in profiles/schema.py)."""
+    `ModelProfile.prompt_style` in profiles/schema.py). Always returns a
+    single positive-prompt string for "🔬 Analyze & Regenerate" to generate
+    from as-is — a Qwen-VL caption's suggested negative (see
+    `analyze_caption`) is deliberately not fed into generation here, only
+    into the standalone analyzer displays (see `handlers._analyze_both`/
+    `_analyze_both_deep`)."""
     if style == "tags":
         return await analyze_tags(image_bytes, settings)
-    return await analyze_caption(image_bytes, settings)
+    positive, _negative = await analyze_caption(image_bytes, settings)
+    return positive

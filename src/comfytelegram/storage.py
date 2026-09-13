@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS derived_prompt (
     chat_id INTEGER NOT NULL,
     checkpoint TEXT NOT NULL,
     prompt TEXT NOT NULL,
+    negative_prompt TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
 """
@@ -118,8 +119,24 @@ class Storage:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.executescript(_SCHEMA)  # already commits internally
+        # `CREATE TABLE IF NOT EXISTS` is a no-op against a table that
+        # already existed before a column was added to _SCHEMA — with no
+        # migrations framework, a new column on an existing table needs its
+        # own guarded ALTER TABLE instead.
+        self._add_column_if_missing(
+            "derived_prompt", "negative_prompt", "TEXT NOT NULL DEFAULT ''"
+        )
         #: Last `_prune()` sweep time per table — see PRUNE_INTERVAL_SECONDS.
         self._last_prune: dict[str, float] = {}
+
+    def _add_column_if_missing(self, table: str, column: str, column_def: str) -> None:
+        """Add `column` to `table` if it isn't there yet — `table`/`column`/
+        `column_def` are always internal string literals (never user input),
+        so building the ALTER TABLE statement by interpolation is safe."""
+        existing = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            with self._conn:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_def}")
 
     def get_checkpoint(self, chat_id: int) -> str | None:
         """The checkpoint filename this chat last selected via `/model`, or
@@ -333,30 +350,47 @@ class Storage:
         chat_id, params_json = row
         return {"chat_id": chat_id, "params": json.loads(params_json)}
 
-    def store_derived_prompt(self, prompt_id: str, chat_id: int, checkpoint: str, prompt: str) -> None:
+    def store_derived_prompt(
+        self,
+        prompt_id: str,
+        chat_id: int,
+        checkpoint: str,
+        prompt: str,
+        negative_prompt: str = "",
+    ) -> None:
         """Record one analyzer's output from the "🏷️ Analyze" button (WD14
         tags or a Qwen-VL caption) so its own "🎨 Generate" button can start
         a fresh generation from exactly that prompt later, keyed by an id
         embedded in that button's callback_data — same per-message pattern
-        as `pending_result`/`generation_snapshot`."""
+        as `pending_result`/`generation_snapshot`. `negative_prompt` is only
+        ever non-empty for a Qwen-VL caption's suggested negative (WD14 tags
+        have no such concept) — see `analysis.analyze_caption`."""
         self._prune("derived_prompt")
         with self._conn:
             self._conn.execute(
-                "INSERT OR REPLACE INTO derived_prompt (prompt_id, chat_id, checkpoint, prompt, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (prompt_id, chat_id, checkpoint, prompt, time.time()),
+                "INSERT OR REPLACE INTO derived_prompt "
+                "(prompt_id, chat_id, checkpoint, prompt, negative_prompt, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (prompt_id, chat_id, checkpoint, prompt, negative_prompt, time.time()),
             )
 
     def get_derived_prompt(self, prompt_id: str) -> dict[str, Any] | None:
         """The row `store_derived_prompt` wrote for `prompt_id`, or None if
         it doesn't exist (never stored, or pruned past its TTL)."""
         row = self._conn.execute(
-            "SELECT chat_id, checkpoint, prompt FROM derived_prompt WHERE prompt_id = ?", (prompt_id,)
+            "SELECT chat_id, checkpoint, prompt, negative_prompt FROM derived_prompt "
+            "WHERE prompt_id = ?",
+            (prompt_id,),
         ).fetchone()
         if row is None:
             return None
-        chat_id, checkpoint, prompt = row
-        return {"chat_id": chat_id, "checkpoint": checkpoint, "prompt": prompt}
+        chat_id, checkpoint, prompt, negative_prompt = row
+        return {
+            "chat_id": chat_id,
+            "checkpoint": checkpoint,
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+        }
 
     def close(self) -> None:
         """Close the underlying sqlite connection."""

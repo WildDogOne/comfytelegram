@@ -41,7 +41,7 @@ async def test_photo_message_sends_both_derived_prompts_with_generate_buttons():
         patch("comfytelegram.handlers.analyze_tags", new=AsyncMock(return_value="1girl, outdoors")),
         patch(
             "comfytelegram.handlers.analyze_caption_deep",
-            new=AsyncMock(return_value="a girl outside"),
+            new=AsyncMock(return_value=("a girl outside", "blurry")),
         ),
     ):
         await photo_message(update, context)
@@ -49,10 +49,16 @@ async def test_photo_message_sends_both_derived_prompts_with_generate_buttons():
     context.bot.get_file.assert_awaited_once_with("large")  # largest photo size
     storage = context.bot_data["storage"]
     assert storage.store_derived_prompt.call_count == 2
+    negative_args = [call.args[-1] for call in storage.store_derived_prompt.call_args_list]
+    assert "blurry" in negative_args
 
     texts = [call.args[0] for call in message.reply_text.await_args_list]
     assert any(t.startswith("🏷️ WD14 tags:\n1girl, outdoors") for t in texts)
-    assert any(t.startswith("💬 Qwen-VL caption (deep):\na girl outside") for t in texts)
+    assert any(
+        t.startswith("💬 Qwen-VL caption (deep):\na girl outside")
+        and "🚫 Suggested negative:\nblurry" in t
+        for t in texts
+    )
 
 
 @pytest.mark.asyncio
@@ -67,7 +73,7 @@ async def test_photo_message_reports_one_analyzer_failing_without_blocking_the_o
         patch("comfytelegram.handlers.analyze_tags", new=_boom),
         patch(
             "comfytelegram.handlers.analyze_caption_deep",
-            new=AsyncMock(return_value="a girl outside"),
+            new=AsyncMock(return_value=("a girl outside", "blurry")),
         ),
     ):
         await photo_message(update, context)

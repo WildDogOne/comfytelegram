@@ -13,6 +13,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -37,12 +38,71 @@ from comfytelegram.handlers import (
     stream_cancel_callback,
     stream_command,
 )
+from comfytelegram.message_text import TEXT_CONTENT, message_text
 from comfytelegram.profiles import load_profiles
 from comfytelegram.settings import Settings, load_settings
 from comfytelegram.settings_menu import settings_callback, settings_command
 from comfytelegram.storage import Storage
 
 logger = logging.getLogger(__name__)
+
+#: Every `/command` the bot answers, as (name, callback). Single source of
+#: truth: `build_application` registers a `CommandHandler` per entry, and
+#: `_UNHANDLED_FILTER` below is built from the same names, so adding a
+#: command here can't leave the two disagreeing about what's known.
+_COMMANDS = (
+    ("start", start),
+    ("help", help_command),
+    ("model", model_command),
+    ("settings", settings_command),
+    ("character", character_command),
+    ("characters", characters_command),
+    ("stream", stream_command),
+    ("stop", stop_command),
+)
+
+#: Matches exactly the messages none of the real handlers can claim: a
+#: `/command` that isn't one of `_COMMANDS` (`filters.COMMAND` keeps it out
+#: of `generate_message`, and no `CommandHandler` wants it), or a message
+#: that's neither text nor a photo (a sticker, a voice note, a document).
+#: Both used to be dropped in total silence — no reply, no log line, the
+#: bot simply appearing to ignore you. Pairs with `TEXT_CONTENT` rather
+#: than `filters.TEXT` so it stays the exact complement of the real
+#: handlers' filters, and doesn't claim rich messages back off them.
+_UNHANDLED_FILTER = (
+    filters.COMMAND
+    & ~filters.Regex(rf"^/({'|'.join(name for name, _ in _COMMANDS)})(@\w+)?(\s|$)")
+) | ~(TEXT_CONTENT | filters.PHOTO)
+
+
+async def _log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Record every update the bot receives, before dispatch. Registered in
+    its own group (-1) so it observes without consuming. Exists because
+    "I sent a prompt and nothing happened" is otherwise indistinguishable
+    between "the update never arrived" and "it arrived but no handler
+    matched it" — with this line in the log, the two look different."""
+    text = message_text(update.effective_message)
+    logger.info(
+        "update %s chat=%s %s",
+        update.update_id,
+        update.effective_chat.id if update.effective_chat else None,
+        f"text={text!r}" if text is not None else update,
+    )
+
+
+async def _unhandled_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Answer anything `_UNHANDLED_FILTER` catches instead of ignoring it.
+    Runs in group 1, i.e. after the real handlers, and its filter is the
+    complement of theirs, so it can't double-reply to a message they
+    already took."""
+    message = update.effective_message
+    logger.warning("No handler matched update %s: %r", update.update_id, message_text(message))
+    await message.reply_text(
+        "I didn't understand that. Send a plain text prompt to generate, a "
+        "photo to analyze it, or /help for the command list.\n\n(A message "
+        "starting with \"/\" is read as a command — drop the slash to use it "
+        "as a prompt.)"
+    )
 
 
 async def _post_init(application: Application) -> None:
@@ -104,14 +164,8 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["profiles"] = load_profiles(settings.model_profiles_dir)
     application.bot_data["storage"] = Storage(settings.state_db_path)
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("model", model_command))
-    application.add_handler(CommandHandler("settings", settings_command))
-    application.add_handler(CommandHandler("character", character_command))
-    application.add_handler(CommandHandler("characters", characters_command))
-    application.add_handler(CommandHandler("stream", stream_command))
-    application.add_handler(CommandHandler("stop", stop_command))
+    for name, callback in _COMMANDS:
+        application.add_handler(CommandHandler(name, callback))
     application.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
     application.add_handler(CallbackQueryHandler(postprocess_callback, pattern=r"^pp:"))
     application.add_handler(
@@ -128,7 +182,13 @@ def build_application(settings: Settings) -> Application:
         CallbackQueryHandler(stream_cancel_callback, pattern=rf"^{STREAM_CANCEL_CALLBACK_DATA}$")
     )
     application.add_handler(MessageHandler(filters.PHOTO, photo_message))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, generate_message))
+    application.add_handler(MessageHandler(TEXT_CONTENT & ~filters.COMMAND, generate_message))
+
+    # Group -1 runs before the real handlers and, being its own group,
+    # never consumes the update — it only records that the bot saw it.
+    application.add_handler(TypeHandler(Update, _log_update), group=-1)
+    application.add_handler(MessageHandler(_UNHANDLED_FILTER, _unhandled_message), group=1)
+
     application.add_error_handler(_error_handler)
 
     return application

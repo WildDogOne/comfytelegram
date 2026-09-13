@@ -78,13 +78,18 @@ async def _run_graph(
     """Submit a graph, wait for it to finish, and download every image the
     given save node produced. Returns (bytes, filename) pairs."""
     client_id = uuid.uuid4().hex
-    prompt_id = await client.queue_prompt(prompt_graph, client_id=client_id)
+    # Connect before queueing, never after: ComfyUI drops execution events
+    # aimed at a client that isn't connected yet, so submitting first can
+    # lose the terminal event of a fast job and hang here forever. See
+    # `ComfyClient.connect_events`.
+    async with client.connect_events(client_id=client_id) as events:
+        prompt_id = await client.queue_prompt(prompt_graph, client_id=client_id)
 
-    async for progress in client.watch(prompt_id, client_id=client_id):
-        if on_progress is not None:
-            await on_progress(progress)
-        if progress.done:
-            break
+        async for progress in events.watch(prompt_id):
+            if on_progress is not None:
+                await on_progress(progress)
+            if progress.done:
+                break
 
     history = await client.get_history(prompt_id)
     if history is None:

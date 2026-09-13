@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 import pytest
 
 from comfytelegram.comfy_client import JobProgress
@@ -13,13 +15,24 @@ class _StubComfyClient:
 
     def __init__(self) -> None:
         self.queued_graph: dict | None = None
+        self.connected_client_id: str | None = None
 
     async def queue_prompt(self, prompt: dict, *, client_id: str) -> str:
+        assert self.connected_client_id == client_id, (
+            "the event socket must be connected before the prompt is queued — "
+            "see ComfyClient.connect_events"
+        )
         self.queued_graph = prompt
         return "prompt-1"
 
-    async def watch(self, prompt_id: str, *, client_id: str):
-        yield JobProgress(prompt_id=prompt_id, node_id=None, value=None, max=None, done=True)
+    @asynccontextmanager
+    async def connect_events(self, *, client_id: str):
+        self.connected_client_id = client_id
+        yield self._Events()
+
+    class _Events:
+        async def watch(self, prompt_id: str):
+            yield JobProgress(prompt_id=prompt_id, node_id=None, value=None, max=None, done=True)
 
     async def get_history(self, prompt_id: str) -> dict:
         save_node_id = next(

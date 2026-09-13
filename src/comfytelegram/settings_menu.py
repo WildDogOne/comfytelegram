@@ -31,6 +31,7 @@ from telegram.ext import ContextTypes
 
 from comfytelegram.auth import reject_if_unauthorized, reject_if_unauthorized_callback
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError
+from comfytelegram.message_text import message_text
 from comfytelegram.profiles import (
     PROMPT_OVERRIDE_FIELDS,
     ModelProfile,
@@ -476,7 +477,7 @@ async def handle_custom_value_message(update: Update, context: ContextTypes.DEFA
     del context.chat_data["awaiting_field"]
 
     message = update.effective_message
-    raw_value = (message.text or "").strip()
+    raw_value = (message_text(message) or "").strip()
     meta = FIELDS_BY_KEY.get(field)
     if meta is None or not raw_value:
         await message.reply_text("Cancelled.")

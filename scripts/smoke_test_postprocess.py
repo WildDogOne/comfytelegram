@@ -35,15 +35,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 async def run_stage(client: ComfyClient, name: str, prompt_graph: dict, save_node_id: str, out_dir: Path) -> None:
     t0 = time.monotonic()
     client_id = f"smoke-{name}"
-    prompt_id = await client.queue_prompt(prompt_graph, client_id=client_id)
-    print(f"[{name}] queued prompt_id={prompt_id}")
+    async with client.connect_events(client_id=client_id) as events:
+        prompt_id = await client.queue_prompt(prompt_graph, client_id=client_id)
+        print(f"[{name}] queued prompt_id={prompt_id}")
 
-    async for progress in client.watch(prompt_id, client_id=client_id):
-        if progress.done:
-            print(f"[{name}] done in {time.monotonic() - t0:.1f}s")
-            break
-        if progress.value is not None:
-            print(f"[{name}]   node={progress.node_id} step {progress.value}/{progress.max}")
+        async for progress in events.watch(prompt_id):
+            if progress.done:
+                print(f"[{name}] done in {time.monotonic() - t0:.1f}s")
+                break
+            if progress.value is not None:
+                print(f"[{name}]   node={progress.node_id} step {progress.value}/{progress.max}")
 
     history = await client.get_history(prompt_id)
     if history is None:

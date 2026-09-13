@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self
@@ -22,7 +23,7 @@ class ComfyUIError(RuntimeError):
 
 @dataclass
 class JobProgress:
-    """One event from `ComfyClient.watch()`: either a step update
+    """One event from `JobEvents.watch()`: either a step update
     (`node_id`/`value`/`max` set) or the terminal `done=True` event, which
     carries no node/value info."""
 
@@ -176,41 +177,66 @@ class ComfyClient:
             resp.raise_for_status()
             return await resp.json()
 
-    async def watch(self, prompt_id: str, *, client_id: str) -> AsyncIterator[JobProgress]:
+    @asynccontextmanager
+    async def connect_events(self, *, client_id: str) -> AsyncIterator[JobEvents]:
+        """Open the progress websocket for `client_id`.
+
+        Must be entered *before* `queue_prompt` is called with that same
+        `client_id`. ComfyUI targets every execution event at the
+        submitting client's socket and drops it outright when that socket
+        isn't connected yet — its `send_json` is `elif sid in self.sockets`,
+        with no buffering and no replay. Queueing first therefore leaves a
+        window where a job that finishes inside it (a warm model, a
+        few-step turbo checkpoint, an execution-cache hit) fires its
+        terminal event into the void, and the watcher then waits forever
+        for an event that already happened.
+        """
+        url = f"{self.ws_base}/ws?clientId={client_id}"
+        async with self.session.ws_connect(url) as ws:
+            yield JobEvents(ws)
+
+
+class JobEvents:
+    """A live ComfyUI progress websocket, handed out by
+    `ComfyClient.connect_events` so the connection can be established
+    before the prompt it watches is submitted — see there for why."""
+
+    def __init__(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        self._ws = ws
+
+    async def watch(self, prompt_id: str) -> AsyncIterator[JobProgress]:
         """Stream progress events for `prompt_id` until it's terminal.
 
         The final yielded event has done=True. The websocket stream itself
         doesn't carry output file references — follow up with
         `get_history(prompt_id)` for those.
         """
-        url = f"{self.ws_base}/ws?clientId={client_id}"
-        async with self.session.ws_connect(url) as ws:
-            async for msg in ws:
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    continue
-                event = json.loads(msg.data)
-                etype = event.get("type")
-                data = event.get("data", {})
+        async for msg in self._ws:
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                continue
+            event = json.loads(msg.data)
+            etype = event.get("type")
+            data = event.get("data", {})
 
-                if etype == "progress" and data.get("prompt_id") == prompt_id:
-                    yield JobProgress(
-                        prompt_id=prompt_id,
-                        node_id=data.get("node"),
-                        value=data.get("value"),
-                        max=data.get("max"),
-                    )
-                elif (
-                    etype == "executing"
-                    and data.get("prompt_id") == prompt_id
-                    and data.get("node") is None
-                ):
-                    # node becomes None once the whole prompt has finished executing
-                    yield JobProgress(
-                        prompt_id=prompt_id, node_id=None, value=None, max=None, done=True
-                    )
-                    return
-                elif etype == "execution_error" and data.get("prompt_id") == prompt_id:
-                    raise ComfyUIError(f"Execution error: {data}")
+            if etype == "progress" and data.get("prompt_id") == prompt_id:
+                yield JobProgress(
+                    prompt_id=prompt_id,
+                    node_id=data.get("node"),
+                    value=data.get("value"),
+                    max=data.get("max"),
+                )
+            elif (
+                etype == "executing"
+                and data.get("prompt_id") == prompt_id
+                and data.get("node") is None
+            ):
+                # node becomes None once the whole prompt has finished executing
+                yield JobProgress(
+                    prompt_id=prompt_id, node_id=None, value=None, max=None, done=True
+                )
+                return
+            elif etype == "execution_error" and data.get("prompt_id") == prompt_id:
+                raise ComfyUIError(f"Execution error: {data}")
 
 
 def _enum_choices(node_info: dict[str, Any], input_name: str) -> list[str]:

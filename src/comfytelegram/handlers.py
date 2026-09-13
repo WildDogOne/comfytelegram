@@ -37,6 +37,7 @@ from comfytelegram.analysis import (
 from comfytelegram.auth import reject_if_unauthorized, reject_if_unauthorized_callback
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
 from comfytelegram.generation import GeneratedImage, generate, post_process, repeat
+from comfytelegram.message_text import message_text
 from comfytelegram.profiles import (
     ModelProfile,
     apply_profile_override,
@@ -359,7 +360,12 @@ async def _send_and_store_result(
     )
 
 
-async def _run_analyzer(label: str, awaitable: Awaitable[str]) -> str | None:
+_AnalyzerResult = TypeVar("_AnalyzerResult")
+
+
+async def _run_analyzer(
+    label: str, awaitable: Awaitable[_AnalyzerResult]
+) -> _AnalyzerResult | None:
     """Isolate one analyzer's failure (e.g. WD14 files not staged, Ollama
     unreachable) from the other, so a side-by-side comparison still shows
     whichever one actually worked. None means it failed — the caller skips
@@ -373,15 +379,19 @@ async def _run_analyzer(label: str, awaitable: Awaitable[str]) -> str | None:
         return None
 
 
-async def _analyze_both(source_bytes: bytes, settings: Settings) -> tuple[str | None, str | None]:
+async def _analyze_both(
+    source_bytes: bytes, settings: Settings
+) -> tuple[str | None, tuple[str, str] | None]:
     """Run both analyzers regardless of any checkpoint's configured
     `prompt_style` — unlike Analyze & Regenerate, which must commit to one
     prompt to actually generate from, this is for comparing WD14 tags
-    against a Qwen-VL caption side by side. Used by `postprocess_callback`'s
-    "🏷️ Analyze" branch (for the bot's own generated images, where the quick
-    model is the default and `DEEP_ANALYZE_CALLBACK_KIND` is an opt-in
-    extra) — `photo_message` uses `_analyze_both_deep` instead, see there
-    for why."""
+    against a Qwen-VL caption side by side. The caption side is
+    `(positive, negative)` — see `analyze_caption` — since this standalone
+    display (unlike `analyze_image`'s regenerate dispatch) does surface a
+    suggested negative prompt. Used by `postprocess_callback`'s "🏷️ Analyze"
+    branch (for the bot's own generated images, where the quick model is the
+    default and `DEEP_ANALYZE_CALLBACK_KIND` is an opt-in extra) —
+    `photo_message` uses `_analyze_both_deep` instead, see there for why."""
     tags, caption = await asyncio.gather(
         _run_analyzer("WD14", analyze_tags(source_bytes, settings)),
         _run_analyzer("Qwen-VL", analyze_caption(source_bytes, settings)),
@@ -391,13 +401,14 @@ async def _analyze_both(source_bytes: bytes, settings: Settings) -> tuple[str | 
 
 async def _analyze_both_deep(
     source_bytes: bytes, settings: Settings
-) -> tuple[str | None, str | None]:
-    """Same WD14-tags/Qwen-VL-caption pairing as `_analyze_both`, but the
-    caption side always uses the bigger `analyze_caption_deep` model.
-    `photo_message`'s directly-uploaded photos aren't on the interactive
-    generation critical path the way a checkpoint pick or a "🔬 Analyze &
-    Regenerate" tap is, so there's no reason to default to the cheap model
-    there and make the user ask twice for the better one."""
+) -> tuple[str | None, tuple[str, str] | None]:
+    """Same WD14-tags/Qwen-VL-caption pairing as `_analyze_both` (including
+    the caption side's `(positive, negative)` shape), but the caption side
+    always uses the bigger `analyze_caption_deep` model. `photo_message`'s
+    directly-uploaded photos aren't on the interactive generation critical
+    path the way a checkpoint pick or a "🔬 Analyze & Regenerate" tap is, so
+    there's no reason to default to the cheap model there and make the user
+    ask twice for the better one."""
     tags, caption = await asyncio.gather(
         _run_analyzer("WD14", analyze_tags(source_bytes, settings)),
         _run_analyzer("Qwen-VL (deep)", analyze_caption_deep(source_bytes, settings)),
@@ -412,19 +423,27 @@ async def _send_derived_prompt(
     checkpoint: str,
     label: str,
     prompt: str | None,
+    negative_prompt: str = "",
 ) -> None:
     """One standalone message per analyzer, each with its own "🎨 Generate"/
     "📋 Copy" buttons scoped to that specific prompt (see storage.py's
     `derived_prompt`) — not a shared button on a combined message, since
     the two prompts are independent and the user may only want to act on
-    one of them. Shared by `postprocess_callback` and `photo_message`."""
+    one of them. `negative_prompt`, when non-empty (a Qwen-VL caption's
+    suggested negative — see `analyze_caption` — WD14 tags never have one),
+    is shown as its own line and stored alongside so that "🎨 Generate"
+    button generates with it as the negative prompt too. Shared by
+    `postprocess_callback` and `photo_message`."""
     if prompt is None:
         await reply_target.reply_text(f"{label}: failed — see server log.")
         return
     prompt_id = uuid.uuid4().hex[:12]
-    storage.store_derived_prompt(prompt_id, chat_id, checkpoint, prompt)
+    storage.store_derived_prompt(prompt_id, chat_id, checkpoint, prompt, negative_prompt)
+    text = f"{label}:\n{prompt}"
+    if negative_prompt:
+        text += f"\n\n🚫 Suggested negative:\n{negative_prompt}"
     await reply_target.reply_text(
-        f"{label}:\n{prompt}", reply_markup=_generate_from_prompt_keyboard(prompt_id, prompt)
+        text, reply_markup=_generate_from_prompt_keyboard(prompt_id, prompt)
     )
 
 
@@ -798,7 +817,7 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     message = update.effective_message
-    prompt_text = (message.text or "").strip()
+    prompt_text = (message_text(message) or "").strip()
     if not prompt_text:
         return
 
@@ -871,7 +890,7 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     status_message = await message.reply_text("Analyzing image…")
 
-    async def _download_and_analyze_both() -> tuple[str | None, str | None]:
+    async def _download_and_analyze_both() -> tuple[str | None, tuple[str, str] | None]:
         tg_file = await context.bot.get_file(message.photo[-1].file_id)
         source_bytes = bytes(await tg_file.download_as_bytearray())
         return await _analyze_both_deep(source_bytes, settings)
@@ -882,11 +901,18 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if result is None:
         return
     tags, caption = result
+    caption_positive, caption_negative = caption if caption is not None else (None, "")
     await status_message.delete()
 
     await _send_derived_prompt(message, storage, chat_id, checkpoint, "🏷️ WD14 tags", tags)
     await _send_derived_prompt(
-        message, storage, chat_id, checkpoint, "💬 Qwen-VL caption (deep)", caption
+        message,
+        storage,
+        chat_id,
+        checkpoint,
+        "💬 Qwen-VL caption (deep)",
+        caption_positive,
+        caption_negative,
     )
 
 
@@ -922,7 +948,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         checkpoint = full_params.checkpoint
         chat_id = pending["chat_id"]
 
-        async def _download_and_analyze_both() -> tuple[str | None, str | None]:
+        async def _download_and_analyze_both() -> tuple[str | None, tuple[str, str] | None]:
             tg_file = await context.bot.get_file(pending["file_id"])
             source_bytes = bytes(await tg_file.download_as_bytearray())
             return await _analyze_both(source_bytes, settings)
@@ -933,11 +959,18 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         if result is None:
             return
         tags, caption = result
+        caption_positive, caption_negative = caption if caption is not None else (None, "")
         await status_message.delete()
 
         await _send_derived_prompt(query.message, storage, chat_id, checkpoint, "🏷️ WD14 tags", tags)
         await _send_derived_prompt(
-            query.message, storage, chat_id, checkpoint, "💬 Qwen-VL caption", caption
+            query.message,
+            storage,
+            chat_id,
+            checkpoint,
+            "💬 Qwen-VL caption",
+            caption_positive,
+            caption_negative,
         )
         return
 
@@ -985,7 +1018,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         checkpoint = full_params.checkpoint
         chat_id = pending["chat_id"]
 
-        async def _download_and_analyze_deep() -> str:
+        async def _download_and_analyze_deep() -> tuple[str, str]:
             tg_file = await context.bot.get_file(pending["file_id"])
             source_bytes = bytes(await tg_file.download_as_bytearray())
             return await analyze_caption_deep(source_bytes, settings)
@@ -995,10 +1028,17 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         if caption is None:
             return
+        caption_positive, caption_negative = caption
         await status_message.delete()
 
         await _send_derived_prompt(
-            query.message, storage, chat_id, checkpoint, "🔎 Deep caption", caption
+            query.message,
+            storage,
+            chat_id,
+            checkpoint,
+            "🔎 Deep caption",
+            caption_positive,
+            caption_negative,
         )
         return
 
@@ -1064,7 +1104,9 @@ async def generate_from_prompt_callback(update: Update, context: ContextTypes.DE
     """Backs the "🎨 Generate" button attached to one of "🏷️ Analyze"'s two
     standalone prompt messages — generates from *that specific* derived
     prompt (WD14 tags or Qwen-VL caption), scoped by the prompt_id embedded
-    in callback_data (see storage.py's `derived_prompt`). Uses the chat's
+    in callback_data (see storage.py's `derived_prompt`), including that
+    prompt's stored negative — empty for WD14 tags, a Qwen-VL caption's
+    suggested negative otherwise (see `analyze_caption`). Uses the chat's
     current `/settings` override for the checkpoint the source image was
     generated with, same as Analyze & Regenerate, rather than any stale
     params from that original generation."""
@@ -1099,6 +1141,7 @@ async def generate_from_prompt_callback(update: Update, context: ContextTypes.DE
             checkpoint,
             stored["prompt"],
             profile,
+            extra_negative_prompt=stored["negative_prompt"],
             on_progress=_make_progress_callback(status_message),
         ),
     )
@@ -1177,7 +1220,7 @@ async def _consume_awaiting_stream_prompt(
         return False
 
     message = update.effective_message
-    prompt_text = (message.text or "").strip()
+    prompt_text = (message_text(message) or "").strip()
     if not prompt_text:
         await message.reply_text("Cancelled — no prompt received.")
         return True
