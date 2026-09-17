@@ -17,6 +17,7 @@ import uuid
 from collections.abc import Awaitable
 from typing import Any, TypeVar
 
+from PIL import Image
 from telegram import (
     CopyTextButton,
     InlineKeyboardButton,
@@ -67,6 +68,8 @@ ANALYZE_CALLBACK_KIND = "analyze"
 ANALYZE_ONLY_CALLBACK_KIND = "analyze_only"
 DEEP_ANALYZE_CALLBACK_KIND = "deep_analyze"
 SHOW_PROMPT_CALLBACK_KIND = "show_prompt"
+UPSCALE_CONFIRM_CALLBACK_KIND = "upscale_confirmed"
+UPSCALE_CANCEL_CALLBACK_KIND = "upscale_cancelled"
 AGAIN_CALLBACK_PREFIX = "again:"
 GENERATE_FROM_PROMPT_CALLBACK_PREFIX = "genp:"
 STREAM_CANCEL_CALLBACK_DATA = "stream:cancel"
@@ -100,6 +103,14 @@ PROGRESS_EDIT_INTERVAL = 2.0
 # Stay under it with margin, and fall back to sendDocument (up to 50MB,
 # uncompressed) for anything bigger rather than silently failing.
 TELEGRAM_PHOTO_SIZE_LIMIT = 10_000_000
+
+# A 4x upscale of an image already at or beyond this size (long edge, in
+# pixels) produces a very large, slow render — usually a sign the tapped
+# image was already upscaled (its own "🔍 Upscale 4x" button doesn't know
+# that), not something intentional. Gated behind an explicit confirmation
+# instead of running immediately — see `postprocess_callback`'s
+# `UPSCALE_CONFIRM_CALLBACK_KIND` branch.
+UPSCALE_CONFIRM_THRESHOLD_PX = 2000
 
 #: Persistent custom keyboard (replaces the device's own keyboard for the
 #: whole chat, not an inline button on one message — see `_STREAMING_KEYBOARD`
@@ -171,6 +182,27 @@ def _again_keyboard(snapshot_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     "🔁 Generate Again", callback_data=f"{AGAIN_CALLBACK_PREFIX}{snapshot_id}"
                 )
+            ]
+        ]
+    )
+
+
+def _upscale_confirm_keyboard(result_id: str) -> InlineKeyboardMarkup:
+    """Attached to the "this image is already large" warning (see
+    `postprocess_callback`'s `UPSCALE_CONFIRM_THRESHOLD_PX` gate) — lets the
+    user explicitly confirm a 4x upscale of an already-large image instead
+    of it running immediately, since that's usually an accidental
+    double-upscale rather than something intended."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Upscale anyway",
+                    callback_data=f"pp:{UPSCALE_CONFIRM_CALLBACK_KIND}:{result_id}",
+                ),
+                InlineKeyboardButton(
+                    "❌ Cancel", callback_data=f"pp:{UPSCALE_CANCEL_CALLBACK_KIND}:{result_id}"
+                ),
             ]
         ]
     )
@@ -1026,8 +1058,14 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     exact positive/negative prompt this image was built from, no download
     or generation — see `SHOW_PROMPT_CALLBACK_KIND`), or
     `"upscale"`/`"face"`/`"hand"` (download the source image and run that
-    post-processing stage on it). Alerts instead if `result_id` has
-    expired (see `PENDING_RESULT_TTL_SECONDS`)."""
+    post-processing stage on it). A fresh `"upscale"` tap on an image
+    already at or beyond `UPSCALE_CONFIRM_THRESHOLD_PX` doesn't upscale
+    immediately — it downloads just far enough to measure the image, then
+    replies with a "this is already large — continue?" prompt
+    (`_upscale_confirm_keyboard`) instead, which comes back as either
+    `UPSCALE_CONFIRM_CALLBACK_KIND` (proceed) or
+    `UPSCALE_CANCEL_CALLBACK_KIND` (abort). Alerts instead if `result_id`
+    has expired (see `PENDING_RESULT_TTL_SECONDS`)."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
@@ -1151,15 +1189,40 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    if kind == UPSCALE_CANCEL_CALLBACK_KIND:
+        await _safe_edit_message(query, "Upscale cancelled.", InlineKeyboardMarkup([]))
+        return
+
+    source_bytes: bytes | None = None
+    if kind in ("upscale", UPSCALE_CONFIRM_CALLBACK_KIND):
+        if kind == UPSCALE_CONFIRM_CALLBACK_KIND:
+            await _safe_edit_message(query, "Upscaling anyway…", InlineKeyboardMarkup([]))
+        tg_file = await context.bot.get_file(pending["file_id"])
+        source_bytes = bytes(await tg_file.download_as_bytearray())
+        if kind == "upscale":
+            width, height = Image.open(io.BytesIO(source_bytes)).size
+            if max(width, height) >= UPSCALE_CONFIRM_THRESHOLD_PX:
+                await query.message.reply_text(
+                    f"This image is already {width}×{height} — a 4x upscale would "
+                    f"produce a {width * 4}×{height * 4} image. Upscale anyway?",
+                    reply_markup=_upscale_confirm_keyboard(result_id),
+                )
+                return
+        kind = "upscale"
+
     label = POSTPROCESS_STATUS_LABELS.get(kind, kind.title())
     status_message = await query.message.reply_text(f"{label}…")
 
     async def _download_and_post_process() -> GeneratedImage:
         """Bundle the file download and the post-process call into one
-        awaitable so `_run_reporting_errors` covers both."""
-        tg_file = await context.bot.get_file(pending["file_id"])
-        source_bytes = bytes(await tg_file.download_as_bytearray())
-        return await post_process(client, kind, source_bytes, pending["filename"], full_params)
+        awaitable so `_run_reporting_errors` covers both — unless the
+        upscale size-check above already downloaded the file, in which
+        case that's reused instead of hitting Telegram for it twice."""
+        data = source_bytes
+        if data is None:
+            tg_file = await context.bot.get_file(pending["file_id"])
+            data = bytes(await tg_file.download_as_bytearray())
+        return await post_process(client, kind, data, pending["filename"], full_params)
 
     result = await _run_reporting_errors(
         status_message, label, "post-processing", _download_and_post_process()

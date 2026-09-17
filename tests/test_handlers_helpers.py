@@ -15,6 +15,7 @@ from comfytelegram.handlers import (
     _resolve_effective_prompt,
     _run_reporting_errors,
     _split_negative_prompt,
+    _upscale_confirm_keyboard,
     start,
 )
 
@@ -98,6 +99,13 @@ def test_post_process_keyboard_scopes_every_button_to_result_id():
     assert "pp:analyze:abc123" in callback_data
     assert "pp:deep_analyze:abc123" in callback_data
     assert "pp:show_prompt:abc123" in callback_data
+
+
+def test_upscale_confirm_keyboard_scopes_both_buttons_to_result_id():
+    keyboard = _upscale_confirm_keyboard("abc123")
+    callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert "pp:upscale_confirmed:abc123" in callback_data
+    assert "pp:upscale_cancelled:abc123" in callback_data
 
 
 def test_again_keyboard_scopes_button_to_snapshot_id():
