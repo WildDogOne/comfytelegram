@@ -65,7 +65,11 @@ def test_character_save_and_get(storage: Storage):
     assert storage.get_character(1, "fox") is None
     storage.save_character(1, "fox", "a fox girl, blue eyes", "extra limbs")
     char = storage.get_character(1, "fox")
-    assert char == {"name": "fox", "positive_prompt": "a fox girl, blue eyes", "negative_prompt": "extra limbs"}
+    assert char == {
+        "name": "fox",
+        "positive_prompt": "a fox girl, blue eyes",
+        "negative_prompt": "extra limbs",
+    }
 
 
 def test_character_save_overwrites_by_name(storage: Storage):
@@ -122,4 +126,28 @@ def test_deleting_inactive_character_keeps_other_active(storage: Storage):
     storage.save_character(1, "wolf", "a wolf boy")
     storage.set_active_character(1, "fox")
     storage.delete_character(1, "wolf")
+    assert storage.get_active_character_name(1) == "fox"
+
+
+def test_rename_character_keeps_its_prompt(storage: Storage):
+    storage.save_character(1, "fox", "a fox girl", "extra limbs")
+    storage.rename_character(1, "fox", "vixen")
+    assert storage.get_character(1, "fox") is None
+    char = storage.get_character(1, "vixen")
+    assert char["positive_prompt"] == "a fox girl"
+    assert char["negative_prompt"] == "extra limbs"
+
+
+def test_renaming_active_character_updates_the_activation_pointer(storage: Storage):
+    storage.save_character(1, "fox", "a fox girl")
+    storage.set_active_character(1, "fox")
+    storage.rename_character(1, "fox", "vixen")
+    assert storage.get_active_character_name(1) == "vixen"
+
+
+def test_renaming_inactive_character_leaves_activation_alone(storage: Storage):
+    storage.save_character(1, "fox", "a fox girl")
+    storage.save_character(1, "wolf", "a wolf boy")
+    storage.set_active_character(1, "fox")
+    storage.rename_character(1, "wolf", "coyote")
     assert storage.get_active_character_name(1) == "fox"

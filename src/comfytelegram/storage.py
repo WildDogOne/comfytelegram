@@ -123,9 +123,7 @@ class Storage:
         # already existed before a column was added to _SCHEMA — with no
         # migrations framework, a new column on an existing table needs its
         # own guarded ALTER TABLE instead.
-        self._add_column_if_missing(
-            "derived_prompt", "negative_prompt", "TEXT NOT NULL DEFAULT ''"
-        )
+        self._add_column_if_missing("derived_prompt", "negative_prompt", "TEXT NOT NULL DEFAULT ''")
         #: Last `_prune()` sweep time per table — see PRUNE_INTERVAL_SECONDS.
         self._last_prune: dict[str, float] = {}
 
@@ -176,7 +174,9 @@ class Storage:
                 (chat_id, checkpoint, json.dumps(fields)),
             )
 
-    def set_override_fields(self, chat_id: int, checkpoint: str, fields: dict[str, Any]) -> dict[str, Any]:
+    def set_override_fields(
+        self, chat_id: int, checkpoint: str, fields: dict[str, Any]
+    ) -> dict[str, Any]:
         """Merge `fields` (already-validated ProfileDefaults-shaped values) into
         the existing override for (chat_id, checkpoint) and persist it. Returns
         the merged result."""
@@ -189,7 +189,8 @@ class Storage:
         """Remove every overridden field for (chat_id, checkpoint) — "reset all"."""
         with self._conn:
             self._conn.execute(
-                "DELETE FROM profile_override WHERE chat_id = ? AND checkpoint = ?", (chat_id, checkpoint)
+                "DELETE FROM profile_override WHERE chat_id = ? AND checkpoint = ?",
+                (chat_id, checkpoint),
             )
 
     def clear_override_field(self, chat_id: int, checkpoint: str, field: str) -> dict[str, Any]:
@@ -290,12 +291,30 @@ class Storage:
             for name, positive, negative in rows
         ]
 
+    def rename_character(self, chat_id: int, old_name: str, new_name: str) -> None:
+        """Rename a saved character, keeping its prompt and created_at, and
+        updating this chat's active-character pointer too if it was active
+        under `old_name`. Callers are responsible for checking `old_name`
+        exists and `new_name` isn't already taken — see
+        `handlers._consume_awaiting_character_rename`."""
+        with self._conn:
+            self._conn.execute(
+                "UPDATE character SET name = ? WHERE chat_id = ? AND name = ?",
+                (new_name, chat_id, old_name),
+            )
+            if self.get_active_character_name(chat_id) == old_name:
+                self._conn.execute(
+                    "UPDATE active_character SET name = ? WHERE chat_id = ?", (new_name, chat_id)
+                )
+
     def delete_character(self, chat_id: int, name: str) -> None:
         """Delete a saved character. If it was this chat's active
         character, clears that activation too (rather than leaving it
         pointing at a name that no longer exists)."""
         with self._conn:
-            self._conn.execute("DELETE FROM character WHERE chat_id = ? AND name = ?", (chat_id, name))
+            self._conn.execute(
+                "DELETE FROM character WHERE chat_id = ? AND name = ?", (chat_id, name)
+            )
             active = self.get_active_character_name(chat_id)
             if active == name:
                 self.clear_active_character(chat_id)
@@ -323,7 +342,9 @@ class Storage:
         with self._conn:
             self._conn.execute("DELETE FROM active_character WHERE chat_id = ?", (chat_id,))
 
-    def store_generation_snapshot(self, snapshot_id: str, chat_id: int, params: dict[str, Any]) -> None:
+    def store_generation_snapshot(
+        self, snapshot_id: str, chat_id: int, params: dict[str, Any]
+    ) -> None:
         """Record the resolved generation params (same shape as
         `pending_result.base_params_json` — see handlers.py's serialize
         helper) that one message's own "🔁 Generate Again" button should
@@ -343,7 +364,8 @@ class Storage:
         """The row `store_generation_snapshot` wrote for `snapshot_id`, or
         None if it doesn't exist (never stored, or pruned past its TTL)."""
         row = self._conn.execute(
-            "SELECT chat_id, params_json FROM generation_snapshot WHERE snapshot_id = ?", (snapshot_id,)
+            "SELECT chat_id, params_json FROM generation_snapshot WHERE snapshot_id = ?",
+            (snapshot_id,),
         ).fetchone()
         if row is None:
             return None

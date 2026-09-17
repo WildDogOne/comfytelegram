@@ -7,6 +7,8 @@ from comfytelegram.handlers import (
     _MAIN_KEYBOARD,
     _again_keyboard,
     _characters_keyboard,
+    _consume_awaiting_character_edit,
+    _consume_awaiting_character_rename,
     _extract_file_id,
     _generate_from_prompt_keyboard,
     _post_process_keyboard,
@@ -130,6 +132,145 @@ def test_characters_keyboard_has_no_clear_button_when_none_active():
     keyboard = _characters_keyboard([{"name": "fox"}], active=None)
     callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
     assert "char:clear" not in callback_data
+
+
+def test_characters_keyboard_includes_an_edit_button_per_character():
+    characters = [{"name": "fox"}, {"name": "wolf"}]
+    keyboard = _characters_keyboard(characters, active="fox")
+    callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert "char:edit:fox" in callback_data
+    assert "char:edit:wolf" in callback_data
+
+
+def test_characters_keyboard_includes_a_rename_button_per_character():
+    characters = [{"name": "fox"}, {"name": "wolf"}]
+    keyboard = _characters_keyboard(characters, active="fox")
+    callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert "char:rename:fox" in callback_data
+    assert "char:rename:wolf" in callback_data
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_character_edit_returns_false_when_not_pending():
+    update = MagicMock()
+    context = MagicMock()
+    context.chat_data = {}
+    context.bot_data = {"storage": MagicMock()}
+
+    assert await _consume_awaiting_character_edit(update, context) is False
+    context.bot_data["storage"].save_character.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_character_edit_saves_the_new_prompt():
+    message = AsyncMock()
+    message.text = "new positive | new negative"
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 42
+
+    storage = MagicMock()
+    storage.get_character.return_value = {"positive_prompt": "old", "negative_prompt": ""}
+    context = MagicMock()
+    context.chat_data = {"awaiting_character_edit": "fox"}
+    context.bot_data = {"storage": storage}
+
+    assert await _consume_awaiting_character_edit(update, context) is True
+
+    storage.save_character.assert_called_once_with(42, "fox", "new positive", "new negative")
+    assert "awaiting_character_edit" not in context.chat_data
+    message.reply_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_character_edit_rejects_an_empty_positive_prompt():
+    message = AsyncMock()
+    message.text = "| just a negative"
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 42
+
+    storage = MagicMock()
+    storage.get_character.return_value = {"positive_prompt": "old", "negative_prompt": ""}
+    context = MagicMock()
+    context.chat_data = {"awaiting_character_edit": "fox"}
+    context.bot_data = {"storage": storage}
+
+    assert await _consume_awaiting_character_edit(update, context) is True
+
+    storage.save_character.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_character_rename_returns_false_when_not_pending():
+    update = MagicMock()
+    context = MagicMock()
+    context.chat_data = {}
+    context.bot_data = {"storage": MagicMock()}
+
+    assert await _consume_awaiting_character_rename(update, context) is False
+    context.bot_data["storage"].rename_character.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_character_rename_renames():
+    message = AsyncMock()
+    message.text = "vixen"
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 42
+
+    storage = MagicMock()
+    storage.get_character.side_effect = lambda chat_id, name: (
+        {"positive_prompt": "old", "negative_prompt": ""} if name == "fox" else None
+    )
+    context = MagicMock()
+    context.chat_data = {"awaiting_character_rename": "fox"}
+    context.bot_data = {"storage": storage}
+
+    assert await _consume_awaiting_character_rename(update, context) is True
+
+    storage.rename_character.assert_called_once_with(42, "fox", "vixen")
+    assert "awaiting_character_rename" not in context.chat_data
+    message.reply_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_character_rename_rejects_an_invalid_name():
+    message = AsyncMock()
+    message.text = "not a valid name!"
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 42
+
+    storage = MagicMock()
+    storage.get_character.return_value = {"positive_prompt": "old", "negative_prompt": ""}
+    context = MagicMock()
+    context.chat_data = {"awaiting_character_rename": "fox"}
+    context.bot_data = {"storage": storage}
+
+    assert await _consume_awaiting_character_rename(update, context) is True
+
+    storage.rename_character.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_character_rename_rejects_a_name_already_taken():
+    message = AsyncMock()
+    message.text = "wolf"
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 42
+
+    storage = MagicMock()
+    storage.get_character.return_value = {"positive_prompt": "old", "negative_prompt": ""}
+    context = MagicMock()
+    context.chat_data = {"awaiting_character_rename": "fox"}
+    context.bot_data = {"storage": storage}
+
+    assert await _consume_awaiting_character_rename(update, context) is True
+
+    storage.rename_character.assert_not_called()
 
 
 def test_extract_file_id_prefers_largest_photo_size():

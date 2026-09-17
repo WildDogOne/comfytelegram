@@ -69,6 +69,8 @@ DEEP_ANALYZE_CALLBACK_KIND = "deep_analyze"
 AGAIN_CALLBACK_PREFIX = "again:"
 GENERATE_FROM_PROMPT_CALLBACK_PREFIX = "genp:"
 STREAM_CANCEL_CALLBACK_DATA = "stream:cancel"
+CHARACTER_EDIT_CANCEL_CALLBACK_DATA = "char:edit_cancel"
+CHARACTER_RENAME_CANCEL_CALLBACK_DATA = "char:rename_cancel"
 
 #: Hard ceiling on how many images a single "/stream" run can produce, even
 #: if nobody sends "/stop" — a safety net against an unattended chat quietly
@@ -82,7 +84,7 @@ CHARACTER_HELP = (
     "description every time:\n"
     "/character save <name> | <positive prompt> [| <negative prompt>]\n"
     "/character delete <name>\n"
-    "/characters — list saved characters and activate one\n\n"
+    "/characters — list saved characters, activate one, or ✏️ edit/🔤 rename it\n\n"
     "While a character is active, its prompt is folded into every image "
     "you generate until you switch or clear it."
 )
@@ -174,6 +176,24 @@ def _stream_prompt_cancel_keyboard() -> InlineKeyboardMarkup:
     send a throwaway prompt just to get past it."""
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("❌ Cancel", callback_data=STREAM_CANCEL_CALLBACK_DATA)]]
+    )
+
+
+def _character_edit_cancel_keyboard() -> InlineKeyboardMarkup:
+    """Attached to the "Send the new prompt for '<name>'" follow-up (see
+    `character_callback`'s "✏️ Edit" branch) — lets a mistaken tap back out
+    without having to send a throwaway message just to get past it."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Cancel", callback_data=CHARACTER_EDIT_CANCEL_CALLBACK_DATA)]]
+    )
+
+
+def _character_rename_cancel_keyboard() -> InlineKeyboardMarkup:
+    """Attached to the "Send the new name for '<name>'" follow-up (see
+    `character_callback`'s "🔤 Rename" branch) — lets a mistaken tap back
+    out without having to send a throwaway message just to get past it."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Cancel", callback_data=CHARACTER_RENAME_CANCEL_CALLBACK_DATA)]]
     )
 
 
@@ -491,7 +511,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/model — pick a checkpoint\n"
         "/settings — view or change generation defaults for the current model\n"
         "/character save <name> | <prompt> — save a reusable character design\n"
-        "/characters — list saved characters and activate one\n"
+        "/characters — list saved characters, activate one, or ✏️ edit/🔤 rename it\n"
         f"/stream [prompt] — generate single images back-to-back (up to {STREAM_HARD_LIMIT}) "
         "until /stop, sending each one immediately; omit the prompt and I'll ask for it\n"
         "/stop — stop a running /stream\n"
@@ -573,12 +593,19 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 def _characters_keyboard(
     characters: list[dict[str, Any]], active: str | None
 ) -> InlineKeyboardMarkup:
-    """One button per saved character (✅-marked if it's `active`), plus a
-    "Clear active character" row when one is active."""
+    """One row per saved character: an activate button (✅-marked if it's
+    `active`) plus "✏️ Edit" (change its prompt in place) and "🔤 Rename"
+    buttons, and a "Clear active character" row when one is active."""
     rows = []
     for char in characters:
         label = f"✅ {char['name']}" if char["name"] == active else char["name"]
-        rows.append([InlineKeyboardButton(label, callback_data=f"char:activate:{char['name']}")])
+        rows.append(
+            [
+                InlineKeyboardButton(label, callback_data=f"char:activate:{char['name']}"),
+                InlineKeyboardButton("✏️ Edit", callback_data=f"char:edit:{char['name']}"),
+                InlineKeyboardButton("🔤 Rename", callback_data=f"char:rename:{char['name']}"),
+            ]
+        )
     if active is not None:
         rows.append([InlineKeyboardButton("❌ Clear active character", callback_data="char:clear")])
     return InlineKeyboardMarkup(rows)
@@ -656,9 +683,12 @@ async def characters_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def character_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle a `char:clear` or `char:activate:<name>` tap from
-    `characters_command`'s keyboard: clear or set this chat's active
-    character."""
+    """Handle a `char:clear`, `char:edit_cancel`, `char:rename_cancel`,
+    `char:edit:<name>`, `char:rename:<name>` or `char:activate:<name>` tap
+    from `characters_command`'s keyboard: clear this chat's active
+    character, back out of a pending edit/rename, start one (see
+    `_consume_awaiting_character_edit`/`_consume_awaiting_character_rename`
+    for how the follow-up message is consumed), or activate a character."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
@@ -680,10 +710,54 @@ async def character_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
+    if action == "edit_cancel":
+        context.chat_data.pop("awaiting_character_edit", None)
+        await query.answer("Cancelled.")
+        await _safe_edit_message(
+            query, "Cancelled — character unchanged.", InlineKeyboardMarkup([])
+        )
+        return
+
+    if action == "rename_cancel":
+        context.chat_data.pop("awaiting_character_rename", None)
+        await query.answer("Cancelled.")
+        await _safe_edit_message(
+            query, "Cancelled — character unchanged.", InlineKeyboardMarkup([])
+        )
+        return
+
     name = parts[2]
-    if storage.get_character(chat_id, name) is None:
+    character = storage.get_character(chat_id, name)
+    if character is None:
         await query.answer(
             "That character no longer exists — refresh with /characters.", show_alert=True
+        )
+        return
+
+    if action == "edit":
+        context.chat_data.pop("awaiting_character_rename", None)
+        context.chat_data["awaiting_character_edit"] = name
+        await query.answer()
+        lines = [
+            f"Send the new prompt for '{name}' as:",
+            "<positive prompt> [| <negative prompt>]",
+            "",
+            f"Current positive: {character['positive_prompt']}",
+        ]
+        if character["negative_prompt"]:
+            lines.append(f"Current negative: {character['negative_prompt']}")
+        await query.message.reply_text(
+            "\n".join(lines), reply_markup=_character_edit_cancel_keyboard()
+        )
+        return
+
+    if action == "rename":
+        context.chat_data.pop("awaiting_character_edit", None)
+        context.chat_data["awaiting_character_rename"] = name
+        await query.answer()
+        await query.message.reply_text(
+            f"Send the new name for '{name}' (letters, digits, '-' and '_' only, max 32 chars).",
+            reply_markup=_character_rename_cancel_keyboard(),
         )
         return
 
@@ -804,8 +878,9 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     with live progress, then deliver the result. Defaults to ComfyUI's
     first available checkpoint (and remembers it) if none is selected yet.
     A pending "custom value" `/settings` entry (see
-    `handle_custom_value_message`) takes priority over treating the text as
-    a prompt."""
+    `handle_custom_value_message`) or an in-progress `/stream` prompt or
+    character-edit/-rename entry takes priority over treating the text as a
+    prompt."""
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
         return
@@ -814,6 +889,12 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if await _consume_awaiting_stream_prompt(update, context):
+        return
+
+    if await _consume_awaiting_character_edit(update, context):
+        return
+
+    if await _consume_awaiting_character_rename(update, context):
         return
 
     message = update.effective_message
@@ -1226,6 +1307,92 @@ async def _consume_awaiting_stream_prompt(
         return True
 
     await _start_stream(context, update.effective_chat.id, message, prompt_text)
+    return True
+
+
+async def _consume_awaiting_character_edit(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """If this chat is mid-"send the new prompt for '<name>'" entry (see
+    `character_callback`'s "✏️ Edit" branch), consume the incoming text as
+    that character's new prompt and save it, returning True. Otherwise
+    return False so the caller (`generate_message`) treats the text as a
+    normal generation prompt instead. Mirrors
+    `_consume_awaiting_stream_prompt`."""
+    name = context.chat_data.pop("awaiting_character_edit", None)
+    if name is None:
+        return False
+
+    message = update.effective_message
+    storage: Storage = context.bot_data["storage"]
+    chat_id = update.effective_chat.id
+
+    if storage.get_character(chat_id, name) is None:
+        await message.reply_text(f"'{name}' no longer exists — nothing to edit.")
+        return True
+
+    body = (message_text(message) or "").strip()
+    if not body:
+        await message.reply_text("Cancelled — no prompt received.")
+        return True
+
+    parts = [p.strip() for p in body.split("|")]
+    positive_prompt = parts[0]
+    negative_prompt = parts[1] if len(parts) > 1 else ""
+    if not positive_prompt:
+        await message.reply_text("Positive prompt can't be empty — character unchanged.")
+        return True
+
+    storage.save_character(chat_id, name, positive_prompt, negative_prompt)
+    await message.reply_text(f"Updated character '{name}'.")
+    return True
+
+
+async def _consume_awaiting_character_rename(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """If this chat is mid-"send the new name for '<name>'" entry (see
+    `character_callback`'s "🔤 Rename" branch), consume the incoming text
+    as that character's new name and apply it, returning True. Otherwise
+    return False so the caller (`generate_message`) treats the text as a
+    normal generation prompt instead. Mirrors
+    `_consume_awaiting_character_edit`."""
+    old_name = context.chat_data.pop("awaiting_character_rename", None)
+    if old_name is None:
+        return False
+
+    message = update.effective_message
+    storage: Storage = context.bot_data["storage"]
+    chat_id = update.effective_chat.id
+
+    if storage.get_character(chat_id, old_name) is None:
+        await message.reply_text(f"'{old_name}' no longer exists — nothing to rename.")
+        return True
+
+    new_name = (message_text(message) or "").strip()
+    if not new_name:
+        await message.reply_text("Cancelled — no name received.")
+        return True
+
+    if not CHARACTER_NAME_RE.match(new_name):
+        await message.reply_text(
+            "Character names can only use letters, digits, '-' and '_' (max 32 chars) — "
+            "character unchanged."
+        )
+        return True
+
+    if new_name == old_name:
+        await message.reply_text(f"'{old_name}' is already named that.")
+        return True
+
+    if storage.get_character(chat_id, new_name) is not None:
+        await message.reply_text(
+            f"A character named '{new_name}' already exists — pick a different name."
+        )
+        return True
+
+    storage.rename_character(chat_id, old_name, new_name)
+    await message.reply_text(f"Renamed '{old_name}' to '{new_name}'.")
     return True
 
 
