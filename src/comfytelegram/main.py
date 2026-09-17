@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -46,19 +46,22 @@ from comfytelegram.storage import Storage
 
 logger = logging.getLogger(__name__)
 
-#: Every `/command` the bot answers, as (name, callback). Single source of
-#: truth: `build_application` registers a `CommandHandler` per entry, and
-#: `_UNHANDLED_FILTER` below is built from the same names, so adding a
-#: command here can't leave the two disagreeing about what's known.
+#: Every `/command` the bot answers, as (name, callback, menu description).
+#: Single source of truth: `build_application` registers a `CommandHandler`
+#: per entry, `_UNHANDLED_FILTER` below is built from the same names, and
+#: `_post_init` pushes the descriptions to Telegram's own "/" command menu
+#: (`Bot.set_my_commands` — the same registry BotFather's `/setcommands`
+#: edits, settable directly instead) — so adding a command here can't leave
+#: any of the three disagreeing about what's known.
 _COMMANDS = (
-    ("start", start),
-    ("help", help_command),
-    ("model", model_command),
-    ("settings", settings_command),
-    ("character", character_command),
-    ("characters", characters_command),
-    ("stream", stream_command),
-    ("stop", stop_command),
+    ("start", start, "Show the welcome message and command keyboard"),
+    ("help", help_command, "Show the command list"),
+    ("model", model_command, "Pick a checkpoint"),
+    ("settings", settings_command, "View or change generation defaults for this model"),
+    ("character", character_command, "Save or delete a reusable character design"),
+    ("characters", characters_command, "List, activate, edit, or rename saved characters"),
+    ("stream", stream_command, "Generate images back-to-back until /stop"),
+    ("stop", stop_command, "Stop a running /stream"),
 )
 
 #: Matches exactly the messages none of the real handlers can claim: a
@@ -71,7 +74,7 @@ _COMMANDS = (
 #: handlers' filters, and doesn't claim rich messages back off them.
 _UNHANDLED_FILTER = (
     filters.COMMAND
-    & ~filters.Regex(rf"^/({'|'.join(name for name, _ in _COMMANDS)})(@\w+)?(\s|$)")
+    & ~filters.Regex(rf"^/({'|'.join(name for name, _, _ in _COMMANDS)})(@\w+)?(\s|$)")
 ) | ~(TEXT_CONTENT | filters.PHOTO)
 
 
@@ -100,20 +103,33 @@ async def _unhandled_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await message.reply_text(
         "I didn't understand that. Send a plain text prompt to generate, a "
         "photo to analyze it, or /help for the command list.\n\n(A message "
-        "starting with \"/\" is read as a command — drop the slash to use it "
+        'starting with "/" is read as a command — drop the slash to use it '
         "as a prompt.)"
     )
 
 
 async def _post_init(application: Application) -> None:
     """python-telegram-bot startup hook: open the `ComfyClient` (needs a
-    running event loop, so it can't be built at `build_application` time)
-    and stash it in `bot_data` alongside the other shared singletons."""
+    running event loop, so it can't be built at `build_application` time),
+    stash it in `bot_data` alongside the other shared singletons, and push
+    `_COMMANDS`' descriptions to Telegram's "/" command menu — the same
+    registry BotFather's `/setcommands` edits, so this keeps the menu in
+    sync with the bot's actual commands on every startup instead of
+    needing a manual BotFather edit whenever one is added/removed/
+    reworded."""
     settings: Settings = application.bot_data["settings"]
     client = ComfyClient(settings.comfyui_http_base, settings.comfyui_ws_base)
     await client.__aenter__()
     application.bot_data["comfy_client"] = client
     logger.info("Connected to ComfyUI at %s", settings.comfyui_http_base)
+
+    commands = [BotCommand(name, description) for name, _, description in _COMMANDS]
+    await application.bot.set_my_commands(commands)
+    logger.info(
+        "Registered %d bot commands with Telegram: %s",
+        len(commands),
+        ", ".join(c.command for c in commands),
+    )
 
 
 async def _post_shutdown(application: Application) -> None:
@@ -164,7 +180,7 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["profiles"] = load_profiles(settings.model_profiles_dir)
     application.bot_data["storage"] = Storage(settings.state_db_path)
 
-    for name, callback in _COMMANDS:
+    for name, callback, _ in _COMMANDS:
         application.add_handler(CommandHandler(name, callback))
     application.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
     application.add_handler(CallbackQueryHandler(postprocess_callback, pattern=r"^pp:"))
@@ -200,6 +216,12 @@ def run() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
+    # httpx (python-telegram-bot's HTTP backend) logs every request's full
+    # URL at INFO — including the bot token, since Telegram's API embeds it
+    # in the path (https://api.telegram.org/bot<TOKEN>/<method>). Left at
+    # the basicConfig default, that's the token in plaintext in every log
+    # line, forever. WARNING still surfaces real HTTP failures.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     settings = load_settings()
     application = build_application(settings)
     logger.info("Starting comfytelegram bot")
