@@ -483,9 +483,17 @@ async def _deliver_generation_result(
 ) -> None:
     """Shared tail of `generate_message`/`again_callback` once a batch of
     images has been produced: mint a fresh generation snapshot for the next
-    "Generate Again" tap, update the status message, then send + register
-    each image. `reply_target` is the message new image replies attach to
-    (the original prompt message, or the callback query's own message).
+    "Generate Again" tap, send + register each image, then report "Done"
+    with the "Generate Again" button as a fresh message. `reply_target` is
+    the message new image replies attach to (the original prompt message,
+    or the callback query's own message).
+
+    The "Done" report is a new message sent *after* the images, not an
+    edit of `status_message` in place — an edit can't change a message's
+    position in the chat, so editing the progress message would leave
+    "Generate Again" sitting above the images it refers to. `status_message`
+    is deleted once the images are sent, the same way post-processing
+    (`postprocess_callback`) retires its own progress message.
 
     Images are sent concurrently rather than one at a time — each is an
     independent Telegram call, so a batch shouldn't pay for N sequential
@@ -497,11 +505,12 @@ async def _deliver_generation_result(
     storage.store_generation_snapshot(
         snapshot_id, chat_id, _serialize_generation_params(images[0].full_params)
     )
-    await status_message.edit_text(
-        f"Done — {len(images)} image(s).", reply_markup=_again_keyboard(snapshot_id)
-    )
     await asyncio.gather(
         *(_send_and_store_result(reply_target, chat_id, storage, img) for img in images)
+    )
+    await status_message.delete()
+    await reply_target.reply_text(
+        f"Done — {len(images)} image(s).", reply_markup=_again_keyboard(snapshot_id)
     )
 
 
