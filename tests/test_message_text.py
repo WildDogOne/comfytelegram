@@ -27,6 +27,19 @@ def test_plain_text_is_returned_as_is():
     assert message_text(_message("a red fox")) == "a red fox"
 
 
+def test_crlf_line_endings_are_normalized_to_bare_newlines():
+    """Mobile clients routinely send "\\r\\n" — normalize it so the "---"
+    separator's line-anchored regex and newline-as-comma tag splitting
+    (see `handlers._normalize_prompt_block`) both still work."""
+    assert message_text(_message("1girl\r\noutdoors\r\n---\r\nblurry")) == (
+        "1girl\noutdoors\n---\nblurry"
+    )
+
+
+def test_bare_cr_line_endings_are_normalized_too():
+    assert message_text(_message("1girl\routdoors")) == "1girl\noutdoors"
+
+
 def test_rich_message_blocks_are_reassembled():
     """Newer clients send multi-paragraph messages this way, leaving
     `Message.text` None — the case that used to make the bot silently

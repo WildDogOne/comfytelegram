@@ -66,6 +66,7 @@ POSTPROCESS_STATUS_LABELS = {
 ANALYZE_CALLBACK_KIND = "analyze"
 ANALYZE_ONLY_CALLBACK_KIND = "analyze_only"
 DEEP_ANALYZE_CALLBACK_KIND = "deep_analyze"
+SHOW_PROMPT_CALLBACK_KIND = "show_prompt"
 AGAIN_CALLBACK_PREFIX = "again:"
 GENERATE_FROM_PROMPT_CALLBACK_PREFIX = "genp:"
 STREAM_CANCEL_CALLBACK_DATA = "stream:cancel"
@@ -124,9 +125,12 @@ _STREAMING_KEYBOARD = ReplyKeyboardMarkup([["/stop"]], resize_keyboard=True)
 def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
     """The keyboard attached to a generated/post-processed image: one
     button per `POSTPROCESS_KEYBOARD_LABELS` entry plus Analyze (prompt
-    only), Analyze & Regenerate, and Deep Analyze (prompt only, via the
-    bigger `analyze_caption_deep` model), all scoped to `result_id` (see
-    `storage.py`'s `pending_result`)."""
+    only), Analyze & Regenerate, Deep Analyze (prompt only, via the bigger
+    `analyze_caption_deep` model), and Show Prompt (a debugging button that
+    dumps the exact positive/negative prompt this image was generated
+    with, folded character and profile prefixes included — see
+    `postprocess_callback`'s `SHOW_PROMPT_CALLBACK_KIND` branch), all
+    scoped to `result_id` (see `storage.py`'s `pending_result`)."""
     return InlineKeyboardMarkup(
         [
             [
@@ -145,7 +149,10 @@ def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     "🔎 Deep Analyze", callback_data=f"pp:{DEEP_ANALYZE_CALLBACK_KIND}:{result_id}"
-                )
+                ),
+                InlineKeyboardButton(
+                    "🐛 Show Prompt", callback_data=f"pp:{SHOW_PROMPT_CALLBACK_KIND}:{result_id}"
+                ),
             ],
         ]
     )
@@ -837,7 +844,11 @@ def _split_negative_prompt(text: str) -> tuple[str, str]:
     Without one, falls back to pulling out individual "-token" negatives
     (see `_NEGATIVE_TOKEN_RE`), so "1girl, outdoors, -blurry, -watermark"
     still generates with "blurry, watermark" appended to the negative
-    prompt instead of ending up literally in the positive one."""
+    prompt instead of ending up literally in the positive one. Either way,
+    a bare newline between tags is treated the same as a comma (see
+    `_normalize_prompt_block`) — for someone who prefers writing one tag
+    per line (CRLF included; `message_text` already normalizes it to
+    "\\n") over comma-separating them."""
     block_match = _NEGATIVE_BLOCK_SEP_RE.search(text)
     if block_match:
         positive = _normalize_prompt_block(text[: block_match.start()])
@@ -846,8 +857,7 @@ def _split_negative_prompt(text: str) -> tuple[str, str]:
 
     negatives = [match.group(1) for match in _NEGATIVE_TOKEN_RE.finditer(text)]
     remainder = _NEGATIVE_TOKEN_RE.sub("", text)
-    positive_parts = [part.strip() for part in remainder.split(",")]
-    positive = join_nonempty(positive_parts)
+    positive = _normalize_prompt_block(remainder)
     positive = re.sub(r"\s{2,}", " ", positive).strip()
     return positive, join_nonempty(negatives)
 
@@ -1003,10 +1013,12 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     Qwen-VL caption — and reply with both, no generation, no
     `prompt_style` dispatch; see `ANALYZE_ONLY_CALLBACK_KIND`), `"analyze"`
     (the checkpoint's configured single analyzer, then generate from that
-    prompt — see `ANALYZE_CALLBACK_KIND`), or `"upscale"`/`"face"`/`"hand"`
-    (download the source image and run that post-processing stage on it).
-    Alerts instead if `result_id` has expired (see
-    `PENDING_RESULT_TTL_SECONDS`)."""
+    prompt — see `ANALYZE_CALLBACK_KIND`), `"show_prompt"` (reply with the
+    exact positive/negative prompt this image was built from, no download
+    or generation — see `SHOW_PROMPT_CALLBACK_KIND`), or
+    `"upscale"`/`"face"`/`"hand"` (download the source image and run that
+    post-processing stage on it). Alerts instead if `result_id` has
+    expired (see `PENDING_RESULT_TTL_SECONDS`)."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
@@ -1023,6 +1035,13 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     client: ComfyClient = context.bot_data["comfy_client"]
     full_params = _deserialize_generation_params(pending["base_params"])
+
+    if kind == SHOW_PROMPT_CALLBACK_KIND:
+        negative = full_params.negative_prompt or "(none)"
+        await query.message.reply_text(
+            f"Positive:\n{full_params.positive_prompt}\n\nNegative:\n{negative}"
+        )
+        return
 
     if kind == ANALYZE_ONLY_CALLBACK_KIND:
         status_message = await query.message.reply_text("Analyzing image…")

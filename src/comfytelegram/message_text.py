@@ -25,14 +25,19 @@ def message_text(message: Message | None) -> str | None:
     reconstruction of the `rich_message` blocks in `api_kwargs`. Blocks are
     joined with newlines, which restores the paragraph breaks the sender
     typed — the "---" negative-prompt separator (see
-    `handlers._split_negative_prompt`) depends on those surviving. Returns
+    `handlers._split_negative_prompt`) depends on those surviving. Line
+    endings are normalized to bare "\\n" (mobile Telegram clients routinely
+    send "\\r\\n") so downstream newline-sensitive parsing — the "---"
+    separator's own line-anchored regex, and `_normalize_prompt_block`
+    treating a newline like a comma between tags — sees one consistent
+    form instead of silently failing to match a "\\r"-tainted line. Returns
     None when the message carries no text at all in either form (a sticker,
     a voice note), so callers can keep treating None as "not a text
     message"."""
     if message is None:
         return None
     if message.text is not None:
-        return message.text
+        return _normalize_line_endings(message.text)
 
     rich_message = message.api_kwargs.get("rich_message")
     if not isinstance(rich_message, dict):
@@ -44,7 +49,12 @@ def message_text(message: Message | None) -> str | None:
     texts = [block.get("text") for block in blocks if isinstance(block, dict)]
     if not any(isinstance(text, str) and text for text in texts):
         return None
-    return "\n".join(text for text in texts if isinstance(text, str))
+    return _normalize_line_endings("\n".join(text for text in texts if isinstance(text, str)))
+
+
+def _normalize_line_endings(text: str) -> str:
+    """Collapse "\\r\\n" and bare "\\r" line endings down to "\\n"."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 class _TextContent(filters.MessageFilter):

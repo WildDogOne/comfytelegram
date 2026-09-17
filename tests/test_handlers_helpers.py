@@ -69,6 +69,12 @@ def test_split_negative_prompt_block_separator_ignores_mid_word_hyphens():
     assert negative == "blurry"
 
 
+def test_split_negative_prompt_treats_newlines_like_commas_without_a_block_separator():
+    positive, negative = _split_negative_prompt("1girl\noutdoors\n-blurry\n-watermark")
+    assert positive == "1girl, outdoors"
+    assert negative == "blurry, watermark"
+
+
 def test_resolve_effective_prompt_without_a_character():
     effective_prompt, extra_negative = _resolve_effective_prompt("1girl, -blurry", None)
     assert effective_prompt == "1girl"
@@ -91,6 +97,7 @@ def test_post_process_keyboard_scopes_every_button_to_result_id():
     assert "pp:analyze_only:abc123" in callback_data
     assert "pp:analyze:abc123" in callback_data
     assert "pp:deep_analyze:abc123" in callback_data
+    assert "pp:show_prompt:abc123" in callback_data
 
 
 def test_again_keyboard_scopes_button_to_snapshot_id():
