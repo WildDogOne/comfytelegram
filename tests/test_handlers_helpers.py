@@ -16,11 +16,13 @@ from comfytelegram.handlers import (
     _resolve_tag_sources,
     _run_reporting_errors,
     _split_negative_prompt,
+    _tag_prompt_text,
+    _tag_results_keyboard,
     _upscale_confirm_keyboard,
     start,
 )
 from comfytelegram.profiles import ModelProfile
-from comfytelegram.tags import TagSource
+from comfytelegram.tags import TagResult, TagSource
 
 
 def test_split_negative_prompt_pulls_out_comma_separated_tags():
@@ -135,6 +137,22 @@ def test_generate_from_prompt_keyboard_includes_copy_button_at_telegram_limit():
     keyboard = _generate_from_prompt_keyboard("prompt123", "x" * 256)
     _generate_button, copy_button = keyboard.inline_keyboard[0]
     assert copy_button.copy_text.text == "x" * 256
+
+
+def test_tag_prompt_text_replaces_underscores_with_spaces():
+    assert _tag_prompt_text("blue_eyes") == "blue eyes"
+
+
+def test_tag_prompt_text_leaves_spaceless_tags_unchanged():
+    assert _tag_prompt_text("smile") == "smile"
+
+
+def test_tag_results_keyboard_copies_spaces_but_displays_underscores():
+    result = TagResult(source=TagSource.DANBOORU, name="blue_eyes", category=0, post_count=1000)
+    keyboard = _tag_results_keyboard([result])
+    (button,) = keyboard.inline_keyboard[0]
+    assert button.text == "📋 blue_eyes"
+    assert button.copy_text.text == "blue eyes"
 
 
 def test_characters_keyboard_marks_active_character():

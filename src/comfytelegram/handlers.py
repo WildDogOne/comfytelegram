@@ -1666,15 +1666,30 @@ def _tag_result_line(result: TagResult) -> str:
     return line
 
 
+def _tag_prompt_text(name: str) -> str:
+    """Danbooru/e621 tag names are stored with underscores
+    (`"blue_eyes"`), but checkpoints are trained on space-separated prompt
+    text — pasting the raw underscored form in verbatim is a token
+    mismatch the model won't recognize. Swap underscores for spaces for
+    the copy-to-clipboard/prompt-insertion text; the display line
+    (`_tag_result_line`) still shows the raw stored name, since that's
+    what `tags_db.search`/`lookup_exact` actually match against."""
+    return name.replace("_", " ")
+
+
 def _tag_results_keyboard(results: list[TagResult]) -> InlineKeyboardMarkup:
     """One row per hit: a native tap-to-copy button (`CopyTextButton`, same
-    pattern `_generate_from_prompt_keyboard` uses) for pasting the exact
-    tag text into the next prompt message. Tag names are always well under
+    pattern `_generate_from_prompt_keyboard` uses) for pasting the tag
+    straight into the next prompt message. Tag names are always well under
     Telegram's 256-char `copy_text` cap, so unlike that keyboard, no
     length-gating is needed here."""
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(f"📋 {result.name}", copy_text=CopyTextButton(result.name))]
+            [
+                InlineKeyboardButton(
+                    f"📋 {result.name}", copy_text=CopyTextButton(_tag_prompt_text(result.name))
+                )
+            ]
             for result in results
         ]
     )
