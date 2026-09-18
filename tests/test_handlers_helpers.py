@@ -5,6 +5,8 @@ import pytest
 from comfytelegram.comfy_client import ComfyUIError
 from comfytelegram.handlers import (
     _MAIN_KEYBOARD,
+    SHOW_PROMPT_CALLBACK_KIND,
+    TAGCHECK_TOKEN_LIMIT,
     _again_keyboard,
     _characters_keyboard,
     _consume_awaiting_character_edit,
@@ -15,15 +17,20 @@ from comfytelegram.handlers import (
     _resolve_effective_prompt,
     _resolve_tag_sources,
     _run_reporting_errors,
+    _serialize_generation_params,
     _split_negative_prompt,
+    _strip_prompt_weight,
     _tag_prompt_text,
     _tag_results_keyboard,
+    _tagcheck_lines,
     _upscale_confirm_keyboard,
+    postprocess_callback,
     start,
 )
 from comfytelegram.profiles import ModelProfile
 from comfytelegram.tags import TagResult, TagSource
 from comfytelegram.topics import NO_TOPIC
+from comfytelegram.workflows import GenerationParams
 
 
 def test_split_negative_prompt_pulls_out_comma_separated_tags():
@@ -418,3 +425,191 @@ def test_resolve_tag_sources_searches_both_when_no_checkpoint_selected():
     sources, remainder = _resolve_tag_sources("fox", None, [])
     assert sources == [TagSource.DANBOORU, TagSource.E621]
     assert remainder == "fox"
+
+
+def _tag_result(name: str, post_count: int, source: TagSource = TagSource.DANBOORU) -> TagResult:
+    return TagResult(source=source, name=name, category=0, post_count=post_count)
+
+
+def test_tagcheck_lines_marks_a_known_common_tag():
+    tags_db = MagicMock()
+    tags_db.lookup_exact.return_value = _tag_result("1girl", 500_000)
+    settings = MagicMock(tag_rare_threshold=100)
+
+    lines = _tagcheck_lines("1girl", [TagSource.DANBOORU], tags_db, settings)
+
+    assert lines == ["✅ 1girl — 500,000 posts (danbooru)"]
+
+
+def test_tagcheck_lines_flags_a_rare_tag():
+    tags_db = MagicMock()
+    tags_db.lookup_exact.return_value = _tag_result("obscure_tag", 5)
+    settings = MagicMock(tag_rare_threshold=100)
+
+    lines = _tagcheck_lines("obscure_tag", [TagSource.DANBOORU], tags_db, settings)
+
+    assert lines == ["⚠️ obscure_tag — rare (5 posts, danbooru)"]
+
+
+def test_tagcheck_lines_flags_an_unknown_tag_with_a_suggestion():
+    tags_db = MagicMock()
+    tags_db.lookup_exact.return_value = None
+    tags_db.search.return_value = [_tag_result("1girl", 500_000)]
+    settings = MagicMock(tag_rare_threshold=100)
+
+    lines = _tagcheck_lines("1gril", [TagSource.DANBOORU], tags_db, settings)
+
+    assert lines == ['❌ 1gril — not a known tag — did you mean "1girl"?']
+
+
+def test_strip_prompt_weight_unwraps_an_explicit_weight():
+    assert _strip_prompt_weight("(yellow markings:1.2)") == "yellow markings"
+
+
+def test_strip_prompt_weight_unwraps_plain_emphasis():
+    assert _strip_prompt_weight("(masterpiece)") == "masterpiece"
+
+
+def test_strip_prompt_weight_unwraps_nested_emphasis():
+    assert _strip_prompt_weight("((masterpiece))") == "masterpiece"
+
+
+def test_strip_prompt_weight_unwraps_bracket_de_emphasis():
+    assert _strip_prompt_weight("[lowres:0.8]") == "lowres"
+
+
+def test_strip_prompt_weight_leaves_a_plain_tag_alone():
+    assert _strip_prompt_weight("1girl") == "1girl"
+
+
+def test_strip_prompt_weight_leaves_a_tag_with_a_literal_paren_alone():
+    assert _strip_prompt_weight("hat_(costume)") == "hat_(costume)"
+
+
+def test_tagcheck_lines_looks_up_the_tag_inside_weight_syntax():
+    tags_db = MagicMock()
+    tags_db.lookup_exact.return_value = _tag_result("yellow markings", 5_000)
+    settings = MagicMock(tag_rare_threshold=100)
+
+    lines = _tagcheck_lines("(yellow markings:1.2)", [TagSource.DANBOORU], tags_db, settings)
+
+    tags_db.lookup_exact.assert_called_once_with("yellow markings", [TagSource.DANBOORU])
+    assert lines == ["✅ (yellow markings:1.2) — 5,000 posts (danbooru)"]
+
+
+def test_tagcheck_lines_truncates_at_the_token_limit():
+    tags_db = MagicMock()
+    tags_db.lookup_exact.return_value = _tag_result("t", 500_000)
+    settings = MagicMock(tag_rare_threshold=100)
+    prompt = ", ".join(f"tag{i}" for i in range(TAGCHECK_TOKEN_LIMIT + 5))
+
+    lines = _tagcheck_lines(prompt, [TagSource.DANBOORU], tags_db, settings)
+
+    assert len(lines) == TAGCHECK_TOKEN_LIMIT + 1
+    assert lines[-1] == f"…5 more token(s) omitted (limit {TAGCHECK_TOKEN_LIMIT})."
+
+
+def _pending_result_mock(profile: ModelProfile, positive: str, negative: str = "") -> MagicMock:
+    params = GenerationParams(
+        checkpoint="fluffyfurry.safetensors", positive_prompt=positive, negative_prompt=negative
+    )
+    storage = MagicMock()
+    storage.get_pending_result.return_value = {
+        "base_params": _serialize_generation_params(params),
+        "chat_id": 1,
+        "file_id": "file123",
+    }
+    return storage
+
+
+@pytest.mark.asyncio
+async def test_show_prompt_appends_tag_check_for_a_tag_style_profile():
+    query = AsyncMock()
+    query.data = f"pp:{SHOW_PROMPT_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(
+        match=["fluffyfurry*"], display_name="x", prompt_style="tags", tag_dictionary="e621"
+    )
+    storage = _pending_result_mock(profile, "fox, blue_eyes", "blurry")
+    tags_db = MagicMock()
+    tags_db.stats.return_value = {"e621": 100}
+    tags_db.lookup_exact.return_value = _tag_result("fox", 500_000, TagSource.E621)
+
+    context = MagicMock()
+    context.bot_data = {
+        "settings": MagicMock(allowed_user_ids=None, tag_rare_threshold=100),
+        "storage": storage,
+        "comfy_client": MagicMock(),
+        "profiles": [profile],
+        "tags_db": tags_db,
+    }
+
+    await postprocess_callback(update, context)
+
+    assert query.message.reply_text.await_count == 2
+    prompt_message = query.message.reply_text.await_args_list[0].args[0]
+    assert "fox, blue_eyes" in prompt_message
+    tagcheck_message = query.message.reply_text.await_args_list[1].args[0]
+    assert "Tag check (positive)" in tagcheck_message
+    assert "Tag check (negative)" in tagcheck_message
+    assert "fox" in tagcheck_message
+    assert "blurry" in tagcheck_message
+
+
+@pytest.mark.asyncio
+async def test_show_prompt_skips_tag_check_for_a_natural_language_profile():
+    query = AsyncMock()
+    query.data = f"pp:{SHOW_PROMPT_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["anima*"], display_name="x", prompt_style="natural")
+    storage = _pending_result_mock(profile, "a fox in the snow")
+    tags_db = MagicMock()
+    tags_db.stats.return_value = {"e621": 100}
+
+    context = MagicMock()
+    context.bot_data = {
+        "settings": MagicMock(allowed_user_ids=None, tag_rare_threshold=100),
+        "storage": storage,
+        "comfy_client": MagicMock(),
+        "profiles": [profile],
+        "tags_db": tags_db,
+    }
+
+    await postprocess_callback(update, context)
+
+    assert query.message.reply_text.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_show_prompt_skips_tag_check_when_no_tag_data_imported():
+    query = AsyncMock()
+    query.data = f"pp:{SHOW_PROMPT_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(
+        match=["fluffyfurry*"], display_name="x", prompt_style="tags", tag_dictionary="e621"
+    )
+    storage = _pending_result_mock(profile, "fox")
+    tags_db = MagicMock()
+    tags_db.stats.return_value = {"e621": 0, "danbooru": 0}
+
+    context = MagicMock()
+    context.bot_data = {
+        "settings": MagicMock(allowed_user_ids=None, tag_rare_threshold=100),
+        "storage": storage,
+        "comfy_client": MagicMock(),
+        "profiles": [profile],
+        "tags_db": tags_db,
+    }
+
+    await postprocess_callback(update, context)
+
+    assert query.message.reply_text.await_count == 1

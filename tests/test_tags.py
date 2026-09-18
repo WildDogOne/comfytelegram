@@ -102,6 +102,125 @@ def test_search_ranks_by_post_count_within_same_rank(db: TagDatabase, tmp_path: 
     assert [r.name for r in results] == ["fox_ears", "fox"]
 
 
+def test_search_by_frequency_ranks_a_common_substring_match_above_a_rare_prefix_match(
+    db: TagDatabase, tmp_path: Path
+):
+    path = _csv(
+        tmp_path,
+        "e621.csv",
+        [
+            "anthro,0,100,",
+            "big_anthro_dude,0,4000000,",
+        ],
+    )
+    import_csv(db, TagSource.E621, path)
+
+    results = db.search("anthro", [TagSource.E621], limit=10, by_frequency=True)
+    assert [r.name for r in results] == ["big_anthro_dude", "anthro"]
+
+
+def test_search_by_frequency_still_caps_at_limit(db: TagDatabase, tmp_path: Path):
+    path = _csv(
+        tmp_path,
+        "e621.csv",
+        [
+            "fox,5,1000,",
+            "fox_ears,5,50000,",
+            "fox_tail,5,20000,",
+        ],
+    )
+    import_csv(db, TagSource.E621, path)
+
+    results = db.search("fox", [TagSource.E621], limit=2, by_frequency=True)
+    assert [r.name for r in results] == ["fox_ears", "fox_tail"]
+
+
+def test_search_falls_back_to_fuzzy_matching_when_no_substring_hits(
+    db: TagDatabase, tmp_path: Path
+):
+    path = _csv(tmp_path, "danbooru.csv", ["1girl,0,5000000,", "solo,0,4000000,"])
+    import_csv(db, TagSource.DANBOORU, path)
+
+    # "1gril" shares no substring with "1girl" (the "ri"/"ir" are
+    # transposed), so plain substring matching alone finds nothing.
+    results = db.search("1gril", [TagSource.DANBOORU], limit=10)
+    assert [r.name for r in results] == ["1girl"]
+
+
+def test_search_never_pads_real_matches_out_with_fuzzy_guesses(db: TagDatabase, tmp_path: Path):
+    # Regression test for a reported bug: "/tags dimple" had 5 genuine
+    # substring hits, well under limit=15, and the old "top up to limit"
+    # fuzzy fallback padded the rest of the page with unrelated tags —
+    # "temple", "nipples", "male" — that just happened to score above the
+    # ratio threshold against a handful of e621's most common tags.
+    path = _csv(
+        tmp_path,
+        "e621.csv",
+        [
+            "dimple,0,147,",
+            "back_dimples,0,659,",
+            "tail_dimple,0,277,",
+            "dimple_piercing,0,128,",
+            "butt_dimples,0,78,",
+            "temple,0,1650,",
+            "nipples,0,1559290,",
+            "male,0,3093404,",
+        ],
+    )
+    import_csv(db, TagSource.E621, path)
+
+    results = db.search("dimple", [TagSource.E621], limit=15, by_frequency=True)
+    assert {r.name for r in results} == {
+        "dimple",
+        "back_dimples",
+        "tail_dimple",
+        "dimple_piercing",
+        "butt_dimples",
+    }
+
+
+def test_search_fuzzy_fallback_never_runs_with_any_real_match(db: TagDatabase, tmp_path: Path):
+    path = _csv(
+        tmp_path,
+        "danbooru.csv",
+        [
+            "big_anthro_dude,0,100,",
+            "anthro,0,4000000,",
+        ],
+    )
+    import_csv(db, TagSource.DANBOORU, path)
+
+    # Even a single real substring match should stand on its own, not get
+    # topped up with fuzzy guesses to fill out `limit`.
+    results = db.search("anthro", [TagSource.DANBOORU], limit=15)
+    assert [r.name for r in results] == ["anthro", "big_anthro_dude"]
+
+
+def test_search_fuzzy_fallback_ranks_by_closeness_then_frequency(db: TagDatabase, tmp_path: Path):
+    path = _csv(
+        tmp_path,
+        "danbooru.csv",
+        [
+            "grey_eyes,0,1000,",  # closer match, far fewer posts
+            "gray_ears,0,5000000,",  # less close, but way more popular
+        ],
+    )
+    import_csv(db, TagSource.DANBOORU, path)
+
+    # Closeness of match outranks raw popularity in the fuzzy fallback —
+    # unlike a real substring/prefix match, a fuzzy guess is only useful if
+    # it's actually the tag the user meant.
+    results = db.search("gray_eyes", [TagSource.DANBOORU], limit=10)
+    assert [r.name for r in results] == ["grey_eyes", "gray_ears"]
+
+
+def test_search_fuzzy_fallback_ignores_unrelated_tags(db: TagDatabase, tmp_path: Path):
+    path = _csv(tmp_path, "danbooru.csv", ["humanoid,0,1000,"])
+    import_csv(db, TagSource.DANBOORU, path)
+
+    assert db.search("anthro", [TagSource.DANBOORU], limit=10) == []
+
+
 def test_search_matches_aliases_and_resolves_to_canonical_tag(db: TagDatabase, tmp_path: Path):
     path = _csv(tmp_path, "e621.csv", ['anthro,0,4000000,"anthropomorphic,antro"'])
     import_csv(db, TagSource.E621, path)

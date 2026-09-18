@@ -15,6 +15,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from collections.abc import Iterable
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from comfytelegram.tags.schema import TagResult, TagRow, TagSource
@@ -50,6 +51,23 @@ CREATE TABLE IF NOT EXISTS tag_source_meta (
 #: the whole table. Ordered by post_count DESC first, so truncation drops
 #: the least relevant rows, not arbitrary ones.
 _CANDIDATE_FETCH_LIMIT = 500
+
+#: Fuzzy fallback (see `_fuzzy_matches`) only scores tags whose length is
+#: within this many characters of the query — a typo rarely adds/drops
+#: more than a couple, and this keeps the fallback's own candidate query
+#: from having to consider the whole table.
+_FUZZY_LENGTH_SLOP = 3
+
+#: Same purpose as `_CANDIDATE_FETCH_LIMIT`, for the fuzzy fallback's own
+#: (length-filtered, not substring-filtered) candidate query.
+_FUZZY_CANDIDATE_LIMIT = 5000
+
+#: Minimum `difflib.SequenceMatcher` ratio for a fuzzy fallback candidate
+#: to be considered a match at all, vs. just two unrelated tags that happen
+#: to be a similar length — e.g. a "dimple" search fuzzy-matching "temple"
+#: or "male" at 0.6. Real single-edit typos of a tag of any reasonable
+#: length still clear this comfortably (0.8+ in practice).
+_FUZZY_MIN_RATIO = 0.72
 
 
 def _normalize(text: str) -> str:
@@ -122,11 +140,35 @@ class TagDatabase:
             for source in TagSource
         }
 
-    def search(self, query: str, sources: Iterable[TagSource], limit: int = 15) -> list[TagResult]:
-        """Tag name/alias search: prefix matches rank above substring
-        matches, then by post_count descending. A tag matched directly by
-        its own name always wins over the same tag surfaced through one of
-        its aliases, even if the alias match technically ranks higher."""
+    def search(
+        self,
+        query: str,
+        sources: Iterable[TagSource],
+        limit: int = 15,
+        *,
+        by_frequency: bool = False,
+    ) -> list[TagResult]:
+        """Tag name/alias search. Default ranking puts prefix matches above
+        substring matches, then sorts by post_count descending within each
+        group — good for a "did you mean" hint, where the closest textual
+        match matters more than raw popularity. `by_frequency=True` instead
+        sorts the whole candidate pool by post_count alone (`/tags`'s own
+        listing wants the most-used matching tags first, not a rare prefix
+        match outranking a far more common substring one). Either way, a
+        tag matched directly by its own name always wins over the same tag
+        surfaced through one of its aliases, even if the alias match
+        technically ranks higher.
+
+        Only falls back to `_fuzzy_matches`' edit-distance-tolerant
+        candidates when substring matching finds *nothing at all* — e.g. a
+        typo like "1gril" shares no substring with "1girl". A query with
+        even one real hit never reaches for a fuzzy guess just to pad the
+        result list out to `limit`: real, if few, beats padding a "dimple"
+        search out to 15 rows with "temple"/"nipples"/"male" once its 5
+        genuine matches run out. Fuzzy results are ranked by closeness of
+        match first and post_count second — a fuzzy guess is only useful
+        if it's actually the tag meant, no matter how popular a
+        less-similar guess is."""
         needle = _normalize(query)
         sources = list(sources)
         if not needle or not sources:
@@ -157,11 +199,55 @@ class TagDatabase:
             if key not in candidates:
                 candidates[key] = TagResult(TagSource(source), name, category, post_count, alias)
 
-        def rank(result: TagResult) -> tuple[int, int]:
-            text = result.matched_alias or result.name
-            return (0 if text.startswith(needle) else 1, -result.post_count)
+        if by_frequency:
+            ranked = sorted(candidates.values(), key=lambda r: -r.post_count)
+        else:
 
-        return sorted(candidates.values(), key=rank)[:limit]
+            def rank(result: TagResult) -> tuple[int, int]:
+                text = result.matched_alias or result.name
+                return (0 if text.startswith(needle) else 1, -result.post_count)
+
+            ranked = sorted(candidates.values(), key=rank)
+
+        if ranked:
+            return ranked[:limit]
+
+        fuzzy = self._fuzzy_matches(needle, sources, exclude=set(candidates))
+        fuzzy.sort(key=lambda item: (-item[0], -item[1].post_count))
+        return [result for _, result in fuzzy][:limit]
+
+    def _fuzzy_matches(
+        self, needle: str, sources: list[TagSource], exclude: set[tuple[str, str]]
+    ) -> list[tuple[float, TagResult]]:
+        """`search()`'s edit-distance-tolerant fallback, for typos that
+        share no substring with the tag they meant. Scored with stdlib
+        `difflib.SequenceMatcher` against a candidate pool filtered by
+        name length (within `_FUZZY_LENGTH_SLOP` of `needle`) rather than
+        substring containment — cheap enough to run without a dedicated
+        fuzzy index, and only reached when `search()`'s real matches don't
+        already fill `limit`. Alias names aren't scored — a fuzzy match
+        against a tag's own name is what "did you mean" callers actually
+        want, and skipping aliases here keeps the fallback to one query."""
+        source_values = [s.value for s in sources]
+        placeholders = ",".join("?" for _ in sources)
+        min_len = max(1, len(needle) - _FUZZY_LENGTH_SLOP)
+        max_len = len(needle) + _FUZZY_LENGTH_SLOP
+
+        rows = self._conn.execute(
+            f"SELECT source, name, category, post_count FROM tag "
+            f"WHERE source IN ({placeholders}) AND LENGTH(name) BETWEEN ? AND ? "
+            f"ORDER BY post_count DESC LIMIT {_FUZZY_CANDIDATE_LIMIT}",
+            [*source_values, min_len, max_len],
+        ).fetchall()
+
+        matches = []
+        for source, name, category, post_count in rows:
+            if (source, name) in exclude:
+                continue
+            ratio = SequenceMatcher(None, needle, name).ratio()
+            if ratio >= _FUZZY_MIN_RATIO:
+                matches.append((ratio, TagResult(TagSource(source), name, category, post_count)))
+        return matches
 
     def lookup_exact(self, token: str, sources: Iterable[TagSource]) -> TagResult | None:
         """Exact (case/space-insensitive) match against a tag's own name,

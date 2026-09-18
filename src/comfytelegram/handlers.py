@@ -1069,7 +1069,9 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     (the checkpoint's configured single analyzer, then generate from that
     prompt — see `ANALYZE_CALLBACK_KIND`), `"show_prompt"` (reply with the
     exact positive/negative prompt this image was built from, no download
-    or generation — see `SHOW_PROMPT_CALLBACK_KIND`), or
+    or generation — plus a `/tagcheck`-style tag-health check on it, if
+    this image's checkpoint profile is tag-trained and tag data is
+    imported; see `SHOW_PROMPT_CALLBACK_KIND`), or
     `"upscale"`/`"face"`/`"hand"` (download the source image and run that
     post-processing stage on it). A fresh `"upscale"` tap on an image
     already at or beyond `UPSCALE_CONFIRM_THRESHOLD_PX` doesn't upscale
@@ -1101,6 +1103,24 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text(
             f"Positive:\n{full_params.positive_prompt}\n\nNegative:\n{negative}"
         )
+
+        tags_db: TagDatabase = context.bot_data["tags_db"]
+        profiles: list[ModelProfile] = context.bot_data["profiles"]
+        profile = resolve_profile(full_params.checkpoint, profiles)
+        # Tag-health only makes sense for comma-separated booru tags, not a
+        # natural-language caption — gated on prompt_style, same as
+        # analyze_image()'s own tags-vs-caption dispatch.
+        if profile is not None and profile.prompt_style == "tags" and any(tags_db.stats().values()):
+            sources, _ = _resolve_tag_sources("", full_params.checkpoint, profiles)
+            report = ["🔎 Tag check (positive):"]
+            report.extend(_tagcheck_lines(full_params.positive_prompt, sources, tags_db, settings))
+            if full_params.negative_prompt:
+                report.append("")
+                report.append("🔎 Tag check (negative):")
+                report.extend(
+                    _tagcheck_lines(full_params.negative_prompt, sources, tags_db, settings)
+                )
+            await query.message.reply_text("\n".join(report))
         return
 
     if kind == ANALYZE_ONLY_CALLBACK_KIND:
@@ -1708,9 +1728,14 @@ async def tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     help build a prompt. Scoped to whichever dictionary the current chat's
     checkpoint profile prefers via `tag_dictionary` (both, if none/unset),
     overridable with a leading "danbooru:"/"e621:" on the query itself.
-    Each hit gets a native tap-to-copy button for pasting straight into the
-    next prompt message. Doesn't require ComfyUI to be reachable — this is
-    pure local sqlite lookup, so it works even before a model is selected."""
+    Results are ranked purely by post_count (`search(..., by_frequency=True)`)
+    since this is a "what are the most-used matching tags" listing capped
+    to `tag_search_results` — unlike a "did you mean" hint, there's no
+    reason for a rare prefix match to outrank a far more common substring
+    one here. Each hit gets a native tap-to-copy button for pasting
+    straight into the next prompt message. Doesn't require ComfyUI to be
+    reachable — this is pure local sqlite lookup, so it works even before a
+    model is selected."""
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
         return
@@ -1736,7 +1761,7 @@ async def tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    results = tags_db.search(query, sources, limit=settings.tag_search_results)
+    results = tags_db.search(query, sources, limit=settings.tag_search_results, by_frequency=True)
     if not results:
         await message.reply_text(f"No tags found for {query!r}.")
         return
@@ -1748,12 +1773,62 @@ async def tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+#: ComfyUI/A1111-style emphasis wrapping a whole tag — `(tag)`, `((tag))`,
+#: `(tag:1.2)` to raise weight, `[tag]`/`[tag:0.9]` to lower it. Matched
+#: separately per bracket kind (rather than one `[(\[]`-class pattern) so
+#: mismatched wrapping like `(tag]` is deliberately left alone instead of
+#: silently accepted.
+_PAREN_WEIGHT_RE = re.compile(r"^\(+(?P<name>.+?)(?::[0-9]*\.?[0-9]+)?\)+$")
+_BRACKET_WEIGHT_RE = re.compile(r"^\[+(?P<name>.+?)(?::[0-9]*\.?[0-9]+)?\]+$")
+
+
+def _strip_prompt_weight(token: str) -> str:
+    """Unwrap a comma-split prompt token's emphasis syntax, if any, down to
+    the bare tag name — e.g. `"(yellow markings:1.2)"` -> `"yellow
+    markings"`. Without this, `_tagcheck_lines` looks up the wrapper
+    itself, which is never a real tag, and always reports it as unknown
+    regardless of whether the tag inside it is valid."""
+    match = _PAREN_WEIGHT_RE.match(token) or _BRACKET_WEIGHT_RE.match(token)
+    return match.group("name").strip() if match else token
+
+
+def _tagcheck_lines(
+    prompt_text: str, sources: list[TagSource], tags_db: TagDatabase, settings: Settings
+) -> list[str]:
+    """Comma-split `prompt_text` (this codebase's usual booru-prompt
+    convention) and check each token against `tags_db`: found & common
+    (✅), found but rare — i.e. little training data behind it (⚠️), or not
+    a known tag at all (❌, with a "did you mean" hint when a close match
+    turns up). Emphasis syntax (see `_strip_prompt_weight`) is stripped
+    before lookup but the token is still displayed as the user wrote it.
+    Shared by `tagcheck_command` and `postprocess_callback`'s
+    `SHOW_PROMPT_CALLBACK_KIND` branch."""
+    tokens = [token for token in (t.strip() for t in prompt_text.split(",")) if token]
+    omitted = max(0, len(tokens) - TAGCHECK_TOKEN_LIMIT)
+    tokens = tokens[:TAGCHECK_TOKEN_LIMIT]
+
+    lines = []
+    for token in tokens:
+        lookup_token = _strip_prompt_weight(token)
+        result = tags_db.lookup_exact(lookup_token, sources)
+        if result is None:
+            hint = ""
+            suggestions = tags_db.search(lookup_token, sources, limit=1)
+            if suggestions:
+                hint = f' — did you mean "{suggestions[0].name}"?'
+            lines.append(f"❌ {token} — not a known tag{hint}")
+        elif result.post_count < settings.tag_rare_threshold:
+            lines.append(f"⚠️ {token} — rare ({result.post_count:,} posts, {result.source.value})")
+        else:
+            lines.append(f"✅ {token} — {result.post_count:,} posts ({result.source.value})")
+    if omitted:
+        lines.append(f"…{omitted} more token(s) omitted (limit {TAGCHECK_TOKEN_LIMIT}).")
+    return lines
+
+
 async def tagcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/tagcheck <prompt>` — split a whole prompt on commas (this
-    codebase's usual booru-prompt convention) and check each token against
-    the tag database: found & common (✅), found but rare — i.e. little
-    training data behind it (⚠️), or not a known tag at all (❌, with a
-    "did you mean" hint when a close match turns up). Same source
+    """`/tagcheck <prompt>` — check each comma-separated tag in `prompt`
+    against the tag database (see `_tagcheck_lines`). Same source
     resolution/override as `tags_command`."""
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
@@ -1780,24 +1855,5 @@ async def tagcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    tokens = [token for token in (t.strip() for t in prompt_text.split(",")) if token]
-    omitted = max(0, len(tokens) - TAGCHECK_TOKEN_LIMIT)
-    tokens = tokens[:TAGCHECK_TOKEN_LIMIT]
-
-    lines = []
-    for token in tokens:
-        result = tags_db.lookup_exact(token, sources)
-        if result is None:
-            hint = ""
-            suggestions = tags_db.search(token, sources, limit=1)
-            if suggestions:
-                hint = f' — did you mean "{suggestions[0].name}"?'
-            lines.append(f"❌ {token} — not a known tag{hint}")
-        elif result.post_count < settings.tag_rare_threshold:
-            lines.append(f"⚠️ {token} — rare ({result.post_count:,} posts, {result.source.value})")
-        else:
-            lines.append(f"✅ {token} — {result.post_count:,} posts ({result.source.value})")
-    if omitted:
-        lines.append(f"…{omitted} more token(s) omitted (limit {TAGCHECK_TOKEN_LIMIT}).")
-
+    lines = _tagcheck_lines(prompt_text, sources, tags_db, settings)
     await message.reply_text("\n".join(lines))
