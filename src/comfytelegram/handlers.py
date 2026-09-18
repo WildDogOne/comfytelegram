@@ -972,7 +972,7 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
     effective_prompt, extra_negative = _resolve_effective_prompt(prompt_text, character)
 
-    status_message = await message.reply_text("Generating… 0%")
+    status_message = await message.reply_text("Generating… 0%", disable_notification=True)
 
     images = await _run_reporting_errors(
         status_message,
@@ -1020,7 +1020,7 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if checkpoint is None:
         return
 
-    status_message = await message.reply_text("Analyzing image…")
+    status_message = await message.reply_text("Analyzing image…", disable_notification=True)
 
     async def _download_and_analyze_both() -> tuple[str | None, tuple[str, str] | None]:
         tg_file = await context.bot.get_file(message.photo[-1].file_id)
@@ -1091,7 +1091,9 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if kind == ANALYZE_ONLY_CALLBACK_KIND:
-        status_message = await query.message.reply_text("Analyzing image…")
+        status_message = await query.message.reply_text(
+            "Analyzing image…", disable_notification=True
+        )
         checkpoint = full_params.checkpoint
         chat_id = pending["chat_id"]
 
@@ -1122,7 +1124,9 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if kind == ANALYZE_CALLBACK_KIND:
-        status_message = await query.message.reply_text("Analyzing image…")
+        status_message = await query.message.reply_text(
+            "Analyzing image…", disable_notification=True
+        )
 
         checkpoint = full_params.checkpoint
         chat_id = pending["chat_id"]
@@ -1161,7 +1165,9 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if kind == DEEP_ANALYZE_CALLBACK_KIND:
-        status_message = await query.message.reply_text("Deep analyzing image…")
+        status_message = await query.message.reply_text(
+            "Deep analyzing image…", disable_notification=True
+        )
         checkpoint = full_params.checkpoint
         chat_id = pending["chat_id"]
 
@@ -1211,7 +1217,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         kind = "upscale"
 
     label = POSTPROCESS_STATUS_LABELS.get(kind, kind.title())
-    status_message = await query.message.reply_text(f"{label}…")
+    status_message = await query.message.reply_text(f"{label}…", disable_notification=True)
 
     async def _download_and_post_process() -> GeneratedImage:
         """Bundle the file download and the post-process call into one
@@ -1259,7 +1265,7 @@ async def again_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     client: ComfyClient = context.bot_data["comfy_client"]
     full_params = _deserialize_generation_params(snapshot["params"])
 
-    status_message = await query.message.reply_text("Generating… 0%")
+    status_message = await query.message.reply_text("Generating… 0%", disable_notification=True)
     images = await _run_reporting_errors(
         status_message,
         "Generation",
@@ -1303,7 +1309,7 @@ async def generate_from_prompt_callback(update: Update, context: ContextTypes.DE
     profile = resolve_profile(checkpoint, profiles)
     profile = apply_profile_override(profile, checkpoint, storage.get_override(chat_id, checkpoint))
 
-    status_message = await query.message.reply_text("Generating… 0%")
+    status_message = await query.message.reply_text("Generating… 0%", disable_notification=True)
     images = await _run_reporting_errors(
         status_message,
         "Generation",
@@ -1549,6 +1555,7 @@ async def _run_stream(
             f"🔁 Streaming started (up to {STREAM_HARD_LIMIT} images) — "
             "tap /stop below (or send it) to end early.",
             reply_markup=_STREAMING_KEYBOARD,
+            disable_notification=True,
         )
 
         for i in range(STREAM_HARD_LIMIT):
