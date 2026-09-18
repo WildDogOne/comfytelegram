@@ -13,6 +13,7 @@ from comfytelegram.handlers import (
     stream_cancel_callback,
     stream_command,
 )
+from comfytelegram.topics import NO_TOPIC
 
 
 def _settings_mock() -> MagicMock:
@@ -21,6 +22,7 @@ def _settings_mock() -> MagicMock:
 
 def _update_mock(*, chat_id: int = 1, user_id: int = 1) -> tuple[MagicMock, AsyncMock]:
     message = AsyncMock()
+    message.message_thread_id = None
     update = MagicMock()
     update.effective_message = message
     update.effective_chat.id = chat_id
@@ -30,6 +32,7 @@ def _update_mock(*, chat_id: int = 1, user_id: int = 1) -> tuple[MagicMock, Asyn
 
 def _callback_update_mock(*, chat_id: int = 1, user_id: int = 1) -> tuple[MagicMock, AsyncMock]:
     query = AsyncMock()
+    query.message.message_thread_id = None
     update = MagicMock()
     update.callback_query = query
     update.effective_chat.id = chat_id
@@ -98,7 +101,7 @@ async def test_stream_command_asks_for_a_prompt_when_none_given():
     await stream_command(update, context)
 
     assert message.reply_text.await_args.args[0].startswith("What should the stream generate?")
-    assert context.chat_data["awaiting_stream_prompt"] is True
+    assert context.chat_data["awaiting_stream_prompt"][NO_TOPIC] is True
     assert "active_streams" not in context.bot_data
     _, kwargs = message.reply_text.await_args
     buttons = [b.callback_data for row in kwargs["reply_markup"].inline_keyboard for b in row]
@@ -110,7 +113,7 @@ async def test_stream_cancel_callback_clears_the_flag_and_edits_the_message():
     update, query = _callback_update_mock()
     context = MagicMock()
     context.bot_data = {"settings": _settings_mock()}
-    context.chat_data = {"awaiting_stream_prompt": True}
+    context.chat_data = {"awaiting_stream_prompt": {NO_TOPIC: True}}
 
     await stream_cancel_callback(update, context)
 
@@ -151,7 +154,7 @@ async def test_consume_awaiting_stream_prompt_starts_the_stream():
     update, message = _update_mock()
     message.text = "a fox in the snow"
     context = MagicMock()
-    context.chat_data = {"awaiting_stream_prompt": True}
+    context.chat_data = {"awaiting_stream_prompt": {NO_TOPIC: True}}
     context.bot_data = {}
 
     with patch("comfytelegram.handlers._run_stream", new=AsyncMock()):
@@ -169,7 +172,7 @@ async def test_consume_awaiting_stream_prompt_reports_empty_message():
     update, message = _update_mock()
     message.text = "   "
     context = MagicMock()
-    context.chat_data = {"awaiting_stream_prompt": True}
+    context.chat_data = {"awaiting_stream_prompt": {NO_TOPIC: True}}
 
     result = await _consume_awaiting_stream_prompt(update, context)
 

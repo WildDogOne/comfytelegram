@@ -23,6 +23,7 @@ from comfytelegram.handlers import (
 )
 from comfytelegram.profiles import ModelProfile
 from comfytelegram.tags import TagResult, TagSource
+from comfytelegram.topics import NO_TOPIC
 
 
 def test_split_negative_prompt_pulls_out_comma_separated_tags():
@@ -201,6 +202,7 @@ async def test_consume_awaiting_character_edit_returns_false_when_not_pending():
 async def test_consume_awaiting_character_edit_saves_the_new_prompt():
     message = AsyncMock()
     message.text = "new positive | new negative"
+    message.message_thread_id = None
     update = MagicMock()
     update.effective_message = message
     update.effective_chat.id = 42
@@ -208,7 +210,7 @@ async def test_consume_awaiting_character_edit_saves_the_new_prompt():
     storage = MagicMock()
     storage.get_character.return_value = {"positive_prompt": "old", "negative_prompt": ""}
     context = MagicMock()
-    context.chat_data = {"awaiting_character_edit": "fox"}
+    context.chat_data = {"awaiting_character_edit": {NO_TOPIC: "fox"}}
     context.bot_data = {"storage": storage}
 
     assert await _consume_awaiting_character_edit(update, context) is True
@@ -222,6 +224,7 @@ async def test_consume_awaiting_character_edit_saves_the_new_prompt():
 async def test_consume_awaiting_character_edit_rejects_an_empty_positive_prompt():
     message = AsyncMock()
     message.text = "| just a negative"
+    message.message_thread_id = None
     update = MagicMock()
     update.effective_message = message
     update.effective_chat.id = 42
@@ -229,7 +232,7 @@ async def test_consume_awaiting_character_edit_rejects_an_empty_positive_prompt(
     storage = MagicMock()
     storage.get_character.return_value = {"positive_prompt": "old", "negative_prompt": ""}
     context = MagicMock()
-    context.chat_data = {"awaiting_character_edit": "fox"}
+    context.chat_data = {"awaiting_character_edit": {NO_TOPIC: "fox"}}
     context.bot_data = {"storage": storage}
 
     assert await _consume_awaiting_character_edit(update, context) is True
@@ -252,6 +255,7 @@ async def test_consume_awaiting_character_rename_returns_false_when_not_pending(
 async def test_consume_awaiting_character_rename_renames():
     message = AsyncMock()
     message.text = "vixen"
+    message.message_thread_id = None
     update = MagicMock()
     update.effective_message = message
     update.effective_chat.id = 42
@@ -261,7 +265,7 @@ async def test_consume_awaiting_character_rename_renames():
         {"positive_prompt": "old", "negative_prompt": ""} if name == "fox" else None
     )
     context = MagicMock()
-    context.chat_data = {"awaiting_character_rename": "fox"}
+    context.chat_data = {"awaiting_character_rename": {NO_TOPIC: "fox"}}
     context.bot_data = {"storage": storage}
 
     assert await _consume_awaiting_character_rename(update, context) is True
@@ -275,6 +279,7 @@ async def test_consume_awaiting_character_rename_renames():
 async def test_consume_awaiting_character_rename_rejects_an_invalid_name():
     message = AsyncMock()
     message.text = "not a valid name!"
+    message.message_thread_id = None
     update = MagicMock()
     update.effective_message = message
     update.effective_chat.id = 42
@@ -282,7 +287,7 @@ async def test_consume_awaiting_character_rename_rejects_an_invalid_name():
     storage = MagicMock()
     storage.get_character.return_value = {"positive_prompt": "old", "negative_prompt": ""}
     context = MagicMock()
-    context.chat_data = {"awaiting_character_rename": "fox"}
+    context.chat_data = {"awaiting_character_rename": {NO_TOPIC: "fox"}}
     context.bot_data = {"storage": storage}
 
     assert await _consume_awaiting_character_rename(update, context) is True
@@ -294,6 +299,7 @@ async def test_consume_awaiting_character_rename_rejects_an_invalid_name():
 async def test_consume_awaiting_character_rename_rejects_a_name_already_taken():
     message = AsyncMock()
     message.text = "wolf"
+    message.message_thread_id = None
     update = MagicMock()
     update.effective_message = message
     update.effective_chat.id = 42
@@ -301,7 +307,7 @@ async def test_consume_awaiting_character_rename_rejects_a_name_already_taken():
     storage = MagicMock()
     storage.get_character.return_value = {"positive_prompt": "old", "negative_prompt": ""}
     context = MagicMock()
-    context.chat_data = {"awaiting_character_rename": "fox"}
+    context.chat_data = {"awaiting_character_rename": {NO_TOPIC: "fox"}}
     context.bot_data = {"storage": storage}
 
     assert await _consume_awaiting_character_rename(update, context) is True

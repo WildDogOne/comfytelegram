@@ -49,6 +49,7 @@ from comfytelegram.settings import Settings
 from comfytelegram.settings_menu import _safe_edit_message, handle_custom_value_message
 from comfytelegram.storage import Storage
 from comfytelegram.tags import TagDatabase, TagResult, TagSource, category_label
+from comfytelegram.topics import pop_pending, set_pending
 from comfytelegram.workflows import GenerationParams, LoraSpec
 
 logger = logging.getLogger(__name__)
@@ -771,7 +772,7 @@ async def character_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if action == "edit_cancel":
-        context.chat_data.pop("awaiting_character_edit", None)
+        pop_pending(context.chat_data, "awaiting_character_edit", query.message)
         await query.answer("Cancelled.")
         await _safe_edit_message(
             query, "Cancelled — character unchanged.", InlineKeyboardMarkup([])
@@ -779,7 +780,7 @@ async def character_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if action == "rename_cancel":
-        context.chat_data.pop("awaiting_character_rename", None)
+        pop_pending(context.chat_data, "awaiting_character_rename", query.message)
         await query.answer("Cancelled.")
         await _safe_edit_message(
             query, "Cancelled — character unchanged.", InlineKeyboardMarkup([])
@@ -795,8 +796,8 @@ async def character_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if action == "edit":
-        context.chat_data.pop("awaiting_character_rename", None)
-        context.chat_data["awaiting_character_edit"] = name
+        pop_pending(context.chat_data, "awaiting_character_rename", query.message)
+        set_pending(context.chat_data, "awaiting_character_edit", query.message, name)
         await query.answer()
         lines = [
             f"Send the new prompt for '{name}' as:",
@@ -812,8 +813,8 @@ async def character_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if action == "rename":
-        context.chat_data.pop("awaiting_character_edit", None)
-        context.chat_data["awaiting_character_rename"] = name
+        pop_pending(context.chat_data, "awaiting_character_edit", query.message)
+        set_pending(context.chat_data, "awaiting_character_rename", query.message, name)
         await query.answer()
         await query.message.reply_text(
             f"Send the new name for '{name}' (letters, digits, '-' and '_' only, max 32 chars).",
@@ -1355,7 +1356,10 @@ async def stream_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     `_MAIN_KEYBOARD` always sends exactly that, since a reply-keyboard
     button can only ever send fixed text, unlike an inline keyboard's
     `switch_inline_query` — this instead sets `context.chat_data`'s
-    `awaiting_stream_prompt` flag and asks for the prompt as a follow-up
+    `awaiting_stream_prompt` flag, scoped to this message's forum topic via
+    `topics.set_pending` (so starting a stream in one topic of a
+    topics-enabled group can't be clobbered or wrongly answered by
+    unrelated text in another), and asks for the prompt as a follow-up
     message (with a "❌ Cancel" button to back out — see
     `_stream_prompt_cancel_keyboard`/`stream_cancel_callback`), consumed by
     `_consume_awaiting_stream_prompt` (mirrors settings_menu's
@@ -1368,7 +1372,7 @@ async def stream_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     parts = (message.text or "").split(maxsplit=1)
     prompt_text = parts[1].strip() if len(parts) > 1 else ""
     if not prompt_text:
-        context.chat_data["awaiting_stream_prompt"] = True
+        set_pending(context.chat_data, "awaiting_stream_prompt", message, True)
         await message.reply_text(
             "What should the stream generate? Send the prompt as your next "
             "message (or type /stream <prompt> directly next time).",
@@ -1406,10 +1410,10 @@ async def _consume_awaiting_stream_prompt(
     the stream, returning True. Otherwise return False so the caller (
     `generate_message`) treats the text as a normal generation prompt
     instead."""
-    if not context.chat_data.pop("awaiting_stream_prompt", False):
+    message = update.effective_message
+    if not pop_pending(context.chat_data, "awaiting_stream_prompt", message):
         return False
 
-    message = update.effective_message
     prompt_text = (message_text(message) or "").strip()
     if not prompt_text:
         await message.reply_text("Cancelled — no prompt received.")
@@ -1428,11 +1432,11 @@ async def _consume_awaiting_character_edit(
     return False so the caller (`generate_message`) treats the text as a
     normal generation prompt instead. Mirrors
     `_consume_awaiting_stream_prompt`."""
-    name = context.chat_data.pop("awaiting_character_edit", None)
+    message = update.effective_message
+    name = pop_pending(context.chat_data, "awaiting_character_edit", message)
     if name is None:
         return False
 
-    message = update.effective_message
     storage: Storage = context.bot_data["storage"]
     chat_id = update.effective_chat.id
 
@@ -1466,11 +1470,11 @@ async def _consume_awaiting_character_rename(
     return False so the caller (`generate_message`) treats the text as a
     normal generation prompt instead. Mirrors
     `_consume_awaiting_character_edit`."""
-    old_name = context.chat_data.pop("awaiting_character_rename", None)
+    message = update.effective_message
+    old_name = pop_pending(context.chat_data, "awaiting_character_rename", message)
     if old_name is None:
         return False
 
-    message = update.effective_message
     storage: Storage = context.bot_data["storage"]
     chat_id = update.effective_chat.id
 
@@ -1519,7 +1523,7 @@ async def stream_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
     if await reject_if_unauthorized_callback(query, user_id, settings):
         return
 
-    if not context.chat_data.pop("awaiting_stream_prompt", False):
+    if not pop_pending(context.chat_data, "awaiting_stream_prompt", query.message):
         await query.answer("Nothing to cancel.")
         return
 

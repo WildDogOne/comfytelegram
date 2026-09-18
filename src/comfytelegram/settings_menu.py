@@ -42,6 +42,7 @@ from comfytelegram.profiles import (
 )
 from comfytelegram.settings import Settings
 from comfytelegram.storage import Storage
+from comfytelegram.topics import pop_pending, set_pending
 
 
 @dataclass(frozen=True)
@@ -429,7 +430,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     if action == "c":
-        context.chat_data["awaiting_field"] = field
+        set_pending(context.chat_data, "awaiting_field", query.message, field)
         await query.answer()
         await _safe_edit_message(
             query,
@@ -471,12 +472,11 @@ async def handle_custom_value_message(update: Update, context: ContextTypes.DEFA
     """If this chat is mid-"custom value" entry, consume the incoming text
     message as that value and return True. Otherwise return False so the
     caller treats it as a normal generation prompt."""
-    field = context.chat_data.get("awaiting_field")
+    message = update.effective_message
+    field = pop_pending(context.chat_data, "awaiting_field", message)
     if field is None:
         return False
-    del context.chat_data["awaiting_field"]
 
-    message = update.effective_message
     raw_value = (message_text(message) or "").strip()
     meta = FIELDS_BY_KEY.get(field)
     if meta is None or not raw_value:
