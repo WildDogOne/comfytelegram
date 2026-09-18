@@ -28,6 +28,8 @@ Files starting with `_` are ignored (reserved for docs/schema files).
   },
   "positive_prompt_prefix": "quality tags prepended before the user's prompt",
   "negative_prompt_prefix": "used as the negative prompt whenever the user doesn't supply one",
+  "tag_dictionary": "e621",            // "danbooru", "e621", or omit to search/check both — see below
+
   "loras": [
     {
       "name": "family/style.safetensors",
@@ -50,6 +52,18 @@ main [README](../README.md#background-the-reference-workflow)). The other
 three are common community-recommended starting points for those model
 families, not values verified against a specific checkpoint on this
 install — tune them once you've run a few generations.
+
+### `tag_dictionary` — scoping `/tags`/`/tagcheck`
+
+Independent of `prompt_style` (which just picks WD14 vs. Qwen-VL for image
+analysis). `tag_dictionary` picks which local tag database `/tags`
+(search) and `/tagcheck` (prompt scanner) default to for this checkpoint —
+`"e621"` for furry-trained models, `"danbooru"` for anime/manga-trained
+ones. Leave it unset for a checkpoint that isn't clearly one or the other
+(both commands then search/check against both dictionaries); either
+command's caller can still override it per-call with a `danbooru:`/`e621:`
+prefix. See the main README's "Tag search" section for how the databases
+themselves get populated.
 
 ### `loader: "split"` — Anima-style architectures
 

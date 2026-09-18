@@ -6,20 +6,22 @@ services:
     env_file:
       - .env
     environment:
-      STATE_DB_PATH: /app/state.sqlite3
+      STATE_DB_PATH: /app/data/state.sqlite3
+      TAGS_DB_PATH: /app/data/tags.sqlite3
     volumes:
       # Bind-mounted straight to the repo path on the host, so the sqlite
-      # state file is the same file `uv run comfytelegram` would produce
-      # outside Docker — inspect/back it up directly, no volume commands
-      # needed. (Generated images aren't written to disk at all — they're
-      # sent to Telegram straight from memory — so there's no outputs/ mount
-      # here.)
+      # files are the same ones `uv run comfytelegram` would produce outside
+      # Docker — inspect/back them up directly, no volume commands needed.
+      # (Generated images aren't written to disk at all — they're sent to
+      # Telegram straight from memory — so there's no outputs/ mount here.)
       #
-      # Docker bind-mounts a *missing* file as an empty directory instead of
-      # creating a file, which breaks sqlite3.connect() — run
-      # `touch state.sqlite3` on the host once before the first `up` if it
-      # doesn't already exist.
-      - ./state.sqlite3:/app/state.sqlite3
+      # A *directory* mount, not one per sqlite file: Docker bind-mounts a
+      # missing host *file* as an empty directory instead of creating a
+      # file, which breaks sqlite3.connect() on first run — mounting the
+      # containing directory instead sidesteps that entirely (a missing
+      # host directory is exactly what Docker does create automatically),
+      # no manual `touch`/setup step needed before the first `up`.
+      - ./data:/app/data
       # Edit profiles on the host without rebuilding the image. Drop this
       # if you're fine with whatever was baked in at build time.
       - ./model_profiles:/app/model_profiles:ro

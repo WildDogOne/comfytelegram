@@ -12,6 +12,7 @@
     "height": 1024
   },
   "prompt_style": "tags",
+  "tag_dictionary": "danbooru",
   "positive_prompt_prefix": "masterpiece, best quality, very aesthetic, absurdres",
   "negative_prompt_prefix": "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality",
   "loras": []

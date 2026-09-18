@@ -219,7 +219,7 @@ __marimo__/
 
 # comfytelegram project-specific
 /outputs/
-/state.sqlite3
+/data/
 /models/
 .claude
 sample.json

@@ -13,11 +13,14 @@ from comfytelegram.handlers import (
     _generate_from_prompt_keyboard,
     _post_process_keyboard,
     _resolve_effective_prompt,
+    _resolve_tag_sources,
     _run_reporting_errors,
     _split_negative_prompt,
     _upscale_confirm_keyboard,
     start,
 )
+from comfytelegram.profiles import ModelProfile
+from comfytelegram.tags import TagSource
 
 
 def test_split_negative_prompt_pulls_out_comma_separated_tags():
@@ -358,3 +361,36 @@ async def test_run_reporting_errors_reports_unexpected_exception_generically():
 
     assert result is None
     status_message.edit_text.assert_awaited_once_with("Upscaling failed with an unexpected error.")
+
+
+def test_resolve_tag_sources_prefix_override_wins_over_profile():
+    profile = ModelProfile(match=["*"], display_name="x", tag_dictionary="danbooru")
+    sources, remainder = _resolve_tag_sources("e621:fox ears", "ckpt.safetensors", [profile])
+    assert sources == [TagSource.E621]
+    assert remainder == "fox ears"
+
+
+def test_resolve_tag_sources_prefix_override_is_case_insensitive():
+    sources, remainder = _resolve_tag_sources("DANBOORU:1girl", None, [])
+    assert sources == [TagSource.DANBOORU]
+    assert remainder == "1girl"
+
+
+def test_resolve_tag_sources_uses_profile_tag_dictionary_when_no_override():
+    profile = ModelProfile(match=["furry*"], display_name="x", tag_dictionary="e621")
+    sources, remainder = _resolve_tag_sources("fox", "furrytoonmix.safetensors", [profile])
+    assert sources == [TagSource.E621]
+    assert remainder == "fox"
+
+
+def test_resolve_tag_sources_searches_both_when_profile_leaves_it_unset():
+    profile = ModelProfile(match=["*"], display_name="x")
+    sources, remainder = _resolve_tag_sources("fox", "ckpt.safetensors", [profile])
+    assert sources == [TagSource.DANBOORU, TagSource.E621]
+    assert remainder == "fox"
+
+
+def test_resolve_tag_sources_searches_both_when_no_checkpoint_selected():
+    sources, remainder = _resolve_tag_sources("fox", None, [])
+    assert sources == [TagSource.DANBOORU, TagSource.E621]
+    assert remainder == "fox"

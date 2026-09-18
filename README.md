@@ -64,6 +64,11 @@ CLI at runtime.
   characters, and every post-processing button all persist in a local
   SQLite file, not memory. (A running `/stream` doesn't — it's a live
   background task, so it stops if the bot restarts.)
+- **Tag search** — `/tags <query>` searches a local danbooru/e621 tag
+  database and hands back tap-to-copy buttons for pasting matches straight
+  into a prompt; `/tagcheck <prompt>` checks a whole prompt's tags against
+  it, flagging unknown or rarely-used ones. See [Tag search](#tag-search)
+  below.
 
 ## Requirements
 
@@ -119,7 +124,6 @@ see the Docker section below for the container case specifically.
 A `Dockerfile` and `docker-compose.yml` are included:
 
 ```bash
-touch state.sqlite3   # only needed once, before the very first run
 docker compose up -d --build
 ```
 
@@ -128,12 +132,12 @@ The container uses host networking by default (so `COMFYUI_HOST=127.0.0.1`/
 the same host, matching the non-Docker setup above) — Linux-only. On
 macOS/Windows, switch to the `extra_hosts`/`host.docker.internal`
 alternative commented in `docker-compose.yml` (set both `COMFYUI_HOST` and
-`OLLAMA_HOST` to `host.docker.internal` in that case). The sqlite state
-file, `model_profiles/`, and `models/wd14/` are bind-mounted from the repo,
-so they're the same files a bare `uv run comfytelegram` would use — no
-Docker volume commands needed to inspect or back them up, and no image
-rebuild needed to pick up a WD14 model you stage later (see
-[Image analysis](#image-analysis)).
+`OLLAMA_HOST` to `host.docker.internal` in that case). The `data/` directory
+(sqlite state + tag database), `model_profiles/`, and `models/wd14/` are
+bind-mounted from the repo, so they're the same files a bare `uv run
+comfytelegram` would use — no Docker volume commands needed to inspect or
+back them up, and no image rebuild needed to pick up a WD14 model you stage
+later (see [Image analysis](#image-analysis)).
 
 ## Using the bot
 
@@ -199,6 +203,55 @@ defaults for one checkpoint or a family of them (glob-matched against the
 filename). Drop in a new file to add support for a model — no code changes
 needed. Full format and worked examples in
 [`model_profiles/README.md`](model_profiles/README.md).
+
+## Tag search
+
+`/tags <query>` and `/tagcheck <prompt>` are backed by a local sqlite tag
+database (`Settings.tags_db_path`, default `data/tags.sqlite3`), built from CSVs
+published by [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDragon/dbr-e621-lists-archive)
+— the companion archive of the
+[danbooru-e621-tag-list-processor](https://github.com/DraconicDragon/danbooru-e621-tag-list-processor)
+project.
+
+**It populates itself automatically** — at startup the bot checks each
+source (danbooru, e621) and, in the background (doesn't delay startup),
+downloads the newest CSV for any source that's missing or older than
+`Settings.tag_db_max_age_days` (default 30, matching the archive's own
+monthly refresh cadence). A fresh checkout self-populates on first run; an
+existing install just stays current. A failed check (no network, GitHub
+unreachable) logs a warning and leaves whatever was already imported —
+`/tags`/`/tagcheck` just report "no tag data imported yet" until it
+succeeds. Set `TAG_DB_AUTO_UPDATE=false` to disable this (e.g. an
+offline/airgapped install) and manage the database entirely by hand
+instead:
+
+```bash
+uv run python scripts/update_tag_db.py                  # both danbooru and e621
+uv run python scripts/update_tag_db.py --source e621     # just one
+uv run python scripts/update_tag_db.py --danbooru-csv /path/to/local.csv
+```
+
+The script (also useful with auto-update left on, e.g. to force a refresh
+right now, or target one source) downloads the newest dated CSV from the
+archive for each source — or imports a local file you built yourself with
+the upstream processor via `--danbooru-csv`/`--e621-csv`, which also work
+as a fully offline path if you'd rather not hit GitHub's API — and swaps it
+in wholesale.
+
+- **`/tags <query>`** searches tag names and aliases, ranked by post count
+  (roughly, how well-represented a tag is in the model's training data), and
+  replies with a tap-to-copy button per match. It's scoped to whichever
+  dictionary the current chat's checkpoint prefers — a model profile's
+  `tag_dictionary` field (`"e621"` for furry-trained checkpoints, `"danbooru"`
+  for anime/manga-trained ones; see [`model_profiles/README.md`](model_profiles/README.md))
+  — or both if that's unset. Override the scope for one query with a
+  `danbooru:`/`e621:` prefix, e.g. `/tags e621:fox ears`.
+- **`/tagcheck <prompt>`** splits a whole prompt on commas and checks each
+  tag: ✅ known and reasonably common, ⚠️ known but rare (below
+  `Settings.tag_rare_threshold` posts — a sign the model saw little of it
+  during training), or ❌ not a recognized tag at all (with a "did you
+  mean" suggestion when a close match exists). Same source scoping/override
+  as `/tags`.
 
 ## Development
 
@@ -267,6 +320,12 @@ shared singletons (`Settings`, `ComfyClient`, loaded `ModelProfile`s,
   working after a bot restart.
 - **`auth.py`** — the `ALLOWED_USER_IDS` allowlist check shared by
   `handlers.py` and `settings_menu.py`.
+- **`tags/`** — the local danbooru/e621 tag database backing `/tags`/
+  `/tagcheck` (`TagDatabase`, its own sqlite file, separate from
+  `storage.py`'s per-chat state since this is bulk reference data
+  wholesale-replaced by `scripts/update_tag_db.py`) plus the CSV importer
+  for the DraconicDragon tag-list archive format. See
+  [Tag search](#tag-search) above.
 
 ### Background: the reference workflow
 

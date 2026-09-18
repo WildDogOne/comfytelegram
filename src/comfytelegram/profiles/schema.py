@@ -85,6 +85,17 @@ class ModelProfile(BaseModel):
         ),
     )
 
+    tag_dictionary: Literal["danbooru", "e621"] | None = Field(
+        None,
+        description=(
+            "Which booru tag dictionary '/tags' and '/tagcheck' default to for this "
+            "checkpoint — 'e621' for furry-trained models, 'danbooru' for anime/manga-"
+            "trained ones. Unset searches/checks against both. Independent of "
+            "prompt_style: a checkpoint can be tag-trained without this being set, in "
+            "which case both dictionaries are searched."
+        ),
+    )
+
     loader: Literal["checkpoint", "split"] = Field(
         "checkpoint",
         description=(

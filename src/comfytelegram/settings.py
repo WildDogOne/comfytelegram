@@ -11,6 +11,17 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_DIR.parent.parent
 
+#: Durable local state (sqlite files) lives under one gitignored directory
+#: rather than loose at the project root. Not just tidiness: Docker bind-
+#: mounts a *missing host file* as an empty directory instead of creating a
+#: file, which breaks `sqlite3.connect()` on first run — a directory-level
+#: mount (`docker-compose.yml`'s `./data:/app/data`) doesn't have that
+#: problem, since a missing host *directory* is exactly what Docker does
+#: create automatically. Each `Storage`/`TagDatabase.__init__` still
+#: `mkdir(parents=True, exist_ok=True)`s its own file's parent, so this
+#: works identically for a bare `uv run comfytelegram` too.
+DATA_DIR = PROJECT_ROOT / "data"
+
 
 class Settings(BaseSettings):
     """Bot-wide runtime config, populated from environment variables / `.env`
@@ -25,7 +36,9 @@ class Settings(BaseSettings):
     comfyui_port: int = Field(8188, description="ComfyUI HTTP/WS port")
     comfyui_use_tls: bool = Field(False, description="Use https/wss instead of http/ws")
 
-    ollama_host: str = Field("127.0.0.1", description="Host running Ollama (for Qwen-VL image analysis)")
+    ollama_host: str = Field(
+        "127.0.0.1", description="Host running Ollama (for Qwen-VL image analysis)"
+    )
     ollama_port: int = Field(11434, description="Ollama HTTP port")
     ollama_vision_model: str = Field(
         "qwen3.5:4b",
@@ -65,9 +78,41 @@ class Settings(BaseSettings):
         description="Directory of per-checkpoint default-settings JSON files",
     )
     state_db_path: Path = Field(
-        default=PROJECT_ROOT / "state.sqlite3",
+        default=DATA_DIR / "state.sqlite3",
         description="SQLite file for durable per-chat state (selected model, profile overrides)",
     )
+
+    tags_db_path: Path = Field(
+        default=DATA_DIR / "tags.sqlite3",
+        description=(
+            "SQLite file for the local danbooru/e621 tag database backing /tags and "
+            "/tagcheck. Separate from state_db_path since it's bulk reference data "
+            "wholesale-replaced by an import, not per-chat state. Self-populates on "
+            "first startup unless tag_db_auto_update is disabled — see that field."
+        ),
+    )
+    tag_db_auto_update: bool = Field(
+        True,
+        description=(
+            "Automatically refresh any tag source (danbooru/e621) that's missing or "
+            "older than tag_db_max_age_days, in the background at bot startup (doesn't "
+            "block startup; a failed fetch — e.g. no network — just logs a warning and "
+            "leaves whatever was already imported). Disable for an offline/airgapped "
+            "install and populate tags_db_path with scripts/update_tag_db.py instead."
+        ),
+    )
+    tag_db_max_age_days: float = Field(
+        30,
+        description=(
+            "How old a tag source's last import can get before the startup auto-update "
+            "refreshes it — matches the upstream archive's own monthly refresh cadence."
+        ),
+    )
+    tag_rare_threshold: int = Field(
+        100,
+        description="post_count floor below which /tagcheck flags a tag as rare (little training data)",
+    )
+    tag_search_results: int = Field(15, description="Max rows /tags replies with per query")
 
     # NoDecode: pydantic-settings would otherwise try to JSON-decode this env
     # var before validation ever sees it (its default behavior for list-typed

@@ -48,6 +48,7 @@ from comfytelegram.profiles import (
 from comfytelegram.settings import Settings
 from comfytelegram.settings_menu import _safe_edit_message, handle_custom_value_message
 from comfytelegram.storage import Storage
+from comfytelegram.tags import TagDatabase, TagResult, TagSource, category_label
 from comfytelegram.workflows import GenerationParams, LoraSpec
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,15 @@ CHARACTER_RENAME_CANCEL_CALLBACK_DATA = "char:rename_cancel"
 STREAM_HARD_LIMIT = 100
 
 CHARACTER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+#: A leading "danbooru:"/"e621:" on a `/tags`/`/tagcheck` query overrides
+#: the checkpoint-profile-driven dictionary choice — see `_resolve_tag_sources`.
+_TAG_SOURCE_PREFIX_RE = re.compile(r"^(danbooru|e621):\s*", re.IGNORECASE)
+
+#: Hard ceiling on how many comma-separated tokens a single `/tagcheck` call
+#: processes — a full paragraph pasted by mistake shouldn't produce a
+#: thousand-line reply.
+TAGCHECK_TOKEN_LIMIT = 60
 
 CHARACTER_HELP = (
     "Save a reusable character design so you don't have to retype its "
@@ -563,6 +573,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"/stream [prompt] — generate single images back-to-back (up to {STREAM_HARD_LIMIT}) "
         "until /stop, sending each one immediately; omit the prompt and I'll ask for it\n"
         "/stop — stop a running /stream\n"
+        "/tags <query> — search danbooru/e621 tags to build a prompt\n"
+        "/tagcheck <prompt> — check a prompt's tags against the tag database\n"
         "/help — show this message",
         reply_markup=_MAIN_KEYBOARD,
     )
@@ -1625,3 +1637,148 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     task.cancel()
     await update.effective_message.reply_text("Stopping the stream…")
+
+
+def _resolve_tag_sources(
+    args_text: str, checkpoint: str | None, profiles: list[ModelProfile]
+) -> tuple[list[TagSource], str]:
+    """Split a leading "danbooru:"/"e621:" override off `args_text` if
+    present (case-insensitive) and use it as-is; otherwise fall back to the
+    resolved checkpoint's profile `tag_dictionary` (both sources if there's
+    no checkpoint/profile, or the profile leaves it unset). Shared by
+    `tags_command` and `tagcheck_command`. Pure function — no I/O, so it's
+    unit-testable without a live checkpoint/profile lookup."""
+    match = _TAG_SOURCE_PREFIX_RE.match(args_text)
+    if match:
+        return [TagSource(match.group(1).lower())], args_text[match.end() :]
+
+    profile = resolve_profile(checkpoint, profiles) if checkpoint else None
+    if profile is not None and profile.tag_dictionary is not None:
+        return [TagSource(profile.tag_dictionary)], args_text
+    return [TagSource.DANBOORU, TagSource.E621], args_text
+
+
+def _tag_result_line(result: TagResult) -> str:
+    label = category_label(result.source, result.category)
+    line = f"{result.name} ({result.source.value}/{label}) — {result.post_count:,} posts"
+    if result.matched_alias:
+        line += f' [via alias "{result.matched_alias}"]'
+    return line
+
+
+def _tag_results_keyboard(results: list[TagResult]) -> InlineKeyboardMarkup:
+    """One row per hit: a native tap-to-copy button (`CopyTextButton`, same
+    pattern `_generate_from_prompt_keyboard` uses) for pasting the exact
+    tag text into the next prompt message. Tag names are always well under
+    Telegram's 256-char `copy_text` cap, so unlike that keyboard, no
+    length-gating is needed here."""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"📋 {result.name}", copy_text=CopyTextButton(result.name))]
+            for result in results
+        ]
+    )
+
+
+def _no_tag_data_message() -> str:
+    return "No tag data imported yet — run scripts/update_tag_db.py first (see README)."
+
+
+async def tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/tags <query>` — search the local danbooru/e621 tag database to
+    help build a prompt. Scoped to whichever dictionary the current chat's
+    checkpoint profile prefers via `tag_dictionary` (both, if none/unset),
+    overridable with a leading "danbooru:"/"e621:" on the query itself.
+    Each hit gets a native tap-to-copy button for pasting straight into the
+    next prompt message. Doesn't require ComfyUI to be reachable — this is
+    pure local sqlite lookup, so it works even before a model is selected."""
+    settings: Settings = context.bot_data["settings"]
+    if await reject_if_unauthorized(update, settings):
+        return
+
+    message = update.effective_message
+    tags_db: TagDatabase = context.bot_data["tags_db"]
+    if not any(tags_db.stats().values()):
+        await message.reply_text(_no_tag_data_message())
+        return
+
+    raw = (message.text or "").split(maxsplit=1)
+    args_text = raw[1].strip() if len(raw) > 1 else ""
+
+    storage: Storage = context.bot_data["storage"]
+    profiles: list[ModelProfile] = context.bot_data["profiles"]
+    checkpoint = storage.get_checkpoint(update.effective_chat.id)
+    sources, query = _resolve_tag_sources(args_text, checkpoint, profiles)
+    query = query.strip()
+    if not query:
+        await message.reply_text(
+            'Usage: /tags <query> — optionally prefixed with "danbooru:" or "e621:" '
+            'to search a specific dictionary, e.g. "/tags e621:fox"'
+        )
+        return
+
+    results = tags_db.search(query, sources, limit=settings.tag_search_results)
+    if not results:
+        await message.reply_text(f"No tags found for {query!r}.")
+        return
+
+    header = f"Tags matching {query!r} ({'/'.join(s.value for s in sources)}):"
+    await message.reply_text(
+        header + "\n" + "\n".join(_tag_result_line(r) for r in results),
+        reply_markup=_tag_results_keyboard(results),
+    )
+
+
+async def tagcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/tagcheck <prompt>` — split a whole prompt on commas (this
+    codebase's usual booru-prompt convention) and check each token against
+    the tag database: found & common (✅), found but rare — i.e. little
+    training data behind it (⚠️), or not a known tag at all (❌, with a
+    "did you mean" hint when a close match turns up). Same source
+    resolution/override as `tags_command`."""
+    settings: Settings = context.bot_data["settings"]
+    if await reject_if_unauthorized(update, settings):
+        return
+
+    message = update.effective_message
+    tags_db: TagDatabase = context.bot_data["tags_db"]
+    if not any(tags_db.stats().values()):
+        await message.reply_text(_no_tag_data_message())
+        return
+
+    raw = (message.text or "").split(maxsplit=1)
+    args_text = raw[1].strip() if len(raw) > 1 else ""
+
+    storage: Storage = context.bot_data["storage"]
+    profiles: list[ModelProfile] = context.bot_data["profiles"]
+    checkpoint = storage.get_checkpoint(update.effective_chat.id)
+    sources, prompt_text = _resolve_tag_sources(args_text, checkpoint, profiles)
+    prompt_text = prompt_text.strip()
+    if not prompt_text:
+        await message.reply_text(
+            "Usage: /tagcheck <prompt> — checks each comma-separated tag against the "
+            'tag database. Same "danbooru:"/"e621:" prefix override as /tags.'
+        )
+        return
+
+    tokens = [token for token in (t.strip() for t in prompt_text.split(",")) if token]
+    omitted = max(0, len(tokens) - TAGCHECK_TOKEN_LIMIT)
+    tokens = tokens[:TAGCHECK_TOKEN_LIMIT]
+
+    lines = []
+    for token in tokens:
+        result = tags_db.lookup_exact(token, sources)
+        if result is None:
+            hint = ""
+            suggestions = tags_db.search(token, sources, limit=1)
+            if suggestions:
+                hint = f' — did you mean "{suggestions[0].name}"?'
+            lines.append(f"❌ {token} — not a known tag{hint}")
+        elif result.post_count < settings.tag_rare_threshold:
+            lines.append(f"⚠️ {token} — rare ({result.post_count:,} posts, {result.source.value})")
+        else:
+            lines.append(f"✅ {token} — {result.post_count:,} posts ({result.source.value})")
+    if omitted:
+        lines.append(f"…{omitted} more token(s) omitted (limit {TAGCHECK_TOKEN_LIMIT}).")
+
+    await message.reply_text("\n".join(lines))

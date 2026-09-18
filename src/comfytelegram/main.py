@@ -3,6 +3,7 @@ handlers together, then runs polling."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from telegram import BotCommand, Update
@@ -37,12 +38,15 @@ from comfytelegram.handlers import (
     stop_command,
     stream_cancel_callback,
     stream_command,
+    tagcheck_command,
+    tags_command,
 )
 from comfytelegram.message_text import TEXT_CONTENT, message_text
 from comfytelegram.profiles import load_profiles
 from comfytelegram.settings import Settings, load_settings
 from comfytelegram.settings_menu import settings_callback, settings_command
 from comfytelegram.storage import Storage
+from comfytelegram.tags import TagDatabase, refresh_if_stale
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +66,8 @@ _COMMANDS = (
     ("characters", characters_command, "List, activate, edit, or rename saved characters"),
     ("stream", stream_command, "Generate images back-to-back until /stop"),
     ("stop", stop_command, "Stop a running /stream"),
+    ("tags", tags_command, "Search danbooru/e621 tags to build a prompt"),
+    ("tagcheck", tagcheck_command, "Check a prompt's tags against the tag database"),
 )
 
 #: Matches exactly the messages none of the real handlers can claim: a
@@ -111,12 +117,13 @@ async def _unhandled_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def _post_init(application: Application) -> None:
     """python-telegram-bot startup hook: open the `ComfyClient` (needs a
     running event loop, so it can't be built at `build_application` time),
-    stash it in `bot_data` alongside the other shared singletons, and push
+    stash it in `bot_data` alongside the other shared singletons, push
     `_COMMANDS`' descriptions to Telegram's "/" command menu — the same
     registry BotFather's `/setcommands` edits, so this keeps the menu in
     sync with the bot's actual commands on every startup instead of
     needing a manual BotFather edit whenever one is added/removed/
-    reworded."""
+    reworded — and, unless disabled, fire the tag database's staleness
+    check as a background task (see `_start_tag_db_refresh`)."""
     settings: Settings = application.bot_data["settings"]
     client = ComfyClient(settings.comfyui_http_base, settings.comfyui_ws_base)
     await client.__aenter__()
@@ -131,20 +138,51 @@ async def _post_init(application: Application) -> None:
         ", ".join(c.command for c in commands),
     )
 
+    _start_tag_db_refresh(application, settings)
+
+
+def _start_tag_db_refresh(application: Application, settings: Settings) -> None:
+    """Fire `refresh_if_stale` as an unawaited background task, so a fresh
+    checkout self-populates `tags_db` and an existing one stays within
+    `tag_db_max_age_days` without blocking bot startup on a multi-MB GitHub
+    download (or failing it outright if there's no network right now — a
+    failed refresh just logs a warning and leaves /tags/tagcheck reporting
+    "no data yet" or serving whatever was already imported). Kept as its
+    own function so `build_application`'s test coverage can leave
+    `tag_db_auto_update` off without needing a running event loop. The task
+    is stashed in `bot_data` purely to keep a strong reference to it (an
+    unreferenced asyncio task can be garbage-collected mid-flight) and so
+    `_post_shutdown` can cancel it if it's still running."""
+    if not settings.tag_db_auto_update:
+        return
+    tags_db: TagDatabase = application.bot_data["tags_db"]
+    application.bot_data["tag_db_refresh_task"] = asyncio.create_task(
+        refresh_if_stale(tags_db, settings.tag_db_max_age_days)
+    )
+
 
 async def _post_shutdown(application: Application) -> None:
     """python-telegram-bot shutdown hook: cancel any still-running "/stream"
-    tasks (so they don't linger as unawaited tasks after the event loop
-    they belong to closes), then close the ComfyUI HTTP session and the
-    sqlite connection cleanly."""
+    tasks and the tag database refresh task (so they don't linger as
+    unawaited tasks after the event loop they belong to closes — though for
+    the refresh task, cancellation only stops it between sources, since its
+    actual network I/O runs in a worker thread `asyncio.to_thread` doesn't
+    interrupt), then close the ComfyUI HTTP session and the sqlite
+    connections cleanly."""
     for task in application.bot_data.get("active_streams", {}).values():
         task.cancel()
+    tag_db_refresh_task: asyncio.Task | None = application.bot_data.get("tag_db_refresh_task")
+    if tag_db_refresh_task is not None:
+        tag_db_refresh_task.cancel()
     client: ComfyClient | None = application.bot_data.get("comfy_client")
     if client is not None:
         await client.__aexit__(None, None, None)
     storage: Storage | None = application.bot_data.get("storage")
     if storage is not None:
         storage.close()
+    tags_db: TagDatabase | None = application.bot_data.get("tags_db")
+    if tags_db is not None:
+        tags_db.close()
 
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -179,6 +217,7 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["settings"] = settings
     application.bot_data["profiles"] = load_profiles(settings.model_profiles_dir)
     application.bot_data["storage"] = Storage(settings.state_db_path)
+    application.bot_data["tags_db"] = TagDatabase(settings.tags_db_path)
 
     for name, callback, _ in _COMMANDS:
         application.add_handler(CommandHandler(name, callback))
