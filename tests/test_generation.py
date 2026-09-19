@@ -1,11 +1,31 @@
+import io
 from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock
 
 import pytest
+from PIL import Image
 
 from comfytelegram.comfy_client import JobProgress
-from comfytelegram.generation import _to_post_process_base, generate
+from comfytelegram.generation import (
+    _detailer_found_nothing,
+    _to_post_process_base,
+    generate,
+    post_process,
+)
 from comfytelegram.profiles import ModelProfile, ProfileDefaults
 from comfytelegram.workflows import GenerationParams, LoraSpec
+
+
+def _solid_png(width: int, height: int, color: tuple[int, int, int]) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height), color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _solid_mask_png(width: int, height: int, value: int) -> bytes:
+    buf = io.BytesIO()
+    Image.new("L", (width, height), value).save(buf, format="PNG")
+    return buf.getvalue()
 
 
 class _StubComfyClient:
@@ -51,6 +71,176 @@ class _StubComfyClient:
 
     async def get_image_bytes(self, filename: str, subfolder: str, folder_type: str) -> bytes:
         return b"fake-image-bytes"
+
+
+class _StubUploadingComfyClient(_StubComfyClient):
+    """`_StubComfyClient` plus `upload_image`, for `post_process()` tests.
+    `output_bytes` is what the main `SaveImage` node produces. `mask_bytes`
+    (grayscale PNG bytes — all-black simulates "nothing detected") is what
+    the detailer's detection-check `PreviewImage` node produces (see
+    `_build_detailer` — a `PreviewImage`, not `SaveImage`, so the check
+    doesn't leave a stray file in ComfyUI's permanent output folder); None
+    (the default) simulates that node never producing an image at all
+    (e.g. an upscale graph, which has no such node)."""
+
+    def __init__(self, output_bytes: bytes, mask_bytes: bytes | None = None) -> None:
+        super().__init__()
+        self._output_bytes = output_bytes
+        self._mask_bytes = mask_bytes
+
+    async def upload_image(
+        self, source, *, filename: str | None = None, subfolder: str = "", overwrite: bool = False
+    ) -> dict:
+        return {"name": filename or "uploaded.png"}
+
+    def _main_save_node_id(self) -> str:
+        return next(
+            node_id
+            for node_id, node in self.queued_graph.items()
+            if node["class_type"] == "SaveImage"
+        )
+
+    def _detection_node_id(self) -> str | None:
+        return next(
+            (
+                node_id
+                for node_id, node in self.queued_graph.items()
+                if node["class_type"] == "PreviewImage"
+            ),
+            None,
+        )
+
+    async def get_history(self, prompt_id: str) -> dict:
+        outputs = {
+            self._main_save_node_id(): {
+                "images": [{"filename": "out.png", "subfolder": "", "type": "output"}]
+            }
+        }
+        detection_id = self._detection_node_id()
+        if detection_id is not None and self._mask_bytes is not None:
+            outputs[detection_id] = {
+                "images": [{"filename": "mask.png", "subfolder": "", "type": "temp"}]
+            }
+        return {"status": {"status_str": "success"}, "outputs": outputs}
+
+    async def get_image_bytes(self, filename: str, subfolder: str, folder_type: str) -> bytes:
+        if filename == "mask.png":
+            return self._mask_bytes
+        return self._output_bytes
+
+
+@pytest.mark.asyncio
+async def test_detailer_found_nothing_true_for_a_black_mask():
+    client = AsyncMock()
+    client.get_image_bytes.return_value = _solid_mask_png(4, 4, 0)
+    history = {
+        "outputs": {"9": {"images": [{"filename": "m.png", "subfolder": "", "type": "output"}]}}
+    }
+
+    assert await _detailer_found_nothing(client, history, "9") is True
+
+
+@pytest.mark.asyncio
+async def test_detailer_found_nothing_false_for_a_non_black_mask():
+    client = AsyncMock()
+    client.get_image_bytes.return_value = _solid_mask_png(4, 4, 200)
+    history = {
+        "outputs": {"9": {"images": [{"filename": "m.png", "subfolder": "", "type": "output"}]}}
+    }
+
+    assert await _detailer_found_nothing(client, history, "9") is False
+
+
+@pytest.mark.asyncio
+async def test_detailer_found_nothing_false_when_node_produced_no_images():
+    client = AsyncMock()
+    history = {"outputs": {"9": {"images": []}}}
+
+    assert await _detailer_found_nothing(client, history, "9") is False
+
+
+@pytest.mark.asyncio
+async def test_detailer_found_nothing_false_when_node_id_absent():
+    client = AsyncMock()
+    history = {"outputs": {}}
+
+    assert await _detailer_found_nothing(client, history, "9") is False
+
+
+@pytest.mark.asyncio
+async def test_detailer_found_nothing_false_when_download_fails():
+    client = AsyncMock()
+    client.get_image_bytes.side_effect = RuntimeError("boom")
+    history = {
+        "outputs": {"9": {"images": [{"filename": "m.png", "subfolder": "", "type": "output"}]}}
+    }
+
+    assert await _detailer_found_nothing(client, history, "9") is False
+
+
+@pytest.mark.asyncio
+async def test_post_process_face_detailer_flags_unchanged_when_mask_is_black():
+    source = _solid_png(10, 10, (255, 0, 0))
+    # Slightly different from the source, simulating ComfyUI's own
+    # float32 round-trip noise on a true pass-through — this must NOT by
+    # itself prevent "unchanged" from being reported, since the mask (not
+    # the output image) is the actual detection signal now.
+    output = _solid_png(10, 10, (254, 1, 1))
+    mask = _solid_mask_png(10, 10, 0)
+    client = _StubUploadingComfyClient(output, mask_bytes=mask)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    result = await post_process(client, "face", source, "source.png", params)
+
+    assert result.unchanged is True
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_detailer_does_not_flag_a_real_change():
+    source = _solid_png(10, 10, (255, 0, 0))
+    output = _solid_png(10, 10, (0, 255, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(output, mask_bytes=mask)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    result = await post_process(client, "hand", source, "source.png", params)
+
+    assert result.unchanged is False
+
+
+@pytest.mark.asyncio
+async def test_post_process_face_detailer_defaults_to_changed_when_mask_missing():
+    """If the detection-check node's image can't be found at all,
+    post_process() must default to "assume something happened" rather
+    than risk wrongly suppressing a real result."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source, mask_bytes=None)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    result = await post_process(client, "face", source, "source.png", params)
+
+    assert result.unchanged is False
+
+
+@pytest.mark.asyncio
+async def test_post_process_upscale_never_flags_unchanged():
+    """An upscale graph has no detection-check node at all, so there's no
+    "detector found nothing" case to flag for it."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    result = await post_process(client, "upscale", source, "source.png", params)
+
+    assert result.unchanged is False
 
 
 def test_to_post_process_base_carries_only_the_relevant_fields():

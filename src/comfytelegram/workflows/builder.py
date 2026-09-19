@@ -397,16 +397,34 @@ def _build_detailer(
     params: FaceDetailerParams | HandDetailerParams,
     *,
     label: str,
-) -> tuple[dict[str, Any], str]:
+) -> tuple[dict[str, Any], str, str]:
     """Shared graph shape behind `build_face_detailer` and
     `build_hand_detailer` — Impact Pack's `FaceDetailer` node is really a
     generic detect-crop-inpaint-composite node despite the name, so hand-
     detailing is the same graph with a hand-trained `bbox_detector` model
     swapped in (see `HandDetailerParams`). `label` ("Face"/"Hand") only
     affects node titles shown in the ComfyUI UI, not graph behavior.
-    Returns (prompt_dict, save_image_node_id). `source_filename` must
-    already exist in ComfyUI's `input` directory (upload it first via
-    `ComfyClient.upload_image`)."""
+    Returns (prompt_dict, save_image_node_id, detection_preview_node_id).
+    `source_filename` must already exist in ComfyUI's `input` directory
+    (upload it first via `ComfyClient.upload_image`).
+
+    The detailer's `mask` output (index 3) is the accumulated detection
+    mask over the whole image — separate from the main composited `image`
+    output (index 0), which the node always emits regardless of whether it
+    actually detected anything (a silent no-op pass-through of the source
+    when it didn't). Converting that mask to an image (`MaskToImage`) and
+    routing it to its own `PreviewImage` gives `post_process()` a direct,
+    ComfyUI-native "did this detect anything at all" signal — completely
+    black means nothing was detected — instead of trying to infer it by
+    diffing the final output's pixels against the source, which doesn't
+    work reliably since ComfyUI's own float32 image round-trip (uint8 ->
+    tensor -> uint8) can shift pixel values by a level or two even on a
+    true pass-through. `PreviewImage` rather than `SaveImage` here on
+    purpose — `/history`+`/view` only expose a node's output at all for an
+    "output node" like either of these, but `PreviewImage` writes to
+    ComfyUI's ephemeral `temp` folder instead of the permanent `output`
+    one, so this internal detection check doesn't leave a stray extra file
+    behind per face/hand post-process the way a second `SaveImage` would."""
     g = PromptGraph()
 
     load = g.add("LoadImage", {"image": source_filename}, title="Source Image")
@@ -468,14 +486,20 @@ def _build_detailer(
         {"images": [detailer, 0], "filename_prefix": params.filename_prefix},
         title="Save Image",
     )
-    return g.as_prompt(), save
+    mask_image = g.add("MaskToImage", {"mask": [detailer, 3]}, title=f"{label} Detection Mask")
+    detection_preview = g.add(
+        "PreviewImage",
+        {"images": [mask_image, 0]},
+        title=f"{label} Detection Check (internal — not a result image)",
+    )
+    return g.as_prompt(), save, detection_preview
 
 
 def build_face_detailer(
     source_filename: str,
     base: PostProcessBaseParams,
     params: FaceDetailerParams,
-) -> tuple[dict[str, Any], str]:
+) -> tuple[dict[str, Any], str, str]:
     """Build the Impact Pack FaceDetailer post-processing graph, targeting
     faces. See `_build_detailer` for the shared graph shape."""
     return _build_detailer(source_filename, base, params, label="Face")
@@ -485,7 +509,7 @@ def build_hand_detailer(
     source_filename: str,
     base: PostProcessBaseParams,
     params: HandDetailerParams,
-) -> tuple[dict[str, Any], str]:
+) -> tuple[dict[str, Any], str, str]:
     """Build the same Impact Pack detailer graph as `build_face_detailer`,
     but with a hand-trained bbox model — see `_build_detailer` and
     `HandDetailerParams`."""

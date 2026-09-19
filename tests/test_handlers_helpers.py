@@ -1,8 +1,9 @@
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from comfytelegram.comfy_client import ComfyUIError
+from comfytelegram.generation import GeneratedImage
 from comfytelegram.handlers import (
     _MAIN_KEYBOARD,
     SHOW_PROMPT_CALLBACK_KIND,
@@ -518,6 +519,7 @@ def _pending_result_mock(profile: ModelProfile, positive: str, negative: str = "
         "base_params": _serialize_generation_params(params),
         "chat_id": 1,
         "file_id": "file123",
+        "filename": "source.png",
     }
     return storage
 
@@ -613,3 +615,75 @@ async def test_show_prompt_skips_tag_check_when_no_tag_data_imported():
     await postprocess_callback(update, context)
 
     assert query.message.reply_text.await_count == 1
+
+
+def _postprocess_context(storage: MagicMock, profile: ModelProfile) -> MagicMock:
+    context = MagicMock()
+    context.bot_data = {
+        "settings": MagicMock(allowed_user_ids=None),
+        "storage": storage,
+        "comfy_client": MagicMock(),
+        "profiles": [profile],
+    }
+    context.bot.get_file = AsyncMock(
+        return_value=MagicMock(download_as_bytearray=AsyncMock(return_value=bytearray(b"orig")))
+    )
+    return context
+
+
+@pytest.mark.asyncio
+async def test_face_detail_with_no_detection_sends_a_warning_instead_of_the_image():
+    query = AsyncMock()
+    query.data = "pp:face:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+
+    unchanged_result = GeneratedImage(
+        data=b"orig",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=True,
+    )
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock(return_value=unchanged_result)):
+        await postprocess_callback(update, context)
+
+    assert query.message.reply_text.await_args_list[-1].args[0] == (
+        "⚠️ No face detected — image unchanged."
+    )
+    query.message.reply_photo.assert_not_called()
+    storage.store_pending_result.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hand_detail_with_a_real_change_sends_the_image_normally():
+    query = AsyncMock()
+    query.data = "pp:hand:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+
+    changed_result = GeneratedImage(
+        data=b"refined",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)):
+        await postprocess_callback(update, context)
+
+    query.message.reply_photo.assert_awaited_once()
+    storage.store_pending_result.assert_called_once()
+    assert not any("unchanged" in call.args[0] for call in query.message.reply_text.await_args_list)

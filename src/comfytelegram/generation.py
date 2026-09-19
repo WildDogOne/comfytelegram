@@ -9,11 +9,15 @@ against a live server.
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
+
+import numpy as np
+from PIL import Image
 
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
 from comfytelegram.profiles import ModelProfile, resolve_generation_params
@@ -45,6 +49,52 @@ class GeneratedImage:
     #: post-processing so the checkpoint/filename it came from is known to
     #: "🔬 Analyze & Regenerate" and "🔁 Generate Again" (see handlers.py).
     full_params: GenerationParams
+    #: True if this came from `post_process(kind="face"/"hand")` and Impact
+    #: Pack's bbox detector found nothing to refine, so the node silently
+    #: passed the source image through unchanged instead of erroring — see
+    #: `_detailer_found_nothing`. Always False for a fresh txt2img/
+    #: `repeat()` image or an upscale (which always changes pixel
+    #: dimensions), since there's either no source to compare against or a
+    #: no-op isn't possible. `postprocess_callback` surfaces this as a
+    #: warning instead of silently handing back what looks like a
+    #: successful refinement.
+    unchanged: bool = False
+
+
+#: Max grayscale pixel value `_detailer_found_nothing` still treats as "no
+#: mask at all" — an all-zero mask stays exactly 0 through PNG encoding (no
+#: floating-point rounding is possible at that boundary), so this is just a
+#: hair of slack, not a real tolerance band.
+_ZERO_MASK_TOLERANCE = 1
+
+
+async def _detailer_found_nothing(
+    client: ComfyClient, history: dict[str, Any], detection_node_id: str
+) -> bool:
+    """True only if we can positively confirm the detailer's detection mask
+    (see `_build_detailer`'s docstring — `detection_node_id` is the
+    `PreviewImage` fed by its `mask` output) came back completely black,
+    meaning Impact Pack's bbox detector found nothing and the detailer's
+    main `image` output is an unmodified pass-through of the source. This
+    is what `post_process()` actually wants to know — diffing the final
+    output image's pixels against the source doesn't work reliably, since
+    ComfyUI's own float32 round-trip (uint8 -> tensor -> uint8) can shift
+    pixel values by a level or two even on a true no-op pass-through.
+    Returns False (i.e. "assume it did something") whenever that can't be
+    confirmed — no image at that node, or a download/decode failure —
+    since wrongly suppressing a real result is worse than an occasional
+    missed "nothing detected" notice."""
+    images = history.get("outputs", {}).get(detection_node_id, {}).get("images", [])
+    if not images:
+        return False
+    img = images[0]
+    try:
+        data = await client.get_image_bytes(img["filename"], img["subfolder"], img["type"])
+        pixels = np.asarray(Image.open(io.BytesIO(data)).convert("L"))
+    except Exception:
+        logger.warning("Couldn't inspect detailer detection mask", exc_info=True)
+        return False
+    return bool(pixels.max() <= _ZERO_MASK_TOLERANCE)
 
 
 def _to_post_process_base(params: GenerationParams) -> PostProcessBaseParams:
@@ -74,9 +124,13 @@ async def _run_graph(
     save_node_id: str,
     *,
     on_progress: ProgressCallback | None,
-) -> list[tuple[bytes, str]]:
+) -> tuple[list[tuple[bytes, str]], dict[str, Any]]:
     """Submit a graph, wait for it to finish, and download every image the
-    given save node produced. Returns (bytes, filename) pairs."""
+    given save node produced. Returns ((bytes, filename) pairs, the raw
+    history dict) — the history is handed back too so a caller that needs
+    to inspect another node's output (`post_process()`'s detection-check
+    node, see `_detailer_found_nothing`) doesn't need a second /history
+    round-trip."""
     client_id = uuid.uuid4().hex
     # Connect before queueing, never after: ComfyUI drops execution events
     # aimed at a client that isn't connected yet, so submitting first can
@@ -108,7 +162,7 @@ async def _run_graph(
     data_list = await asyncio.gather(
         *(client.get_image_bytes(img["filename"], img["subfolder"], img["type"]) for img in images)
     )
-    return list(zip(data_list, (img["filename"] for img in images)))
+    return list(zip(data_list, (img["filename"] for img in images))), history
 
 
 async def generate(
@@ -145,7 +199,7 @@ async def generate(
         "Submitting txt2img: checkpoint=%s cfg=%s steps=%s", checkpoint, params.cfg, params.steps
     )
 
-    raw = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
+    raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
     return [GeneratedImage(data=data, filename=name, full_params=params) for data, name in raw]
 
 
@@ -158,28 +212,39 @@ async def post_process(
     *,
     on_progress: ProgressCallback | None = None,
 ) -> GeneratedImage:
-    """Upload a previously-generated image and run one post-processing stage on it."""
+    """Upload a previously-generated image and run one post-processing stage
+    on it. For `kind="face"`/`"hand"`, the returned `GeneratedImage.unchanged`
+    is True if Impact Pack's bbox detector found nothing to refine — the
+    node just passes the source through as-is in that case rather than
+    erroring, which otherwise looks like a successful (but pointless)
+    refinement (see `_detailer_found_nothing`)."""
     base_params = _to_post_process_base(full_params)
     upload = await client.upload_image(source_image, filename=source_filename)
     uploaded_name = upload["name"]
 
+    detection_node_id: str | None = None
     if kind == "upscale":
         prompt_graph, save_node_id = build_upscale(uploaded_name, base_params, UpscaleParams())
     elif kind == "face":
-        prompt_graph, save_node_id = build_face_detailer(
+        prompt_graph, save_node_id, detection_node_id = build_face_detailer(
             uploaded_name, base_params, FaceDetailerParams()
         )
     elif kind == "hand":
-        prompt_graph, save_node_id = build_hand_detailer(
+        prompt_graph, save_node_id, detection_node_id = build_hand_detailer(
             uploaded_name, base_params, HandDetailerParams()
         )
     else:
         raise ValueError(f"Unknown post-processing kind: {kind}")
 
     logger.info("Submitting post-process (%s) on %s", kind, uploaded_name)
-    raw = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
+    raw, history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
     data, filename = raw[0]
-    return GeneratedImage(data=data, filename=filename, full_params=full_params)
+    unchanged = detection_node_id is not None and await _detailer_found_nothing(
+        client, history, detection_node_id
+    )
+    return GeneratedImage(
+        data=data, filename=filename, full_params=full_params, unchanged=unchanged
+    )
 
 
 async def repeat(
@@ -201,7 +266,7 @@ async def repeat(
         fresh_params.steps,
     )
 
-    raw = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
+    raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
     return [
         GeneratedImage(data=data, filename=name, full_params=fresh_params) for data, name in raw
     ]

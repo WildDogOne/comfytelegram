@@ -104,7 +104,9 @@ async def main() -> None:
             await run_stage(client, "upscale", prompt_graph, save_id, out_dir)
 
         if args.stage in ("face", "both"):
-            prompt_graph, save_id = build_face_detailer(uploaded_name, base, FaceDetailerParams())
+            prompt_graph, save_id, _detection_id = build_face_detailer(
+                uploaded_name, base, FaceDetailerParams()
+            )
             await run_stage(client, "face", prompt_graph, save_id, out_dir)
 
 

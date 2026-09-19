@@ -165,7 +165,9 @@ def test_build_face_detailer_honors_explicit_seed():
         positive_prompt="a fox",
         negative_prompt="low quality",
     )
-    prompt, _save_id = build_face_detailer("uploaded.png", base, FaceDetailerParams(seed=888))
+    prompt, _save_id, _detection_id = build_face_detailer(
+        "uploaded.png", base, FaceDetailerParams(seed=888)
+    )
     detailer = next(n for n in prompt.values() if n["class_type"] == "FaceDetailer")
     assert detailer["inputs"]["seed"] == 888
 
@@ -196,12 +198,23 @@ def test_build_face_detailer_wires_detector_and_sam():
         positive_prompt="a fox",
         negative_prompt="low quality",
     )
-    prompt, save_id = build_face_detailer("uploaded.png", base, FaceDetailerParams())
+    prompt, save_id, detection_id = build_face_detailer("uploaded.png", base, FaceDetailerParams())
 
-    detailer = next(n for n in prompt.values() if n["class_type"] == "FaceDetailer")
+    detailer_id = next(nid for nid, n in prompt.items() if n["class_type"] == "FaceDetailer")
+    detailer = prompt[detailer_id]
     assert "bbox_detector" in detailer["inputs"]
     assert "sam_model_opt" in detailer["inputs"]
     assert prompt[save_id]["class_type"] == "SaveImage"
+    assert prompt[save_id]["inputs"]["images"] == [detailer_id, 0]
+
+    # The detection-check node is a *separate* PreviewImage (not SaveImage
+    # — see _build_detailer's docstring for why) fed by the detailer's mask
+    # output via MaskToImage — see post_process()'s _detailer_found_nothing.
+    assert detection_id != save_id
+    assert prompt[detection_id]["class_type"] == "PreviewImage"
+    mask_image_id = prompt[detection_id]["inputs"]["images"][0]
+    assert prompt[mask_image_id]["class_type"] == "MaskToImage"
+    assert prompt[mask_image_id]["inputs"]["mask"] == [detailer_id, 3]
 
 
 def test_build_hand_detailer_honors_explicit_seed():
@@ -210,7 +223,9 @@ def test_build_hand_detailer_honors_explicit_seed():
         positive_prompt="a fox",
         negative_prompt="low quality",
     )
-    prompt, _save_id = build_hand_detailer("uploaded.png", base, HandDetailerParams(seed=888))
+    prompt, _save_id, _detection_id = build_hand_detailer(
+        "uploaded.png", base, HandDetailerParams(seed=888)
+    )
     detailer = next(n for n in prompt.values() if n["class_type"] == "FaceDetailer")
     assert detailer["inputs"]["seed"] == 888
 
@@ -221,7 +236,7 @@ def test_build_hand_detailer_wires_detector_and_sam_with_hand_bbox_model():
         positive_prompt="a fox",
         negative_prompt="low quality",
     )
-    prompt, save_id = build_hand_detailer("uploaded.png", base, HandDetailerParams())
+    prompt, save_id, detection_id = build_hand_detailer("uploaded.png", base, HandDetailerParams())
 
     detector = next(n for n in prompt.values() if n["class_type"] == "UltralyticsDetectorProvider")
     assert detector["inputs"]["model_name"] == "bbox/hand_yolov8s.pt"
@@ -230,3 +245,4 @@ def test_build_hand_detailer_wires_detector_and_sam_with_hand_bbox_model():
     assert "bbox_detector" in detailer["inputs"]
     assert "sam_model_opt" in detailer["inputs"]
     assert prompt[save_id]["class_type"] == "SaveImage"
+    assert detection_id != save_id

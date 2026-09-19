@@ -1079,8 +1079,12 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     replies with a "this is already large — continue?" prompt
     (`_upscale_confirm_keyboard`) instead, which comes back as either
     `UPSCALE_CONFIRM_CALLBACK_KIND` (proceed) or
-    `UPSCALE_CANCEL_CALLBACK_KIND` (abort). Alerts instead if `result_id`
-    has expired (see `PENDING_RESULT_TTL_SECONDS`)."""
+    `UPSCALE_CANCEL_CALLBACK_KIND` (abort). A `"face"`/`"hand"` result whose
+    detector found nothing to refine (`GeneratedImage.unchanged`, see
+    `post_process`) isn't sent or stored at all — it's pixel-identical to
+    what's already on screen, so re-posting it would just be noise — a
+    "⚠️ No face/hand detected" text reply stands in for it instead. Alerts
+    instead if `result_id` has expired (see `PENDING_RESULT_TTL_SECONDS`)."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
@@ -1270,6 +1274,10 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     await status_message.delete()
+    if result.unchanged:
+        subject = "face" if kind == "face" else "hand"
+        await query.message.reply_text(f"⚠️ No {subject} detected — image unchanged.")
+        return
     await _send_and_store_result(query.message, pending["chat_id"], storage, result)
 
 
