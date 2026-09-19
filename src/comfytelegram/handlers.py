@@ -172,9 +172,10 @@ def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
     style tag-health check on the prompt this image was built from — see
     `postprocess_callback`'s `ANALYZE_PROMPT_CALLBACK_KIND` branch), Deep
     Analyze (image analysis via the bigger `analyze_caption_deep` model),
-    and Show Prompt (a debugging button that just dumps the exact
+    and Show Prompt (a debugging button that dumps the exact
     positive/negative prompt this image was generated with, folded
-    character and profile prefixes included — see `postprocess_callback`'s
+    character and profile prefixes included, plus a second reply with just
+    the text the user typed — see `postprocess_callback`'s
     `SHOW_PROMPT_CALLBACK_KIND` branch), all scoped to `result_id` (see
     `storage.py`'s `pending_result`). "🖐️ Hand Detail" doesn't post-process
     on this tap alone — see `postprocess_callback`'s `"hand"` branch for the
@@ -389,6 +390,20 @@ def _generate_from_prompt_keyboard(prompt_id: str, prompt: str) -> InlineKeyboar
     return InlineKeyboardMarkup([buttons])
 
 
+def _raw_prompt_copy_text(raw_positive: str, raw_negative: str) -> str:
+    """The exact text `postprocess_callback`'s `SHOW_PROMPT_CALLBACK_KIND`
+    branch hands back for its "as typed" reply — no "Positive:"/
+    "Negative:" labels, since this is meant to be 100% reusable as-is,
+    whether grabbed via its "📋 Copy" button or selected by hand from the
+    message text. `raw_positive` alone when there's no raw negative;
+    otherwise `raw_positive` + this bot's own "---" block separator (see
+    `_split_negative_prompt`) + `raw_negative`, so pasting the result back
+    in as a new prompt message round-trips through that same split."""
+    if raw_negative:
+        return f"{raw_positive}\n---\n{raw_negative}"
+    return raw_positive
+
+
 async def _send_result_image(
     message: Message,
     data: bytes,
@@ -450,6 +465,8 @@ def _serialize_generation_params(params: GenerationParams) -> dict[str, Any]:
         "clip_type": params.clip_type,
         "vae_name": params.vae_name,
         "model_sampling_shift": params.model_sampling_shift,
+        "raw_positive_prompt": params.raw_positive_prompt,
+        "raw_negative_prompt": params.raw_negative_prompt,
     }
 
 
@@ -477,6 +494,8 @@ def _deserialize_generation_params(data: dict[str, Any]) -> GenerationParams:
         clip_type=data.get("clip_type", "stable_diffusion"),
         vae_name=data.get("vae_name", ""),
         model_sampling_shift=data.get("model_sampling_shift"),
+        raw_positive_prompt=data.get("raw_positive_prompt", ""),
+        raw_negative_prompt=data.get("raw_negative_prompt", ""),
     )
 
 
@@ -1034,22 +1053,25 @@ def _split_negative_prompt(text: str) -> tuple[str, str]:
 
 def _resolve_effective_prompt(
     prompt_text: str, character: dict[str, str] | None
-) -> tuple[str, str]:
+) -> tuple[str, str, str, str]:
     """Combine a raw prompt message with the active character (if any) into
-    `(effective_prompt, extra_negative_prompt)` for `generate()`: splits the
-    message into positive/negative (a "---" block separator, or else
-    "-token" negatives — see `_split_negative_prompt`), folds the
-    character's own saved positive/negative prompt in around them, and
-    leaves profile-level negative defaults for `generate()`/`resolve_generation_params`
-    to layer underneath."""
-    positive, negative = _split_negative_prompt(prompt_text)
+    `(effective_prompt, extra_negative_prompt, raw_positive, raw_negative)`
+    for `generate()`: splits the message into positive/negative (a "---"
+    block separator, or else "-token" negatives — see
+    `_split_negative_prompt`), folds the character's own saved
+    positive/negative prompt in around them, and leaves profile-level
+    negative defaults for `generate()`/`resolve_generation_params` to layer
+    underneath. `raw_positive`/`raw_negative` are that same split, *before*
+    the character folding — exactly what the user typed, for "🐛 Show
+    Prompt"'s second output (see `GenerationParams.raw_positive_prompt`)."""
+    raw_positive, raw_negative = _split_negative_prompt(prompt_text)
     effective_prompt = (
-        join_nonempty([character["positive_prompt"], positive]) if character else positive
+        join_nonempty([character["positive_prompt"], raw_positive]) if character else raw_positive
     )
     extra_negative = (
-        join_nonempty([character["negative_prompt"], negative]) if character else negative
+        join_nonempty([character["negative_prompt"], raw_negative]) if character else raw_negative
     )
-    return effective_prompt, extra_negative
+    return effective_prompt, extra_negative, raw_positive, raw_negative
 
 
 async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1099,7 +1121,9 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     character = (
         storage.get_character(chat_id, active_character_name) if active_character_name else None
     )
-    effective_prompt, extra_negative = _resolve_effective_prompt(prompt_text, character)
+    effective_prompt, extra_negative, raw_positive, raw_negative = _resolve_effective_prompt(
+        prompt_text, character
+    )
 
     status_message = await message.reply_text("Generating… 0%", disable_notification=True)
 
@@ -1113,6 +1137,8 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             effective_prompt,
             profile,
             extra_negative_prompt=extra_negative,
+            raw_positive_prompt=raw_positive,
+            raw_negative_prompt=raw_negative,
             on_progress=_make_progress_callback(status_message),
         ),
     )
@@ -1184,7 +1210,17 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     `prompt_style` dispatch; see `ANALYZE_ONLY_CALLBACK_KIND`),
     `"show_prompt"` (reply with the exact positive/negative prompt this
     image was built from, no download or generation and no tag check — see
-    `SHOW_PROMPT_CALLBACK_KIND`), `"analyze_prompt"` (a `/tagcheck`-style
+    `SHOW_PROMPT_CALLBACK_KIND` — followed by a second reply with just what
+    the user actually typed, stripped of the profile's prompt prefixes and
+    any active character's saved prompt — see
+    `GenerationParams.raw_positive_prompt`/`_resolve_effective_prompt` —
+    or a "not available" note for a pending_result row stored before that
+    field existed. That second reply is plain, label-free text — see
+    `_raw_prompt_copy_text` — plus, when it's short enough for Telegram's
+    `MAX_COPY_TEXT` cap, a "📋 Copy" button (same gating as
+    `_generate_from_prompt_keyboard`'s), so it's reusable as a whole
+    without hand-editing out "Positive:"/"Negative:" labels first),
+    `"analyze_prompt"` (a `/tagcheck`-style
     tag-health check on that same prompt instead, if this image's
     checkpoint profile is tag-trained and tag data is imported — see
     `ANALYZE_PROMPT_CALLBACK_KIND`), or
@@ -1232,6 +1268,21 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text(
             f"Positive:\n{full_params.positive_prompt}\n\nNegative:\n{negative}"
         )
+        if full_params.raw_positive_prompt or full_params.raw_negative_prompt:
+            copy_text = _raw_prompt_copy_text(
+                full_params.raw_positive_prompt, full_params.raw_negative_prompt
+            )
+            keyboard = None
+            if len(copy_text) <= InlineKeyboardButtonLimit.MAX_COPY_TEXT:
+                keyboard = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("📋 Copy", copy_text=CopyTextButton(copy_text))]]
+                )
+            await query.message.reply_text(f"As typed:\n\n{copy_text}", reply_markup=keyboard)
+        else:
+            await query.message.reply_text(
+                "As typed (no profile/character prompt): not available — this image "
+                "was generated before this existed."
+            )
         return
 
     if kind == ANALYZE_PROMPT_CALLBACK_KIND:
@@ -1520,6 +1571,8 @@ async def generate_from_prompt_callback(update: Update, context: ContextTypes.DE
             stored["prompt"],
             profile,
             extra_negative_prompt=stored["negative_prompt"],
+            raw_positive_prompt=stored["prompt"],
+            raw_negative_prompt=stored["negative_prompt"],
             on_progress=_make_progress_callback(status_message),
         ),
     )
@@ -1752,7 +1805,9 @@ async def _run_stream(
         character = (
             storage.get_character(chat_id, active_character_name) if active_character_name else None
         )
-        effective_prompt, extra_negative = _resolve_effective_prompt(prompt_text, character)
+        effective_prompt, extra_negative, raw_positive, raw_negative = _resolve_effective_prompt(
+            prompt_text, character
+        )
 
         status_message = await message.reply_text(
             f"🔁 Streaming started (up to {STREAM_HARD_LIMIT} images) — "
@@ -1769,6 +1824,8 @@ async def _run_stream(
                 effective_prompt,
                 profile,
                 extra_negative_prompt=extra_negative,
+                raw_positive_prompt=raw_positive,
+                raw_negative_prompt=raw_negative,
                 overrides={"batch_size": 1},
                 on_progress=_make_progress_callback(
                     status_message, label=f"Streaming {count}/{STREAM_HARD_LIMIT}"

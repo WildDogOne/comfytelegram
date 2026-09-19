@@ -26,6 +26,7 @@ from comfytelegram.handlers import (
     _hand_mode_keyboard,
     _hand_point_keyboard,
     _post_process_keyboard,
+    _raw_prompt_copy_text,
     _resolve_effective_prompt,
     _resolve_tag_sources,
     _run_reporting_errors,
@@ -103,16 +104,32 @@ def test_split_negative_prompt_treats_newlines_like_commas_without_a_block_separ
 
 
 def test_resolve_effective_prompt_without_a_character():
-    effective_prompt, extra_negative = _resolve_effective_prompt("1girl, -blurry", None)
+    effective_prompt, extra_negative, raw_positive, raw_negative = _resolve_effective_prompt(
+        "1girl, -blurry", None
+    )
     assert effective_prompt == "1girl"
     assert extra_negative == "blurry"
+    assert raw_positive == "1girl"
+    assert raw_negative == "blurry"
 
 
 def test_resolve_effective_prompt_folds_in_the_active_character():
     character = {"positive_prompt": "aria, red hair", "negative_prompt": "bad anatomy"}
-    effective_prompt, extra_negative = _resolve_effective_prompt("outdoors, -blurry", character)
+    effective_prompt, extra_negative, raw_positive, raw_negative = _resolve_effective_prompt(
+        "outdoors, -blurry", character
+    )
     assert effective_prompt == "aria, red hair, outdoors"
     assert extra_negative == "bad anatomy, blurry"
+    assert raw_positive == "outdoors"
+    assert raw_negative == "blurry"
+
+
+def test_raw_prompt_copy_text_joins_positive_and_negative_with_block_separator():
+    assert _raw_prompt_copy_text("1girl, outdoors", "blurry") == "1girl, outdoors\n---\nblurry"
+
+
+def test_raw_prompt_copy_text_is_positive_only_without_a_negative():
+    assert _raw_prompt_copy_text("1girl, outdoors", "") == "1girl, outdoors"
 
 
 def test_post_process_keyboard_scopes_every_button_to_result_id():
@@ -522,9 +539,20 @@ def test_tagcheck_lines_truncates_at_the_token_limit():
     assert lines[-1] == f"…5 more token(s) omitted (limit {TAGCHECK_TOKEN_LIMIT})."
 
 
-def _pending_result_mock(profile: ModelProfile, positive: str, negative: str = "") -> MagicMock:
+def _pending_result_mock(
+    profile: ModelProfile,
+    positive: str,
+    negative: str = "",
+    *,
+    raw_positive: str = "",
+    raw_negative: str = "",
+) -> MagicMock:
     params = GenerationParams(
-        checkpoint="fluffyfurry.safetensors", positive_prompt=positive, negative_prompt=negative
+        checkpoint="fluffyfurry.safetensors",
+        positive_prompt=positive,
+        negative_prompt=negative,
+        raw_positive_prompt=raw_positive,
+        raw_negative_prompt=raw_negative,
     )
     storage = MagicMock()
     storage.get_pending_result.return_value = {
@@ -562,10 +590,88 @@ async def test_show_prompt_never_runs_a_tag_check():
 
     await postprocess_callback(update, context)
 
-    assert query.message.reply_text.await_count == 1
+    assert query.message.reply_text.await_count == 2
     prompt_message = query.message.reply_text.await_args_list[0].args[0]
     assert "fox, blue_eyes" in prompt_message
+    raw_message = query.message.reply_text.await_args_list[1].args[0]
+    assert "not available" in raw_message
     tags_db.lookup_exact.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_show_prompt_second_output_strips_profile_and_character_prompt():
+    query = AsyncMock()
+    query.data = f"pp:{SHOW_PROMPT_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(
+        match=["fluffyfurry*"], display_name="x", prompt_style="tags", tag_dictionary="e621"
+    )
+    storage = _pending_result_mock(
+        profile,
+        "masterpiece, aria, red hair, fox, blue_eyes",
+        "low quality, bad anatomy, blurry",
+        raw_positive="fox, blue_eyes",
+        raw_negative="blurry",
+    )
+    tags_db = MagicMock()
+    tags_db.stats.return_value = {"e621": 100}
+
+    context = MagicMock()
+    context.bot_data = {
+        "settings": MagicMock(allowed_user_ids=None, tag_rare_threshold=100),
+        "storage": storage,
+        "comfy_client": MagicMock(),
+        "profiles": [profile],
+        "tags_db": tags_db,
+    }
+
+    await postprocess_callback(update, context)
+
+    assert query.message.reply_text.await_count == 2
+    raw_call = query.message.reply_text.await_args_list[1]
+    raw_message = raw_call.args[0]
+    assert "fox, blue_eyes\n---\nblurry" in raw_message
+    assert "masterpiece" not in raw_message
+    assert "aria" not in raw_message
+    assert "Positive:" not in raw_message
+    assert "Negative:" not in raw_message
+
+    keyboard = raw_call.kwargs["reply_markup"]
+    copy_button = keyboard.inline_keyboard[0][0]
+    assert copy_button.copy_text.text == "fox, blue_eyes\n---\nblurry"
+
+
+@pytest.mark.asyncio
+async def test_show_prompt_omits_copy_button_past_telegram_limit():
+    query = AsyncMock()
+    query.data = f"pp:{SHOW_PROMPT_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["fluffyfurry*"], display_name="x")
+    long_prompt = "tag, " * 100  # well past MAX_COPY_TEXT (256 chars)
+    storage = _pending_result_mock(
+        profile, long_prompt, "", raw_positive=long_prompt, raw_negative=""
+    )
+
+    context = MagicMock()
+    context.bot_data = {
+        "settings": MagicMock(allowed_user_ids=None, tag_rare_threshold=100),
+        "storage": storage,
+        "comfy_client": MagicMock(),
+        "profiles": [profile],
+        "tags_db": MagicMock(),
+    }
+
+    await postprocess_callback(update, context)
+
+    raw_call = query.message.reply_text.await_args_list[1]
+    assert long_prompt.strip() in raw_call.args[0]
+    assert raw_call.kwargs["reply_markup"] is None
 
 
 @pytest.mark.asyncio

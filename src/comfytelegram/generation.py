@@ -174,6 +174,8 @@ async def generate(
     profile: ModelProfile | None,
     *,
     extra_negative_prompt: str = "",
+    raw_positive_prompt: str = "",
+    raw_negative_prompt: str = "",
     overrides: dict[str, Any] | None = None,
     on_progress: ProgressCallback | None = None,
 ) -> list[GeneratedImage]:
@@ -183,9 +185,13 @@ async def generate(
     prompt folded in by the caller (see `handlers.py`'s `generate_message`)
     since it's just free text; `extra_negative_prompt` carries that same
     character's negative prompt through separately, since profile
-    resolution owns the negative prompt entirely otherwise. `overrides`
-    wins over both the profile and its own defaults (see
-    `resolve_generation_params`) — used by "/stream" to force
+    resolution owns the negative prompt entirely otherwise.
+    `raw_positive_prompt`/`raw_negative_prompt` are the caller's record of
+    what the user actually typed, before any profile/character prompt got
+    folded in — see `GenerationParams.raw_positive_prompt` — and ride along
+    unmodified onto the returned images' `full_params` for "🐛 Show Prompt"
+    to display. `overrides` wins over both the profile and its own
+    defaults (see `resolve_generation_params`) — used by "/stream" to force
     `batch_size=1` per request without touching the chat's persisted
     `/settings` override.
     """
@@ -195,6 +201,8 @@ async def generate(
         profile,
         overrides=overrides,
         extra_negative_prompt=extra_negative_prompt,
+        raw_positive_prompt=raw_positive_prompt,
+        raw_negative_prompt=raw_negative_prompt,
     )
     prompt_graph, save_node_id = build_txt2img(params)
     logger.info(

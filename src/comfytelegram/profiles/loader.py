@@ -91,6 +91,8 @@ def resolve_generation_params(
     *,
     overrides: dict[str, Any] | None = None,
     extra_negative_prompt: str = "",
+    raw_positive_prompt: str = "",
+    raw_negative_prompt: str = "",
 ) -> GenerationParams:
     """Combine a model profile's defaults with the user's prompt and any explicit
     overrides (highest priority, e.g. a user-set /cfg or /steps command) into a
@@ -100,6 +102,12 @@ def resolve_generation_params(
     prefix — e.g. an active saved character's negative prompt (see
     `storage.py`'s `character` table), which isn't part of the model
     profile at all.
+
+    `raw_positive_prompt`/`raw_negative_prompt` carry straight through onto
+    the returned `GenerationParams` unchanged — they're not folded into
+    `positive_prompt`/`negative_prompt` at all, just the caller's own
+    record of what the user actually typed before any profile/character
+    prompt got mixed in (see `GenerationParams.raw_positive_prompt`).
     """
     overrides = dict(overrides or {})
 
@@ -133,6 +141,8 @@ def resolve_generation_params(
         "positive_prompt": positive_prompt,
         "negative_prompt": negative_prompt,
         "loras": loras,
+        "raw_positive_prompt": raw_positive_prompt,
+        "raw_negative_prompt": raw_negative_prompt,
         **architecture_fields,
         **field_defaults,
     }

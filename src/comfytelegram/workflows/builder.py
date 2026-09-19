@@ -105,6 +105,15 @@ class GenerationParams:
     #: after the UNET load (Anima's AuraFlow-style sampling); `None` skips
     #: that node entirely for split architectures that don't need it.
     model_sampling_shift: float | None = None
+    #: The exact text the user typed, before `resolve_generation_params`
+    #: folded in the profile's `positive_prompt_prefix`/
+    #: `negative_prompt_prefix` or an active character's saved prompt.
+    #: Not used to build the graph (`positive_prompt`/`negative_prompt` are)
+    #: — it just rides along for `handlers.py`'s "🐛 Show Prompt" to show a
+    #: second, unprefixed view. Empty for pending_result rows serialized
+    #: before this field existed.
+    raw_positive_prompt: str = ""
+    raw_negative_prompt: str = ""
 
     def resolved_seed(self) -> int:
         """This request's seed, or a freshly-rolled random one if unset."""

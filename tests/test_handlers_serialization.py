@@ -16,6 +16,8 @@ def _sample_params() -> GenerationParams:
         batch_size=2,
         clip_skip=-2,
         loras=[LoraSpec(name="a.safetensors", strength_model=0.8, strength_clip=1.0)],
+        raw_positive_prompt="a fox",
+        raw_negative_prompt="blurry",
     )
 
 
@@ -41,6 +43,8 @@ def test_generation_params_roundtrip_through_serialization():
     assert restored.clip_type == params.clip_type
     assert restored.vae_name == params.vae_name
     assert restored.model_sampling_shift == params.model_sampling_shift
+    assert restored.raw_positive_prompt == params.raw_positive_prompt
+    assert restored.raw_negative_prompt == params.raw_negative_prompt
 
 
 def test_split_loader_params_roundtrip_through_serialization():
@@ -83,3 +87,5 @@ def test_deserialize_falls_back_to_defaults_for_pre_regenerate_rows():
     assert restored.steps == 30  # GenerationParams' own generic default
     assert restored.cfg == 7.0
     assert restored.loader == "checkpoint"  # pre-split-loader rows default to the old behavior
+    assert restored.raw_positive_prompt == ""  # pre-raw-prompt rows have nothing to fall back to
+    assert restored.raw_negative_prompt == ""

@@ -145,6 +145,32 @@ def test_resolve_generation_params_extra_negative_without_profile():
     assert params.negative_prompt == "blurry"
 
 
+def test_resolve_generation_params_carries_raw_prompt_through_unfolded():
+    profile = _synthetic_profile()
+    params = resolve_generation_params(
+        "synthetic_test_ckpt.safetensors",
+        "aria, a fox",
+        profile,
+        extra_negative_prompt="bad anatomy, blurry",
+        raw_positive_prompt="a fox",
+        raw_negative_prompt="blurry",
+    )
+    assert params.raw_positive_prompt == "a fox"
+    assert params.raw_negative_prompt == "blurry"
+    # unlike positive_prompt/negative_prompt, the raw fields never see the
+    # profile's prefixes or the character text folded into user_prompt/
+    # extra_negative_prompt above.
+    assert "masterpiece" not in params.raw_positive_prompt
+    assert "aria" not in params.raw_positive_prompt
+    assert "bad anatomy" not in params.raw_negative_prompt
+
+
+def test_resolve_generation_params_defaults_raw_prompt_to_empty():
+    params = resolve_generation_params("unknown.safetensors", "a fox", None)
+    assert params.raw_positive_prompt == ""
+    assert params.raw_negative_prompt == ""
+
+
 def test_lora_default_to_spec_drops_default_enabled_flag():
     lora = LoraDefault(name="a.safetensors", strength_model=0.8, strength_clip=0.9, default_enabled=False)
     spec = lora.to_spec()
