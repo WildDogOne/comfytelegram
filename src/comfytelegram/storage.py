@@ -8,7 +8,7 @@ Again" button (keyed like `pending_result`, by an id embedded in that
 specific message's callback_data, not by chat_id — so an older message's
 button always repeats *its own* generation, not whatever the chat most
 recently generated), and the derived-prompt registry that backs each
-"🎨 Generate" button under a "🏷️ Analyze" result (which specific analyzer
+"🎨 Generate" button under a "🏷️ Analyze Image" result (which specific analyzer
 output — WD14 tags or Qwen-VL caption — that button should generate from).
 
 That last one used to live only in an in-memory dict (`state.py`, now
@@ -380,7 +380,7 @@ class Storage:
         prompt: str,
         negative_prompt: str = "",
     ) -> None:
-        """Record one analyzer's output from the "🏷️ Analyze" button (WD14
+        """Record one analyzer's output from the "🏷️ Analyze Image" button (WD14
         tags or a Qwen-VL caption) so its own "🎨 Generate" button can start
         a fresh generation from exactly that prompt later, keyed by an id
         embedded in that button's callback_data — same per-message pattern

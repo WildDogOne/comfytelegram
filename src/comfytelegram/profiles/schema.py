@@ -79,9 +79,9 @@ class ModelProfile(BaseModel):
     prompt_style: Literal["tags", "natural"] = Field(
         "natural",
         description=(
-            "Which image analyzer the '🔬 Analyze & Regenerate' button uses for this "
-            "checkpoint: 'tags' for booru/danbooru-tag-trained checkpoints (WD14 tagger), "
-            "'natural' for checkpoints that expect prose-style prompts (Qwen-VL captioning)."
+            "Whether this checkpoint expects comma-separated booru tags or a "
+            "prose-style prompt. Gates the '🐛 Show Prompt' button's tag-health check "
+            "(handlers.py's SHOW_PROMPT_CALLBACK_KIND branch) to tag-style prompts only."
         ),
     )
 

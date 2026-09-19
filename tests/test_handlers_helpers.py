@@ -6,6 +6,7 @@ from comfytelegram.comfy_client import ComfyUIError
 from comfytelegram.generation import GeneratedImage
 from comfytelegram.handlers import (
     _MAIN_KEYBOARD,
+    ANALYZE_PROMPT_CALLBACK_KIND,
     SHOW_PROMPT_CALLBACK_KIND,
     TAGCHECK_TOKEN_LIMIT,
     _again_keyboard,
@@ -110,7 +111,7 @@ def test_post_process_keyboard_scopes_every_button_to_result_id():
     assert "pp:face:abc123" in callback_data
     assert "pp:hand:abc123" in callback_data
     assert "pp:analyze_only:abc123" in callback_data
-    assert "pp:analyze:abc123" in callback_data
+    assert f"pp:{ANALYZE_PROMPT_CALLBACK_KIND}:abc123" in callback_data
     assert "pp:deep_analyze:abc123" in callback_data
     assert "pp:show_prompt:abc123" in callback_data
 
@@ -525,9 +526,41 @@ def _pending_result_mock(profile: ModelProfile, positive: str, negative: str = "
 
 
 @pytest.mark.asyncio
-async def test_show_prompt_appends_tag_check_for_a_tag_style_profile():
+async def test_show_prompt_never_runs_a_tag_check():
     query = AsyncMock()
     query.data = f"pp:{SHOW_PROMPT_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(
+        match=["fluffyfurry*"], display_name="x", prompt_style="tags", tag_dictionary="e621"
+    )
+    storage = _pending_result_mock(profile, "fox, blue_eyes", "blurry")
+    tags_db = MagicMock()
+    tags_db.stats.return_value = {"e621": 100}
+
+    context = MagicMock()
+    context.bot_data = {
+        "settings": MagicMock(allowed_user_ids=None, tag_rare_threshold=100),
+        "storage": storage,
+        "comfy_client": MagicMock(),
+        "profiles": [profile],
+        "tags_db": tags_db,
+    }
+
+    await postprocess_callback(update, context)
+
+    assert query.message.reply_text.await_count == 1
+    prompt_message = query.message.reply_text.await_args_list[0].args[0]
+    assert "fox, blue_eyes" in prompt_message
+    tags_db.lookup_exact.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_analyze_prompt_runs_a_tag_check_for_a_tag_style_profile():
+    query = AsyncMock()
+    query.data = f"pp:{ANALYZE_PROMPT_CALLBACK_KIND}:abc123"
     update = MagicMock()
     update.callback_query = query
     update.effective_user.id = 1
@@ -551,10 +584,8 @@ async def test_show_prompt_appends_tag_check_for_a_tag_style_profile():
 
     await postprocess_callback(update, context)
 
-    assert query.message.reply_text.await_count == 2
-    prompt_message = query.message.reply_text.await_args_list[0].args[0]
-    assert "fox, blue_eyes" in prompt_message
-    tagcheck_message = query.message.reply_text.await_args_list[1].args[0]
+    assert query.message.reply_text.await_count == 1
+    tagcheck_message = query.message.reply_text.await_args_list[0].args[0]
     assert "Tag check (positive)" in tagcheck_message
     assert "Tag check (negative)" in tagcheck_message
     assert "fox" in tagcheck_message
@@ -562,9 +593,9 @@ async def test_show_prompt_appends_tag_check_for_a_tag_style_profile():
 
 
 @pytest.mark.asyncio
-async def test_show_prompt_skips_tag_check_for_a_natural_language_profile():
+async def test_analyze_prompt_reports_unavailable_for_a_natural_language_profile():
     query = AsyncMock()
-    query.data = f"pp:{SHOW_PROMPT_CALLBACK_KIND}:abc123"
+    query.data = f"pp:{ANALYZE_PROMPT_CALLBACK_KIND}:abc123"
     update = MagicMock()
     update.callback_query = query
     update.effective_user.id = 1
@@ -586,12 +617,15 @@ async def test_show_prompt_skips_tag_check_for_a_natural_language_profile():
     await postprocess_callback(update, context)
 
     assert query.message.reply_text.await_count == 1
+    message = query.message.reply_text.await_args_list[0].args[0]
+    assert "No tag check available" in message
+    tags_db.lookup_exact.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_show_prompt_skips_tag_check_when_no_tag_data_imported():
+async def test_analyze_prompt_reports_unavailable_when_no_tag_data_imported():
     query = AsyncMock()
-    query.data = f"pp:{SHOW_PROMPT_CALLBACK_KIND}:abc123"
+    query.data = f"pp:{ANALYZE_PROMPT_CALLBACK_KIND}:abc123"
     update = MagicMock()
     update.callback_query = query
     update.effective_user.id = 1
@@ -615,6 +649,8 @@ async def test_show_prompt_skips_tag_check_when_no_tag_data_imported():
     await postprocess_callback(update, context)
 
     assert query.message.reply_text.await_count == 1
+    message = query.message.reply_text.await_args_list[0].args[0]
+    assert "No tag check available" in message
 
 
 def _postprocess_context(storage: MagicMock, profile: ModelProfile) -> MagicMock:

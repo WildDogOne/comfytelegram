@@ -1,36 +1,32 @@
-"""Image-to-prompt analysis: backs the "🔬 Analyze & Regenerate" button.
+"""Image-to-prompt analysis: backs the "🏷️ Analyze Image"/"🔎 Deep Analyze" buttons
+and directly-uploaded photos.
 
-Two independent analyzers, chosen per-checkpoint by a model profile's
-`prompt_style` field (see profiles/schema.py):
+Two independent analyzers:
 
-- "tags": WD14 tagger (ONNX, run locally via onnxruntime) — for
+- `analyze_tags` — WD14 tagger (ONNX, run locally via onnxruntime) — for
   booru/danbooru-tag-trained checkpoints like Pony/Illustrious/Animagine
   merges, whose training captions are comma-separated tags, not prose.
-- "natural": Qwen-VL, called through a local Ollama server — for
+- `analyze_caption` — Qwen-VL, called through a local Ollama server — for
   checkpoints (e.g. stock SDXL) that expect natural-language prompts.
+
+Both always run together (see `handlers._analyze_both`/`_analyze_both_deep`)
+so a side-by-side comparison is available regardless of a checkpoint's
+`prompt_style` (see profiles/schema.py) — that field only gates the
+"🐛 Show Prompt" button's tag-health check, not which analyzer runs.
 
 A third analyzer — `analyze_caption_deep` — runs a bigger, slower vision
 model (`Settings.ollama_deep_vision_model`) through the same Ollama server.
-It's not part of `analyze_image`'s `prompt_style` dispatch (which still
-picks between `analyze_tags`/`analyze_caption` for generation) and stays
-opt-in via the "🔎 Deep Analyze" button for the bot's own generated images
-(`handlers.postprocess_callback`'s `DEEP_ANALYZE_CALLBACK_KIND` branch),
-since those sit on an interactive path where the quick default's speed
-matters. Directly-uploaded photos (`handlers.photo_message`) aren't on that
-path, so they use it unconditionally instead of the quick model — see
+It stays opt-in via the "🔎 Deep Analyze" button for the bot's own generated
+images (`handlers.postprocess_callback`'s `DEEP_ANALYZE_CALLBACK_KIND`
+branch), since those sit on an interactive path where the quick default's
+speed matters. Directly-uploaded photos (`handlers.photo_message`) aren't on
+that path, so they use it unconditionally instead of the quick model — see
 `handlers._analyze_both_deep`.
 
 `analyze_tags` returns a single tag-string prompt fragment; `analyze_caption`/
 `analyze_caption_deep` return `(positive, negative)` — the Qwen-VL prompt
 asks for a suggested negative (visible flaws/defects) alongside the
-description, parsed out by `_parse_caption_response`. `analyze_image`, the
-`prompt_style`-dispatching entry point `generate()`-bound flows use, always
-returns just a positive-prompt string: it discards any suggested negative
-rather than feed it into generation, since that's a bigger behavior change
-than the "🏷️ Analyze"/"🔎 Deep Analyze" standalone displays (see
-`handlers._analyze_both`/`_analyze_both_deep`) were meant for. Those two are
-the only places a suggested negative prompt is shown to the user or stored
-for its own "🎨 Generate" button.
+description, parsed out by `_parse_caption_response`.
 
 The WD14 model files (model.onnx + selected_tags.csv) are *not* downloaded
 automatically. Hugging Face serves large model files from an LFS/Xet CDN on
@@ -51,7 +47,6 @@ import io
 import logging
 import re
 from pathlib import Path
-from typing import Literal
 
 import aiohttp
 import numpy as np
@@ -191,7 +186,7 @@ class _WD14Model:
 def _load_wd14_model(model_path: str, tags_path: str) -> _WD14Model:
     """Loading is a real cost (reading a few-hundred-MB file into an ONNX
     session), so `lru_cache` makes it happen once per process and get reused
-    across every "Analyze & Regenerate" tap rather than per-request."""
+    across every "🏷️ Analyze Image" tap rather than per-request."""
     session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
     with open(tags_path, newline="", encoding="utf-8") as f:
         tags = [(row["name"], int(row["category"])) for row in csv.DictReader(f)]
@@ -302,9 +297,7 @@ async def analyze_caption(image_bytes: bytes, settings: Settings) -> tuple[str, 
     model (Qwen-VL by default — see Settings.ollama_vision_model), for
     checkpoints that expect natural-language prompts rather than tags.
     Returns `(positive, negative)` — see `_parse_caption_response`; `negative`
-    is only ever surfaced by the standalone "🏷️ Analyze" display
-    (`handlers._analyze_both`), not by `analyze_image`'s regenerate dispatch
-    below, which discards it."""
+    is surfaced by the standalone "🏷️ Analyze Image" display (`handlers._analyze_both`)."""
     raw = await _caption_via_ollama(image_bytes, settings.ollama_vision_model, settings)
     return _parse_caption_response(raw)
 
@@ -312,27 +305,12 @@ async def analyze_caption(image_bytes: bytes, settings: Settings) -> tuple[str, 
 async def analyze_caption_deep(image_bytes: bytes, settings: Settings) -> tuple[str, str]:
     """Caption the image via Ollama running the bigger, slower model
     configured at `Settings.ollama_deep_vision_model`, for when the quick
-    `analyze_caption` model's description isn't detailed enough. Not wired
-    into `analyze_image`'s `prompt_style` dispatch (generation always uses
-    the quick model). Used unconditionally for directly-uploaded photos
-    (`handlers.photo_message` isn't on an interactive generation path), and
-    opt-in via the "🔎 Deep Analyze" button for the bot's own generated
-    images (`handlers.postprocess_callback`'s `DEEP_ANALYZE_CALLBACK_KIND`
-    branch), where the quick default's speed matters more. Returns
+    `analyze_caption` model's description isn't detailed enough. Used
+    unconditionally for directly-uploaded photos (`handlers.photo_message`
+    isn't on an interactive generation path), and opt-in via the
+    "🔎 Deep Analyze" button for the bot's own generated images
+    (`handlers.postprocess_callback`'s `DEEP_ANALYZE_CALLBACK_KIND` branch),
+    where the quick default's speed matters more. Returns
     `(positive, negative)`, same as `analyze_caption`."""
     raw = await _caption_via_ollama(image_bytes, settings.ollama_deep_vision_model, settings)
     return _parse_caption_response(raw)
-
-
-async def analyze_image(image_bytes: bytes, style: Literal["tags", "natural"], settings: Settings) -> str:
-    """Dispatch to the analyzer matching a checkpoint's `prompt_style` (see
-    `ModelProfile.prompt_style` in profiles/schema.py). Always returns a
-    single positive-prompt string for "🔬 Analyze & Regenerate" to generate
-    from as-is — a Qwen-VL caption's suggested negative (see
-    `analyze_caption`) is deliberately not fed into generation here, only
-    into the standalone analyzer displays (see `handlers._analyze_both`/
-    `_analyze_both_deep`)."""
-    if style == "tags":
-        return await analyze_tags(image_bytes, settings)
-    positive, _negative = await analyze_caption(image_bytes, settings)
-    return positive

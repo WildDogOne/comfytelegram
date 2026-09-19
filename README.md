@@ -25,19 +25,15 @@ CLI at runtime.
   (UltimateSDUpscale, 4x), ✨ Face Detail, and 🖐️ Hand Detail buttons (the
   latter two both Impact Pack's `FaceDetailer` node — it's a generic
   detect/crop/inpaint node despite the name, so hand-detailing is the same
-  graph with a hand-trained bbox detector swapped in), plus 🏷️ Analyze (run
+  graph with a hand-trained bbox detector swapped in), plus 🏷️ Analyze Image (run
   *both* the WD14 tagger and a Qwen-VL caption, each sent as its own message
-  with its own 🎨 Generate button, for comparing them side by side) and 🔬
-  Analyze & Regenerate (the checkpoint's
-  configured analyzer only, then generate from it) and a 🔁 Generate Again
-  button on the whole batch.
-- **Image-to-prompt analysis** — 🔬 Analyze & Regenerate picks a single
-  analyzer per checkpoint — a WD14 tagger (booru-tag checkpoints) or a
-  Qwen-VL caption via a local Ollama server (natural-language checkpoints).
-  🏷️ Analyze runs both regardless of checkpoint, for comparing them. See
-  [Image analysis](#image-analysis) below.
+  with its own 🎨 Generate button, for comparing them side by side) and a
+  🔁 Generate Again button on the whole batch.
+- **Image-to-prompt analysis** — 🏷️ Analyze Image runs both a WD14 tagger and a
+  Qwen-VL caption via a local Ollama server, regardless of checkpoint, for
+  comparing them side by side. See [Image analysis](#image-analysis) below.
 - **Upload a photo for analysis** — send the bot any photo (not one of its
-  own generated images — those use the 🏷️ Analyze button instead) and it
+  own generated images — those use the 🏷️ Analyze Image button instead) and it
   runs the same side-by-side WD14/Qwen-VL analysis, each reply with its own
   🎨 Generate button.
 - **`/settings`** — an in-place inline-keyboard menu to view and override a
@@ -102,7 +98,7 @@ uv run comfytelegram
 | `COMFYUI_HOST` | no | `127.0.0.1` | host ComfyUI is reachable at |
 | `COMFYUI_PORT` | no | `8188` | ComfyUI's HTTP/WS port |
 | `COMFYUI_USE_TLS` | no | `false` | use `https`/`wss` instead of `http`/`ws` |
-| `OLLAMA_HOST` / `OLLAMA_PORT` | no | `127.0.0.1` / `11434` | Ollama server for 🏷️ Analyze's natural-language captioning |
+| `OLLAMA_HOST` / `OLLAMA_PORT` | no | `127.0.0.1` / `11434` | Ollama server for 🏷️ Analyze Image's natural-language captioning |
 | `OLLAMA_VISION_MODEL` | no | `qwen3.5:4b` | vision-capable Ollama model tag to caption with (`ollama pull` it first) — kept small by default since it has to coexist in VRAM with whatever checkpoint ComfyUI keeps resident |
 | `WD14_MODEL_REPO` | no | `SmilingWolf/wd-vit-tagger-v3` | Hugging Face repo the WD14 tagger files come from (see [Image analysis](#image-analysis)) |
 | `WD14_MODEL_DIR` | no | `models/wd14` | local directory holding `model.onnx` + `selected_tags.csv` |
@@ -159,28 +155,27 @@ Every generated image comes with inline buttons:
 - **🔍 Upscale 4x** / **✨ Face Detail** / **🖐️ Hand Detail** — run that
   post-processing stage on this specific image and send the result (itself
   with its own buttons, so passes can be chained).
-- **🏷️ Analyze** — analyze *this image* with **both** the WD14 tagger and a
+- **🏷️ Analyze Image** — analyze *this image* with **both** the WD14 tagger and a
   Qwen-VL caption (regardless of the checkpoint's `prompt_style`), replying
   with two separate messages — one per analyzer — each carrying its own
   **🎨 Generate** button to start a fresh generation from exactly that
   prompt, so you can compare them and pick one manually.
-- **🔬 Analyze & Regenerate** — analyze with whichever single analyzer the
-  checkpoint's model profile configures, then generate a fresh image from
-  that derived prompt automatically, against the same checkpoint/settings.
 - **🔁 Generate Again** (on the "Done" status message) — re-run the *whole*
   last batch with a fresh seed, for quickly building up more variations
   without retyping the prompt.
 
 ## Image analysis
 
-🔬 Analyze & Regenerate picks its analyzer per checkpoint, from that
-checkpoint's model profile `prompt_style` field (see
-[`model_profiles/`](model_profiles/)) — 🏷️ Analyze runs both analyzers
-unconditionally instead, since it exists for comparing them:
+🏷️ Analyze Image runs both analyzers unconditionally, for comparing them side by
+side. A checkpoint's model profile `prompt_style` field (see
+[`model_profiles/`](model_profiles/)) doesn't pick which one runs here — it
+only gates whether the "🔬 Analyze Prompt" button (a `/tagcheck`-style
+tag-health check on the prompt this image was built from, separate from
+"🐛 Show Prompt", which just dumps the raw prompt text) has anything to
+check:
 
-- **`"tags"`** — for booru/danbooru-tag-trained checkpoints (Pony,
-  Illustrious/FurryToonMix, Animagine merges), run locally through a WD14
-  tagger ONNX model via `onnxruntime`. **The model files are not
+- **WD14 tags** — booru-style comma-separated tags, run locally through a
+  WD14 tagger ONNX model via `onnxruntime`. **The model files are not
   downloaded automatically** — Hugging Face serves them (`model.onnx`,
   ~370MB) from an LFS/Xet-backed CDN on a different hostname than
   `huggingface.co` itself, which some restricted-egress hosts allow while
@@ -190,11 +185,10 @@ unconditionally instead, since it exists for comparing them:
   curl -L -o model.onnx https://huggingface.co/SmilingWolf/wd-vit-tagger-v3/resolve/main/model.onnx
   curl -L -o selected_tags.csv https://huggingface.co/SmilingWolf/wd-vit-tagger-v3/resolve/main/selected_tags.csv
   ```
-- **`"natural"`** (the default) — for checkpoints that expect prose-style
-  prompts, caption the image via a vision-capable model on a local Ollama
-  server (`OLLAMA_VISION_MODEL`, e.g. Qwen-VL). Needs `ollama pull
-  <model>` done ahead of time and Ollama reachable at `OLLAMA_HOST`/
-  `OLLAMA_PORT`.
+- **Qwen-VL caption** — a prose-style description plus a suggested negative
+  prompt, via a vision-capable model on a local Ollama server
+  (`OLLAMA_VISION_MODEL`, e.g. Qwen-VL). Needs `ollama pull <model>` done
+  ahead of time and Ollama reachable at `OLLAMA_HOST`/`OLLAMA_PORT`.
 
 ## Model profiles
 
@@ -303,10 +297,9 @@ shared singletons (`Settings`, `ComfyClient`, loaded `ModelProfile`s,
   submitted-and-collected result. `handlers.py` calls these directly;
   `scripts/smoke_test*.py` do the equivalent inline for manual checks.
 - **`analysis.py`** — Telegram-independent image-to-prompt analysis backing
-  🏷️ Analyze and 🔬 Analyze & Regenerate: `analyze_tags()` (WD14 tagger via
-  `onnxruntime`) and `analyze_caption()` (Qwen-VL via a local Ollama
-  server), dispatched by `analyze_image()` based on a checkpoint's model
-  profile `prompt_style`. See [Image analysis](#image-analysis) above.
+  🏷️ Analyze Image: `analyze_tags()` (WD14 tagger via `onnxruntime`) and
+  `analyze_caption()` (Qwen-VL via a local Ollama server), always run
+  together. See [Image analysis](#image-analysis) above.
 - **`handlers.py`** — all Telegram-facing commands and callbacks.
 - **`settings_menu.py`** — the `/settings` in-place inline-keyboard UI.
   Enum fields build their button grid from ComfyUI's live `/object_info`,

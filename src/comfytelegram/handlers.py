@@ -32,7 +32,6 @@ from telegram.ext import ContextTypes
 from comfytelegram.analysis import (
     analyze_caption,
     analyze_caption_deep,
-    analyze_image,
     analyze_tags,
 )
 from comfytelegram.auth import reject_if_unauthorized, reject_if_unauthorized_callback
@@ -66,10 +65,10 @@ POSTPROCESS_STATUS_LABELS = {
     "face": "Refining face",
     "hand": "Refining hand",
 }
-ANALYZE_CALLBACK_KIND = "analyze"
 ANALYZE_ONLY_CALLBACK_KIND = "analyze_only"
 DEEP_ANALYZE_CALLBACK_KIND = "deep_analyze"
 SHOW_PROMPT_CALLBACK_KIND = "show_prompt"
+ANALYZE_PROMPT_CALLBACK_KIND = "analyze_prompt"
 UPSCALE_CONFIRM_CALLBACK_KIND = "upscale_confirmed"
 UPSCALE_CANCEL_CALLBACK_KIND = "upscale_cancelled"
 AGAIN_CALLBACK_PREFIX = "again:"
@@ -146,13 +145,16 @@ _STREAMING_KEYBOARD = ReplyKeyboardMarkup([["/stop"]], resize_keyboard=True)
 
 def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
     """The keyboard attached to a generated/post-processed image: one
-    button per `POSTPROCESS_KEYBOARD_LABELS` entry plus Analyze (prompt
-    only), Analyze & Regenerate, Deep Analyze (prompt only, via the bigger
-    `analyze_caption_deep` model), and Show Prompt (a debugging button that
-    dumps the exact positive/negative prompt this image was generated
-    with, folded character and profile prefixes included — see
-    `postprocess_callback`'s `SHOW_PROMPT_CALLBACK_KIND` branch), all
-    scoped to `result_id` (see `storage.py`'s `pending_result`)."""
+    button per `POSTPROCESS_KEYBOARD_LABELS` entry plus Analyze Image (image
+    analysis, prompt only, no generation), Analyze Prompt (a `/tagcheck`-
+    style tag-health check on the prompt this image was built from — see
+    `postprocess_callback`'s `ANALYZE_PROMPT_CALLBACK_KIND` branch), Deep
+    Analyze (image analysis via the bigger `analyze_caption_deep` model),
+    and Show Prompt (a debugging button that just dumps the exact
+    positive/negative prompt this image was generated with, folded
+    character and profile prefixes included — see `postprocess_callback`'s
+    `SHOW_PROMPT_CALLBACK_KIND` branch), all scoped to `result_id` (see
+    `storage.py`'s `pending_result`)."""
     return InlineKeyboardMarkup(
         [
             [
@@ -161,11 +163,11 @@ def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    "🏷️ Analyze", callback_data=f"pp:{ANALYZE_ONLY_CALLBACK_KIND}:{result_id}"
+                    "🏷️ Analyze Image", callback_data=f"pp:{ANALYZE_ONLY_CALLBACK_KIND}:{result_id}"
                 ),
                 InlineKeyboardButton(
-                    "🔬 Analyze & Regenerate",
-                    callback_data=f"pp:{ANALYZE_CALLBACK_KIND}:{result_id}",
+                    "🔬 Analyze Prompt",
+                    callback_data=f"pp:{ANALYZE_PROMPT_CALLBACK_KIND}:{result_id}",
                 ),
             ],
             [
@@ -248,7 +250,7 @@ def _character_rename_cancel_keyboard() -> InlineKeyboardMarkup:
 
 
 def _generate_from_prompt_keyboard(prompt_id: str, prompt: str) -> InlineKeyboardMarkup:
-    """Attached to each of "🏷️ Analyze"'s standalone prompt messages: a
+    """Attached to each of "🏷️ Analyze Image"'s standalone prompt messages: a
     "🎨 Generate" button that generates from *that specific* derived prompt
     (WD14 tags or a Qwen-VL caption) without retyping it, scoped to
     `prompt_id` (see storage.py's `derived_prompt`), plus — only when the
@@ -453,12 +455,11 @@ async def _analyze_both(
     source_bytes: bytes, settings: Settings
 ) -> tuple[str | None, tuple[str, str] | None]:
     """Run both analyzers regardless of any checkpoint's configured
-    `prompt_style` — unlike Analyze & Regenerate, which must commit to one
-    prompt to actually generate from, this is for comparing WD14 tags
-    against a Qwen-VL caption side by side. The caption side is
+    `prompt_style` — this is for comparing WD14 tags against a Qwen-VL
+    caption side by side, so both always run. The caption side is
     `(positive, negative)` — see `analyze_caption` — since this standalone
-    display (unlike `analyze_image`'s regenerate dispatch) does surface a
-    suggested negative prompt. Used by `postprocess_callback`'s "🏷️ Analyze"
+    display does surface a suggested negative prompt. Used by
+    `postprocess_callback`'s "🏷️ Analyze Image"
     branch (for the bot's own generated images, where the quick model is the
     default and `DEEP_ANALYZE_CALLBACK_KIND` is an opt-in extra) —
     `photo_message` uses `_analyze_both_deep` instead, see there for why."""
@@ -476,9 +477,9 @@ async def _analyze_both_deep(
     the caption side's `(positive, negative)` shape), but the caption side
     always uses the bigger `analyze_caption_deep` model. `photo_message`'s
     directly-uploaded photos aren't on the interactive generation critical
-    path the way a checkpoint pick or a "🔬 Analyze & Regenerate" tap is, so
-    there's no reason to default to the cheap model there and make the user
-    ask twice for the better one."""
+    path the way a "🏷️ Analyze Image" tap on a generated image is, so there's no
+    reason to default to the cheap model there and make the user ask twice
+    for the better one."""
     tags, caption = await asyncio.gather(
         _run_analyzer("WD14", analyze_tags(source_bytes, settings)),
         _run_analyzer("Qwen-VL (deep)", analyze_caption_deep(source_bytes, settings)),
@@ -1009,7 +1010,7 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle a directly-uploaded photo — as opposed to one of the bot's own
     generated images, which get analyzed via `_post_process_keyboard`'s
-    "🏷️ Analyze" button instead — by running it through both analyzers and
+    "🏷️ Analyze Image" button instead — by running it through both analyzers and
     replying with each, including a "🎨 Generate" button on each so the
     derived prompt can be used right away. The caption side always uses the
     bigger `analyze_caption_deep` model (`_analyze_both_deep`, not the
@@ -1065,13 +1066,13 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     """Handle a `pp:<kind>:<result_id>` tap from `_post_process_keyboard`:
     `kind` is `"analyze_only"` (run *both* analyzers — WD14 tags and
     Qwen-VL caption — and reply with both, no generation, no
-    `prompt_style` dispatch; see `ANALYZE_ONLY_CALLBACK_KIND`), `"analyze"`
-    (the checkpoint's configured single analyzer, then generate from that
-    prompt — see `ANALYZE_CALLBACK_KIND`), `"show_prompt"` (reply with the
-    exact positive/negative prompt this image was built from, no download
-    or generation — plus a `/tagcheck`-style tag-health check on it, if
-    this image's checkpoint profile is tag-trained and tag data is
-    imported; see `SHOW_PROMPT_CALLBACK_KIND`), or
+    `prompt_style` dispatch; see `ANALYZE_ONLY_CALLBACK_KIND`),
+    `"show_prompt"` (reply with the exact positive/negative prompt this
+    image was built from, no download or generation and no tag check — see
+    `SHOW_PROMPT_CALLBACK_KIND`), `"analyze_prompt"` (a `/tagcheck`-style
+    tag-health check on that same prompt instead, if this image's
+    checkpoint profile is tag-trained and tag data is imported — see
+    `ANALYZE_PROMPT_CALLBACK_KIND`), or
     `"upscale"`/`"face"`/`"hand"` (download the source image and run that
     post-processing stage on it). A fresh `"upscale"` tap on an image
     already at or beyond `UPSCALE_CONFIRM_THRESHOLD_PX` doesn't upscale
@@ -1107,24 +1108,29 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text(
             f"Positive:\n{full_params.positive_prompt}\n\nNegative:\n{negative}"
         )
+        return
 
+    if kind == ANALYZE_PROMPT_CALLBACK_KIND:
         tags_db: TagDatabase = context.bot_data["tags_db"]
         profiles: list[ModelProfile] = context.bot_data["profiles"]
         profile = resolve_profile(full_params.checkpoint, profiles)
         # Tag-health only makes sense for comma-separated booru tags, not a
         # natural-language caption — gated on prompt_style, same as
-        # analyze_image()'s own tags-vs-caption dispatch.
-        if profile is not None and profile.prompt_style == "tags" and any(tags_db.stats().values()):
-            sources, _ = _resolve_tag_sources("", full_params.checkpoint, profiles)
-            report = ["🔎 Tag check (positive):"]
-            report.extend(_tagcheck_lines(full_params.positive_prompt, sources, tags_db, settings))
-            if full_params.negative_prompt:
-                report.append("")
-                report.append("🔎 Tag check (negative):")
-                report.extend(
-                    _tagcheck_lines(full_params.negative_prompt, sources, tags_db, settings)
-                )
-            await query.message.reply_text("\n".join(report))
+        # `_analyze_both`'s own tags-vs-caption pairing.
+        if profile is None or profile.prompt_style != "tags" or not any(tags_db.stats().values()):
+            await query.message.reply_text(
+                "No tag check available for this image — its checkpoint isn't "
+                "tag-trained, or no tag data has been imported yet."
+            )
+            return
+        sources, _ = _resolve_tag_sources("", full_params.checkpoint, profiles)
+        report = ["🔎 Tag check (positive):"]
+        report.extend(_tagcheck_lines(full_params.positive_prompt, sources, tags_db, settings))
+        if full_params.negative_prompt:
+            report.append("")
+            report.append("🔎 Tag check (negative):")
+            report.extend(_tagcheck_lines(full_params.negative_prompt, sources, tags_db, settings))
+        await query.message.reply_text("\n".join(report))
         return
 
     if kind == ANALYZE_ONLY_CALLBACK_KIND:
@@ -1158,47 +1164,6 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             caption_positive,
             caption_negative,
         )
-        return
-
-    if kind == ANALYZE_CALLBACK_KIND:
-        status_message = await query.message.reply_text(
-            "Analyzing image…", disable_notification=True
-        )
-
-        checkpoint = full_params.checkpoint
-        chat_id = pending["chat_id"]
-        profiles: list[ModelProfile] = context.bot_data["profiles"]
-        profile = resolve_profile(checkpoint, profiles)
-        profile = apply_profile_override(
-            profile, checkpoint, storage.get_override(chat_id, checkpoint)
-        )
-        style = profile.prompt_style if profile else "natural"
-
-        async def _analyze_and_generate() -> list[GeneratedImage]:
-            """Bundle the download, analysis, and generation into one
-            awaitable so `_run_reporting_errors` covers all three stages."""
-            tg_file = await context.bot.get_file(pending["file_id"])
-            source_bytes = bytes(await tg_file.download_as_bytearray())
-            derived_prompt = await analyze_image(source_bytes, style, settings)
-            # Sent as its own message, once, right as analysis finishes —
-            # not as a caption on each generated image, which would repeat
-            # the same prompt once per image in a batch.
-            await query.message.reply_text(derived_prompt)
-            await status_message.edit_text("Generating… 0%")
-            return await generate(
-                client,
-                checkpoint,
-                derived_prompt,
-                profile,
-                on_progress=_make_progress_callback(status_message),
-            )
-
-        images = await _run_reporting_errors(
-            status_message, "Analysis", "analyze-and-regenerate", _analyze_and_generate()
-        )
-        if images is None:
-            return
-        await _deliver_generation_result(status_message, query.message, chat_id, storage, images)
         return
 
     if kind == DEEP_ANALYZE_CALLBACK_KIND:
@@ -1320,15 +1285,15 @@ async def again_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def generate_from_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Backs the "🎨 Generate" button attached to one of "🏷️ Analyze"'s two
+    """Backs the "🎨 Generate" button attached to one of "🏷️ Analyze Image"'s two
     standalone prompt messages — generates from *that specific* derived
     prompt (WD14 tags or Qwen-VL caption), scoped by the prompt_id embedded
     in callback_data (see storage.py's `derived_prompt`), including that
     prompt's stored negative — empty for WD14 tags, a Qwen-VL caption's
     suggested negative otherwise (see `analyze_caption`). Uses the chat's
     current `/settings` override for the checkpoint the source image was
-    generated with, same as Analyze & Regenerate, rather than any stale
-    params from that original generation."""
+    generated with, rather than any stale params from that original
+    generation."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None

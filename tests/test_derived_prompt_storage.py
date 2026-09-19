@@ -45,7 +45,7 @@ def test_derived_prompt_defaults_to_empty_negative_prompt(storage: Storage):
 
 
 def test_derived_prompt_scoped_per_message_not_chat(storage: Storage):
-    """The "🏷️ Analyze" button writes two rows per tap (WD14 tags and a
+    """The "🏷️ Analyze Image" button writes two rows per tap (WD14 tags and a
     Qwen-VL caption) — each must stay independently addressable by its own
     "🎨 Generate" button, not collapse into one chat-wide record."""
     storage.store_derived_prompt("tags", 42, "ckpt.safetensors", "fox, forest, solo")

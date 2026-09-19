@@ -47,7 +47,7 @@ class GeneratedImage:
     #: The fully-resolved settings this image (or the base generation it was
     #: post-processed from) was made with. Carried forward through
     #: post-processing so the checkpoint/filename it came from is known to
-    #: "🔬 Analyze & Regenerate" and "🔁 Generate Again" (see handlers.py).
+    #: "🔁 Generate Again" (see handlers.py).
     full_params: GenerationParams
     #: True if this came from `post_process(kind="face"/"hand")` and Impact
     #: Pack's bbox detector found nothing to refine, so the node silently
