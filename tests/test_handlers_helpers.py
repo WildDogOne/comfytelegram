@@ -11,7 +11,9 @@ from comfytelegram.handlers import (
     ANALYZE_PROMPT_CALLBACK_KIND,
     HAND_AUTO_CALLBACK_KIND,
     HAND_MANUAL_CALLBACK_KIND,
+    HAND_POINT_BOX_SIZE_FRAC_BASE,
     HAND_POINT_GRID_SIZE,
+    HAND_POINT_GRID_SIZE_FINE,
     HAND_POINT_PREVIEW_MAX_DIM,
     SHOW_PROMPT_CALLBACK_KIND,
     TAGCHECK_TOKEN_LIMIT,
@@ -38,6 +40,7 @@ from comfytelegram.handlers import (
     _tagcheck_lines,
     _upscale_confirm_keyboard,
     hand_point_callback,
+    hand_point_density_callback,
     postprocess_callback,
     start,
 )
@@ -895,8 +898,8 @@ async def test_hand_manual_sends_a_gridded_photo_with_point_buttons():
     query.message.reply_photo.assert_awaited_once()
     keyboard = query.message.reply_photo.await_args.kwargs["reply_markup"]
     callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
-    assert len(callback_data) == HAND_POINT_GRID_SIZE**2
-    assert "hp:abc123:0:0" in callback_data
+    assert len(callback_data) == HAND_POINT_GRID_SIZE**2 + 1
+    assert f"hp:abc123:{HAND_POINT_GRID_SIZE}:0:0" in callback_data
 
 
 def test_hand_mode_keyboard_scopes_both_buttons_to_result_id():
@@ -910,7 +913,21 @@ def test_hand_point_keyboard_labels_cells_by_row_letter_and_column_number():
     keyboard = _hand_point_keyboard("abc123")
     labels = [b.text for row in keyboard.inline_keyboard for b in row]
     assert labels[0] == "A1"
-    assert labels[-1] == f"{chr(ord('A') + HAND_POINT_GRID_SIZE - 1)}{HAND_POINT_GRID_SIZE}"
+    last_cell_label = labels[HAND_POINT_GRID_SIZE**2 - 1]
+    assert last_cell_label == f"{chr(ord('A') + HAND_POINT_GRID_SIZE - 1)}{HAND_POINT_GRID_SIZE}"
+
+
+def test_hand_point_keyboard_offers_a_finer_grid_button_below_default_density():
+    keyboard = _hand_point_keyboard("abc123")
+    callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert f"hpz:abc123:{HAND_POINT_GRID_SIZE_FINE}" in callback_data
+
+
+def test_hand_point_keyboard_omits_the_finer_grid_button_once_already_fine():
+    keyboard = _hand_point_keyboard("abc123", grid_size=HAND_POINT_GRID_SIZE_FINE)
+    callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert not any(data.startswith("hpz:") for data in callback_data)
+    assert len(callback_data) == HAND_POINT_GRID_SIZE_FINE**2
 
 
 @pytest.mark.parametrize("size", [(64, 64), (17, 401)])
@@ -940,7 +957,7 @@ def test_draw_hand_point_grid_downscales_a_large_source():
 @pytest.mark.asyncio
 async def test_hand_point_callback_runs_manual_post_process_with_the_tapped_point():
     query = AsyncMock()
-    query.data = "hp:abc123:1:2"
+    query.data = f"hp:abc123:{HAND_POINT_GRID_SIZE}:1:2"
     update = MagicMock()
     update.callback_query = query
     update.effective_user.id = 1
@@ -966,14 +983,47 @@ async def test_hand_point_callback_runs_manual_post_process_with_the_tapped_poin
     assert post_process_mock.await_args.args[1] == "hand_manual"
     expected_point_frac = ((2 + 0.5) / HAND_POINT_GRID_SIZE, (1 + 0.5) / HAND_POINT_GRID_SIZE)
     assert post_process_mock.await_args.kwargs["point_frac"] == expected_point_frac
+    assert post_process_mock.await_args.kwargs["box_size_frac"] == pytest.approx(
+        HAND_POINT_BOX_SIZE_FRAC_BASE / HAND_POINT_GRID_SIZE
+    )
     query.message.reply_photo.assert_awaited_once()
     storage.store_pending_result.assert_called_once()
 
 
 @pytest.mark.asyncio
+async def test_hand_point_callback_shrinks_the_marked_box_for_a_finer_grid():
+    query = AsyncMock()
+    query.data = f"hp:abc123:{HAND_POINT_GRID_SIZE_FINE}:1:2"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+
+    changed_result = GeneratedImage(
+        data=b"refined",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch(
+        "comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)
+    ) as post_process_mock:
+        await hand_point_callback(update, context)
+
+    assert post_process_mock.await_args.kwargs["box_size_frac"] == pytest.approx(
+        HAND_POINT_BOX_SIZE_FRAC_BASE / HAND_POINT_GRID_SIZE_FINE
+    )
+
+
+@pytest.mark.asyncio
 async def test_hand_point_callback_alerts_on_an_expired_result():
     query = AsyncMock()
-    query.data = "hp:abc123:0:0"
+    query.data = f"hp:abc123:{HAND_POINT_GRID_SIZE}:0:0"
     update = MagicMock()
     update.callback_query = query
     update.effective_user.id = 1
@@ -984,6 +1034,54 @@ async def test_hand_point_callback_alerts_on_an_expired_result():
     context.bot_data = {"settings": MagicMock(allowed_user_ids=None), "storage": storage}
 
     await hand_point_callback(update, context)
+
+    query.answer.assert_awaited_once_with(
+        "That result has expired — generate a new image.", show_alert=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_hand_point_density_callback_rerenders_at_the_finer_grid():
+    query = AsyncMock()
+    query.data = f"hpz:abc123:{HAND_POINT_GRID_SIZE_FINE}"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    source_png = io.BytesIO()
+    Image.new("RGB", (64, 64)).save(source_png, format="PNG")
+    context.bot.get_file = AsyncMock(
+        return_value=MagicMock(
+            download_as_bytearray=AsyncMock(return_value=bytearray(source_png.getvalue()))
+        )
+    )
+
+    await hand_point_density_callback(update, context)
+
+    query.message.reply_photo.assert_awaited_once()
+    keyboard = query.message.reply_photo.await_args.kwargs["reply_markup"]
+    callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert len(callback_data) == HAND_POINT_GRID_SIZE_FINE**2
+    assert f"hp:abc123:{HAND_POINT_GRID_SIZE_FINE}:0:0" in callback_data
+
+
+@pytest.mark.asyncio
+async def test_hand_point_density_callback_alerts_on_an_expired_result():
+    query = AsyncMock()
+    query.data = f"hpz:abc123:{HAND_POINT_GRID_SIZE_FINE}"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    storage = MagicMock()
+    storage.get_pending_result.return_value = None
+    context = MagicMock()
+    context.bot_data = {"settings": MagicMock(allowed_user_ids=None), "storage": storage}
+
+    await hand_point_density_callback(update, context)
 
     query.answer.assert_awaited_once_with(
         "That result has expired — generate a new image.", show_alert=True

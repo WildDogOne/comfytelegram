@@ -23,6 +23,7 @@ from comfytelegram.handlers import (
     AGAIN_CALLBACK_PREFIX,
     GENERATE_FROM_PROMPT_CALLBACK_PREFIX,
     HAND_POINT_CALLBACK_PREFIX,
+    HAND_POINT_DENSITY_CALLBACK_PREFIX,
     STREAM_CANCEL_CALLBACK_DATA,
     again_callback,
     character_callback,
@@ -31,6 +32,7 @@ from comfytelegram.handlers import (
     generate_from_prompt_callback,
     generate_message,
     hand_point_callback,
+    hand_point_density_callback,
     help_command,
     model_callback,
     model_command,
@@ -225,6 +227,11 @@ def build_application(settings: Settings) -> Application:
         application.add_handler(CommandHandler(name, callback))
     application.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
     application.add_handler(CallbackQueryHandler(postprocess_callback, pattern=r"^pp:"))
+    application.add_handler(
+        CallbackQueryHandler(
+            hand_point_density_callback, pattern=rf"^{HAND_POINT_DENSITY_CALLBACK_PREFIX}"
+        )
+    )
     application.add_handler(
         CallbackQueryHandler(hand_point_callback, pattern=rf"^{HAND_POINT_CALLBACK_PREFIX}")
     )

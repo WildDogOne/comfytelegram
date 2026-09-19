@@ -221,6 +221,7 @@ async def post_process(
     full_params: GenerationParams,
     *,
     point_frac: tuple[float, float] | None = None,
+    box_size_frac: float | None = None,
     on_progress: ProgressCallback | None = None,
 ) -> GeneratedImage:
     """Upload a previously-generated image and run one post-processing stage
@@ -232,7 +233,12 @@ async def post_process(
     detection entirely and inpaints a small mask centered on `point_frac`
     (required for this kind — see `build_hand_detailer_manual`, backing
     handlers.py's "✋ Tap to mark" flow); `unchanged` is always False for it,
-    since a manually placed mask can't come back empty."""
+    since a manually placed mask can't come back empty. `box_size_frac`
+    overrides `ManualHandDetailerParams`' default mask size for `"hand_manual"`
+    — handlers.py's `hand_point_callback` shrinks it for a denser tap grid
+    (see `HAND_POINT_BOX_SIZE_FRAC_BASE`) so the marked region stays roughly
+    cell-sized instead of a fixed fraction of the image regardless of
+    density; ignored for every other `kind`."""
     base_params = _to_post_process_base(full_params)
     upload = await client.upload_image(source_image, filename=source_filename)
     uploaded_name = upload["name"]
@@ -251,8 +257,13 @@ async def post_process(
     elif kind == "hand_manual":
         assert point_frac is not None, "hand_manual requires point_frac"
         image_size = Image.open(io.BytesIO(source_image)).size
+        manual_params = (
+            ManualHandDetailerParams()
+            if box_size_frac is None
+            else ManualHandDetailerParams(box_size_frac=box_size_frac)
+        )
         prompt_graph, save_node_id = build_hand_detailer_manual(
-            uploaded_name, base_params, ManualHandDetailerParams(), point_frac, image_size
+            uploaded_name, base_params, manual_params, point_frac, image_size
         )
     else:
         raise ValueError(f"Unknown post-processing kind: {kind}")

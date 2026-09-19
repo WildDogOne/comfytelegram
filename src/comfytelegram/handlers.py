@@ -49,7 +49,7 @@ from comfytelegram.settings_menu import _safe_edit_message, handle_custom_value_
 from comfytelegram.storage import Storage
 from comfytelegram.tags import TagDatabase, TagResult, TagSource, category_label
 from comfytelegram.topics import pop_pending, set_pending
-from comfytelegram.workflows import GenerationParams, LoraSpec
+from comfytelegram.workflows import GenerationParams, LoraSpec, ManualHandDetailerParams
 
 logger = logging.getLogger(__name__)
 
@@ -76,15 +76,35 @@ UPSCALE_CANCEL_CALLBACK_KIND = "upscale_cancelled"
 #: `HAND_AUTO_CALLBACK_KIND` runs often can't find a hand at all.
 HAND_AUTO_CALLBACK_KIND = "hand_auto"
 HAND_MANUAL_CALLBACK_KIND = "hand_manual"
-#: Grid resolution for "✋ Tap to mark" (see `_draw_hand_point_grid`/
+#: Default grid resolution for "✋ Tap to mark" (see `_draw_hand_point_grid`/
 #: `_hand_point_keyboard`) — coarse enough to keep the keyboard to
-#: `HAND_POINT_GRID_SIZE` rows of `HAND_POINT_GRID_SIZE` buttons each.
+#: `HAND_POINT_GRID_SIZE` rows of `HAND_POINT_GRID_SIZE` buttons each. A hand
+#: that lands on a cell corner (split across up to 4 tiles) can still miss
+#: at this density — `HAND_POINT_GRID_SIZE_FINE`/`_hand_point_density_keyboard`
+#: is the escape hatch for that.
 HAND_POINT_GRID_SIZE = 4
-#: Callback_data prefix for a tapped grid cell (`hp:<result_id>:<row>:<col>`)
-#: — its own namespace, separate from `pp:`, so `postprocess_callback`'s
-#: `query.data.split(":", 2)` parsing doesn't need to account for the extra
-#: row/col fields (see `hand_point_callback`, registered on this in main.py).
+#: Denser alternative grid, one "🔍 Finer grid" tap away (see
+#: `_hand_point_keyboard`/`hand_point_density_callback`) — 8x8 still fits
+#: Telegram's 8-buttons-per-row cap exactly, so it needs no extra paging.
+HAND_POINT_GRID_SIZE_FINE = 8
+#: `ManualHandDetailerParams.box_size_frac` is sized for `HAND_POINT_GRID_SIZE`
+#: (deliberately bigger than one cell, for tap-precision margin — see its
+#: docstring); scaled by `HAND_POINT_GRID_SIZE / grid_size` so the finer grid
+#: marks a correspondingly smaller region instead of still inpainting ~35% of
+#: the image regardless of which cell was tapped (see `hand_point_callback`).
+HAND_POINT_BOX_SIZE_FRAC_BASE = ManualHandDetailerParams().box_size_frac * HAND_POINT_GRID_SIZE
+#: Callback_data prefix for a tapped grid cell
+#: (`hp:<result_id>:<grid_size>:<row>:<col>`) — its own namespace, separate
+#: from `pp:`, so `postprocess_callback`'s `query.data.split(":", 2)` parsing
+#: doesn't need to account for the extra grid_size/row/col fields (see
+#: `hand_point_callback`, registered on this in main.py).
 HAND_POINT_CALLBACK_PREFIX = "hp:"
+#: Callback_data prefix for the "🔍 Finer grid" button
+#: (`hpz:<result_id>:<grid_size>`) — re-renders the same source image at a
+#: denser grid (see `hand_point_density_callback`, registered on this in
+#: main.py). Its own namespace rather than folding into `HAND_POINT_CALLBACK_PREFIX`
+#: since it carries no row/col.
+HAND_POINT_DENSITY_CALLBACK_PREFIX = "hpz:"
 AGAIN_CALLBACK_PREFIX = "again:"
 GENERATE_FROM_PROMPT_CALLBACK_PREFIX = "genp:"
 STREAM_CANCEL_CALLBACK_DATA = "stream:cancel"
@@ -265,13 +285,13 @@ def _hand_mode_keyboard(result_id: str) -> InlineKeyboardMarkup:
     )
 
 
-def _draw_hand_point_grid(image_bytes: bytes) -> bytes:
-    """Overlay a `HAND_POINT_GRID_SIZE`x`HAND_POINT_GRID_SIZE` grid onto a
-    copy of `image_bytes`, each cell labeled with the same row-letter/
-    column-number text as its matching `_hand_point_keyboard` button (e.g.
-    "B3"), so a cell can be identified without having to count grid lines.
-    Uses `ImageFont.load_default(size=...)` — Pillow's built-in scalable
-    bitmap font (no TTF file to locate/bundle) — with a black outline
+def _draw_hand_point_grid(image_bytes: bytes, grid_size: int = HAND_POINT_GRID_SIZE) -> bytes:
+    """Overlay a `grid_size`x`grid_size` grid onto a copy of `image_bytes`,
+    each cell labeled with the same row-letter/column-number text as its
+    matching `_hand_point_keyboard` button (e.g. "B3"), so a cell can be
+    identified without having to count grid lines. Uses
+    `ImageFont.load_default(size=...)` — Pillow's built-in scalable bitmap
+    font (no TTF file to locate/bundle) — with a black outline
     (`stroke_width`/`stroke_fill`) rather than a filled backing box behind
     it, so the label stays legible over any image content without covering
     much of it. Downscales first if the source exceeds
@@ -288,19 +308,19 @@ def _draw_hand_point_grid(image_bytes: bytes) -> bytes:
     width, height = image.size
     line_color = (255, 0, 0)
     line_width = max(1, min(width, height) // 400)
-    cell_width = width / HAND_POINT_GRID_SIZE
-    cell_height = height / HAND_POINT_GRID_SIZE
-    for i in range(1, HAND_POINT_GRID_SIZE):
-        x = round(width * i / HAND_POINT_GRID_SIZE)
+    cell_width = width / grid_size
+    cell_height = height / grid_size
+    for i in range(1, grid_size):
+        x = round(width * i / grid_size)
         draw.line([(x, 0), (x, height)], fill=line_color, width=line_width)
-        y = round(height * i / HAND_POINT_GRID_SIZE)
+        y = round(height * i / grid_size)
         draw.line([(0, y), (width, y)], fill=line_color, width=line_width)
 
     font_size = max(10, round(min(cell_width, cell_height) * 0.12))
     font = ImageFont.load_default(size=font_size)
     padding = max(2, font_size // 3)
-    for row in range(HAND_POINT_GRID_SIZE):
-        for col in range(HAND_POINT_GRID_SIZE):
+    for row in range(grid_size):
+        for col in range(grid_size):
             label = f"{chr(ord('A') + row)}{col + 1}"
             text_x = col * cell_width + padding
             text_y = row * cell_height + padding
@@ -318,20 +338,40 @@ def _draw_hand_point_grid(image_bytes: bytes) -> bytes:
     return out.getvalue()
 
 
-def _hand_point_keyboard(result_id: str) -> InlineKeyboardMarkup:
+def _hand_point_keyboard(
+    result_id: str, grid_size: int = HAND_POINT_GRID_SIZE
+) -> InlineKeyboardMarkup:
     """One button per grid cell drawn by `_draw_hand_point_grid`, labeled by
     row letter + column number (e.g. "B3") in reading order, callback_data
-    `hp:<result_id>:<row>:<col>` (see `hand_point_callback`)."""
+    `hp:<result_id>:<grid_size>:<row>:<col>` (see `hand_point_callback`).
+    Below the grid, a "🔍 Finer grid" button (absent once already at
+    `HAND_POINT_GRID_SIZE_FINE`) re-renders the same source at that higher
+    density — for a hand that lands on a cell corner and is split across
+    several tiles at this resolution (see `hand_point_density_callback`)."""
     rows = []
-    for row in range(HAND_POINT_GRID_SIZE):
+    for row in range(grid_size):
         row_letter = chr(ord("A") + row)
         rows.append(
             [
                 InlineKeyboardButton(
                     f"{row_letter}{col + 1}",
-                    callback_data=f"{HAND_POINT_CALLBACK_PREFIX}{result_id}:{row}:{col}",
+                    callback_data=(
+                        f"{HAND_POINT_CALLBACK_PREFIX}{result_id}:{grid_size}:{row}:{col}"
+                    ),
                 )
-                for col in range(HAND_POINT_GRID_SIZE)
+                for col in range(grid_size)
+            ]
+        )
+    if grid_size < HAND_POINT_GRID_SIZE_FINE:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"🔍 Finer grid ({HAND_POINT_GRID_SIZE_FINE}×{HAND_POINT_GRID_SIZE_FINE})",
+                    callback_data=(
+                        f"{HAND_POINT_DENSITY_CALLBACK_PREFIX}{result_id}:"
+                        f"{HAND_POINT_GRID_SIZE_FINE}"
+                    ),
+                )
             ]
         )
     return InlineKeyboardMarkup(rows)
@@ -1443,21 +1483,25 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def hand_point_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle a `hp:<result_id>:<row>:<col>` tap from `_hand_point_keyboard`
-    (the "✋ Tap to mark" grid `postprocess_callback`'s `HAND_MANUAL_CALLBACK_KIND`
-    branch sends) — downloads the source image, turns the tapped cell into
-    a fractional (x, y) point at its center, and runs
-    `post_process(kind="hand_manual")` on it. Unlike the auto-detect path,
-    a manually marked region is never "nothing detected", so there's no
-    `unchanged` check here."""
+    """Handle a `hp:<result_id>:<grid_size>:<row>:<col>` tap from
+    `_hand_point_keyboard` (the "✋ Tap to mark" grid
+    `postprocess_callback`'s `HAND_MANUAL_CALLBACK_KIND` branch sends, or
+    `hand_point_density_callback`'s finer re-render) — downloads the source
+    image, turns the tapped cell into a fractional (x, y) point at its
+    center, and runs `post_process(kind="hand_manual")` on it. The marked
+    box is scaled down for a denser `grid_size` (see
+    `HAND_POINT_BOX_SIZE_FRAC_BASE`) so it stays roughly cell-sized instead
+    of covering the same fraction of the image regardless of density.
+    Unlike the auto-detect path, a manually marked region is never "nothing
+    detected", so there's no `unchanged` check here."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
     if await reject_if_unauthorized_callback(query, user_id, settings):
         return
 
-    _, result_id, row_str, col_str = query.data.split(":")
-    row, col = int(row_str), int(col_str)
+    _, result_id, grid_size_str, row_str, col_str = query.data.split(":")
+    grid_size, row, col = int(grid_size_str), int(row_str), int(col_str)
     storage: Storage = context.bot_data["storage"]
     pending = storage.get_pending_result(result_id)
     if pending is None:
@@ -1468,9 +1512,10 @@ async def hand_point_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     client: ComfyClient = context.bot_data["comfy_client"]
     full_params = _deserialize_generation_params(pending["base_params"])
     point_frac = (
-        (col + 0.5) / HAND_POINT_GRID_SIZE,
-        (row + 0.5) / HAND_POINT_GRID_SIZE,
+        (col + 0.5) / grid_size,
+        (row + 0.5) / grid_size,
     )
+    box_size_frac = HAND_POINT_BOX_SIZE_FRAC_BASE / grid_size
 
     status_message = await query.message.reply_text("Refining hand…", disable_notification=True)
 
@@ -1478,7 +1523,13 @@ async def hand_point_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         tg_file = await context.bot.get_file(pending["file_id"])
         data = bytes(await tg_file.download_as_bytearray())
         return await post_process(
-            client, "hand_manual", data, pending["filename"], full_params, point_frac=point_frac
+            client,
+            "hand_manual",
+            data,
+            pending["filename"],
+            full_params,
+            point_frac=point_frac,
+            box_size_frac=box_size_frac,
         )
 
     result = await _run_reporting_errors(
@@ -1489,6 +1540,37 @@ async def hand_point_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await status_message.delete()
     await _send_and_store_result(query.message, pending["chat_id"], storage, result)
+
+
+async def hand_point_density_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle a `hpz:<result_id>:<grid_size>` tap from `_hand_point_keyboard`'s
+    "🔍 Finer grid" button — re-downloads the same source image and replies
+    with a fresh gridded photo/keyboard at the denser `grid_size`, the same
+    way `postprocess_callback`'s `HAND_MANUAL_CALLBACK_KIND` branch renders
+    the initial grid."""
+    query = update.callback_query
+    settings: Settings = context.bot_data["settings"]
+    user_id = update.effective_user.id if update.effective_user else None
+    if await reject_if_unauthorized_callback(query, user_id, settings):
+        return
+
+    _, result_id, grid_size_str = query.data.split(":")
+    grid_size = int(grid_size_str)
+    storage: Storage = context.bot_data["storage"]
+    pending = storage.get_pending_result(result_id)
+    if pending is None:
+        await query.answer("That result has expired — generate a new image.", show_alert=True)
+        return
+
+    await query.answer()
+    tg_file = await context.bot.get_file(pending["file_id"])
+    source_bytes = bytes(await tg_file.download_as_bytearray())
+    gridded = _draw_hand_point_grid(source_bytes, grid_size)
+    await query.message.reply_photo(
+        photo=io.BytesIO(gridded),
+        caption="Tap the cell over the hand:",
+        reply_markup=_hand_point_keyboard(result_id, grid_size),
+    )
 
 
 async def again_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
