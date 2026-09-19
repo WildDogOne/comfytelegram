@@ -243,6 +243,35 @@ async def test_post_process_upscale_never_flags_unchanged():
     assert result.unchanged is False
 
 
+@pytest.mark.asyncio
+async def test_post_process_hand_manual_never_flags_unchanged():
+    """A manually-marked mask has no detection-check node either (see
+    `build_hand_detailer_manual`) — it's never "nothing detected"."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    result = await post_process(
+        client, "hand_manual", source, "source.png", params, point_frac=(0.5, 0.5)
+    )
+
+    assert result.unchanged is False
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_manual_requires_point_frac():
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    with pytest.raises(AssertionError):
+        await post_process(client, "hand_manual", source, "source.png", params)
+
+
 def test_to_post_process_base_carries_only_the_relevant_fields():
     params = GenerationParams(
         checkpoint="ckpt.safetensors",

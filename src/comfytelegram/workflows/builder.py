@@ -514,3 +514,136 @@ def build_hand_detailer(
     but with a hand-trained bbox model — see `_build_detailer` and
     `HandDetailerParams`."""
     return _build_detailer(source_filename, base, params, label="Hand")
+
+
+@dataclass
+class ManualHandDetailerParams:
+    """Same tunables as `HandDetailerParams` minus everything specific to
+    YOLO/SAM auto-detection — used when the user taps a point instead of
+    relying on the bbox detector (see `build_hand_detailer_manual`, backing
+    "✋ Tap to mark")."""
+
+    guide_size: int = 512
+    max_size: int = 1024
+    steps: int = 25
+    cfg: float = 5.0
+    sampler_name: str = "euler_ancestral"
+    scheduler: str = "normal"
+    denoise: float = 0.5
+    feather: int = 10
+    seed: int | None = None
+    filename_prefix: str = "comfytelegram_hand"
+    #: Side length of the manually-marked mask, as a fraction of the
+    #: image's shorter edge — centered on the tapped point.
+    box_size_frac: float = 0.35
+    #: How far around the marked box `MaskToSEGS` widens the crop for
+    #: guide-size resizing — same role as `HandDetailerParams.bbox_crop_factor`.
+    crop_factor: float = 3.0
+
+
+def build_hand_detailer_manual(
+    source_filename: str,
+    base: PostProcessBaseParams,
+    params: ManualHandDetailerParams,
+    point_frac: tuple[float, float],
+    image_size: tuple[int, int],
+) -> tuple[dict[str, Any], str]:
+    """Build a hand-detail graph that skips YOLO/SAM detection entirely and
+    instead inpaints a small rectangular mask centered on a user-tapped
+    point — for when the auto-detector in `build_hand_detailer` can't find
+    the hand at all (see `handlers.py`'s "✋ Tap to mark" flow).
+
+    `point_frac` is the tap location as (x_fraction, y_fraction) of the
+    image; `image_size` is that image's actual (width, height) in pixels —
+    the caller resolves both since ComfyUI's `SolidMask` needs concrete
+    pixel dimensions, not a dynamic size derived from the loaded image.
+
+    The mask itself is built from core nodes only (`SolidMask` +
+    `MaskComposite`, "add" a small filled square onto an all-zero canvas at
+    the clamped tap offset), then handed to Impact Pack's `MaskToSEGS` to
+    become a `SEGS` region and `DetailerForEach` — the modular sibling of
+    `FaceDetailer`/`_build_detailer`'s node that inpaints a given `SEGS`
+    directly instead of running its own bbox detection. No detection-mask
+    preview node is needed here (unlike `_build_detailer`) since a manually
+    placed mask is never empty, so this returns just
+    (prompt_dict, save_image_node_id), matching `build_upscale`'s shape.
+    `source_filename` must already exist in ComfyUI's `input` directory
+    (upload it first via `ComfyClient.upload_image`)."""
+    g = PromptGraph()
+
+    load = g.add("LoadImage", {"image": source_filename}, title="Source Image")
+    model_ref, clip_ref, vae_ref, positive, negative = _build_model_clip_vae(g, base)
+
+    width, height = image_size
+    box_size = max(1, int(min(width, height) * params.box_size_frac))
+    x_center = point_frac[0] * width
+    y_center = point_frac[1] * height
+    box_x = int(min(max(x_center - box_size / 2, 0), width - box_size))
+    box_y = int(min(max(y_center - box_size / 2, 0), height - box_size))
+
+    base_mask = g.add(
+        "SolidMask", {"value": 0.0, "width": width, "height": height}, title="Blank Mask"
+    )
+    patch_mask = g.add(
+        "SolidMask", {"value": 1.0, "width": box_size, "height": box_size}, title="Marked Patch"
+    )
+    marked_mask = g.add(
+        "MaskComposite",
+        {
+            "destination": [base_mask, 0],
+            "source": [patch_mask, 0],
+            "x": box_x,
+            "y": box_y,
+            "operation": "add",
+        },
+        title="Marked Region",
+    )
+    segs = g.add(
+        "MaskToSEGS",
+        {
+            "mask": [marked_mask, 0],
+            "combined": False,
+            "crop_factor": params.crop_factor,
+            "bbox_fill": False,
+            "drop_size": 10,
+            "contour_fill": False,
+        },
+        title="Marked Region SEGS",
+    )
+
+    detailer = g.add(
+        "DetailerForEach",
+        {
+            "image": [load, 0],
+            "segs": [segs, 0],
+            "model": list(model_ref),
+            "clip": list(clip_ref),
+            "vae": list(vae_ref),
+            "positive": [positive, 0],
+            "negative": [negative, 0],
+            "guide_size": params.guide_size,
+            "guide_size_for": True,
+            "max_size": params.max_size,
+            "seed": _resolve_seed(params.seed),
+            "steps": params.steps,
+            "cfg": params.cfg,
+            "sampler_name": params.sampler_name,
+            "scheduler": params.scheduler,
+            "denoise": params.denoise,
+            "feather": params.feather,
+            "noise_mask": True,
+            "force_inpaint": True,
+            "wildcard": "",
+            "cycle": 1,
+            "inpaint_model": False,
+            "noise_mask_feather": 20,
+        },
+        title="Hand Detailer (manual)",
+    )
+
+    save = g.add(
+        "SaveImage",
+        {"images": [detailer, 0], "filename_prefix": params.filename_prefix},
+        title="Save Image",
+    )
+    return g.as_prompt(), save

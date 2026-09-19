@@ -3,11 +3,13 @@ from comfytelegram.workflows.builder import (
     GenerationParams,
     HandDetailerParams,
     LoraSpec,
+    ManualHandDetailerParams,
     PostProcessBaseParams,
     UpscaleParams,
     _resolve_seed,
     build_face_detailer,
     build_hand_detailer,
+    build_hand_detailer_manual,
     build_txt2img,
     build_upscale,
 )
@@ -246,3 +248,63 @@ def test_build_hand_detailer_wires_detector_and_sam_with_hand_bbox_model():
     assert "sam_model_opt" in detailer["inputs"]
     assert prompt[save_id]["class_type"] == "SaveImage"
     assert detection_id != save_id
+
+
+def test_build_hand_detailer_manual_marks_a_box_centered_on_the_tapped_point():
+    base = PostProcessBaseParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+    )
+    prompt, save_id = build_hand_detailer_manual(
+        "uploaded.png",
+        base,
+        ManualHandDetailerParams(seed=888, box_size_frac=0.5),
+        point_frac=(0.5, 0.5),
+        image_size=(200, 100),
+    )
+
+    assert "UltralyticsDetectorProvider" not in _class_types(prompt)
+    assert "SAMLoader" not in _class_types(prompt)
+
+    base_mask, patch_mask = (n for n in prompt.values() if n["class_type"] == "SolidMask")
+    assert base_mask["inputs"] == {"value": 0.0, "width": 200, "height": 100}
+    box_size = int(min(200, 100) * 0.5)
+    assert patch_mask["inputs"] == {"value": 1.0, "width": box_size, "height": box_size}
+
+    composite = next(n for n in prompt.values() if n["class_type"] == "MaskComposite")
+    assert composite["inputs"]["operation"] == "add"
+    # Point at the exact center: the box should sit centered too.
+    assert composite["inputs"]["x"] == 100 - box_size // 2
+    assert composite["inputs"]["y"] == 50 - box_size // 2
+
+    segs = next(n for n in prompt.values() if n["class_type"] == "MaskToSEGS")
+    assert segs["inputs"]["mask"][0] == next(
+        k for k, n in prompt.items() if n["class_type"] == "MaskComposite"
+    )
+
+    detailer = next(n for n in prompt.values() if n["class_type"] == "DetailerForEach")
+    assert detailer["inputs"]["seed"] == 888
+    assert detailer["inputs"]["segs"][0] == next(
+        k for k, n in prompt.items() if n["class_type"] == "MaskToSEGS"
+    )
+    assert prompt[save_id]["class_type"] == "SaveImage"
+
+
+def test_build_hand_detailer_manual_clamps_the_box_at_image_edges():
+    base = PostProcessBaseParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+    )
+    prompt, _save_id = build_hand_detailer_manual(
+        "uploaded.png",
+        base,
+        ManualHandDetailerParams(box_size_frac=0.5),
+        point_frac=(0.0, 0.0),
+        image_size=(200, 100),
+    )
+
+    composite = next(n for n in prompt.values() if n["class_type"] == "MaskComposite")
+    assert composite["inputs"]["x"] == 0
+    assert composite["inputs"]["y"] == 0

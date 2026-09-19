@@ -17,7 +17,7 @@ import uuid
 from collections.abc import Awaitable
 from typing import Any, TypeVar
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from telegram import (
     CopyTextButton,
     InlineKeyboardButton,
@@ -71,6 +71,20 @@ SHOW_PROMPT_CALLBACK_KIND = "show_prompt"
 ANALYZE_PROMPT_CALLBACK_KIND = "analyze_prompt"
 UPSCALE_CONFIRM_CALLBACK_KIND = "upscale_confirmed"
 UPSCALE_CANCEL_CALLBACK_KIND = "upscale_cancelled"
+#: "🖐️ Hand Detail" doesn't post-process immediately — it asks auto vs.
+#: manual first (see `_hand_mode_keyboard`), since the YOLO bbox detector
+#: `HAND_AUTO_CALLBACK_KIND` runs often can't find a hand at all.
+HAND_AUTO_CALLBACK_KIND = "hand_auto"
+HAND_MANUAL_CALLBACK_KIND = "hand_manual"
+#: Grid resolution for "✋ Tap to mark" (see `_draw_hand_point_grid`/
+#: `_hand_point_keyboard`) — coarse enough to keep the keyboard to
+#: `HAND_POINT_GRID_SIZE` rows of `HAND_POINT_GRID_SIZE` buttons each.
+HAND_POINT_GRID_SIZE = 4
+#: Callback_data prefix for a tapped grid cell (`hp:<result_id>:<row>:<col>`)
+#: — its own namespace, separate from `pp:`, so `postprocess_callback`'s
+#: `query.data.split(":", 2)` parsing doesn't need to account for the extra
+#: row/col fields (see `hand_point_callback`, registered on this in main.py).
+HAND_POINT_CALLBACK_PREFIX = "hp:"
 AGAIN_CALLBACK_PREFIX = "again:"
 GENERATE_FROM_PROMPT_CALLBACK_PREFIX = "genp:"
 STREAM_CANCEL_CALLBACK_DATA = "stream:cancel"
@@ -154,7 +168,9 @@ def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
     positive/negative prompt this image was generated with, folded
     character and profile prefixes included — see `postprocess_callback`'s
     `SHOW_PROMPT_CALLBACK_KIND` branch), all scoped to `result_id` (see
-    `storage.py`'s `pending_result`)."""
+    `storage.py`'s `pending_result`). "🖐️ Hand Detail" doesn't post-process
+    on this tap alone — see `postprocess_callback`'s `"hand"` branch for the
+    auto/manual choice it replies with instead."""
     return InlineKeyboardMarkup(
         [
             [
@@ -219,6 +235,89 @@ def _upscale_confirm_keyboard(result_id: str) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def _hand_mode_keyboard(result_id: str) -> InlineKeyboardMarkup:
+    """Attached to "🖐️ Hand Detail"'s first reply — lets the user pick
+    auto-detection (today's YOLO/SAM behavior, `HAND_AUTO_CALLBACK_KIND`) or
+    tap a point themselves (`HAND_MANUAL_CALLBACK_KIND`) for when the
+    detector can't find the hand at all. See `postprocess_callback`."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🤖 Auto-detect", callback_data=f"pp:{HAND_AUTO_CALLBACK_KIND}:{result_id}"
+                ),
+                InlineKeyboardButton(
+                    "✋ Tap to mark", callback_data=f"pp:{HAND_MANUAL_CALLBACK_KIND}:{result_id}"
+                ),
+            ]
+        ]
+    )
+
+
+def _draw_hand_point_grid(image_bytes: bytes) -> bytes:
+    """Overlay a `HAND_POINT_GRID_SIZE`x`HAND_POINT_GRID_SIZE` grid onto a
+    copy of `image_bytes`, each cell labeled with the same row-letter/
+    column-number text as its matching `_hand_point_keyboard` button (e.g.
+    "B3"), so a cell can be identified without having to count grid lines.
+    Uses `ImageFont.load_default(size=...)` — Pillow's built-in scalable
+    bitmap font (no TTF file to locate/bundle) — with a black outline
+    (`stroke_width`/`stroke_fill`) rather than a filled backing box behind
+    it, so the label stays legible over any image content without covering
+    much of it. Returns PNG bytes."""
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    draw = ImageDraw.Draw(image)
+    width, height = image.size
+    line_color = (255, 0, 0)
+    line_width = max(1, min(width, height) // 400)
+    cell_width = width / HAND_POINT_GRID_SIZE
+    cell_height = height / HAND_POINT_GRID_SIZE
+    for i in range(1, HAND_POINT_GRID_SIZE):
+        x = round(width * i / HAND_POINT_GRID_SIZE)
+        draw.line([(x, 0), (x, height)], fill=line_color, width=line_width)
+        y = round(height * i / HAND_POINT_GRID_SIZE)
+        draw.line([(0, y), (width, y)], fill=line_color, width=line_width)
+
+    font_size = max(10, round(min(cell_width, cell_height) * 0.12))
+    font = ImageFont.load_default(size=font_size)
+    padding = max(2, font_size // 3)
+    for row in range(HAND_POINT_GRID_SIZE):
+        for col in range(HAND_POINT_GRID_SIZE):
+            label = f"{chr(ord('A') + row)}{col + 1}"
+            text_x = col * cell_width + padding
+            text_y = row * cell_height + padding
+            draw.text(
+                (text_x, text_y),
+                label,
+                fill=(255, 255, 0),
+                font=font,
+                stroke_width=max(1, font_size // 8),
+                stroke_fill=(0, 0, 0),
+            )
+
+    out = io.BytesIO()
+    image.save(out, format="PNG")
+    return out.getvalue()
+
+
+def _hand_point_keyboard(result_id: str) -> InlineKeyboardMarkup:
+    """One button per grid cell drawn by `_draw_hand_point_grid`, labeled by
+    row letter + column number (e.g. "B3") in reading order, callback_data
+    `hp:<result_id>:<row>:<col>` (see `hand_point_callback`)."""
+    rows = []
+    for row in range(HAND_POINT_GRID_SIZE):
+        row_letter = chr(ord("A") + row)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{row_letter}{col + 1}",
+                    callback_data=f"{HAND_POINT_CALLBACK_PREFIX}{result_id}:{row}:{col}",
+                )
+                for col in range(HAND_POINT_GRID_SIZE)
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 def _stream_prompt_cancel_keyboard() -> InlineKeyboardMarkup:
@@ -1084,8 +1183,17 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     detector found nothing to refine (`GeneratedImage.unchanged`, see
     `post_process`) isn't sent or stored at all — it's pixel-identical to
     what's already on screen, so re-posting it would just be noise — a
-    "⚠️ No face/hand detected" text reply stands in for it instead. Alerts
-    instead if `result_id` has expired (see `PENDING_RESULT_TTL_SECONDS`)."""
+    "⚠️ No face/hand detected" text reply stands in for it instead. `"hand"`
+    itself doesn't post-process immediately — the YOLO bbox detector behind
+    it often can't find a hand at all, so it instead replies with
+    `_hand_mode_keyboard`'s auto/manual choice: `HAND_AUTO_CALLBACK_KIND`
+    (translated back to `"hand"` right before the block above, so it takes
+    the same path a direct `"hand"` tap used to) or `HAND_MANUAL_CALLBACK_KIND`
+    (downloads the source, overlays a tap grid via `_draw_hand_point_grid`,
+    and replies with it plus `_hand_point_keyboard` — a grid-cell tap is
+    handled by the separate `hand_point_callback`, not this function, since
+    it needs a row/col in its callback_data). Alerts instead if `result_id`
+    has expired (see `PENDING_RESULT_TTL_SECONDS`)."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
@@ -1201,6 +1309,27 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await _safe_edit_message(query, "Upscale cancelled.", InlineKeyboardMarkup([]))
         return
 
+    if kind == "hand":
+        await query.message.reply_text(
+            "Auto-detect usually finds it, but you can mark the hand yourself if it keeps missing:",
+            reply_markup=_hand_mode_keyboard(result_id),
+        )
+        return
+
+    if kind == HAND_MANUAL_CALLBACK_KIND:
+        tg_file = await context.bot.get_file(pending["file_id"])
+        source_bytes = bytes(await tg_file.download_as_bytearray())
+        gridded = _draw_hand_point_grid(source_bytes)
+        await query.message.reply_photo(
+            photo=io.BytesIO(gridded),
+            caption="Tap the cell over the hand:",
+            reply_markup=_hand_point_keyboard(result_id),
+        )
+        return
+
+    if kind == HAND_AUTO_CALLBACK_KIND:
+        kind = "hand"
+
     source_bytes: bytes | None = None
     if kind in ("upscale", UPSCALE_CONFIRM_CALLBACK_KIND):
         if kind == UPSCALE_CONFIRM_CALLBACK_KIND:
@@ -1243,6 +1372,55 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         subject = "face" if kind == "face" else "hand"
         await query.message.reply_text(f"⚠️ No {subject} detected — image unchanged.")
         return
+    await _send_and_store_result(query.message, pending["chat_id"], storage, result)
+
+
+async def hand_point_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle a `hp:<result_id>:<row>:<col>` tap from `_hand_point_keyboard`
+    (the "✋ Tap to mark" grid `postprocess_callback`'s `HAND_MANUAL_CALLBACK_KIND`
+    branch sends) — downloads the source image, turns the tapped cell into
+    a fractional (x, y) point at its center, and runs
+    `post_process(kind="hand_manual")` on it. Unlike the auto-detect path,
+    a manually marked region is never "nothing detected", so there's no
+    `unchanged` check here."""
+    query = update.callback_query
+    settings: Settings = context.bot_data["settings"]
+    user_id = update.effective_user.id if update.effective_user else None
+    if await reject_if_unauthorized_callback(query, user_id, settings):
+        return
+
+    _, result_id, row_str, col_str = query.data.split(":")
+    row, col = int(row_str), int(col_str)
+    storage: Storage = context.bot_data["storage"]
+    pending = storage.get_pending_result(result_id)
+    if pending is None:
+        await query.answer("That result has expired — generate a new image.", show_alert=True)
+        return
+
+    await query.answer()
+    client: ComfyClient = context.bot_data["comfy_client"]
+    full_params = _deserialize_generation_params(pending["base_params"])
+    point_frac = (
+        (col + 0.5) / HAND_POINT_GRID_SIZE,
+        (row + 0.5) / HAND_POINT_GRID_SIZE,
+    )
+
+    status_message = await query.message.reply_text("Refining hand…", disable_notification=True)
+
+    async def _download_and_post_process() -> GeneratedImage:
+        tg_file = await context.bot.get_file(pending["file_id"])
+        data = bytes(await tg_file.download_as_bytearray())
+        return await post_process(
+            client, "hand_manual", data, pending["filename"], full_params, point_frac=point_frac
+        )
+
+    result = await _run_reporting_errors(
+        status_message, "Refining hand", "post-processing", _download_and_post_process()
+    )
+    if result is None:
+        return
+
+    await status_message.delete()
     await _send_and_store_result(query.message, pending["chat_id"], storage, result)
 
 

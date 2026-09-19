@@ -28,7 +28,11 @@ CLI at runtime.
   graph with a hand-trained bbox detector swapped in), plus 🏷️ Analyze Image (run
   *both* the WD14 tagger and a Qwen-VL caption, each sent as its own message
   with its own 🎨 Generate button, for comparing them side by side) and a
-  🔁 Generate Again button on the whole batch.
+  🔁 Generate Again button on the whole batch. 🖐️ Hand Detail asks 🤖
+  Auto-detect or ✋ Tap to mark first, since the YOLO bbox detector often
+  can't find a hand at all — tapping a cell on a coarse grid overlay
+  inpaints a small mask centered there instead, skipping detection
+  entirely.
 - **Image-to-prompt analysis** — 🏷️ Analyze Image runs both a WD14 tagger and a
   Qwen-VL caption via a local Ollama server, regardless of checkpoint, for
   comparing them side by side. See [Image analysis](#image-analysis) below.
@@ -154,7 +158,11 @@ Every generated image comes with inline buttons:
 
 - **🔍 Upscale 4x** / **✨ Face Detail** / **🖐️ Hand Detail** — run that
   post-processing stage on this specific image and send the result (itself
-  with its own buttons, so passes can be chained).
+  with its own buttons, so passes can be chained). **🖐️ Hand Detail** asks
+  **🤖 Auto-detect** (the usual YOLO/SAM detector) or **✋ Tap to mark**
+  first — the latter sends the image back with a grid overlay and one
+  button per cell, and inpaints a small mask centered on whichever cell you
+  tap, for when the detector can't find the hand at all.
 - **🏷️ Analyze Image** — analyze *this image* with **both** the WD14 tagger and a
   Qwen-VL caption (regardless of the checkpoint's `prompt_style`), replying
   with two separate messages — one per analyzer — each carrying its own
@@ -275,19 +283,26 @@ shared singletons (`Settings`, `ComfyClient`, loaded `ModelProfile`s,
   API (`/prompt`, `/history`, `/view`, `/object_info`, `/ws`). No knowledge
   of Telegram or prompts/profiles.
 - **`workflows/builder.py`** — `PromptGraph`, a small imperative builder for
-  ComfyUI API-format node graphs. Builds four graphs: `build_txt2img`,
-  `build_upscale` (UltimateSDUpscale), `build_face_detailer` and
-  `build_hand_detailer` (both Impact Pack's `FaceDetailer` node — it's a
-  generic detect/crop/inpaint/composite node regardless of name, so the two
-  share a `_build_detailer` graph builder and differ only in which
-  bbox-detector model gets wired in). Post-processing graphs are freshly
-  submitted (`LoadImage` from an uploaded source) rather than chained onto
-  the original sampler run, so any single image from a batch can be picked
-  for refinement independent of seed/batch state. The checkpoint/clip/vae
-  wiring these all share (`_build_model_clip_vae`) branches on a profile's
-  `loader` field: `"checkpoint"` (the default, single `CheckpointLoaderSimple`
-  node) or `"split"`, for architectures shipped as separate UNET/text-encoder/
-  VAE files (currently Anima) — see [`model_profiles/`](model_profiles/).
+  ComfyUI API-format node graphs. Builds `build_txt2img`, `build_upscale`
+  (UltimateSDUpscale), `build_face_detailer` and `build_hand_detailer`
+  (both Impact Pack's `FaceDetailer` node — it's a generic detect/crop/
+  inpaint/composite node regardless of name, so the two share a
+  `_build_detailer` graph builder and differ only in which bbox-detector
+  model gets wired in), and `build_hand_detailer_manual` — a hand-only
+  variant for when that bbox detector can't find one at all: instead of
+  `UltralyticsDetectorProvider`/`SAMLoader`, it builds a small rectangular
+  mask centered on a user-tapped point (`SolidMask`+`MaskComposite`), turns
+  it into a `SEGS` region with Impact Pack's `MaskToSEGS`, and feeds that to
+  `DetailerForEach` — the modular sibling of `FaceDetailer` that inpaints a
+  ready-made `SEGS` instead of running its own detection. Post-processing
+  graphs are freshly submitted (`LoadImage` from an uploaded source) rather
+  than chained onto the original sampler run, so any single image from a
+  batch can be picked for refinement independent of seed/batch state. The
+  checkpoint/clip/vae wiring these all share (`_build_model_clip_vae`)
+  branches on a profile's `loader` field: `"checkpoint"` (the default,
+  single `CheckpointLoaderSimple` node) or `"split"`, for architectures
+  shipped as separate UNET/text-encoder/VAE files (currently Anima) — see
+  [`model_profiles/`](model_profiles/).
 - **`profiles/`** — the `ModelProfile` pydantic schema plus a loader that
   glob-matches a checkpoint filename against every `*.json` in
   `model_profiles/` and layers profile defaults → user prompt → any
@@ -300,7 +315,11 @@ shared singletons (`Settings`, `ComfyClient`, loaded `ModelProfile`s,
   🏷️ Analyze Image: `analyze_tags()` (WD14 tagger via `onnxruntime`) and
   `analyze_caption()` (Qwen-VL via a local Ollama server), always run
   together. See [Image analysis](#image-analysis) above.
-- **`handlers.py`** — all Telegram-facing commands and callbacks.
+- **`handlers.py`** — all Telegram-facing commands and callbacks, including
+  the auto/manual choice behind 🖐️ Hand Detail (`_hand_mode_keyboard`) and
+  the tap-a-grid-cell flow it can lead to (`_draw_hand_point_grid`/
+  `_hand_point_keyboard`, handled by its own `hand_point_callback` since a
+  tapped cell's callback_data needs a row/col alongside the result id).
 - **`settings_menu.py`** — the `/settings` in-place inline-keyboard UI.
   Enum fields build their button grid from ComfyUI's live `/object_info`,
   so the menu can never offer a value the server would reject.

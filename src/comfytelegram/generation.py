@@ -25,10 +25,12 @@ from comfytelegram.workflows import (
     FaceDetailerParams,
     GenerationParams,
     HandDetailerParams,
+    ManualHandDetailerParams,
     PostProcessBaseParams,
     UpscaleParams,
     build_face_detailer,
     build_hand_detailer,
+    build_hand_detailer_manual,
     build_txt2img,
     build_upscale,
 )
@@ -205,11 +207,12 @@ async def generate(
 
 async def post_process(
     client: ComfyClient,
-    kind: Literal["upscale", "face", "hand"],
+    kind: Literal["upscale", "face", "hand", "hand_manual"],
     source_image: bytes,
     source_filename: str,
     full_params: GenerationParams,
     *,
+    point_frac: tuple[float, float] | None = None,
     on_progress: ProgressCallback | None = None,
 ) -> GeneratedImage:
     """Upload a previously-generated image and run one post-processing stage
@@ -217,7 +220,11 @@ async def post_process(
     is True if Impact Pack's bbox detector found nothing to refine — the
     node just passes the source through as-is in that case rather than
     erroring, which otherwise looks like a successful (but pointless)
-    refinement (see `_detailer_found_nothing`)."""
+    refinement (see `_detailer_found_nothing`). `kind="hand_manual"` skips
+    detection entirely and inpaints a small mask centered on `point_frac`
+    (required for this kind — see `build_hand_detailer_manual`, backing
+    handlers.py's "✋ Tap to mark" flow); `unchanged` is always False for it,
+    since a manually placed mask can't come back empty."""
     base_params = _to_post_process_base(full_params)
     upload = await client.upload_image(source_image, filename=source_filename)
     uploaded_name = upload["name"]
@@ -232,6 +239,12 @@ async def post_process(
     elif kind == "hand":
         prompt_graph, save_node_id, detection_node_id = build_hand_detailer(
             uploaded_name, base_params, HandDetailerParams()
+        )
+    elif kind == "hand_manual":
+        assert point_frac is not None, "hand_manual requires point_frac"
+        image_size = Image.open(io.BytesIO(source_image)).size
+        prompt_graph, save_node_id = build_hand_detailer_manual(
+            uploaded_name, base_params, ManualHandDetailerParams(), point_frac, image_size
         )
     else:
         raise ValueError(f"Unknown post-processing kind: {kind}")

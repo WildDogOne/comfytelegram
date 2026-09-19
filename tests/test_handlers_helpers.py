@@ -1,20 +1,28 @@
+import io
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from PIL import Image
 
 from comfytelegram.comfy_client import ComfyUIError
 from comfytelegram.generation import GeneratedImage
 from comfytelegram.handlers import (
     _MAIN_KEYBOARD,
     ANALYZE_PROMPT_CALLBACK_KIND,
+    HAND_AUTO_CALLBACK_KIND,
+    HAND_MANUAL_CALLBACK_KIND,
+    HAND_POINT_GRID_SIZE,
     SHOW_PROMPT_CALLBACK_KIND,
     TAGCHECK_TOKEN_LIMIT,
     _again_keyboard,
     _characters_keyboard,
     _consume_awaiting_character_edit,
     _consume_awaiting_character_rename,
+    _draw_hand_point_grid,
     _extract_file_id,
     _generate_from_prompt_keyboard,
+    _hand_mode_keyboard,
+    _hand_point_keyboard,
     _post_process_keyboard,
     _resolve_effective_prompt,
     _resolve_tag_sources,
@@ -26,6 +34,7 @@ from comfytelegram.handlers import (
     _tag_results_keyboard,
     _tagcheck_lines,
     _upscale_confirm_keyboard,
+    hand_point_callback,
     postprocess_callback,
     start,
 )
@@ -698,9 +707,32 @@ async def test_face_detail_with_no_detection_sends_a_warning_instead_of_the_imag
 
 
 @pytest.mark.asyncio
-async def test_hand_detail_with_a_real_change_sends_the_image_normally():
+async def test_hand_tap_offers_an_auto_or_manual_choice_without_post_processing():
     query = AsyncMock()
     query.data = "pp:hand:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock()) as post_process_mock:
+        await postprocess_callback(update, context)
+
+    post_process_mock.assert_not_called()
+    query.message.reply_text.assert_awaited_once()
+    keyboard = query.message.reply_text.await_args.kwargs["reply_markup"]
+    callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert f"pp:{HAND_AUTO_CALLBACK_KIND}:abc123" in callback_data
+    assert f"pp:{HAND_MANUAL_CALLBACK_KIND}:abc123" in callback_data
+
+
+@pytest.mark.asyncio
+async def test_hand_auto_with_a_real_change_sends_the_image_normally():
+    query = AsyncMock()
+    query.data = f"pp:{HAND_AUTO_CALLBACK_KIND}:abc123"
     update = MagicMock()
     update.callback_query = query
     update.effective_user.id = 1
@@ -717,9 +749,122 @@ async def test_hand_detail_with_a_real_change_sends_the_image_normally():
         ),
         unchanged=False,
     )
-    with patch("comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)):
+    with patch(
+        "comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)
+    ) as post_process_mock:
         await postprocess_callback(update, context)
 
+    post_process_mock.assert_awaited_once()
+    assert post_process_mock.await_args.args[1] == "hand"
     query.message.reply_photo.assert_awaited_once()
     storage.store_pending_result.assert_called_once()
     assert not any("unchanged" in call.args[0] for call in query.message.reply_text.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_hand_manual_sends_a_gridded_photo_with_point_buttons():
+    query = AsyncMock()
+    query.data = f"pp:{HAND_MANUAL_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    source_png = io.BytesIO()
+    Image.new("RGB", (64, 64)).save(source_png, format="PNG")
+    context.bot.get_file = AsyncMock(
+        return_value=MagicMock(
+            download_as_bytearray=AsyncMock(return_value=bytearray(source_png.getvalue()))
+        )
+    )
+
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock()) as post_process_mock:
+        await postprocess_callback(update, context)
+
+    post_process_mock.assert_not_called()
+    query.message.reply_photo.assert_awaited_once()
+    keyboard = query.message.reply_photo.await_args.kwargs["reply_markup"]
+    callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert len(callback_data) == HAND_POINT_GRID_SIZE**2
+    assert "hp:abc123:0:0" in callback_data
+
+
+def test_hand_mode_keyboard_scopes_both_buttons_to_result_id():
+    keyboard = _hand_mode_keyboard("abc123")
+    callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert f"pp:{HAND_AUTO_CALLBACK_KIND}:abc123" in callback_data
+    assert f"pp:{HAND_MANUAL_CALLBACK_KIND}:abc123" in callback_data
+
+
+def test_hand_point_keyboard_labels_cells_by_row_letter_and_column_number():
+    keyboard = _hand_point_keyboard("abc123")
+    labels = [b.text for row in keyboard.inline_keyboard for b in row]
+    assert labels[0] == "A1"
+    assert labels[-1] == f"{chr(ord('A') + HAND_POINT_GRID_SIZE - 1)}{HAND_POINT_GRID_SIZE}"
+
+
+@pytest.mark.parametrize("size", [(64, 64), (17, 401)])
+def test_draw_hand_point_grid_returns_a_same_size_png(size):
+    source = io.BytesIO()
+    Image.new("RGB", size, (100, 150, 200)).save(source, format="PNG")
+
+    gridded = _draw_hand_point_grid(source.getvalue())
+
+    out = Image.open(io.BytesIO(gridded))
+    assert out.format == "PNG"
+    assert out.size == size
+
+
+@pytest.mark.asyncio
+async def test_hand_point_callback_runs_manual_post_process_with_the_tapped_point():
+    query = AsyncMock()
+    query.data = "hp:abc123:1:2"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+
+    changed_result = GeneratedImage(
+        data=b"refined",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch(
+        "comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)
+    ) as post_process_mock:
+        await hand_point_callback(update, context)
+
+    post_process_mock.assert_awaited_once()
+    assert post_process_mock.await_args.args[1] == "hand_manual"
+    expected_point_frac = ((2 + 0.5) / HAND_POINT_GRID_SIZE, (1 + 0.5) / HAND_POINT_GRID_SIZE)
+    assert post_process_mock.await_args.kwargs["point_frac"] == expected_point_frac
+    query.message.reply_photo.assert_awaited_once()
+    storage.store_pending_result.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_hand_point_callback_alerts_on_an_expired_result():
+    query = AsyncMock()
+    query.data = "hp:abc123:0:0"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    storage = MagicMock()
+    storage.get_pending_result.return_value = None
+    context = MagicMock()
+    context.bot_data = {"settings": MagicMock(allowed_user_ids=None), "storage": storage}
+
+    await hand_point_callback(update, context)
+
+    query.answer.assert_awaited_once_with(
+        "That result has expired — generate a new image.", show_alert=True
+    )
