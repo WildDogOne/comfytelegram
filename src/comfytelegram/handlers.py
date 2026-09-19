@@ -14,7 +14,9 @@ import logging
 import re
 import time
 import uuid
+from collections import Counter
 from collections.abc import Awaitable
+from pathlib import Path
 from typing import Any, TypeVar
 
 from PIL import Image, ImageDraw, ImageFont
@@ -761,10 +763,30 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await start(update, context)
 
 
+def _checkpoint_labels(checkpoints: list[str], profiles: list[ModelProfile]) -> list[str]:
+    """Resolve each checkpoint to its matching profile's `display_name`
+    (falling back to the raw filename when none matches), then disambiguate
+    any labels that collide — e.g. several version variants of one model
+    (`FurryToonMix_v2.safetensors`, `FurryToonMix_v3.safetensors`) all
+    matching the same profile's glob and thus getting the same static
+    `display_name` — by appending each colliding checkpoint's filename stem,
+    the one piece of information that actually varies between them."""
+    raw_labels = []
+    for ckpt in checkpoints:
+        profile = resolve_profile(ckpt, profiles)
+        raw_labels.append(profile.display_name if profile else ckpt)
+    counts = Counter(raw_labels)
+    return [
+        f"{label} ({Path(ckpt).stem})" if counts[label] > 1 else label
+        for ckpt, label in zip(checkpoints, raw_labels)
+    ]
+
+
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/model` — list checkpoints ComfyUI has installed as an inline
     keyboard (labeled with the matching profile's `display_name` where one
-    exists), for `model_callback` to act on."""
+    exists, disambiguated by filename when several checkpoints share a
+    label — see `_checkpoint_labels`), for `model_callback` to act on."""
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
         return
@@ -785,11 +807,11 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     context.bot_data["available_checkpoints"] = checkpoints
 
-    buttons = []
-    for i, ckpt in enumerate(checkpoints):
-        profile = resolve_profile(ckpt, profiles)
-        label = profile.display_name if profile else ckpt
-        buttons.append([InlineKeyboardButton(label, callback_data=f"model:{i}")])
+    labels = _checkpoint_labels(checkpoints, profiles)
+    buttons = [
+        [InlineKeyboardButton(label, callback_data=f"model:{i}")]
+        for i, label in enumerate(labels)
+    ]
 
     await update.effective_message.reply_text(
         "Choose a model:", reply_markup=InlineKeyboardMarkup(buttons)
@@ -819,8 +841,7 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     storage.set_checkpoint(update.effective_chat.id, checkpoint)
 
     profiles: list[ModelProfile] = context.bot_data["profiles"]
-    profile = resolve_profile(checkpoint, profiles)
-    label = profile.display_name if profile else checkpoint
+    label = _checkpoint_labels(checkpoints, profiles)[index]
 
     await query.answer()
     await query.edit_message_text(f"Model set to: {label}")

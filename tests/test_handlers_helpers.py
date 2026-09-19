@@ -20,6 +20,7 @@ from comfytelegram.handlers import (
     TELEGRAM_PHOTO_SIZE_LIMIT,
     _again_keyboard,
     _characters_keyboard,
+    _checkpoint_labels,
     _consume_awaiting_character_edit,
     _consume_awaiting_character_rename,
     _draw_hand_point_grid,
@@ -438,6 +439,33 @@ def test_resolve_tag_sources_prefix_override_is_case_insensitive():
     sources, remainder = _resolve_tag_sources("DANBOORU:1girl", None, [])
     assert sources == [TagSource.DANBOORU]
     assert remainder == "1girl"
+
+
+def test_checkpoint_labels_disambiguates_versions_sharing_one_profile():
+    profile = ModelProfile(match=["furrytoonmix_*"], display_name="FurryToonMix XL")
+    labels = _checkpoint_labels(
+        ["furrytoonmix_v2.safetensors", "furrytoonmix_v3.safetensors"], [profile]
+    )
+    assert labels == [
+        "FurryToonMix XL (furrytoonmix_v2)",
+        "FurryToonMix XL (furrytoonmix_v3)",
+    ]
+
+
+def test_checkpoint_labels_leaves_unique_display_names_alone():
+    profiles = [
+        ModelProfile(match=["furry*"], display_name="FurryToonMix XL"),
+        ModelProfile(match=["pony*"], display_name="PonyXL"),
+    ]
+    labels = _checkpoint_labels(
+        ["furrytoonmix_v3.safetensors", "ponyxl.safetensors"], profiles
+    )
+    assert labels == ["FurryToonMix XL", "PonyXL"]
+
+
+def test_checkpoint_labels_falls_back_to_filename_without_a_matching_profile():
+    labels = _checkpoint_labels(["unmatched.safetensors"], [])
+    assert labels == ["unmatched.safetensors"]
 
 
 def test_resolve_tag_sources_uses_profile_tag_dictionary_when_no_override():
