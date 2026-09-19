@@ -30,6 +30,7 @@ def test_all_shipped_profiles_load(profiles):
         "Animagine XL",
         "Anima Aesthetic",
         "Anima Turbo",
+        "AutismMix SDXL",
     }
 
 
