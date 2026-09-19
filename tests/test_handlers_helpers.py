@@ -12,8 +12,10 @@ from comfytelegram.handlers import (
     HAND_AUTO_CALLBACK_KIND,
     HAND_MANUAL_CALLBACK_KIND,
     HAND_POINT_GRID_SIZE,
+    HAND_POINT_PREVIEW_MAX_DIM,
     SHOW_PROMPT_CALLBACK_KIND,
     TAGCHECK_TOKEN_LIMIT,
+    TELEGRAM_PHOTO_SIZE_LIMIT,
     _again_keyboard,
     _characters_keyboard,
     _consume_awaiting_character_edit,
@@ -815,6 +817,18 @@ def test_draw_hand_point_grid_returns_a_same_size_png(size):
     out = Image.open(io.BytesIO(gridded))
     assert out.format == "PNG"
     assert out.size == size
+
+
+def test_draw_hand_point_grid_downscales_a_large_source():
+    source = io.BytesIO()
+    Image.new("RGB", (4000, 2000), (100, 150, 200)).save(source, format="PNG")
+
+    gridded = _draw_hand_point_grid(source.getvalue())
+
+    out = Image.open(io.BytesIO(gridded))
+    assert max(out.size) == HAND_POINT_PREVIEW_MAX_DIM
+    assert out.size[0] / out.size[1] == pytest.approx(2.0, rel=0.01)
+    assert len(gridded) < TELEGRAM_PHOTO_SIZE_LIMIT
 
 
 @pytest.mark.asyncio

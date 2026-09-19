@@ -136,6 +136,14 @@ TELEGRAM_PHOTO_SIZE_LIMIT = 10_000_000
 # `UPSCALE_CONFIRM_CALLBACK_KIND` branch.
 UPSCALE_CONFIRM_THRESHOLD_PX = 2000
 
+# Long-edge cap (pixels) for the "✋ Tap to mark" grid preview (see
+# `_draw_hand_point_grid`) — it's only there to pick a cell, not a final
+# result, so it's downscaled before the grid/labels are drawn onto it. An
+# already-upscaled source (e.g. a 4x-upscale run through Hand Detail again)
+# can otherwise render a gridded PNG past TELEGRAM_PHOTO_SIZE_LIMIT, which
+# `reply_photo` (unlike `_send_result_image`) has no oversize fallback for.
+HAND_POINT_PREVIEW_MAX_DIM = 1280
+
 #: Persistent custom keyboard (replaces the device's own keyboard for the
 #: whole chat, not an inline button on one message — see `_STREAMING_KEYBOARD`
 #: below for why that distinction matters) listing every top-level command.
@@ -265,8 +273,16 @@ def _draw_hand_point_grid(image_bytes: bytes) -> bytes:
     bitmap font (no TTF file to locate/bundle) — with a black outline
     (`stroke_width`/`stroke_fill`) rather than a filled backing box behind
     it, so the label stays legible over any image content without covering
-    much of it. Returns PNG bytes."""
+    much of it. Downscales first if the source exceeds
+    `HAND_POINT_PREVIEW_MAX_DIM` on its long edge — this is only a preview
+    for picking a cell, not a final result, and `hand_point_callback`
+    re-derives the tapped point's pixel location from the *original*
+    downloaded image anyway (see its `point_frac` math), so the preview's
+    resolution has no bearing on where the eventual mask ends up. Returns
+    PNG bytes."""
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    if max(image.size) > HAND_POINT_PREVIEW_MAX_DIM:
+        image.thumbnail((HAND_POINT_PREVIEW_MAX_DIM, HAND_POINT_PREVIEW_MAX_DIM), Image.LANCZOS)
     draw = ImageDraw.Draw(image)
     width, height = image.size
     line_color = (255, 0, 0)
