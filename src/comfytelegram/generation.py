@@ -22,6 +22,7 @@ from PIL import Image
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
 from comfytelegram.profiles import ModelProfile, resolve_generation_params
 from comfytelegram.workflows import (
+    DrawnMaskHandDetailerParams,
     FaceDetailerParams,
     GenerationParams,
     HandDetailerParams,
@@ -30,6 +31,7 @@ from comfytelegram.workflows import (
     UpscaleParams,
     build_face_detailer,
     build_hand_detailer,
+    build_hand_detailer_drawn_mask,
     build_hand_detailer_manual,
     build_txt2img,
     build_upscale,
@@ -123,6 +125,25 @@ def _to_post_process_base(params: GenerationParams) -> PostProcessBaseParams:
     )
 
 
+#: How long `_run_graph` waits for a websocket event before checking
+#: `/history` directly instead. Connecting before queueing (see
+#: `ComfyClient.connect_events`) closes the *usual* window for ComfyUI to
+#: drop a job's terminal event into the void, but not every one — verified
+#: against a live server: a fast job (steps small enough, or the checkpoint/
+#: prompt nodes execution-cached from a prior run, per its own
+#: `execution_cached` history message) can still finish and fire its
+#: terminal `executing{node: null}` before this process's websocket
+#: handshake has been fully registered server-side, with nothing left to
+#: ever arrive after that — no buffering, no replay. `/history` is
+#: authoritative regardless of the socket's state, so silence past this
+#: many seconds falls back to polling it directly rather than waiting on an
+#: event that may already have been lost. Short enough to catch a lost-event
+#: hang quickly, long enough that a real in-progress step (checked every
+#: tick this fires during) doesn't trigger more than the occasional spare
+#: /history call.
+_WS_EVENT_FALLBACK_SECONDS = 5.0
+
+
 async def _run_graph(
     client: ComfyClient,
     prompt_graph: dict,
@@ -144,11 +165,27 @@ async def _run_graph(
     async with client.connect_events(client_id=client_id) as events:
         prompt_id = await client.queue_prompt(prompt_graph, client_id=client_id)
 
-        async for progress in events.watch(prompt_id):
+        watcher = events.watch(prompt_id).__aiter__()
+        done = False
+        while not done:
+            try:
+                progress = await asyncio.wait_for(
+                    watcher.__anext__(), timeout=_WS_EVENT_FALLBACK_SECONDS
+                )
+            except StopAsyncIteration:
+                break
+            except TimeoutError:
+                # See _WS_EVENT_FALLBACK_SECONDS — the terminal event may
+                # simply never come; /history tells us definitively whether
+                # the job is actually still running.
+                history = await client.get_history(prompt_id)
+                if history is not None and history.get("status", {}).get("completed"):
+                    done = True
+                continue
             if on_progress is not None:
                 await on_progress(progress)
             if progress.done:
-                break
+                done = True
 
     history = await client.get_history(prompt_id)
     if history is None:
@@ -218,13 +255,14 @@ async def generate(
 
 async def post_process(
     client: ComfyClient,
-    kind: Literal["upscale", "face", "hand", "hand_manual"],
+    kind: Literal["upscale", "face", "hand", "hand_manual", "hand_drawn"],
     source_image: bytes,
     source_filename: str,
     full_params: GenerationParams,
     *,
     point_frac: tuple[float, float] | None = None,
     box_size_frac: float | None = None,
+    mask_bytes: bytes | None = None,
     on_progress: ProgressCallback | None = None,
 ) -> GeneratedImage:
     """Upload a previously-generated image and run one post-processing stage
@@ -241,7 +279,10 @@ async def post_process(
     — handlers.py's `hand_point_callback` shrinks it for a denser tap grid
     (see `HAND_POINT_BOX_SIZE_FRAC_BASE`) so the marked region stays roughly
     cell-sized instead of a fixed fraction of the image regardless of
-    density; ignored for every other `kind`."""
+    density; ignored for every other `kind`. `kind="hand_drawn"` also skips
+    detection, inpainting a freehand mask instead (required for this kind —
+    see `build_hand_detailer_drawn_mask`, backing the Telegram WebApp mask
+    editor); `unchanged` is always False for it too, for the same reason."""
     base_params = _to_post_process_base(full_params)
     upload = await client.upload_image(source_image, filename=source_filename)
     uploaded_name = upload["name"]
@@ -270,6 +311,12 @@ async def post_process(
         )
         prompt_graph, save_node_id = build_hand_detailer_manual(
             uploaded_name, base_params, manual_params, point_frac, image_size
+        )
+    elif kind == "hand_drawn":
+        assert mask_bytes is not None, "hand_drawn requires mask_bytes"
+        mask_upload = await client.upload_image(mask_bytes, filename=f"mask_{source_filename}")
+        prompt_graph, save_node_id = build_hand_detailer_drawn_mask(
+            uploaded_name, mask_upload["name"], base_params, DrawnMaskHandDetailerParams()
         )
     else:
         raise ValueError(f"Unknown post-processing kind: {kind}")

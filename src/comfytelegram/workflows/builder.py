@@ -701,3 +701,103 @@ def build_hand_detailer_manual(
         title="Save Image",
     )
     return g.as_prompt(), save
+
+
+@dataclass
+class DrawnMaskHandDetailerParams:
+    """Same tunables as `ManualHandDetailerParams` minus the tapped-point/box
+    geometry — there's no box to size or center here, since the mask comes
+    from a freehand drawing instead (see `build_hand_detailer_drawn_mask`,
+    backing the Telegram WebApp mask editor)."""
+
+    guide_size: int = 512
+    max_size: int = 1024
+    steps: int = 25
+    cfg: float = 5.0
+    sampler_name: str = "euler_ancestral"
+    scheduler: str = "normal"
+    denoise: float = 0.5
+    feather: int = 10
+    seed: int | None = None
+    filename_prefix: str = "comfytelegram_hand"
+    #: Same role as `ManualHandDetailerParams.crop_factor`.
+    crop_factor: float = 3.0
+
+
+def build_hand_detailer_drawn_mask(
+    source_filename: str,
+    mask_filename: str,
+    base: PostProcessBaseParams,
+    params: DrawnMaskHandDetailerParams,
+) -> tuple[dict[str, Any], str]:
+    """Build a hand-detail graph from a mask the user drew freehand (the
+    Telegram WebApp mask editor), instead of YOLO/SAM detection
+    (`build_hand_detailer`) or a fixed box around a tapped point
+    (`build_hand_detailer_manual`). Both `source_filename` and
+    `mask_filename` must already exist in ComfyUI's `input` directory
+    (upload both first via `ComfyClient.upload_image`) — the mask is a
+    plain grayscale PNG (white = inpaint, black = keep), read via the core
+    `LoadImageMask` node's red channel.
+
+    Same downstream shape as `build_hand_detailer_manual` (`MaskToSEGS` ->
+    `DetailerForEach`) and the same reasoning for skipping a detection-check
+    `PreviewImage` node — a mask the user drew by hand is never empty."""
+    g = PromptGraph()
+
+    load = g.add("LoadImage", {"image": source_filename}, title="Source Image")
+    model_ref, clip_ref, vae_ref, positive, negative = _build_model_clip_vae(g, base)
+
+    mask = g.add(
+        "LoadImageMask",
+        {"image": mask_filename, "channel": "red"},
+        title="Drawn Mask",
+    )
+    segs = g.add(
+        "MaskToSEGS",
+        {
+            "mask": [mask, 0],
+            "combined": False,
+            "crop_factor": params.crop_factor,
+            "bbox_fill": False,
+            "drop_size": 10,
+            "contour_fill": False,
+        },
+        title="Drawn Region SEGS",
+    )
+
+    detailer = g.add(
+        "DetailerForEach",
+        {
+            "image": [load, 0],
+            "segs": [segs, 0],
+            "model": list(model_ref),
+            "clip": list(clip_ref),
+            "vae": list(vae_ref),
+            "positive": [positive, 0],
+            "negative": [negative, 0],
+            "guide_size": params.guide_size,
+            "guide_size_for": True,
+            "max_size": params.max_size,
+            "seed": _resolve_seed(params.seed),
+            "steps": params.steps,
+            "cfg": params.cfg,
+            "sampler_name": params.sampler_name,
+            "scheduler": params.scheduler,
+            "denoise": params.denoise,
+            "feather": params.feather,
+            "noise_mask": True,
+            "force_inpaint": True,
+            "wildcard": "",
+            "cycle": 1,
+            "inpaint_model": False,
+            "noise_mask_feather": 20,
+        },
+        title="Hand Detailer (drawn mask)",
+    )
+
+    save = g.add(
+        "SaveImage",
+        {"images": [detailer, 0], "filename_prefix": params.filename_prefix},
+        title="Save Image",
+    )
+    return g.as_prompt(), save

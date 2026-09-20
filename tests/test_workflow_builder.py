@@ -1,4 +1,5 @@
 from comfytelegram.workflows.builder import (
+    DrawnMaskHandDetailerParams,
     FaceDetailerParams,
     GenerationParams,
     HandDetailerParams,
@@ -9,6 +10,7 @@ from comfytelegram.workflows.builder import (
     _resolve_seed,
     build_face_detailer,
     build_hand_detailer,
+    build_hand_detailer_drawn_mask,
     build_hand_detailer_manual,
     build_txt2img,
     build_upscale,
@@ -66,9 +68,7 @@ def test_build_txt2img_with_loras_and_clip_skip_chains_correctly():
     assert clip_skip_node["inputs"]["stop_at_clip_layer"] == -2
 
     # positive/negative CLIPTextEncode must read from the clip-skip output, not raw checkpoint clip
-    clip_skip_id = next(
-        nid for nid, n in prompt.items() if n["class_type"] == "CLIPSetLastLayer"
-    )
+    clip_skip_id = next(nid for nid, n in prompt.items() if n["class_type"] == "CLIPSetLastLayer")
     text_encodes = [n for n in prompt.values() if n["class_type"] == "CLIPTextEncode"]
     assert len(text_encodes) == 2
     for node in text_encodes:
@@ -356,3 +356,37 @@ def test_build_hand_detailer_manual_clamps_the_box_at_image_edges():
     composite = next(n for n in prompt.values() if n["class_type"] == "MaskComposite")
     assert composite["inputs"]["x"] == 0
     assert composite["inputs"]["y"] == 0
+
+
+def test_build_hand_detailer_drawn_mask_loads_mask_via_load_image_mask():
+    base = PostProcessBaseParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+    )
+    prompt, save_id = build_hand_detailer_drawn_mask(
+        "uploaded.png",
+        "mask_uploaded.png",
+        base,
+        DrawnMaskHandDetailerParams(seed=888),
+    )
+
+    assert "UltralyticsDetectorProvider" not in _class_types(prompt)
+    assert "SAMLoader" not in _class_types(prompt)
+    assert "SolidMask" not in _class_types(prompt)
+    assert "MaskComposite" not in _class_types(prompt)
+
+    mask_load = next(n for n in prompt.values() if n["class_type"] == "LoadImageMask")
+    assert mask_load["inputs"] == {"image": "mask_uploaded.png", "channel": "red"}
+
+    segs = next(n for n in prompt.values() if n["class_type"] == "MaskToSEGS")
+    assert segs["inputs"]["mask"][0] == next(
+        k for k, n in prompt.items() if n["class_type"] == "LoadImageMask"
+    )
+
+    detailer = next(n for n in prompt.values() if n["class_type"] == "DetailerForEach")
+    assert detailer["inputs"]["seed"] == 888
+    assert detailer["inputs"]["segs"][0] == next(
+        k for k, n in prompt.items() if n["class_type"] == "MaskToSEGS"
+    )
+    assert prompt[save_id]["class_type"] == "SaveImage"

@@ -10,6 +10,7 @@ from comfytelegram.handlers import (
     _MAIN_KEYBOARD,
     ANALYZE_PROMPT_CALLBACK_KIND,
     HAND_AUTO_CALLBACK_KIND,
+    HAND_DRAW_CALLBACK_KIND,
     HAND_MANUAL_CALLBACK_KIND,
     HAND_POINT_BOX_SIZE_FRAC_BASE,
     HAND_POINT_GRID_SIZE,
@@ -46,9 +47,16 @@ from comfytelegram.handlers import (
     start,
 )
 from comfytelegram.profiles import ModelProfile
+from comfytelegram.settings import Settings
 from comfytelegram.tags import TagResult, TagSource
 from comfytelegram.topics import NO_TOPIC
 from comfytelegram.workflows import GenerationParams
+
+
+def _settings(**overrides) -> Settings:
+    # _env_file=None: don't let the real repo-root .env (if present) leak
+    # into these tests — Settings should only reflect what's passed here.
+    return Settings(_env_file=None, telegram_bot_token="test-token", **overrides)
 
 
 def test_split_negative_prompt_pulls_out_comma_separated_tags():
@@ -457,9 +465,7 @@ def test_checkpoint_labels_leaves_unique_display_names_alone():
         ModelProfile(match=["furry*"], display_name="FurryToonMix XL"),
         ModelProfile(match=["pony*"], display_name="PonyXL"),
     ]
-    labels = _checkpoint_labels(
-        ["furrytoonmix_v3.safetensors", "ponyxl.safetensors"], profiles
-    )
+    labels = _checkpoint_labels(["furrytoonmix_v3.safetensors", "ponyxl.safetensors"], profiles)
     assert labels == ["FurryToonMix XL", "PonyXL"]
 
 
@@ -931,10 +937,19 @@ async def test_hand_manual_sends_a_gridded_photo_with_point_buttons():
 
 
 def test_hand_mode_keyboard_scopes_both_buttons_to_result_id():
-    keyboard = _hand_mode_keyboard("abc123")
+    keyboard = _hand_mode_keyboard("abc123", _settings())
     callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
     assert f"pp:{HAND_AUTO_CALLBACK_KIND}:abc123" in callback_data
     assert f"pp:{HAND_MANUAL_CALLBACK_KIND}:abc123" in callback_data
+    assert f"pp:{HAND_DRAW_CALLBACK_KIND}:abc123" not in callback_data
+
+
+def test_hand_mode_keyboard_offers_draw_mask_only_when_relay_configured():
+    keyboard = _hand_mode_keyboard(
+        "abc123", _settings(inpaint_relay_url="https://inpaint.example.com")
+    )
+    callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert f"pp:{HAND_DRAW_CALLBACK_KIND}:abc123" in callback_data
 
 
 def test_hand_point_keyboard_labels_cells_by_row_letter_and_column_number():

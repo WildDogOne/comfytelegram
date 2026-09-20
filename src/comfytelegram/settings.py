@@ -114,6 +114,56 @@ class Settings(BaseSettings):
     )
     tag_search_results: int = Field(15, description="Max rows /tags replies with per query")
 
+    inpaint_relay_url: str | None = Field(
+        None,
+        description=(
+            "Base URL of the public inpaint_relay deployment (see inpaint_relay/ at "
+            'the repo root) — e.g. https://inpaint.example.com. Backs the "🖌️ Draw '
+            'Mask" hand-detail option, which opens a Telegram WebApp there for '
+            "freehand mask drawing. The button is omitted entirely when this is unset, "
+            "since the relay has to be reachable over the public internet for "
+            "Telegram's client to open it — there's no local fallback."
+        ),
+    )
+    inpaint_relay_shared_secret: str | None = Field(
+        None,
+        description=(
+            "Bearer secret shared with inpaint_relay's own INPAINT_RELAY_SHARED_SECRET "
+            "env var, authenticating comfytelegram's job-management calls (creating a "
+            "job, polling/pulling its result, deleting it). Never sent to the browser — "
+            "the relay's own webapp page and image/mask endpoints are reached by "
+            "unguessable per-job token instead, the same trust model as a Telegram "
+            "file_id download link."
+        ),
+    )
+    inpaint_poll_interval_seconds: float = Field(
+        3.0,
+        description=(
+            "How often the background poller checks inpaint_relay for a finished mask "
+            "drawing, per pending job (see storage.py's inpaint_job table). The relay "
+            "can't push to comfytelegram directly — the home box isn't reachable from "
+            "the public internet — so this is outbound polling, the same posture as "
+            "Telegram's own run_polling()."
+        ),
+    )
+
+    @field_validator("inpaint_relay_url")
+    @classmethod
+    def _require_scheme_and_strip_trailing_slash(cls, value: str | None) -> str | None:
+        """A bare hostname (e.g. `inpaint.example.com`, missing `https://`)
+        passes `str` validation fine but breaks every outbound relay call
+        with an opaque `aiohttp.InvalidUrlClientError` at the first button
+        tap/poll tick instead of a clear error at startup — fail loudly
+        here instead. Also strips one trailing slash so
+        `f"{url}/jobs"`-style building elsewhere never produces `//jobs`."""
+        if value is None:
+            return value
+        if not value.startswith(("http://", "https://")):
+            raise ValueError(
+                f"INPAINT_RELAY_URL must start with http:// or https:// (got {value!r})"
+            )
+        return value.rstrip("/")
+
     # NoDecode: pydantic-settings would otherwise try to JSON-decode this env
     # var before validation ever sees it (its default behavior for list-typed
     # fields), rejecting the plain "123,456" form env.example documents.

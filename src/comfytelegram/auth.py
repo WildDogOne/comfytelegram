@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+from urllib.parse import parse_qsl
+
 from telegram import CallbackQuery, Update
 
 from comfytelegram.settings import Settings
@@ -37,3 +41,31 @@ async def reject_if_unauthorized_callback(
         return False
     await query.answer("Not authorized.", show_alert=True)
     return True
+
+
+def validate_webapp_init_data(init_data: str, bot_token: str) -> dict[str, str] | None:
+    """Verify a Telegram WebApp's `Telegram.WebApp.initData` string per
+    Telegram's documented algorithm
+    (https://core.telegram.org/bots/webapps#validating-data-received-via-the-web-app),
+    returning the parsed fields if it's genuinely signed by this bot's
+    token, or None if the signature is missing/invalid.
+
+    This is the only thing standing between inpaint_relay (a public,
+    unauthenticated-by-design host — see `handlers.py`'s
+    `poll_inpaint_jobs`) and running an arbitrary mask through ComfyUI: the
+    relay itself never sees the bot token and can't check this, so
+    comfytelegram must, after pulling a submitted mask back from the relay
+    and before acting on it."""
+    try:
+        parsed = dict(parse_qsl(init_data, strict_parsing=True))
+    except ValueError:
+        return None
+    received_hash = parsed.pop("hash", None)
+    if not received_hash:
+        return None
+    data_check_string = "\n".join(f"{key}={value}" for key, value in sorted(parsed.items()))
+    secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+    expected_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected_hash, received_hash):
+        return None
+    return parsed

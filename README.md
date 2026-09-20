@@ -108,6 +108,9 @@ uv run comfytelegram
 | `WD14_MODEL_DIR` | no | `models/wd14` | local directory holding `model.onnx` + `selected_tags.csv` |
 | `WD14_TAG_THRESHOLD` | no | `0.35` | minimum WD14 tag confidence to include in a derived prompt |
 | `ALLOWED_USER_IDS` | no | (empty = anyone) | comma-separated Telegram numeric user IDs allowed to use the bot |
+| `INPAINT_RELAY_URL` | no | (unset = feature disabled) | base URL of a separately-deployed `inpaint_relay/` (see below) — backs **🖌️ Draw Mask** |
+| `INPAINT_RELAY_SHARED_SECRET` | only if `INPAINT_RELAY_URL` is set | — | must match the relay's own `INPAINT_RELAY_SHARED_SECRET` |
+| `INPAINT_POLL_INTERVAL_SECONDS` | no | `3` | how often to poll the relay for a finished mask drawing |
 
 (The settings file is named `settings.py` rather than `config.py`, and the
 template is `env.example` rather than `.env.example`, only because of a
@@ -121,7 +124,7 @@ see the Docker section below for the container case specifically.
 
 ## Running with Docker
 
-A `Dockerfile` and `docker-compose.yml` are included:
+A `Dockerfile` and `docker-compose.example.yml` are included:
 
 ```bash
 docker compose up -d --build
@@ -131,13 +134,43 @@ The container uses host networking by default (so `COMFYUI_HOST=127.0.0.1`/
 `OLLAMA_HOST=127.0.0.1` in `.env` reach ComfyUI/Ollama running directly on
 the same host, matching the non-Docker setup above) — Linux-only. On
 macOS/Windows, switch to the `extra_hosts`/`host.docker.internal`
-alternative commented in `docker-compose.yml` (set both `COMFYUI_HOST` and
+alternative commented in `docker-compose.example.yml` (set both `COMFYUI_HOST` and
 `OLLAMA_HOST` to `host.docker.internal` in that case). The `data/` directory
 (sqlite state + tag database), `model_profiles/`, and `models/wd14/` are
 bind-mounted from the repo, so they're the same files a bare `uv run
 comfytelegram` would use — no Docker volume commands needed to inspect or
 back them up, and no image rebuild needed to pick up a WD14 model you stage
 later (see [Image analysis](#image-analysis)).
+
+## Freehand mask drawing (🖌️ Draw Mask)
+
+**🖐️ Hand Detail**'s **🖌️ Draw Mask** option opens a real freehand mask
+editor inside Telegram, using [Telegram Web Apps](https://core.telegram.org/bots/webapps) —
+a button that opens an HTTPS page in the Telegram client itself. This needs
+a public HTTPS endpoint, which comfytelegram doesn't have on its own: it
+runs on whatever box has ComfyUI, reachable only outbound (to Telegram's own
+servers, via long-polling), never accepting inbound connections.
+
+That's what `inpaint_relay/` (a separate top-level directory in this repo)
+is for — a small, independently-deployed service meant to run on a
+different, *publicly* reachable host (e.g. one already running Traefik for
+other self-hosted services). It serves the mask-editor page and shuttles two
+blobs between comfytelegram and the user's phone: the source image out, the
+drawn mask back. It never talks to ComfyUI and never holds the Telegram bot
+token — comfytelegram itself validates that a submitted mask genuinely came
+from Telegram (via `Telegram.WebApp.initData`'s signature) after pulling it
+back, since the relay has no way to check that itself. See
+`inpaint_relay/README.md` for how to run/deploy it and
+`inpaint_relay/docker-compose.example.yml` for the Traefik label pattern.
+
+Because comfytelegram's own host typically isn't reachable from the public
+internet either, the two sides never talk to each other directly in the
+"public host calls back into comfytelegram" direction — comfytelegram polls
+the relay outbound for a finished drawing (`INPAINT_POLL_INTERVAL_SECONDS`),
+the same posture it already uses to poll Telegram itself. Leaving
+`INPAINT_RELAY_URL` unset skips all of this — the **🖌️ Draw Mask** button is
+simply omitted, and hand detailing falls back to **🤖 Auto-detect**/**✋ Tap
+to mark** as before.
 
 ## Using the bot
 
@@ -159,10 +192,12 @@ Every generated image comes with inline buttons:
 - **🔍 Upscale 4x** / **✨ Face Detail** / **🖐️ Hand Detail** — run that
   post-processing stage on this specific image and send the result (itself
   with its own buttons, so passes can be chained). **🖐️ Hand Detail** asks
-  **🤖 Auto-detect** (the usual YOLO/SAM detector) or **✋ Tap to mark**
-  first — the latter sends the image back with a grid overlay and one
-  button per cell, and inpaints a small mask centered on whichever cell you
-  tap, for when the detector can't find the hand at all.
+  **🤖 Auto-detect** (the usual YOLO/SAM detector), **✋ Tap to mark** (sends
+  the image back with a grid overlay and one button per cell, inpainting a
+  small mask centered on whichever cell you tap), or — only when
+  `INPAINT_RELAY_URL` is configured — **🖌️ Draw Mask**, which opens a
+  Telegram WebApp for drawing a real freehand mask instead of a fixed box.
+  See "Freehand mask drawing (🖌️ Draw Mask)" below for what that needs.
 - **🏷️ Analyze Image** — analyze *this image* with **both** the WD14 tagger and a
   Qwen-VL caption (regardless of the checkpoint's `prompt_style`), replying
   with two separate messages — one per analyzer — each carrying its own

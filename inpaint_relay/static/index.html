@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Draw mask</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #111;
+    --fg: #eee;
+    --accent: #2ea6ff;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overscroll-behavior: none;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    height: 100dvh;
+  }
+  #status {
+    padding: 10px 14px;
+    font-size: 14px;
+    text-align: center;
+  }
+  #canvas-wrap {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    touch-action: none;
+  }
+  #display-canvas {
+    max-width: 100%;
+    max-height: 100%;
+    touch-action: none;
+    border-radius: 4px;
+  }
+  #controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px calc(10px + env(safe-area-inset-bottom));
+  }
+  #controls label {
+    font-size: 13px;
+    white-space: nowrap;
+  }
+  #brush-size {
+    flex: 1;
+  }
+  button {
+    font-size: 15px;
+    padding: 10px 16px;
+    border: none;
+    border-radius: 8px;
+    background: #333;
+    color: var(--fg);
+  }
+  #done-btn {
+    background: var(--accent);
+    color: #fff;
+    font-weight: 600;
+  }
+  button:disabled {
+    opacity: 0.5;
+  }
+  #button-row {
+    display: flex;
+    gap: 10px;
+    padding: 0 14px calc(14px + env(safe-area-inset-bottom));
+  }
+  #button-row button {
+    flex: 1;
+  }
+</style>
+</head>
+<body>
+  <div id="status">Loading image…</div>
+  <div id="canvas-wrap">
+    <canvas id="display-canvas"></canvas>
+  </div>
+  <div id="controls">
+    <label for="brush-size">Brush</label>
+    <input type="range" id="brush-size" min="8" max="120" value="36" />
+  </div>
+  <div id="button-row">
+    <button id="clear-btn">Clear</button>
+    <button id="done-btn">Done</button>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) {
+    tg.ready();
+    tg.expand();
+  }
+
+  // The job token is the final path segment of this page's own URL —
+  // the relay serves this same static file for every job, so the page
+  // itself has to pull the token back out rather than being templated.
+  var token = location.pathname.split("/").filter(Boolean).pop();
+
+  var statusEl = document.getElementById("status");
+  var displayCanvas = document.getElementById("display-canvas");
+  var displayCtx = displayCanvas.getContext("2d");
+  var brushSizeInput = document.getElementById("brush-size");
+  var clearBtn = document.getElementById("clear-btn");
+  var doneBtn = document.getElementById("done-btn");
+
+  // Full-resolution mask, offscreen — this is what actually gets
+  // submitted. Kept at the source image's own pixel dimensions so the
+  // mask lines up 1:1 with it server-side, independent of however small
+  // the phone's screen makes `displayCanvas`.
+  var maskCanvas = document.createElement("canvas");
+  var maskCtx = maskCanvas.getContext("2d");
+
+  var image = new Image();
+  var drawing = false;
+  var scale = 1; // maskCanvas pixels per displayCanvas pixel
+
+  function setStatus(text) {
+    statusEl.textContent = text;
+  }
+
+  function pointFromEvent(evt) {
+    var rect = displayCanvas.getBoundingClientRect();
+    var clientX = evt.touches ? evt.touches[0].clientX : evt.clientX;
+    var clientY = evt.touches ? evt.touches[0].clientY : evt.clientY;
+    var xRatio = displayCanvas.width / rect.width;
+    var yRatio = displayCanvas.height / rect.height;
+    return {
+      x: (clientX - rect.left) * xRatio,
+      y: (clientY - rect.top) * yRatio,
+    };
+  }
+
+  function paintAt(x, y) {
+    var displayRadius = Number(brushSizeInput.value) / 2;
+    displayCtx.beginPath();
+    displayCtx.fillStyle = "rgba(255, 45, 45, 0.55)";
+    displayCtx.arc(x, y, displayRadius, 0, Math.PI * 2);
+    displayCtx.fill();
+
+    maskCtx.beginPath();
+    maskCtx.fillStyle = "#fff";
+    maskCtx.arc(x * scale, y * scale, displayRadius * scale, 0, Math.PI * 2);
+    maskCtx.fill();
+  }
+
+  function redrawImage() {
+    displayCtx.drawImage(image, 0, 0, displayCanvas.width, displayCanvas.height);
+  }
+
+  function resetMask() {
+    maskCtx.fillStyle = "#000";
+    maskCtx.fillRect(0, 0, maskCanvas.width, maskCanvas.height);
+    redrawImage();
+  }
+
+  function onPointerDown(evt) {
+    evt.preventDefault();
+    drawing = true;
+    var p = pointFromEvent(evt);
+    paintAt(p.x, p.y);
+  }
+
+  function onPointerMove(evt) {
+    if (!drawing) return;
+    evt.preventDefault();
+    var p = pointFromEvent(evt);
+    paintAt(p.x, p.y);
+  }
+
+  function onPointerUp() {
+    drawing = false;
+  }
+
+  displayCanvas.addEventListener("pointerdown", onPointerDown);
+  displayCanvas.addEventListener("pointermove", onPointerMove);
+  window.addEventListener("pointerup", onPointerUp);
+  displayCanvas.addEventListener("touchstart", onPointerDown, { passive: false });
+  displayCanvas.addEventListener("touchmove", onPointerMove, { passive: false });
+  window.addEventListener("touchend", onPointerUp);
+
+  clearBtn.addEventListener("click", resetMask);
+
+  doneBtn.addEventListener("click", function () {
+    doneBtn.disabled = true;
+    doneBtn.textContent = "Sending…";
+    maskCanvas.toBlob(function (blob) {
+      var form = new FormData();
+      form.append("mask", blob, "mask.png");
+      form.append("init_data", tg ? tg.initData : "");
+      fetch("/jobs/" + encodeURIComponent(token) + "/mask", {
+        method: "POST",
+        body: form,
+      })
+        .then(function (resp) {
+          if (!resp.ok) throw new Error("Upload failed: " + resp.status);
+          setStatus("Sent — you can close this.");
+          if (tg) {
+            tg.close();
+          }
+        })
+        .catch(function (err) {
+          setStatus("Couldn't send the mask (" + err.message + ") — try again.");
+          doneBtn.disabled = false;
+          doneBtn.textContent = "Done";
+        });
+    }, "image/png");
+  });
+
+  image.onload = function () {
+    // The display canvas's own pixel buffer is capped so the mask editor
+    // stays responsive on a large source image — it's just for drawing,
+    // not the final output, and `scale` maps every stroke back up to
+    // maskCanvas's full source-image resolution regardless of this cap.
+    var maxDisplayDim = 900;
+    var displayScale = Math.min(
+      1,
+      maxDisplayDim / Math.max(image.naturalWidth, image.naturalHeight)
+    );
+    displayCanvas.width = Math.round(image.naturalWidth * displayScale);
+    displayCanvas.height = Math.round(image.naturalHeight * displayScale);
+    maskCanvas.width = image.naturalWidth;
+    maskCanvas.height = image.naturalHeight;
+    scale = image.naturalWidth / displayCanvas.width;
+
+    resetMask();
+    setStatus("Draw over the area to fix, then tap Done.");
+  };
+  image.onerror = function () {
+    setStatus("Couldn't load the image — this link may have expired.");
+    doneBtn.disabled = true;
+    clearBtn.disabled = true;
+  };
+  image.src = "/jobs/" + encodeURIComponent(token) + "/image";
+})();
+</script>
+</body>
+</html>

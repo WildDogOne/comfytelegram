@@ -151,3 +151,53 @@ def test_renaming_inactive_character_leaves_activation_alone(storage: Storage):
     storage.set_active_character(1, "fox")
     storage.rename_character(1, "wolf", "coyote")
     assert storage.get_active_character_name(1) == "fox"
+
+
+def test_inpaint_job_roundtrip_carries_message_thread_id(storage: Storage):
+    storage.store_inpaint_job("tok1", "result1", 42, message_thread_id=827915)
+    (job,) = storage.list_inpaint_jobs()
+    assert job == {
+        "token": "tok1",
+        "result_id": "result1",
+        "chat_id": 42,
+        "message_thread_id": 827915,
+    }
+
+
+def test_inpaint_job_message_thread_id_defaults_to_none(storage: Storage):
+    # A chat with no forum topics has nothing to record here — Telegram
+    # itself gives such messages no message_thread_id at all.
+    storage.store_inpaint_job("tok1", "result1", 42)
+    (job,) = storage.list_inpaint_jobs()
+    assert job["message_thread_id"] is None
+
+
+def test_delete_inpaint_job_removes_it(storage: Storage):
+    storage.store_inpaint_job("tok1", "result1", 42)
+    storage.delete_inpaint_job("tok1")
+    assert storage.list_inpaint_jobs() == []
+
+
+def test_inpaint_job_message_thread_id_column_is_added_to_a_pre_existing_table(tmp_path: Path):
+    # Reproduces a real deployed database: `inpaint_job` already existed
+    # (created before `message_thread_id` was added), so `CREATE TABLE IF
+    # NOT EXISTS` is a no-op against it and the column needs its own
+    # guarded ALTER TABLE — see Storage.__init__'s _add_column_if_missing
+    # calls and CLAUDE.md's storage.py note on this exact pattern.
+    db_path = tmp_path / "state.sqlite3"
+    s1 = Storage(db_path)
+    with s1._conn:
+        s1._conn.execute("DROP TABLE inpaint_job")
+        s1._conn.execute(
+            "CREATE TABLE inpaint_job ("
+            "token TEXT PRIMARY KEY, result_id TEXT NOT NULL, "
+            "chat_id INTEGER NOT NULL, created_at REAL NOT NULL)"
+        )
+    s1.close()
+
+    s2 = Storage(db_path)
+    s2.store_inpaint_job("tok1", "result1", 42, message_thread_id=5)
+    assert s2.list_inpaint_jobs() == [
+        {"token": "tok1", "result_id": "result1", "chat_id": 42, "message_thread_id": 5}
+    ]
+    s2.close()

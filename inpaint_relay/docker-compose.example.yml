@@ -1,0 +1,35 @@
+# Example service block for inpaint_relay, using the same Traefik label
+# pattern as this host's other services (see e.g. immich's docker-compose.example.yml
+# `traefik.http.routers.*` labels) — merge this into your actual public-host
+# compose file (adjusting the network name to whatever Traefik watches
+# there), or run it standalone with `docker compose -f
+# docker-compose.example.yml up -d` on that same Traefik network.
+#
+# Copy env.example to .env first and fill it in (SUBDOMAIN/DOMAIN_NAME
+# below are substituted from that same .env by docker compose itself, the
+# same as env.example's own note explains; INPAINT_RELAY_SHARED_SECRET must
+# match comfytelegram's own .env).
+
+services:
+  inpaint-relay:
+    build: .
+    container_name: inpaint_relay
+    restart: unless-stopped
+    env_file:
+      - .env
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.inpaint-relay.rule=Host(`${SUBDOMAIN}.${DOMAIN_NAME}`)
+      - traefik.http.routers.inpaint-relay.tls=true
+      - traefik.http.routers.inpaint-relay.entrypoints=web,websecure
+      - traefik.http.routers.inpaint-relay.tls.certresolver=mytlschallenge
+      - traefik.http.services.inpaint-relay.loadbalancer.server.port=8000
+
+networks:
+  default:
+    # Replace with whatever external network your Traefik container is
+    # already attached to (e.g. the immich compose file's default network,
+    # or a dedicated "proxy" network) — this service just needs to be
+    # reachable by Traefik, not on the public internet directly itself.
+    external: true
+    name: your-traefik-network

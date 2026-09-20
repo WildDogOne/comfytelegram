@@ -1,3 +1,6 @@
+import pytest
+from pydantic import ValidationError
+
 from comfytelegram.settings import Settings
 
 
@@ -42,3 +45,20 @@ def test_comfyui_ws_base_uses_ws_by_default():
 def test_comfyui_ws_base_uses_wss_when_tls_enabled():
     settings = _settings(comfyui_host="example.com", comfyui_port=1234, comfyui_use_tls=True)
     assert settings.comfyui_ws_base == "wss://example.com:1234"
+
+
+def test_inpaint_relay_url_none_by_default():
+    assert _settings().inpaint_relay_url is None
+
+
+def test_inpaint_relay_url_rejects_a_bare_hostname():
+    # A schemeless value (e.g. copy-pasted straight from a DNS record)
+    # would otherwise break every outbound relay call with an opaque
+    # aiohttp.InvalidUrlClientError instead of a clear error at startup.
+    with pytest.raises(ValidationError, match="http://"):
+        _settings(inpaint_relay_url="inpaint.example.com")
+
+
+def test_inpaint_relay_url_strips_trailing_slash():
+    settings = _settings(inpaint_relay_url="https://inpaint.example.com/")
+    assert settings.inpaint_relay_url == "https://inpaint.example.com"

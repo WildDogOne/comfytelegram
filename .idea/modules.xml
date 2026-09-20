@@ -3,6 +3,7 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/.idea/comfytelegram.iml" filepath="$PROJECT_DIR$/.idea/comfytelegram.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/inpaint-relay.iml" filepath="$PROJECT_DIR$/.idea/inpaint-relay.iml" />
     </modules>
   </component>
 </project>

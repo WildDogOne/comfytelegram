@@ -9,6 +9,7 @@ live in `context.bot_data`, populated once at startup in `main.py`.
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import logging
 import re
@@ -19,24 +20,31 @@ from collections.abc import Awaitable
 from pathlib import Path
 from typing import Any, TypeVar
 
+import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 from telegram import (
+    Bot,
     CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
     ReplyKeyboardMarkup,
     Update,
+    WebAppInfo,
 )
 from telegram.constants import InlineKeyboardButtonLimit
-from telegram.ext import ContextTypes
+from telegram.ext import Application, ContextTypes
 
 from comfytelegram.analysis import (
     analyze_caption,
     analyze_caption_deep,
     analyze_tags,
 )
-from comfytelegram.auth import reject_if_unauthorized, reject_if_unauthorized_callback
+from comfytelegram.auth import (
+    reject_if_unauthorized,
+    reject_if_unauthorized_callback,
+    validate_webapp_init_data,
+)
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
 from comfytelegram.generation import GeneratedImage, generate, post_process, repeat
 from comfytelegram.message_text import message_text
@@ -78,6 +86,16 @@ UPSCALE_CANCEL_CALLBACK_KIND = "upscale_cancelled"
 #: `HAND_AUTO_CALLBACK_KIND` runs often can't find a hand at all.
 HAND_AUTO_CALLBACK_KIND = "hand_auto"
 HAND_MANUAL_CALLBACK_KIND = "hand_manual"
+#: A third `_hand_mode_keyboard` option, shown only when
+#: `Settings.inpaint_relay_url` is configured — opens a Telegram WebApp
+#: (see inpaint_relay/ at the repo root) for freehand mask drawing instead
+#: of a fixed box. See `hand_draw_callback`/`poll_inpaint_jobs`.
+HAND_DRAW_CALLBACK_KIND = "hand_draw"
+#: Timeout for every outbound call to inpaint_relay — it's a small,
+#: same-purpose-built service the bot fully controls the deployment of, so
+#: a slow/unreachable relay should fail fast rather than hang a poller tick
+#: or a button tap.
+_INPAINT_RELAY_TIMEOUT = aiohttp.ClientTimeout(total=15)
 #: Default grid resolution for "✋ Tap to mark" (see `_draw_hand_point_grid`/
 #: `_hand_point_keyboard`) — coarse enough to keep the keyboard to
 #: `HAND_POINT_GRID_SIZE` rows of `HAND_POINT_GRID_SIZE` buttons each. A hand
@@ -268,23 +286,29 @@ def _upscale_confirm_keyboard(result_id: str) -> InlineKeyboardMarkup:
     )
 
 
-def _hand_mode_keyboard(result_id: str) -> InlineKeyboardMarkup:
+def _hand_mode_keyboard(result_id: str, settings: Settings) -> InlineKeyboardMarkup:
     """Attached to "🖐️ Hand Detail"'s first reply — lets the user pick
-    auto-detection (today's YOLO/SAM behavior, `HAND_AUTO_CALLBACK_KIND`) or
+    auto-detection (today's YOLO/SAM behavior, `HAND_AUTO_CALLBACK_KIND`),
     tap a point themselves (`HAND_MANUAL_CALLBACK_KIND`) for when the
-    detector can't find the hand at all. See `postprocess_callback`."""
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "🤖 Auto-detect", callback_data=f"pp:{HAND_AUTO_CALLBACK_KIND}:{result_id}"
-                ),
-                InlineKeyboardButton(
-                    "✋ Tap to mark", callback_data=f"pp:{HAND_MANUAL_CALLBACK_KIND}:{result_id}"
-                ),
-            ]
-        ]
-    )
+    detector can't find the hand at all, or (only when
+    `settings.inpaint_relay_url` is configured) draw a freehand mask in a
+    Telegram WebApp (`HAND_DRAW_CALLBACK_KIND`, see `hand_draw_callback`).
+    See `postprocess_callback`."""
+    row = [
+        InlineKeyboardButton(
+            "🤖 Auto-detect", callback_data=f"pp:{HAND_AUTO_CALLBACK_KIND}:{result_id}"
+        ),
+        InlineKeyboardButton(
+            "✋ Tap to mark", callback_data=f"pp:{HAND_MANUAL_CALLBACK_KIND}:{result_id}"
+        ),
+    ]
+    if settings.inpaint_relay_url:
+        row.append(
+            InlineKeyboardButton(
+                "🖌️ Draw Mask", callback_data=f"pp:{HAND_DRAW_CALLBACK_KIND}:{result_id}"
+            )
+        )
+    return InlineKeyboardMarkup([row])
 
 
 def _draw_hand_point_grid(image_bytes: bytes, grid_size: int = HAND_POINT_GRID_SIZE) -> bytes:
@@ -614,6 +638,213 @@ async def _send_and_store_result(
     )
 
 
+async def _send_and_store_bot_result(
+    bot: Bot,
+    chat_id: int,
+    storage: Storage,
+    img: GeneratedImage,
+    *,
+    message_thread_id: int | None = None,
+) -> None:
+    """`_send_and_store_result`'s counterpart for code with no `Message` to
+    reply into — `poll_inpaint_jobs` runs as a background task, not in
+    response to an update, so it sends straight at `chat_id` via `bot.
+    send_photo`/`send_document` instead of `message.reply_photo`/
+    `reply_document`. `message_thread_id` must be passed through explicitly
+    for the same reason: unlike `message.reply_*` (which Telegram routes
+    into the replied-to message's own forum topic automatically), a bare
+    `chat_id` send has no topic context of its own and defaults to the
+    chat's General topic otherwise."""
+    result_id = uuid.uuid4().hex[:12]
+    reply_markup = _post_process_keyboard(result_id)
+    if len(img.data) <= TELEGRAM_PHOTO_SIZE_LIMIT:
+        sent = await bot.send_photo(
+            chat_id,
+            photo=io.BytesIO(img.data),
+            reply_markup=reply_markup,
+            message_thread_id=message_thread_id,
+        )
+    else:
+        sent = await bot.send_document(
+            chat_id,
+            document=io.BytesIO(img.data),
+            filename=img.filename,
+            caption="Sent as a file — too large for Telegram's photo size limit (10MB).",
+            reply_markup=reply_markup,
+            message_thread_id=message_thread_id,
+        )
+    storage.store_pending_result(
+        result_id,
+        chat_id,
+        _extract_file_id(sent),
+        img.filename,
+        _serialize_generation_params(img.full_params),
+    )
+
+
+async def _relay_create_job(settings: Settings, image_bytes: bytes) -> str:
+    """POST the source image to inpaint_relay's `POST /jobs`, returning the
+    job token it assigns. Raises on any HTTP/network failure — the caller
+    (`postprocess_callback`'s `HAND_DRAW_CALLBACK_KIND` branch) reports that
+    back to the chat like any other post-processing error."""
+    async with (
+        aiohttp.ClientSession(timeout=_INPAINT_RELAY_TIMEOUT) as session,
+        session.post(
+            f"{settings.inpaint_relay_url}/jobs",
+            data=image_bytes,
+            headers={"Authorization": f"Bearer {settings.inpaint_relay_shared_secret}"},
+        ) as resp,
+    ):
+        resp.raise_for_status()
+        payload = await resp.json()
+    return payload["token"]
+
+
+async def _relay_poll_result(settings: Settings, token: str) -> dict[str, Any] | None:
+    """GET a job's status from inpaint_relay's `GET /jobs/{token}/result`.
+    Returns None if it's still waiting on a drawing (`status="pending"`) or
+    the relay no longer knows about it at all (404 — e.g. a relay restart
+    lost its in-memory job store, see inpaint_relay's own docs), or
+    `{"mask": <bytes>, "init_data": <str>}` once the WebApp page has POSTed
+    a finished mask (`status="submitted"`)."""
+    async with (
+        aiohttp.ClientSession(timeout=_INPAINT_RELAY_TIMEOUT) as session,
+        session.get(
+            f"{settings.inpaint_relay_url}/jobs/{token}/result",
+            headers={"Authorization": f"Bearer {settings.inpaint_relay_shared_secret}"},
+        ) as resp,
+    ):
+        if resp.status == 404:
+            return None
+        resp.raise_for_status()
+        payload = await resp.json()
+    if payload.get("status") != "submitted":
+        return None
+    return {
+        "mask": base64.b64decode(payload["mask_base64"]),
+        "init_data": payload["init_data"],
+    }
+
+
+async def _relay_delete_job(settings: Settings, token: str) -> None:
+    """Best-effort cleanup of a consumed job on inpaint_relay — a failure
+    here just means the relay's own TTL sweep clears it out later instead,
+    so it's logged rather than raised."""
+    try:
+        async with aiohttp.ClientSession(timeout=_INPAINT_RELAY_TIMEOUT) as session:
+            await session.delete(
+                f"{settings.inpaint_relay_url}/jobs/{token}",
+                headers={"Authorization": f"Bearer {settings.inpaint_relay_shared_secret}"},
+            )
+    except Exception:
+        logger.warning("Failed to delete inpaint_relay job %s", token, exc_info=True)
+
+
+async def _process_one_inpaint_job(
+    application: Application,
+    settings: Settings,
+    storage: Storage,
+    client: ComfyClient,
+    job: dict[str, Any],
+) -> None:
+    """One `poll_inpaint_jobs` tick's worth of work for a single
+    outstanding job: check the relay, and if a mask has been drawn,
+    validate it actually came from Telegram (see `auth.
+    validate_webapp_init_data` — the relay itself can't check this, since
+    it never holds the bot token) before running it through
+    `post_process(kind="hand_drawn")` and posting the result. Every path
+    past that validation step (including failure) sends *something* into
+    the chat — this runs unattended, so silently dropping a job on error
+    would leave someone staring at the "Draw over the area..." message
+    forever with no idea whether it worked."""
+    token = job["token"]
+    chat_id = job["chat_id"]
+    message_thread_id = job["message_thread_id"]
+    result = await _relay_poll_result(settings, token)
+    if result is None:
+        return  # still pending, or the relay lost track of it — try again next tick
+
+    # Either way past this point, comfytelegram is done with this job —
+    # clear it locally and tell the relay it can forget it too.
+    storage.delete_inpaint_job(token)
+    await _relay_delete_job(settings, token)
+
+    verified = validate_webapp_init_data(result["init_data"], settings.telegram_bot_token)
+    if verified is None:
+        logger.warning("Dropping inpaint_relay job %s: invalid initData signature", token)
+        await application.bot.send_message(
+            chat_id,
+            "⚠️ Couldn't verify the mask editor submission — please try again.",
+            message_thread_id=message_thread_id,
+        )
+        return
+
+    pending = storage.get_pending_result(job["result_id"])
+    if pending is None:
+        logger.warning(
+            "Dropping inpaint_relay job %s: its source pending_result has expired", token
+        )
+        await application.bot.send_message(
+            chat_id,
+            "⚠️ That image has expired — generate a new one before drawing a mask.",
+            message_thread_id=message_thread_id,
+        )
+        return
+
+    status_message = await application.bot.send_message(
+        chat_id,
+        "Refining hand (drawn mask)…",
+        disable_notification=True,
+        message_thread_id=message_thread_id,
+    )
+    full_params = _deserialize_generation_params(pending["base_params"])
+    tg_file = await application.bot.get_file(pending["file_id"])
+    source_bytes = bytes(await tg_file.download_as_bytearray())
+
+    generated = await _run_reporting_errors(
+        status_message,
+        "Refining hand",
+        "hand-drawn post-processing",
+        post_process(
+            client,
+            "hand_drawn",
+            source_bytes,
+            pending["filename"],
+            full_params,
+            mask_bytes=result["mask"],
+        ),
+    )
+    if generated is None:
+        return
+    await status_message.delete()
+    await _send_and_store_bot_result(
+        application.bot, chat_id, storage, generated, message_thread_id=message_thread_id
+    )
+
+
+async def poll_inpaint_jobs(application: Application) -> None:
+    """Background task (started in main.py's `_post_init`, cancelled in
+    `_post_shutdown` — same pattern as the tag-db refresh task): every
+    `settings.inpaint_poll_interval_seconds`, checks inpaint_relay for each
+    outstanding "🖌️ Draw Mask" job (see storage.py's `inpaint_job` table).
+    The relay can't push to comfytelegram directly — the home box isn't
+    reachable from the public internet, only the relay's public host is —
+    so this is outbound polling, the same posture `run_polling()` already
+    uses against Telegram itself. Runs until cancelled; each job's failures
+    are isolated so one bad job (an unreachable relay, an expired
+    pending_result) doesn't stop the rest from being checked."""
+    settings: Settings = application.bot_data["settings"]
+    storage: Storage = application.bot_data["storage"]
+    while True:
+        await asyncio.sleep(settings.inpaint_poll_interval_seconds)
+        client: ComfyClient = application.bot_data["comfy_client"]
+        for job in storage.list_inpaint_jobs():
+            try:
+                await _process_one_inpaint_job(application, settings, storage, client, job)
+            except Exception:
+                logger.exception("Error polling inpaint_relay job %s", job["token"])
+
+
 _AnalyzerResult = TypeVar("_AnalyzerResult")
 
 
@@ -815,8 +1046,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     labels = _checkpoint_labels(checkpoints, profiles)
     buttons = [
-        [InlineKeyboardButton(label, callback_data=f"model:{i}")]
-        for i, label in enumerate(labels)
+        [InlineKeyboardButton(label, callback_data=f"model:{i}")] for i, label in enumerate(labels)
     ]
 
     await update.effective_message.reply_text(
@@ -1446,7 +1676,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if kind == "hand":
         await query.message.reply_text(
             "Auto-detect usually finds it, but you can mark the hand yourself if it keeps missing:",
-            reply_markup=_hand_mode_keyboard(result_id),
+            reply_markup=_hand_mode_keyboard(result_id, settings),
         )
         return
 
@@ -1458,6 +1688,38 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             photo=io.BytesIO(gridded),
             caption="Tap the cell over the hand:",
             reply_markup=_hand_point_keyboard(result_id),
+        )
+        return
+
+    if kind == HAND_DRAW_CALLBACK_KIND:
+        if not settings.inpaint_relay_url:
+            await query.message.reply_text("Mask drawing isn't configured on this bot.")
+            return
+        tg_file = await context.bot.get_file(pending["file_id"])
+        source_bytes = bytes(await tg_file.download_as_bytearray())
+        try:
+            token = await _relay_create_job(settings, source_bytes)
+        except Exception:
+            logger.exception("Failed to create inpaint_relay job")
+            await query.message.reply_text(
+                "Couldn't reach the mask editor server — try again later."
+            )
+            return
+        storage.store_inpaint_job(
+            token, result_id, pending["chat_id"], query.message.message_thread_id
+        )
+        await query.message.reply_text(
+            "Draw over the area to fix, then tap Done in the editor:",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🎨 Open mask editor",
+                            web_app=WebAppInfo(url=f"{settings.inpaint_relay_url}/jobs/{token}"),
+                        )
+                    ]
+                ]
+            ),
         )
         return
 

@@ -103,7 +103,23 @@ CREATE TABLE IF NOT EXISTS derived_prompt (
     negative_prompt TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS inpaint_job (
+    token TEXT PRIMARY KEY,
+    result_id TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    message_thread_id INTEGER,
+    created_at REAL NOT NULL
+);
 """
+
+#: How long an inpaint_job row can linger before the background poller (see
+#: handlers.py's `poll_inpaint_jobs`) gives up on it — generous enough for
+#: someone to actually draw a mask, but short enough that an abandoned
+#: WebApp tab doesn't poll the relay forever. Independent of
+#: PENDING_RESULT_TTL_SECONDS: that one guards re-downloadable Telegram
+#: file_ids meant to last months, this one guards a single in-flight draw.
+INPAINT_JOB_TTL_SECONDS = 30 * 60  # 30 minutes
 
 
 class Storage:
@@ -124,6 +140,7 @@ class Storage:
         # migrations framework, a new column on an existing table needs its
         # own guarded ALTER TABLE instead.
         self._add_column_if_missing("derived_prompt", "negative_prompt", "TEXT NOT NULL DEFAULT ''")
+        self._add_column_if_missing("inpaint_job", "message_thread_id", "INTEGER")
         #: Last `_prune()` sweep time per table — see PRUNE_INTERVAL_SECONDS.
         self._last_prune: dict[str, float] = {}
 
@@ -413,6 +430,62 @@ class Storage:
             "prompt": prompt,
             "negative_prompt": negative_prompt,
         }
+
+    def store_inpaint_job(
+        self, token: str, result_id: str, chat_id: int, message_thread_id: int | None = None
+    ) -> None:
+        """Record that `token` (an inpaint_relay job id — see
+        `handlers.py`'s `hand_draw_callback`) is waiting on a freehand mask
+        drawing for `result_id`'s source image. Sqlite-backed rather than an
+        in-memory dict so a bot restart doesn't strand a job the relay still
+        has pending — `poll_inpaint_jobs` reloads outstanding tokens from
+        here on every tick. `message_thread_id` is the forum topic (if any)
+        the "🖌️ Draw Mask" tap happened in — the poller has no `Message` to
+        reply to (it isn't handling an update), so this is what lets it
+        still send the eventual result into the right topic instead of the
+        chat's General one; see `handlers.py`'s `_process_one_inpaint_job`."""
+        self._prune_inpaint_jobs()
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO inpaint_job "
+                "(token, result_id, chat_id, message_thread_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (token, result_id, chat_id, message_thread_id, time.time()),
+            )
+
+    def list_inpaint_jobs(self) -> list[dict[str, Any]]:
+        """Every outstanding inpaint job token, for `poll_inpaint_jobs` to
+        check against the relay each tick."""
+        self._prune_inpaint_jobs()
+        rows = self._conn.execute(
+            "SELECT token, result_id, chat_id, message_thread_id FROM inpaint_job"
+        ).fetchall()
+        return [
+            {
+                "token": token,
+                "result_id": result_id,
+                "chat_id": chat_id,
+                "message_thread_id": message_thread_id,
+            }
+            for token, result_id, chat_id, message_thread_id in rows
+        ]
+
+    def delete_inpaint_job(self, token: str) -> None:
+        """Drop a job's tracking row — called once `poll_inpaint_jobs` has
+        either processed its finished mask or given up on it, mirroring the
+        matching cleanup call it makes against the relay itself."""
+        with self._conn:
+            self._conn.execute("DELETE FROM inpaint_job WHERE token = ?", (token,))
+
+    def _prune_inpaint_jobs(self) -> None:
+        """Drop rows older than `INPAINT_JOB_TTL_SECONDS` — an abandoned
+        WebApp tab (or a relay that lost the job, e.g. a restart) shouldn't
+        get polled forever. Unlike `_prune`, always runs (no
+        PRUNE_INTERVAL_SECONDS gate): this table is small and low-traffic
+        (one row per in-flight mask draw), not a hot per-image write path."""
+        cutoff = time.time() - INPAINT_JOB_TTL_SECONDS
+        with self._conn:
+            self._conn.execute("DELETE FROM inpaint_job WHERE created_at < ?", (cutoff,))
 
     def close(self) -> None:
         """Close the underlying sqlite connection."""

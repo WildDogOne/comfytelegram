@@ -1,3 +1,4 @@
+import asyncio
 import io
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
@@ -5,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 from PIL import Image
 
+from comfytelegram import generation
 from comfytelegram.comfy_client import JobProgress
 from comfytelegram.generation import (
     _detailer_found_nothing,
@@ -61,7 +63,7 @@ class _StubComfyClient:
             if node["class_type"] == "SaveImage"
         )
         return {
-            "status": {"status_str": "success"},
+            "status": {"status_str": "success", "completed": True},
             "outputs": {
                 save_node_id: {
                     "images": [{"filename": "out.png", "subfolder": "", "type": "output"}]
@@ -121,7 +123,7 @@ class _StubUploadingComfyClient(_StubComfyClient):
             outputs[detection_id] = {
                 "images": [{"filename": "mask.png", "subfolder": "", "type": "temp"}]
             }
-        return {"status": {"status_str": "success"}, "outputs": outputs}
+        return {"status": {"status_str": "success", "completed": True}, "outputs": outputs}
 
     async def get_image_bytes(self, filename: str, subfolder: str, folder_type: str) -> bytes:
         if filename == "mask.png":
@@ -293,6 +295,69 @@ async def test_post_process_hand_manual_requires_point_frac():
 
     with pytest.raises(AssertionError):
         await post_process(client, "hand_manual", source, "source.png", params)
+
+
+@pytest.mark.asyncio
+async def test_run_graph_falls_back_to_history_when_websocket_event_is_lost(monkeypatch):
+    """Reproduces a real, observed failure: ComfyUI can finish and drop a
+    fast job's terminal event before the websocket watcher ever sees it
+    (see `_run_graph`'s `_WS_EVENT_FALLBACK_SECONDS` docstring) — the job
+    still shows up in `/history` as completed, and `_run_graph` must not
+    hang forever waiting on an event that's already gone."""
+    monkeypatch.setattr(generation, "_WS_EVENT_FALLBACK_SECONDS", 0.01)
+
+    class _HangingEvents:
+        async def watch(self, prompt_id: str):
+            await asyncio.Event().wait()
+            yield  # pragma: no cover - never reached; makes this an async generator
+
+    class _StubHangingComfyClient(_StubUploadingComfyClient):
+        @asynccontextmanager
+        async def connect_events(self, *, client_id: str):
+            self.connected_client_id = client_id
+            yield _HangingEvents()
+
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubHangingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    result = await post_process(
+        client, "hand_manual", source, "source.png", params, point_frac=(0.5, 0.5)
+    )
+
+    assert result.data == source
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_drawn_never_flags_unchanged():
+    """A freehand-drawn mask has no detection-check node either (see
+    `build_hand_detailer_drawn_mask`) — it's never "nothing detected"."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    result = await post_process(client, "hand_drawn", source, "source.png", params, mask_bytes=mask)
+
+    assert result.unchanged is False
+    mask_load = next(n for n in client.queued_graph.values() if n["class_type"] == "LoadImageMask")
+    assert mask_load["inputs"]["image"] == "mask_source.png"
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_drawn_requires_mask_bytes():
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    with pytest.raises(AssertionError):
+        await post_process(client, "hand_drawn", source, "source.png", params)
 
 
 def test_to_post_process_base_carries_only_the_relevant_fields():

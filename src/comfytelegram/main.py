@@ -37,6 +37,7 @@ from comfytelegram.handlers import (
     model_callback,
     model_command,
     photo_message,
+    poll_inpaint_jobs,
     postprocess_callback,
     start,
     stop_command,
@@ -127,7 +128,9 @@ async def _post_init(application: Application) -> None:
     sync with the bot's actual commands on every startup instead of
     needing a manual BotFather edit whenever one is added/removed/
     reworded — and, unless disabled, fire the tag database's staleness
-    check as a background task (see `_start_tag_db_refresh`)."""
+    check as a background task (see `_start_tag_db_refresh`), plus the
+    inpaint_relay job poller if that feature is configured (see
+    `_start_inpaint_job_poller`)."""
     settings: Settings = application.bot_data["settings"]
     client = ComfyClient(settings.comfyui_http_base, settings.comfyui_ws_base)
     await client.__aenter__()
@@ -143,6 +146,22 @@ async def _post_init(application: Application) -> None:
     )
 
     _start_tag_db_refresh(application, settings)
+    _start_inpaint_job_poller(application, settings)
+
+
+def _start_inpaint_job_poller(application: Application, settings: Settings) -> None:
+    """Fire `poll_inpaint_jobs` as an unawaited background task, the same
+    way `_start_tag_db_refresh` does for the tag database — only when
+    `inpaint_relay_url` is configured, since there's nothing to poll
+    otherwise (see `Settings.inpaint_relay_url`, `handlers._hand_mode_keyboard`).
+    Stashed in `bot_data` purely to keep a strong reference (an
+    unreferenced asyncio task can be garbage-collected mid-flight) and so
+    `_post_shutdown` can cancel it."""
+    if not settings.inpaint_relay_url:
+        return
+    application.bot_data["inpaint_job_poll_task"] = asyncio.create_task(
+        poll_inpaint_jobs(application)
+    )
 
 
 def _start_tag_db_refresh(application: Application, settings: Settings) -> None:
@@ -178,6 +197,9 @@ async def _post_shutdown(application: Application) -> None:
     tag_db_refresh_task: asyncio.Task | None = application.bot_data.get("tag_db_refresh_task")
     if tag_db_refresh_task is not None:
         tag_db_refresh_task.cancel()
+    inpaint_job_poll_task: asyncio.Task | None = application.bot_data.get("inpaint_job_poll_task")
+    if inpaint_job_poll_task is not None:
+        inpaint_job_poll_task.cancel()
     client: ComfyClient | None = application.bot_data.get("comfy_client")
     if client is not None:
         await client.__aexit__(None, None, None)

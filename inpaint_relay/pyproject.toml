@@ -1,0 +1,20 @@
+[project]
+name = "inpaint-relay"
+version = "0.1.0"
+description = "Public-host relay for comfytelegram's Telegram WebApp mask editor"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.118.0",
+    "python-multipart>=0.0.20",
+    "uvicorn>=0.38.0",
+]
+
+[tool.uv]
+# This is a small standalone service run in place (`uv run uvicorn server:app`),
+# not a library — nothing imports it as a package, so it doesn't need to be
+# built/installed itself, just its dependencies resolved.
+package = false
+
+[tool.ruff]
+line-length = 100
