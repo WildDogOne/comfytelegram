@@ -78,6 +78,25 @@
     background: var(--accent);
     color: #fff;
   }
+  #brush-cursor {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 0;
+    height: 0;
+    box-sizing: border-box;
+    border-radius: 50%;
+    border: 2px solid rgba(255, 45, 45, 0.9);
+    background: rgba(255, 45, 45, 0.15);
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    display: none;
+    z-index: 10;
+  }
+  #brush-cursor.erasing {
+    border-color: rgba(255, 255, 255, 0.9);
+    background: rgba(255, 255, 255, 0.15);
+  }
   #button-row {
     display: flex;
     gap: 10px;
@@ -93,6 +112,7 @@
   <div id="canvas-wrap">
     <canvas id="display-canvas"></canvas>
   </div>
+  <div id="brush-cursor"></div>
   <div id="controls">
     <label for="brush-size">Brush</label>
     <input type="range" id="brush-size" min="8" max="120" value="36" />
@@ -125,6 +145,7 @@
   var clearBtn = document.getElementById("clear-btn");
   var doneBtn = document.getElementById("done-btn");
   var eraseBtn = document.getElementById("erase-btn");
+  var brushCursor = document.getElementById("brush-cursor");
 
   // Full-resolution mask, offscreen — this is what actually gets
   // submitted. Kept at the source image's own pixel dimensions so the
@@ -151,6 +172,36 @@
 
   function setStatus(text) {
     statusEl.textContent = text;
+  }
+
+  // `#brush-cursor` is `position: fixed`, sized/positioned straight from
+  // viewport coordinates — no relative-ancestor math needed, and it stays
+  // correct across the canvas's own centering/scaling inside `#canvas-wrap`.
+  // Its diameter is set in *CSS* pixels, not `displayCanvas`'s own pixel
+  // buffer size — those differ whenever `max-width`/`max-height` scales the
+  // canvas down to fit the screen (see `image.onload`), so brush size (a
+  // canvas-pixel value) has to be converted through the canvas's current
+  // on-screen size, same conversion `pointFromEvent` does in reverse.
+  function updateCursorSize() {
+    var rect = displayCanvas.getBoundingClientRect();
+    var cssPxPerCanvasPx = rect.width / displayCanvas.width;
+    var diameterCss = Number(brushSizeInput.value) * cssPxPerCanvasPx;
+    brushCursor.style.width = diameterCss + "px";
+    brushCursor.style.height = diameterCss + "px";
+  }
+
+  function moveCursor(clientX, clientY) {
+    brushCursor.style.left = clientX + "px";
+    brushCursor.style.top = clientY + "px";
+  }
+
+  function showCursor() {
+    updateCursorSize();
+    brushCursor.style.display = "block";
+  }
+
+  function hideCursor() {
+    brushCursor.style.display = "none";
   }
 
   function pointFromEvent(evt) {
@@ -246,12 +297,49 @@
   displayCanvas.addEventListener("touchmove", onPointerMove, { passive: false });
   window.addEventListener("touchend", onPointerUp);
 
+  // Cursor tracking is independent of the drawing listeners above (DOM
+  // allows multiple listeners per event) so it keeps working — showing
+  // where the *next* dab will land — even while just hovering, not
+  // dragging. Both pointer and touch events are wired, same dual-path
+  // belt-and-suspenders as the drawing listeners above.
+  displayCanvas.addEventListener("pointerenter", showCursor);
+  displayCanvas.addEventListener("pointerleave", hideCursor);
+  displayCanvas.addEventListener("pointerdown", function (evt) {
+    moveCursor(evt.clientX, evt.clientY);
+    showCursor();
+  });
+  displayCanvas.addEventListener("pointermove", function (evt) {
+    moveCursor(evt.clientX, evt.clientY);
+  });
+  displayCanvas.addEventListener(
+    "touchstart",
+    function (evt) {
+      var t = evt.touches[0];
+      if (!t) return;
+      moveCursor(t.clientX, t.clientY);
+      showCursor();
+    },
+    { passive: true }
+  );
+  displayCanvas.addEventListener(
+    "touchmove",
+    function (evt) {
+      var t = evt.touches[0];
+      if (t) moveCursor(t.clientX, t.clientY);
+    },
+    { passive: true }
+  );
+  window.addEventListener("touchend", hideCursor);
+  brushSizeInput.addEventListener("input", updateCursorSize);
+  window.addEventListener("resize", updateCursorSize);
+
   clearBtn.addEventListener("click", resetMask);
 
   eraseBtn.addEventListener("click", function () {
     erasing = !erasing;
     eraseBtn.classList.toggle("active", erasing);
     eraseBtn.textContent = erasing ? "🖌️ Brush" : "🧹 Erase";
+    brushCursor.classList.toggle("erasing", erasing);
   });
 
   doneBtn.addEventListener("click", function () {
