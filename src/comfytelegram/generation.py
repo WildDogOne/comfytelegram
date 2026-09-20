@@ -117,6 +117,9 @@ def _to_post_process_base(params: GenerationParams) -> PostProcessBaseParams:
         clip_type=params.clip_type,
         vae_name=params.vae_name,
         model_sampling_shift=params.model_sampling_shift,
+        tile_controlnet=params.tile_controlnet,
+        tile_controlnet_strength=params.tile_controlnet_strength,
+        upscale_denoise=params.upscale_denoise,
     )
 
 
@@ -245,7 +248,10 @@ async def post_process(
 
     detection_node_id: str | None = None
     if kind == "upscale":
-        prompt_graph, save_node_id = build_upscale(uploaded_name, base_params, UpscaleParams())
+        upscale_params = UpscaleParams()
+        if base_params.upscale_denoise is not None:
+            upscale_params = replace(upscale_params, denoise=base_params.upscale_denoise)
+        prompt_graph, save_node_id = build_upscale(uploaded_name, base_params, upscale_params)
     elif kind == "face":
         prompt_graph, save_node_id, detection_node_id = build_face_detailer(
             uploaded_name, base_params, FaceDetailerParams()

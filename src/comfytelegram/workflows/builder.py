@@ -105,6 +105,25 @@ class GenerationParams:
     #: after the UNET load (Anima's AuraFlow-style sampling); `None` skips
     #: that node entirely for split architectures that don't need it.
     model_sampling_shift: float | None = None
+    #: `build_upscale` only: a ControlNet Tile model filename (loaded via
+    #: `ControlNetLoader`) to condition the UltimateSDUpscale pass on the
+    #: pre-upscale source image. `UltimateSDUpscale` itself crops this hint
+    #: per tile, so it adds detail across the whole image instead of just
+    #: the face/hand-detailer regions, while staying structurally faithful
+    #: to the source. `None` (the default) skips the branch entirely — an
+    #: architecture fact like `loader`/`clip_name` above (a tile ControlNet
+    #: trained for one base model won't work on another), so it rides the
+    #: same profile-to-`GenerationParams`-to-`PostProcessBaseParams` path.
+    tile_controlnet: str | None = None
+    #: `ControlNetApplyAdvanced`'s `strength` for `tile_controlnet` above.
+    tile_controlnet_strength: float = 0.4
+    #: `build_upscale` only: overrides `UpscaleParams.denoise` for this
+    #: checkpoint's "🔍 Upscale 4x" pass. Unlike `tile_controlnet` above this
+    #: is a tunable generation setting rather than an architecture fact, so
+    #: it comes from a profile's `defaults` block (`ProfileDefaults.
+    #: upscale_denoise`) instead of riding straight off the profile. `None`
+    #: (the default) leaves `UpscaleParams.denoise`'s own default in place.
+    upscale_denoise: float | None = None
     #: The exact text the user typed, before `resolve_generation_params`
     #: folded in the profile's `positive_prompt_prefix`/
     #: `negative_prompt_prefix` or an active character's saved prompt.
@@ -206,6 +225,9 @@ class PostProcessBaseParams:
     clip_type: str = "stable_diffusion"
     vae_name: str = ""
     model_sampling_shift: float | None = None
+    tile_controlnet: str | None = None
+    tile_controlnet_strength: float = 0.4
+    upscale_denoise: float | None = None
 
 
 def _build_model_clip_vae(
@@ -313,13 +335,36 @@ def build_upscale(
         "UpscaleModelLoader", {"model_name": params.upscale_model}, title="Upscale Model"
     )
 
+    positive_ref: list[Any] = [positive, 0]
+    negative_ref: list[Any] = [negative, 0]
+    if base.tile_controlnet:
+        cn_loader = g.add(
+            "ControlNetLoader", {"control_net_name": base.tile_controlnet}, title="ControlNet Tile"
+        )
+        cn_apply = g.add(
+            "ControlNetApplyAdvanced",
+            {
+                "positive": positive_ref,
+                "negative": negative_ref,
+                "control_net": [cn_loader, 0],
+                "image": [load, 0],
+                "vae": list(vae_ref),
+                "strength": base.tile_controlnet_strength,
+                "start_percent": 0.0,
+                "end_percent": 1.0,
+            },
+            title="Apply ControlNet Tile",
+        )
+        positive_ref = [cn_apply, 0]
+        negative_ref = [cn_apply, 1]
+
     upscale = g.add(
         "UltimateSDUpscale",
         {
             "image": [load, 0],
             "model": list(model_ref),
-            "positive": [positive, 0],
-            "negative": [negative, 0],
+            "positive": positive_ref,
+            "negative": negative_ref,
             "vae": list(vae_ref),
             "upscale_model": [upscale_model, 0],
             "upscale_by": params.upscale_by,

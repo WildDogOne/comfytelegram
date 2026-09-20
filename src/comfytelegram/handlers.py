@@ -507,6 +507,9 @@ def _serialize_generation_params(params: GenerationParams) -> dict[str, Any]:
         "clip_type": params.clip_type,
         "vae_name": params.vae_name,
         "model_sampling_shift": params.model_sampling_shift,
+        "tile_controlnet": params.tile_controlnet,
+        "tile_controlnet_strength": params.tile_controlnet_strength,
+        "upscale_denoise": params.upscale_denoise,
         "raw_positive_prompt": params.raw_positive_prompt,
         "raw_negative_prompt": params.raw_negative_prompt,
     }
@@ -536,6 +539,9 @@ def _deserialize_generation_params(data: dict[str, Any]) -> GenerationParams:
         clip_type=data.get("clip_type", "stable_diffusion"),
         vae_name=data.get("vae_name", ""),
         model_sampling_shift=data.get("model_sampling_shift"),
+        tile_controlnet=data.get("tile_controlnet"),
+        tile_controlnet_strength=data.get("tile_controlnet_strength", 0.4),
+        upscale_denoise=data.get("upscale_denoise"),
         raw_positive_prompt=data.get("raw_positive_prompt", ""),
         raw_negative_prompt=data.get("raw_negative_prompt", ""),
     )

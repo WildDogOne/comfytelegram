@@ -244,6 +244,29 @@ async def test_post_process_upscale_never_flags_unchanged():
 
 
 @pytest.mark.asyncio
+async def test_post_process_upscale_honors_profile_upscale_denoise():
+    """A profile's `defaults.upscale_denoise` (e.g. furrytoonmix_illustrious.json,
+    tuned alongside its `tile_controlnet`) must actually reach the queued
+    UltimateSDUpscale node instead of always using UpscaleParams' own 0.2
+    default."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        upscale_denoise=0.5,
+    )
+
+    await post_process(client, "upscale", source, "source.png", params)
+
+    upscale_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "UltimateSDUpscale"
+    )
+    assert upscale_node["inputs"]["denoise"] == 0.5
+
+
+@pytest.mark.asyncio
 async def test_post_process_hand_manual_never_flags_unchanged():
     """A manually-marked mask has no detection-check node either (see
     `build_hand_detailer_manual`) — it's never "nothing detected"."""
@@ -321,6 +344,37 @@ def test_to_post_process_base_carries_split_loader_fields():
     assert base.clip_type == "stable_diffusion"
     assert base.vae_name == "qwen_image_vae.safetensors"
     assert base.model_sampling_shift == 3.0
+
+
+def test_to_post_process_base_carries_tile_controlnet_fields():
+    """Without this, a checkpoint with a tile ControlNet configured would
+    lose it on every post-processing pass since build_upscale only sees
+    PostProcessBaseParams, not the original GenerationParams."""
+    params = GenerationParams(
+        checkpoint="illustriousXL_v10.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        tile_controlnet_strength=0.55,
+    )
+
+    base = _to_post_process_base(params)
+
+    assert base.tile_controlnet == "xinsir_tile_sdxl.safetensors"
+    assert base.tile_controlnet_strength == 0.55
+
+
+def test_to_post_process_base_carries_upscale_denoise():
+    params = GenerationParams(
+        checkpoint="illustriousXL_v10.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+        upscale_denoise=0.5,
+    )
+
+    base = _to_post_process_base(params)
+
+    assert base.upscale_denoise == 0.5
 
 
 @pytest.mark.asyncio

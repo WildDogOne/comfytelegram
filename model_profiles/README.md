@@ -24,7 +24,8 @@ Files starting with `_` are ignored (reserved for docs/schema files).
     "scheduler": "normal",
     "clip_skip": -2,
     "width": 1024,
-    "height": 1024
+    "height": 1024,
+    "upscale_denoise": 0.2              // UltimateSDUpscale's denoise for "🔍 Upscale 4x" (omit to use its own default) — see below
   },
   "positive_prompt_prefix": "quality tags prepended before the user's prompt",
   "negative_prompt_prefix": "used as the negative prompt whenever the user doesn't supply one",
@@ -42,7 +43,9 @@ Files starting with `_` are ignored (reserved for docs/schema files).
   "clip_name": "",                     // "split" only: CLIPLoader's text-encoder filename
   "clip_type": "stable_diffusion",     // "split" only: CLIPLoader's `type` input
   "vae_name": "",                      // "split" only: VAELoader's filename
-  "model_sampling_shift": null         // "split" only: shift for a ModelSamplingAuraFlow node (omit/null to skip it)
+  "model_sampling_shift": null,        // "split" only: shift for a ModelSamplingAuraFlow node (omit/null to skip it)
+  "tile_controlnet": null,             // ControlNet Tile model filename for the upscale pass (omit/null to skip it) — see below
+  "tile_controlnet_strength": 0.4      // ControlNetApplyAdvanced's strength for tile_controlnet
 }
 ```
 
@@ -94,3 +97,28 @@ normal way through `defaults` — Anima Aesthetic and Anima Turbo just want
 very different values for them (the two shipped profiles already reflect
 that). `clip_skip` isn't meaningful for a non-CLIP text encoder like
 Anima's, so leave it unset (`-1`, i.e. "don't add that node").
+
+### `tile_controlnet` — detail across the whole image, not just faces/hands
+
+The face/hand detailers only touch the regions Impact Pack's detector
+crops out, so a scene's background/clothing/etc. can end up looking flat
+next to a sharp face after a 4x upscale. Setting `tile_controlnet` to a
+ControlNet Tile model's filename (staged under `models/controlnet/`) adds
+a `ControlNetLoader`+`ControlNetApplyAdvanced` branch to the upscale pass,
+conditioned on the pre-upscale source image — `UltimateSDUpscale` crops
+that hint per tile itself, so it stays structurally faithful to the source
+while still re-diffusing (and therefore adding texture/detail to) every
+tile, not just the detailer regions. Must be a ControlNet trained for this
+checkpoint's base architecture (an SDXL tile ControlNet won't work on an
+Anima/AuraFlow checkpoint, for example) — leave it `null`/omitted if you
+don't have a matching one staged. `tile_controlnet_strength` tunes how
+strongly it holds the upscale to the source; too high fights the extra
+denoise you actually want, too low lets tiles drift/seam.
+
+`tile_controlnet` alone doesn't add detail, though — it just makes it
+*safe* to raise `defaults.upscale_denoise` (how much `UltimateSDUpscale`
+actually re-diffuses per tile) without the image drifting off-structure.
+The two are meant to be tuned together: `furrytoonmix_illustrious.json`
+sets `upscale_denoise: 0.5` (up from the conservative `0.2` the base
+UpscaleParams default mirrors from `sample.json`) precisely because it
+also has a `tile_controlnet` staged to anchor that extra denoise.

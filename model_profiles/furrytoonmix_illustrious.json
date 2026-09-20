@@ -7,7 +7,8 @@
     "steps": 30,
     "sampler_name": "euler_ancestral",
     "scheduler": "normal",
-    "clip_skip": -2
+    "clip_skip": -2,
+    "upscale_denoise": 0.5
   },
   "prompt_style": "tags",
   "tag_dictionary": "e621",
@@ -32,5 +33,7 @@
       "strength_clip": 1.0,
       "default_enabled": false
     }
-  ]
+  ],
+  "tile_controlnet": "xinsir_tile_sdxl.safetensors",
+  "tile_controlnet_strength": 0.25
 }

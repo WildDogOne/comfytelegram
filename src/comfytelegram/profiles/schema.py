@@ -46,6 +46,7 @@ class ProfileDefaults(BaseModel):
     width: int | None = None
     height: int | None = None
     batch_size: int | None = None
+    upscale_denoise: float | None = None
 
 
 class ModelProfile(BaseModel):
@@ -121,4 +122,19 @@ class ModelProfile(BaseModel):
             "the UNET load (Anima's AuraFlow-style sampling). Leave unset for split "
             "architectures that don't need it."
         ),
+    )
+
+    tile_controlnet: str | None = Field(
+        None,
+        description=(
+            "Filename of a ControlNet Tile model (in ComfyUI's models/controlnet) to "
+            "condition the post-processing upscale pass on, for adding detail across "
+            "the whole image instead of just the face/hand-detailer regions. Must be "
+            "trained for this checkpoint's base architecture (e.g. an SDXL tile "
+            "ControlNet won't work on an Anima/AuraFlow checkpoint). Unset (the "
+            "default) skips the branch entirely."
+        ),
+    )
+    tile_controlnet_strength: float = Field(
+        0.4, description="tile_controlnet only: ControlNetApplyAdvanced's strength"
     )

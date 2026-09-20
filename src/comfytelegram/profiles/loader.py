@@ -126,6 +126,8 @@ def resolve_generation_params(
             "clip_type": profile.clip_type,
             "vae_name": profile.vae_name,
             "model_sampling_shift": profile.model_sampling_shift,
+            "tile_controlnet": profile.tile_controlnet,
+            "tile_controlnet_strength": profile.tile_controlnet_strength,
         }
     else:
         positive_prompt = user_prompt

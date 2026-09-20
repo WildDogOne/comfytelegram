@@ -108,6 +108,30 @@ def test_resolve_generation_params_defaults_to_checkpoint_loader_without_profile
     assert params.clip_name == ""
     assert params.vae_name == ""
     assert params.model_sampling_shift is None
+    assert params.tile_controlnet is None
+    assert params.upscale_denoise is None
+
+
+def test_resolve_generation_params_carries_upscale_denoise_from_profile_defaults():
+    profile = ModelProfile(
+        match=["furrytoonmix_*"],
+        display_name="FurryToonMix Test",
+        defaults=ProfileDefaults(upscale_denoise=0.5),
+    )
+    params = resolve_generation_params("furrytoonmix_xlIllustriousV2.safetensors", "a fox", profile)
+    assert params.upscale_denoise == 0.5
+
+
+def test_resolve_generation_params_carries_tile_controlnet_from_profile():
+    profile = ModelProfile(
+        match=["illustriousxl*"],
+        display_name="Illustrious Test",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        tile_controlnet_strength=0.55,
+    )
+    params = resolve_generation_params("illustriousxl_v10.safetensors", "a fox", profile)
+    assert params.tile_controlnet == "xinsir_tile_sdxl.safetensors"
+    assert params.tile_controlnet_strength == 0.55
 
 
 def test_resolve_generation_params_carries_split_loader_fields_from_profile():

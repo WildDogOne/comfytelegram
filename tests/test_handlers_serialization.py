@@ -43,8 +43,35 @@ def test_generation_params_roundtrip_through_serialization():
     assert restored.clip_type == params.clip_type
     assert restored.vae_name == params.vae_name
     assert restored.model_sampling_shift == params.model_sampling_shift
+    assert restored.tile_controlnet == params.tile_controlnet
+    assert restored.tile_controlnet_strength == params.tile_controlnet_strength
+    assert restored.upscale_denoise == params.upscale_denoise
     assert restored.raw_positive_prompt == params.raw_positive_prompt
     assert restored.raw_negative_prompt == params.raw_negative_prompt
+
+
+def test_tile_controlnet_params_roundtrip_through_serialization():
+    params = GenerationParams(
+        checkpoint="illustriousxl_v10.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        tile_controlnet_strength=0.55,
+    )
+    restored = _deserialize_generation_params(_serialize_generation_params(params))
+    assert restored.tile_controlnet == "xinsir_tile_sdxl.safetensors"
+    assert restored.tile_controlnet_strength == 0.55
+
+
+def test_upscale_denoise_roundtrips_through_serialization():
+    params = GenerationParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+        upscale_denoise=0.5,
+    )
+    restored = _deserialize_generation_params(_serialize_generation_params(params))
+    assert restored.upscale_denoise == 0.5
 
 
 def test_split_loader_params_roundtrip_through_serialization():

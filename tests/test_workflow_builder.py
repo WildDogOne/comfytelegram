@@ -194,6 +194,54 @@ def test_build_upscale_wires_source_image_and_saves():
     ]
 
 
+def test_build_upscale_without_tile_controlnet_skips_the_branch():
+    base = PostProcessBaseParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+    )
+    prompt, _save_id = build_upscale("uploaded.png", base, UpscaleParams())
+
+    types = _class_types(prompt)
+    assert "ControlNetLoader" not in types
+    assert "ControlNetApplyAdvanced" not in types
+
+    text_encodes = {nid: n for nid, n in prompt.items() if n["class_type"] == "CLIPTextEncode"}
+    positive_id = next(nid for nid, n in text_encodes.items() if n["inputs"]["text"] == "a fox")
+    upscale_node = next(n for n in prompt.values() if n["class_type"] == "UltimateSDUpscale")
+    assert upscale_node["inputs"]["positive"] == [positive_id, 0]
+
+
+def test_build_upscale_with_tile_controlnet_wires_apply_between_prompt_and_upscale():
+    base = PostProcessBaseParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        tile_controlnet_strength=0.55,
+    )
+    prompt, _save_id = build_upscale("uploaded.png", base, UpscaleParams())
+
+    types = _class_types(prompt)
+    assert types.count("ControlNetLoader") == 1
+    assert types.count("ControlNetApplyAdvanced") == 1
+
+    loader = next(n for n in prompt.values() if n["class_type"] == "ControlNetLoader")
+    assert loader["inputs"]["control_net_name"] == "xinsir_tile_sdxl.safetensors"
+
+    load_id = next(nid for nid, n in prompt.items() if n["class_type"] == "LoadImage")
+    apply = next(n for n in prompt.values() if n["class_type"] == "ControlNetApplyAdvanced")
+    assert apply["inputs"]["image"] == [load_id, 0]
+    assert apply["inputs"]["strength"] == 0.55
+
+    apply_id = next(
+        nid for nid, n in prompt.items() if n["class_type"] == "ControlNetApplyAdvanced"
+    )
+    upscale_node = next(n for n in prompt.values() if n["class_type"] == "UltimateSDUpscale")
+    assert upscale_node["inputs"]["positive"] == [apply_id, 0]
+    assert upscale_node["inputs"]["negative"] == [apply_id, 1]
+
+
 def test_build_face_detailer_wires_detector_and_sam():
     base = PostProcessBaseParams(
         checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
