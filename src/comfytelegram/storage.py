@@ -29,6 +29,16 @@ context manager commits on a clean exit and rolls back on an exception, so
 a method that writes two tables (e.g. `delete_character` clearing the
 active-character row too) can't leave the first write dangling uncommitted
 if the second one raises.
+
+`inpaint_redo` is the one deliberate exception to the "file_id, never raw
+bytes" reasoning above: it backs "🔁 Redo (same mask)" on a hand-drawn-mask
+result (`handlers.py`'s `HAND_REDO_CALLBACK_KIND`), which needs the exact
+drawn mask back to re-run `post_process(kind="hand_drawn")` against a fresh
+seed. Unlike a source/result image, that mask was never itself sent to
+Telegram as a message — it only ever existed as raw bytes passed straight
+into ComfyUI — so there's no `file_id` to point at in the first place, and
+storing the (small, single-purpose grayscale PNG) bytes directly here is
+the only option, not a shortcut around one that already existed.
 """
 
 from __future__ import annotations
@@ -109,6 +119,14 @@ CREATE TABLE IF NOT EXISTS inpaint_job (
     result_id TEXT NOT NULL,
     chat_id INTEGER NOT NULL,
     message_thread_id INTEGER,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS inpaint_redo (
+    result_id TEXT PRIMARY KEY,
+    source_file_id TEXT NOT NULL,
+    source_filename TEXT NOT NULL,
+    mask_png BLOB NOT NULL,
     created_at REAL NOT NULL
 );
 """
@@ -486,6 +504,47 @@ class Storage:
         cutoff = time.time() - INPAINT_JOB_TTL_SECONDS
         with self._conn:
             self._conn.execute("DELETE FROM inpaint_job WHERE created_at < ?", (cutoff,))
+
+    def store_inpaint_redo(
+        self, result_id: str, source_file_id: str, source_filename: str, mask_png: bytes
+    ) -> None:
+        """Record what "🔁 Redo (same mask)" (`handlers.py`'s
+        `HAND_REDO_CALLBACK_KIND`) needs to re-run a hand-drawn-mask
+        refinement against a fresh seed: the pre-refinement source image's
+        Telegram `file_id` (re-downloadable, same as `pending_result`) and
+        the drawn mask's raw PNG bytes — see this module's docstring for why
+        that specific blob, unlike everything else in here, has no `file_id`
+        of its own to point at instead. Keyed by the *same* `result_id` as
+        the `pending_result` row for the refined image this mask produced —
+        `postprocess_callback` looks both up together, and either expiring
+        invalidates the redo button the same way. `_prune`'s default TTL
+        (`PENDING_RESULT_TTL_SECONDS`) keeps them in sync in practice."""
+        self._prune("inpaint_redo")
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO inpaint_redo "
+                "(result_id, source_file_id, source_filename, mask_png, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (result_id, source_file_id, source_filename, mask_png, time.time()),
+            )
+
+    def get_inpaint_redo(self, result_id: str) -> dict[str, Any] | None:
+        """The row `store_inpaint_redo` wrote for `result_id`, or None if it
+        doesn't exist (never stored — not every result has a redoable
+        mask — or pruned past its TTL)."""
+        row = self._conn.execute(
+            "SELECT source_file_id, source_filename, mask_png FROM inpaint_redo "
+            "WHERE result_id = ?",
+            (result_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        source_file_id, source_filename, mask_png = row
+        return {
+            "source_file_id": source_file_id,
+            "source_filename": source_filename,
+            "mask_png": bytes(mask_png),
+        }
 
     def close(self) -> None:
         """Close the underlying sqlite connection."""

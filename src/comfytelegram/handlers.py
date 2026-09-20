@@ -91,6 +91,12 @@ HAND_MANUAL_CALLBACK_KIND = "hand_manual"
 #: (see inpaint_relay/ at the repo root) for freehand mask drawing instead
 #: of a fixed box. See `hand_draw_callback`/`poll_inpaint_jobs`.
 HAND_DRAW_CALLBACK_KIND = "hand_draw"
+#: Attached to a "🖌️ Draw Mask" result (both the first one, from
+#: `_process_one_inpaint_job`, and every subsequent redo) — re-runs the
+#: exact same source image and drawn mask through `post_process
+#: (kind="hand_drawn")` again for a fresh seed/result, without having to
+#: redraw the mask from scratch. See `storage.py`'s `inpaint_redo`.
+HAND_REDO_CALLBACK_KIND = "hand_redo"
 #: Timeout for every outbound call to inpaint_relay — it's a small,
 #: same-purpose-built service the bot fully controls the deployment of, so
 #: a slow/unreachable relay should fail fast rather than hang a poller tick
@@ -309,6 +315,14 @@ def _hand_mode_keyboard(result_id: str, settings: Settings) -> InlineKeyboardMar
             )
         )
     return InlineKeyboardMarkup([row])
+
+
+def _hand_redo_button(result_id: str) -> InlineKeyboardButton:
+    """The extra keyboard row `_send_and_store_result`/`_send_and_store_bot_result`
+    attach to a "🖌️ Draw Mask" result — see `HAND_REDO_CALLBACK_KIND`."""
+    return InlineKeyboardButton(
+        "🔁 Redo (same mask)", callback_data=f"pp:{HAND_REDO_CALLBACK_KIND}:{result_id}"
+    )
 
 
 def _draw_hand_point_grid(image_bytes: bytes, grid_size: int = HAND_POINT_GRID_SIZE) -> bytes:
@@ -620,15 +634,29 @@ async def _run_reporting_errors(
 
 
 async def _send_and_store_result(
-    message: Message, chat_id: int, storage: Storage, img: GeneratedImage
-) -> None:
+    message: Message,
+    chat_id: int,
+    storage: Storage,
+    img: GeneratedImage,
+    *,
+    result_id: str | None = None,
+    extra_keyboard_rows: list[list[InlineKeyboardButton]] | None = None,
+) -> str:
     """Send a generated image with its post-processing keyboard, then persist
     what those buttons need (a re-downloadable file_id + the params to build
-    the next graph) so they still work after a bot restart — see storage.py."""
-    result_id = uuid.uuid4().hex[:12]
-    sent = await _send_result_image(
-        message, img.data, img.filename, _post_process_keyboard(result_id)
-    )
+    the next graph) so they still work after a bot restart — see storage.py.
+    `result_id` defaults to a fresh uuid like every button here, but a
+    caller that needs to know it ahead of time to embed in its own extra
+    button (`extra_keyboard_rows`, appended below the standard ones — see
+    `postprocess_callback`'s `HAND_REDO_CALLBACK_KIND` branch) can pass one
+    in instead. Returns whichever id was actually used."""
+    result_id = result_id or uuid.uuid4().hex[:12]
+    reply_markup = _post_process_keyboard(result_id)
+    if extra_keyboard_rows:
+        reply_markup = InlineKeyboardMarkup(
+            list(reply_markup.inline_keyboard) + extra_keyboard_rows
+        )
+    sent = await _send_result_image(message, img.data, img.filename, reply_markup)
     storage.store_pending_result(
         result_id,
         chat_id,
@@ -636,6 +664,7 @@ async def _send_and_store_result(
         img.filename,
         _serialize_generation_params(img.full_params),
     )
+    return result_id
 
 
 async def _send_and_store_bot_result(
@@ -645,7 +674,9 @@ async def _send_and_store_bot_result(
     img: GeneratedImage,
     *,
     message_thread_id: int | None = None,
-) -> None:
+    result_id: str | None = None,
+    extra_keyboard_rows: list[list[InlineKeyboardButton]] | None = None,
+) -> str:
     """`_send_and_store_result`'s counterpart for code with no `Message` to
     reply into — `poll_inpaint_jobs` runs as a background task, not in
     response to an update, so it sends straight at `chat_id` via `bot.
@@ -654,9 +685,14 @@ async def _send_and_store_bot_result(
     for the same reason: unlike `message.reply_*` (which Telegram routes
     into the replied-to message's own forum topic automatically), a bare
     `chat_id` send has no topic context of its own and defaults to the
-    chat's General topic otherwise."""
-    result_id = uuid.uuid4().hex[:12]
+    chat's General topic otherwise. `result_id`/`extra_keyboard_rows` mirror
+    `_send_and_store_result`'s — see there."""
+    result_id = result_id or uuid.uuid4().hex[:12]
     reply_markup = _post_process_keyboard(result_id)
+    if extra_keyboard_rows:
+        reply_markup = InlineKeyboardMarkup(
+            list(reply_markup.inline_keyboard) + extra_keyboard_rows
+        )
     if len(img.data) <= TELEGRAM_PHOTO_SIZE_LIMIT:
         sent = await bot.send_photo(
             chat_id,
@@ -680,6 +716,7 @@ async def _send_and_store_bot_result(
         img.filename,
         _serialize_generation_params(img.full_params),
     )
+    return result_id
 
 
 async def _relay_create_job(settings: Settings, image_bytes: bytes) -> str:
@@ -738,6 +775,37 @@ async def _relay_delete_job(settings: Settings, token: str) -> None:
             )
     except Exception:
         logger.warning("Failed to delete inpaint_relay job %s", token, exc_info=True)
+
+
+async def _run_hand_drawn_post_process(
+    client: ComfyClient,
+    status_message: Message,
+    source_bytes: bytes,
+    source_filename: str,
+    full_params: GenerationParams,
+    mask_bytes: bytes,
+) -> GeneratedImage | None:
+    """Shared by `_process_one_inpaint_job` (a freshly submitted mask) and
+    `postprocess_callback`'s `HAND_REDO_CALLBACK_KIND` branch (re-running a
+    previously drawn one against a fresh seed — see storage.py's
+    `inpaint_redo` — for when a detailer result comes out badly and
+    redrawing the whole mask from scratch would be overkill) — both need
+    the exact same `post_process` call, status-message error reporting, and
+    status-message cleanup around it. Returns None on failure (already
+    reported into `status_message` by `_run_reporting_errors`); callers
+    should treat that as "stop here", same as `_run_reporting_errors`
+    itself."""
+    generated = await _run_reporting_errors(
+        status_message,
+        "Refining hand",
+        "hand-drawn post-processing",
+        post_process(
+            client, "hand_drawn", source_bytes, source_filename, full_params, mask_bytes=mask_bytes
+        ),
+    )
+    if generated is not None:
+        await status_message.delete()
+    return generated
 
 
 async def _process_one_inpaint_job(
@@ -801,24 +869,23 @@ async def _process_one_inpaint_job(
     tg_file = await application.bot.get_file(pending["file_id"])
     source_bytes = bytes(await tg_file.download_as_bytearray())
 
-    generated = await _run_reporting_errors(
-        status_message,
-        "Refining hand",
-        "hand-drawn post-processing",
-        post_process(
-            client,
-            "hand_drawn",
-            source_bytes,
-            pending["filename"],
-            full_params,
-            mask_bytes=result["mask"],
-        ),
+    generated = await _run_hand_drawn_post_process(
+        client, status_message, source_bytes, pending["filename"], full_params, result["mask"]
     )
     if generated is None:
         return
-    await status_message.delete()
+    new_result_id = uuid.uuid4().hex[:12]
     await _send_and_store_bot_result(
-        application.bot, chat_id, storage, generated, message_thread_id=message_thread_id
+        application.bot,
+        chat_id,
+        storage,
+        generated,
+        message_thread_id=message_thread_id,
+        result_id=new_result_id,
+        extra_keyboard_rows=[[_hand_redo_button(new_result_id)]],
+    )
+    storage.store_inpaint_redo(
+        new_result_id, pending["file_id"], pending["filename"], result["mask"]
     )
 
 
@@ -1541,8 +1608,14 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     (downloads the source, overlays a tap grid via `_draw_hand_point_grid`,
     and replies with it plus `_hand_point_keyboard` — a grid-cell tap is
     handled by the separate `hand_point_callback`, not this function, since
-    it needs a row/col in its callback_data). Alerts instead if `result_id`
-    has expired (see `PENDING_RESULT_TTL_SECONDS`)."""
+    it needs a row/col in its callback_data). `HAND_REDO_CALLBACK_KIND`
+    ("🔁 Redo (same mask)", attached to every hand-drawn-mask result) skips
+    the WebApp editor entirely and re-runs `post_process(kind="hand_drawn")`
+    against the exact same source image and mask stored in `storage.py`'s
+    `inpaint_redo` — a fresh call gets a fresh seed automatically (see
+    `DrawnMaskHandDetailerParams.seed`'s default), so a bad detailer result
+    doesn't require redrawing the whole mask just to try again. Alerts
+    instead if `result_id` has expired (see `PENDING_RESULT_TTL_SECONDS`)."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
@@ -1747,6 +1820,42 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         finally:
             uploads_in_progress.discard(result_id)
+        return
+
+    if kind == HAND_REDO_CALLBACK_KIND:
+        redo = storage.get_inpaint_redo(result_id)
+        if redo is None:
+            await query.message.reply_text(
+                "That mask has expired — draw a new one with 🖌️ Draw Mask."
+            )
+            return
+        tg_file = await context.bot.get_file(redo["source_file_id"])
+        source_bytes = bytes(await tg_file.download_as_bytearray())
+        status_message = await query.message.reply_text(
+            "Refining hand (drawn mask)…", disable_notification=True
+        )
+        generated = await _run_hand_drawn_post_process(
+            client,
+            status_message,
+            source_bytes,
+            redo["source_filename"],
+            full_params,
+            redo["mask_png"],
+        )
+        if generated is None:
+            return
+        new_result_id = uuid.uuid4().hex[:12]
+        await _send_and_store_result(
+            query.message,
+            pending["chat_id"],
+            storage,
+            generated,
+            result_id=new_result_id,
+            extra_keyboard_rows=[[_hand_redo_button(new_result_id)]],
+        )
+        storage.store_inpaint_redo(
+            new_result_id, redo["source_file_id"], redo["source_filename"], redo["mask_png"]
+        )
         return
 
     if kind == HAND_AUTO_CALLBACK_KIND:

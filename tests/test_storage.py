@@ -201,3 +201,33 @@ def test_inpaint_job_message_thread_id_column_is_added_to_a_pre_existing_table(t
         {"token": "tok1", "result_id": "result1", "chat_id": 42, "message_thread_id": 5}
     ]
     s2.close()
+
+
+def test_inpaint_redo_roundtrip(storage: Storage):
+    assert storage.get_inpaint_redo("result1") is None
+    storage.store_inpaint_redo("result1", "file123", "source.png", b"\x89PNGmaskbytes")
+    assert storage.get_inpaint_redo("result1") == {
+        "source_file_id": "file123",
+        "source_filename": "source.png",
+        "mask_png": b"\x89PNGmaskbytes",
+    }
+
+
+def test_inpaint_redo_is_scoped_per_result_id(storage: Storage):
+    storage.store_inpaint_redo("result1", "file123", "a.png", b"mask-a")
+    assert storage.get_inpaint_redo("result2") is None
+
+
+def test_inpaint_redo_survives_reopen(tmp_path: Path):
+    db_path = tmp_path / "state.sqlite3"
+    s1 = Storage(db_path)
+    s1.store_inpaint_redo("result1", "file123", "source.png", b"mask-bytes")
+    s1.close()
+
+    s2 = Storage(db_path)
+    assert s2.get_inpaint_redo("result1") == {
+        "source_file_id": "file123",
+        "source_filename": "source.png",
+        "mask_png": b"mask-bytes",
+    }
+    s2.close()
