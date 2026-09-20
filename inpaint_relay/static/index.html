@@ -171,18 +171,20 @@
   var erasing = false;
   var scale = 1; // maskCanvas pixels per displayCanvas pixel
 
-  // Two-finger pinch-zoom/pan of `displayCanvas` itself, via a CSS
-  // transform — one finger is already spoken for (drawing), so zoom/pan
-  // has to live on a second finger, same convention most drawing apps
-  // use. `view.zoom`/`tx`/`ty` name a `translate(tx, ty) scale(zoom)`
-  // transform (`transform-origin: 0 0`, see the CSS) applied straight to
-  // `#display-canvas` — deliberately not to `#canvas-wrap`, so
-  // `canvas-wrap`'s own `overflow: hidden` box (the visible "window")
-  // stays put on screen and just clips whatever of the transformed canvas
-  // pokes outside it, instead of the whole window growing with the zoom.
-  // `pointFromEvent`/`updateCursorSize` need no changes at all for this —
-  // both already read the canvas's *current* `getBoundingClientRect()`,
-  // which the browser computes post-transform automatically.
+  // Zoom/pan of `displayCanvas` itself, via a CSS transform — two-finger
+  // pinch on touch (one finger is already spoken for by drawing, so zoom/pan
+  // has to live on a second finger, same convention most drawing apps use)
+  // or mousewheel/trackpad on desktop, where there's no second finger at
+  // all (see `handleWheel`). `view.zoom`/`tx`/`ty` name a
+  // `translate(tx, ty) scale(zoom)` transform (`transform-origin: 0 0`, see
+  // the CSS) applied straight to `#display-canvas` — deliberately not to
+  // `#canvas-wrap`, so `canvas-wrap`'s own `overflow: hidden` box (the
+  // visible "window") stays put on screen and just clips whatever of the
+  // transformed canvas pokes outside it, instead of the whole window
+  // growing with the zoom. `pointFromEvent`/`updateCursorSize` need no
+  // changes at all for this — both already read the canvas's *current*
+  // `getBoundingClientRect()`, which the browser computes post-transform
+  // automatically.
   var view = { zoom: 1, tx: 0, ty: 0 };
   var pinch = null;
   // True from the moment a second finger touches down until *every*
@@ -268,30 +270,40 @@
     return { x: (t0.clientX + t1.clientX) / 2, y: (t0.clientY + t1.clientY) / 2 };
   }
 
-  function startPinch(t0, t1) {
-    // `rect.left/top` is always `layoutLeft/Top + view.tx/ty` — the
-    // transform's own translate component doesn't change where the
-    // *untransformed* box would sit in flex-centered layout — so this
-    // recovers that fixed layout position from the current (already
-    // transformed) rect without ever having to reset the transform to
-    // measure it.
+  // `rect.left/top` is always `layoutLeft/Top + view.tx/ty` — the
+  // transform's own translate component doesn't change where the
+  // *untransformed* box would sit in flex-centered layout — so this
+  // recovers that fixed layout position, and the canvas-local point
+  // currently sitting under (clientX, clientY), from the current (already
+  // transformed) rect without ever having to reset the transform to
+  // measure it. Shared by `startPinch` (anchor captured once, held fixed
+  // for the rest of that gesture) and wheel-zoom (recomputed fresh every
+  // discrete tick, since there's no single continuous gesture to anchor).
+  function canvasAnchorPoint(clientX, clientY) {
     var rect = displayCanvas.getBoundingClientRect();
     var layoutLeft = rect.left - view.tx;
     var layoutTop = rect.top - view.ty;
+    return {
+      layoutLeft: layoutLeft,
+      layoutTop: layoutTop,
+      x: (clientX - layoutLeft - view.tx) / view.zoom,
+      y: (clientY - layoutTop - view.ty) / view.zoom,
+    };
+  }
+
+  function startPinch(t0, t1) {
     var mid = touchMidpoint(t0, t1);
+    var anchor = canvasAnchorPoint(mid.x, mid.y);
     pinch = {
       startDist: touchDistance(t0, t1),
       startZoom: view.zoom,
-      layoutLeft: layoutLeft,
-      layoutTop: layoutTop,
+      layoutLeft: anchor.layoutLeft,
+      layoutTop: anchor.layoutTop,
       // The canvas-local point (in `displayCanvas`'s own unscaled CSS
       // pixels) currently sitting under the pinch midpoint — held fixed
       // under that midpoint as the gesture continues, which is what makes
       // a pinch feel anchored rather than the image sliding around.
-      anchor: {
-        x: (mid.x - layoutLeft - view.tx) / view.zoom,
-        y: (mid.y - layoutTop - view.ty) / view.zoom,
-      },
+      anchor: { x: anchor.x, y: anchor.y },
     };
   }
 
@@ -314,6 +326,40 @@
     }
     applyView();
   }
+
+  // Mousewheel/trackpad zoom, for desktop where there's no second finger
+  // to pinch with. Each event is its own discrete step rather than one
+  // continuous gesture, so — unlike `startPinch`/`updatePinch`, which cache
+  // an anchor once and hold it for the gesture's duration — the anchor is
+  // recomputed fresh from the *current* view every tick, then applied
+  // immediately; consecutive ticks compose correctly since each one starts
+  // from where the last left off.
+  var WHEEL_ZOOM_SENSITIVITY = 0.0015;
+
+  function zoomAtPoint(clientX, clientY, factor) {
+    var anchor = canvasAnchorPoint(clientX, clientY);
+    var newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, view.zoom * factor));
+    if (newZoom === view.zoom) return;
+    view.zoom = newZoom;
+    if (newZoom <= MIN_ZOOM) {
+      // Same "pinched all the way back in" reset as updatePinch — snap the
+      // pan back too rather than leaving a stray offset at rest zoom.
+      view.tx = 0;
+      view.ty = 0;
+    } else {
+      view.tx = clientX - anchor.layoutLeft - newZoom * anchor.x;
+      view.ty = clientY - anchor.layoutTop - newZoom * anchor.y;
+    }
+    applyView();
+  }
+
+  function handleWheel(evt) {
+    evt.preventDefault();
+    var factor = Math.exp(-evt.deltaY * WHEEL_ZOOM_SENSITIVITY);
+    zoomAtPoint(evt.clientX, evt.clientY, factor);
+  }
+
+  displayCanvas.addEventListener("wheel", handleWheel, { passive: false });
 
   function setStatus(text) {
     statusEl.textContent = text;
@@ -435,6 +481,36 @@
     drawing = false;
   }
 
+  // Middle- or right-button drag pans instead of drawing — desktop's
+  // equivalent of the second-finger pinch/pan below, for a mouse that only
+  // ever has one point of contact. `setPointerCapture` keeps `pointermove`
+  // targeting `displayCanvas` even once the drag crosses outside its
+  // bounds (routine when panning a zoomed-in image toward its edge), the
+  // same way an ordinary left-button stroke already relies on `pointerup`
+  // being bound to `window` rather than the canvas for the same reason.
+  var panState = null;
+
+  function startPan(evt) {
+    // A chorded second button (e.g. right-click while still mid-stroke
+    // from an earlier left-button press) ends that stroke rather than
+    // drawing and panning at once.
+    endStroke();
+    hideCursor();
+    panState = { startX: evt.clientX, startY: evt.clientY, startTx: view.tx, startTy: view.ty };
+    try {
+      displayCanvas.setPointerCapture(evt.pointerId);
+    } catch (e) {
+      // Unsupported in some embedded WebViews — panning still works, it
+      // just won't track past the canvas's own edge.
+    }
+  }
+
+  function updatePan(evt) {
+    view.tx = panState.startTx + (evt.clientX - panState.startX);
+    view.ty = panState.startTy + (evt.clientY - panState.startY);
+    applyView();
+  }
+
   // Mouse/pen only below — touch is handled entirely separately
   // (`handleTouchStart`/`Move`/`End`), since a pinch needs the full
   // `evt.touches` list a single-pointer Pointer Event can't give it (each
@@ -447,6 +523,12 @@
   function onPointerDown(evt) {
     if (evt.pointerType === "touch") return;
     evt.preventDefault();
+    if (panState) return; // already panning on another button — ignore the rest of the chord
+    if (evt.button === 1 || evt.button === 2) {
+      startPan(evt);
+      return;
+    }
+    if (evt.button !== 0 || drawing) return;
     moveCursor(evt.clientX, evt.clientY);
     showCursor();
     var p = pointFromEvent(evt);
@@ -456,6 +538,10 @@
   function onPointerMove(evt) {
     if (evt.pointerType === "touch") return;
     evt.preventDefault();
+    if (panState) {
+      updatePan(evt);
+      return;
+    }
     moveCursor(evt.clientX, evt.clientY);
     var p = pointFromEvent(evt);
     continueStroke(p.x, p.y);
@@ -463,6 +549,10 @@
 
   function onPointerUp(evt) {
     if (evt.pointerType === "touch") return;
+    if (panState) {
+      panState = null;
+      return;
+    }
     endStroke();
   }
 
@@ -476,6 +566,11 @@
   displayCanvas.addEventListener("pointerleave", function (evt) {
     if (evt.pointerType === "touch") return;
     hideCursor();
+  });
+  // Right-button drag pans (above) rather than opening the browser's
+  // context menu.
+  displayCanvas.addEventListener("contextmenu", function (evt) {
+    evt.preventDefault();
   });
 
   // One finger draws; a second finger switches to pinch-zoom/pan for the
