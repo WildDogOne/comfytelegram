@@ -1695,32 +1695,58 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         if not settings.inpaint_relay_url:
             await query.message.reply_text("Mask drawing isn't configured on this bot.")
             return
-        tg_file = await context.bot.get_file(pending["file_id"])
-        source_bytes = bytes(await tg_file.download_as_bytearray())
-        try:
-            token = await _relay_create_job(settings, source_bytes)
-        except Exception:
-            logger.exception("Failed to create inpaint_relay job")
+        # Uploading a large source image to a remote relay host can take a
+        # few seconds, with nothing on screen to show for it in the
+        # meantime — long enough that a user unsure whether their tap
+        # registered taps "Draw Mask" again. `uploads_in_progress` (checked
+        # and set synchronously, no `await` in between, so two concurrently
+        # scheduled taps on the same result_id can't both pass the check)
+        # turns a repeat tap into a no-op reply instead of a second relay
+        # job/editor button; `status_message`, sent before the upload even
+        # starts, is the actual "yes, this registered" feedback.
+        uploads_in_progress: set[str] = context.bot_data.setdefault(
+            "inpaint_uploads_in_progress", set()
+        )
+        if result_id in uploads_in_progress:
             await query.message.reply_text(
-                "Couldn't reach the mask editor server — try again later."
+                "Still uploading that image to the mask editor — hang tight."
             )
             return
-        storage.store_inpaint_job(
-            token, result_id, pending["chat_id"], query.message.message_thread_id
-        )
-        await query.message.reply_text(
-            "Draw over the area to fix, then tap Done in the editor:",
-            reply_markup=InlineKeyboardMarkup(
-                [
+        uploads_in_progress.add(result_id)
+        try:
+            status_message = await query.message.reply_text(
+                "Uploading image to the mask editor…", disable_notification=True
+            )
+            tg_file = await context.bot.get_file(pending["file_id"])
+            source_bytes = bytes(await tg_file.download_as_bytearray())
+            try:
+                token = await _relay_create_job(settings, source_bytes)
+            except Exception:
+                logger.exception("Failed to create inpaint_relay job")
+                await status_message.edit_text(
+                    "Couldn't reach the mask editor server — try again later."
+                )
+                return
+            storage.store_inpaint_job(
+                token, result_id, pending["chat_id"], query.message.message_thread_id
+            )
+            await status_message.edit_text(
+                "Draw over the area to fix, then tap Done in the editor:",
+                reply_markup=InlineKeyboardMarkup(
                     [
-                        InlineKeyboardButton(
-                            "🎨 Open mask editor",
-                            web_app=WebAppInfo(url=f"{settings.inpaint_relay_url}/jobs/{token}"),
-                        )
+                        [
+                            InlineKeyboardButton(
+                                "🎨 Open mask editor",
+                                web_app=WebAppInfo(
+                                    url=f"{settings.inpaint_relay_url}/jobs/{token}"
+                                ),
+                            )
+                        ]
                     ]
-                ]
-            ),
-        )
+                ),
+            )
+        finally:
+            uploads_in_progress.discard(result_id)
         return
 
     if kind == HAND_AUTO_CALLBACK_KIND:

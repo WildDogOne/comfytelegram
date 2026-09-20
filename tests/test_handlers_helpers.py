@@ -1,3 +1,4 @@
+import asyncio
 import io
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -934,6 +935,105 @@ async def test_hand_manual_sends_a_gridded_photo_with_point_buttons():
     callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
     assert len(callback_data) == HAND_POINT_GRID_SIZE**2 + 1
     assert f"hp:abc123:{HAND_POINT_GRID_SIZE}:0:0" in callback_data
+
+
+@pytest.mark.asyncio
+async def test_hand_draw_shows_an_uploading_status_before_the_editor_button():
+    query = AsyncMock()
+    query.data = f"pp:{HAND_DRAW_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    context.bot_data["settings"] = _settings(inpaint_relay_url="https://inpaint.example.com")
+
+    status_message = AsyncMock()
+    query.message.reply_text.return_value = status_message
+
+    with patch("comfytelegram.handlers._relay_create_job", new=AsyncMock(return_value="tok1")):
+        await postprocess_callback(update, context)
+
+    query.message.reply_text.assert_awaited_once_with(
+        "Uploading image to the mask editor…", disable_notification=True
+    )
+    status_message.edit_text.assert_awaited_once()
+    edit_call = status_message.edit_text.await_args
+    assert "Draw over the area" in edit_call.args[0]
+    button = edit_call.kwargs["reply_markup"].inline_keyboard[0][0]
+    assert button.web_app.url == "https://inpaint.example.com/jobs/tok1"
+    storage.store_inpaint_job.assert_called_once_with(
+        "tok1", "abc123", 1, query.message.message_thread_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_hand_draw_relay_failure_edits_the_status_message_not_a_new_reply():
+    query = AsyncMock()
+    query.data = f"pp:{HAND_DRAW_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    context.bot_data["settings"] = _settings(inpaint_relay_url="https://inpaint.example.com")
+
+    status_message = AsyncMock()
+    query.message.reply_text.return_value = status_message
+
+    with patch(
+        "comfytelegram.handlers._relay_create_job", new=AsyncMock(side_effect=RuntimeError("boom"))
+    ):
+        await postprocess_callback(update, context)
+
+    query.message.reply_text.assert_awaited_once()
+    status_message.edit_text.assert_awaited_once_with(
+        "Couldn't reach the mask editor server — try again later."
+    )
+    storage.store_inpaint_job.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hand_draw_a_second_tap_while_uploading_does_not_start_a_second_job():
+    query = AsyncMock()
+    query.data = f"pp:{HAND_DRAW_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    context.bot_data["settings"] = _settings(inpaint_relay_url="https://inpaint.example.com")
+    query.message.reply_text.return_value = AsyncMock()
+
+    upload_started = asyncio.Event()
+    release_upload = asyncio.Event()
+
+    async def _slow_relay_create_job(*_args, **_kwargs) -> str:
+        upload_started.set()
+        await release_upload.wait()
+        return "tok1"
+
+    relay_create_job_mock = AsyncMock(side_effect=_slow_relay_create_job)
+    with patch("comfytelegram.handlers._relay_create_job", new=relay_create_job_mock):
+        first_tap = asyncio.create_task(postprocess_callback(update, context))
+        await upload_started.wait()
+
+        await postprocess_callback(update, context)
+
+        release_upload.set()
+        await first_tap
+
+    assert relay_create_job_mock.await_count == 1
+    storage.store_inpaint_job.assert_called_once()
+    assert query.message.reply_text.await_args_list[-1].args[0] == (
+        "Still uploading that image to the mask editor — hang tight."
+    )
 
 
 def test_hand_mode_keyboard_scopes_both_buttons_to_result_id():
