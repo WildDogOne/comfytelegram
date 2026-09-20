@@ -44,6 +44,7 @@
     max-height: 100%;
     touch-action: none;
     border-radius: 4px;
+    transform-origin: 0 0;
   }
   #controls {
     display: flex;
@@ -170,6 +171,150 @@
   var erasing = false;
   var scale = 1; // maskCanvas pixels per displayCanvas pixel
 
+  // Two-finger pinch-zoom/pan of `displayCanvas` itself, via a CSS
+  // transform — one finger is already spoken for (drawing), so zoom/pan
+  // has to live on a second finger, same convention most drawing apps
+  // use. `view.zoom`/`tx`/`ty` name a `translate(tx, ty) scale(zoom)`
+  // transform (`transform-origin: 0 0`, see the CSS) applied straight to
+  // `#display-canvas` — deliberately not to `#canvas-wrap`, so
+  // `canvas-wrap`'s own `overflow: hidden` box (the visible "window")
+  // stays put on screen and just clips whatever of the transformed canvas
+  // pokes outside it, instead of the whole window growing with the zoom.
+  // `pointFromEvent`/`updateCursorSize` need no changes at all for this —
+  // both already read the canvas's *current* `getBoundingClientRect()`,
+  // which the browser computes post-transform automatically.
+  var view = { zoom: 1, tx: 0, ty: 0 };
+  var pinch = null;
+  // True from the moment a second finger touches down until *every*
+  // finger has lifted — kept true across a drop to one finger mid-pinch
+  // so that remaining finger can't accidentally start a stroke before the
+  // gesture is fully released.
+  var multiTouchActive = false;
+  var MIN_ZOOM = 1;
+  var MAX_ZOOM = 4;
+
+  // Two fingers landing to start a pinch almost never touch down in the
+  // exact same event — one is reliably a beat quicker. Waiting to see if a
+  // second finger shows up before painting anything felt laggy (the dab
+  // only ever appeared once the ambiguity resolved — on release, for a
+  // fast tap, which reads as backwards: the mark seems to land on *lift*
+  // instead of on *press*). So the first finger's dab is painted straight
+  // away, same as before this feature existed, and instead just kept
+  // *revocable* for up to `PINCH_DETECT_DELAY_MS` — `pendingTouch` holds a
+  // small before-the-dab pixel snapshot (not a full-canvas copy; only the
+  // brush's own bounding box) that a second finger arriving in time rolls
+  // back via `restoreBrushRegion`, so the net result comes out exactly as
+  // if the user had used two fingers from the start.
+  //
+  // A resting finger is never perfectly still — natural tremor moves it a
+  // pixel or two even when the user's intent is to hold it in place while
+  // their *other* finger lands for a pinch. Treating *any* `touchmove` as
+  // "this is a deliberate drag" confirmed the dab on that tremor alone,
+  // which defeated the revocable window regardless of how long
+  // `PINCH_DETECT_DELAY_MS` was — the real second finger would arrive a
+  // moment later to a dab that had already locked itself in. The fix is
+  // the same "touch slop" dead zone every native touch/gesture framework
+  // uses to tell a tap's jitter apart from a real drag (Android's
+  // `ViewConfiguration` touch slop, Flutter's gesture arena, etc.):
+  // `TOUCH_SLOP_PX` of movement from the initial touch point, measured in
+  // raw screen pixels (not canvas pixels — the tremor is a physical-finger
+  // phenomenon, so the threshold has to live in the same space regardless
+  // of any zoom level), before `handleTouchMove` will treat it as a real
+  // stroke and confirm the dab; movement that never exceeds it is ignored
+  // outright, leaving the dab revocable for the rest of the delay window.
+  var pendingTouch = null;
+  var PINCH_DETECT_DELAY_MS = 180;
+  var TOUCH_SLOP_PX = 10;
+
+  function exceedsTouchSlop(clientX, clientY, fromX, fromY) {
+    var dx = clientX - fromX;
+    var dy = clientY - fromY;
+    return dx * dx + dy * dy > TOUCH_SLOP_PX * TOUCH_SLOP_PX;
+  }
+
+  function cancelPendingTouch() {
+    if (pendingTouch) {
+      clearTimeout(pendingTouch.timer);
+      pendingTouch = null;
+    }
+  }
+
+  function snapshotBrushRegion(ctx, cx, cy, radius) {
+    var pad = 2; // rounding safety margin
+    var x = Math.max(0, Math.floor(cx - radius - pad));
+    var y = Math.max(0, Math.floor(cy - radius - pad));
+    var w = Math.min(ctx.canvas.width - x, Math.ceil(radius * 2 + pad * 2));
+    var h = Math.min(ctx.canvas.height - y, Math.ceil(radius * 2 + pad * 2));
+    if (w <= 0 || h <= 0) return null;
+    return { x: x, y: y, data: ctx.getImageData(x, y, w, h) };
+  }
+
+  function restoreBrushRegion(ctx, snapshot) {
+    if (snapshot) ctx.putImageData(snapshot.data, snapshot.x, snapshot.y);
+  }
+
+  function applyView() {
+    displayCanvas.style.transform =
+      "translate(" + view.tx + "px, " + view.ty + "px) scale(" + view.zoom + ")";
+  }
+
+  function touchDistance(t0, t1) {
+    var dx = t0.clientX - t1.clientX;
+    var dy = t0.clientY - t1.clientY;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  function touchMidpoint(t0, t1) {
+    return { x: (t0.clientX + t1.clientX) / 2, y: (t0.clientY + t1.clientY) / 2 };
+  }
+
+  function startPinch(t0, t1) {
+    // `rect.left/top` is always `layoutLeft/Top + view.tx/ty` — the
+    // transform's own translate component doesn't change where the
+    // *untransformed* box would sit in flex-centered layout — so this
+    // recovers that fixed layout position from the current (already
+    // transformed) rect without ever having to reset the transform to
+    // measure it.
+    var rect = displayCanvas.getBoundingClientRect();
+    var layoutLeft = rect.left - view.tx;
+    var layoutTop = rect.top - view.ty;
+    var mid = touchMidpoint(t0, t1);
+    pinch = {
+      startDist: touchDistance(t0, t1),
+      startZoom: view.zoom,
+      layoutLeft: layoutLeft,
+      layoutTop: layoutTop,
+      // The canvas-local point (in `displayCanvas`'s own unscaled CSS
+      // pixels) currently sitting under the pinch midpoint — held fixed
+      // under that midpoint as the gesture continues, which is what makes
+      // a pinch feel anchored rather than the image sliding around.
+      anchor: {
+        x: (mid.x - layoutLeft - view.tx) / view.zoom,
+        y: (mid.y - layoutTop - view.ty) / view.zoom,
+      },
+    };
+  }
+
+  function updatePinch(t0, t1) {
+    if (!pinch) return;
+    var dist = touchDistance(t0, t1);
+    var mid = touchMidpoint(t0, t1);
+    var newZoom = pinch.startZoom * (dist / pinch.startDist);
+    newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, newZoom));
+    view.zoom = newZoom;
+    if (newZoom <= MIN_ZOOM) {
+      // Snap fully back to rest — pinching all the way back in is the
+      // user's "reset zoom" gesture, so don't leave a stray pan offset
+      // that would otherwise need a second gesture to notice and undo.
+      view.tx = 0;
+      view.ty = 0;
+    } else {
+      view.tx = mid.x - pinch.layoutLeft - newZoom * pinch.anchor.x;
+      view.ty = mid.y - pinch.layoutTop - newZoom * pinch.anchor.y;
+    }
+    applyView();
+  }
+
   function setStatus(text) {
     statusEl.textContent = text;
   }
@@ -204,16 +349,20 @@
     brushCursor.style.display = "none";
   }
 
-  function pointFromEvent(evt) {
+  function pointFromClient(clientX, clientY) {
     var rect = displayCanvas.getBoundingClientRect();
-    var clientX = evt.touches ? evt.touches[0].clientX : evt.clientX;
-    var clientY = evt.touches ? evt.touches[0].clientY : evt.clientY;
     var xRatio = displayCanvas.width / rect.width;
     var yRatio = displayCanvas.height / rect.height;
     return {
       x: (clientX - rect.left) * xRatio,
       y: (clientY - rect.top) * yRatio,
     };
+  }
+
+  function pointFromEvent(evt) {
+    var clientX = evt.touches ? evt.touches[0].clientX : evt.clientX;
+    var clientY = evt.touches ? evt.touches[0].clientY : evt.clientY;
+    return pointFromClient(clientX, clientY);
   }
 
   function renderDisplay() {
@@ -272,64 +421,163 @@
     renderDisplay();
   }
 
-  function onPointerDown(evt) {
-    evt.preventDefault();
+  function beginStroke(x, y) {
     drawing = true;
+    paintAt(x, y);
+  }
+
+  function continueStroke(x, y) {
+    if (!drawing) return;
+    paintAt(x, y);
+  }
+
+  function endStroke() {
+    drawing = false;
+  }
+
+  // Mouse/pen only below — touch is handled entirely separately
+  // (`handleTouchStart`/`Move`/`End`), since a pinch needs the full
+  // `evt.touches` list a single-pointer Pointer Event can't give it (each
+  // finger is its own independent pointer). Without this guard, a
+  // touchscreen would fire *both* a Pointer Event and a Touch Event per
+  // finger, double-handling every tap — harmless for one finger (same
+  // coordinates twice), but wrong for two, since the second finger's own
+  // pointerdown/pointermove would start an ordinary paint stroke right
+  // where the pinch code is deliberately suppressing one.
+  function onPointerDown(evt) {
+    if (evt.pointerType === "touch") return;
+    evt.preventDefault();
+    moveCursor(evt.clientX, evt.clientY);
+    showCursor();
     var p = pointFromEvent(evt);
-    paintAt(p.x, p.y);
+    beginStroke(p.x, p.y);
   }
 
   function onPointerMove(evt) {
-    if (!drawing) return;
+    if (evt.pointerType === "touch") return;
     evt.preventDefault();
+    moveCursor(evt.clientX, evt.clientY);
     var p = pointFromEvent(evt);
-    paintAt(p.x, p.y);
+    continueStroke(p.x, p.y);
   }
 
-  function onPointerUp() {
-    drawing = false;
+  function onPointerUp(evt) {
+    if (evt.pointerType === "touch") return;
+    endStroke();
   }
 
   displayCanvas.addEventListener("pointerdown", onPointerDown);
   displayCanvas.addEventListener("pointermove", onPointerMove);
   window.addEventListener("pointerup", onPointerUp);
-  displayCanvas.addEventListener("touchstart", onPointerDown, { passive: false });
-  displayCanvas.addEventListener("touchmove", onPointerMove, { passive: false });
-  window.addEventListener("touchend", onPointerUp);
-
-  // Cursor tracking is independent of the drawing listeners above (DOM
-  // allows multiple listeners per event) so it keeps working — showing
-  // where the *next* dab will land — even while just hovering, not
-  // dragging. Both pointer and touch events are wired, same dual-path
-  // belt-and-suspenders as the drawing listeners above.
-  displayCanvas.addEventListener("pointerenter", showCursor);
-  displayCanvas.addEventListener("pointerleave", hideCursor);
-  displayCanvas.addEventListener("pointerdown", function (evt) {
-    moveCursor(evt.clientX, evt.clientY);
+  displayCanvas.addEventListener("pointerenter", function (evt) {
+    if (evt.pointerType === "touch") return;
     showCursor();
   });
-  displayCanvas.addEventListener("pointermove", function (evt) {
-    moveCursor(evt.clientX, evt.clientY);
+  displayCanvas.addEventListener("pointerleave", function (evt) {
+    if (evt.pointerType === "touch") return;
+    hideCursor();
   });
-  displayCanvas.addEventListener(
-    "touchstart",
-    function (evt) {
-      var t = evt.touches[0];
-      if (!t) return;
-      moveCursor(t.clientX, t.clientY);
-      showCursor();
-    },
-    { passive: true }
-  );
-  displayCanvas.addEventListener(
-    "touchmove",
-    function (evt) {
-      var t = evt.touches[0];
-      if (t) moveCursor(t.clientX, t.clientY);
-    },
-    { passive: true }
-  );
-  window.addEventListener("touchend", hideCursor);
+
+  // One finger draws; a second finger switches to pinch-zoom/pan for the
+  // rest of the gesture (`multiTouchActive` latches until every finger is
+  // lifted, so dropping back to one finger mid-pinch can't be mistaken
+  // for the start of a new stroke).
+  function undoRevocableDab() {
+    if (!pendingTouch) return;
+    restoreBrushRegion(overlayCtx, pendingTouch.overlaySnap);
+    restoreBrushRegion(maskCtx, pendingTouch.maskSnap);
+    renderDisplay();
+    cancelPendingTouch();
+  }
+
+  function handleTouchStart(evt) {
+    if (evt.touches.length >= 2) {
+      evt.preventDefault();
+      // A second finger arriving while the first dab is still revocable
+      // means this was a pinch all along — undo it so the net result is
+      // exactly as if both fingers had landed together.
+      undoRevocableDab();
+      multiTouchActive = true;
+      endStroke();
+      hideCursor();
+      startPinch(evt.touches[0], evt.touches[1]);
+      return;
+    }
+    if (multiTouchActive) return;
+    evt.preventDefault();
+    var t = evt.touches[0];
+    moveCursor(t.clientX, t.clientY);
+    showCursor();
+    var p = pointFromClient(t.clientX, t.clientY);
+    var displayRadius = Number(brushSizeInput.value) / 2;
+    var overlaySnap = snapshotBrushRegion(overlayCtx, p.x, p.y, displayRadius);
+    var maskSnap = snapshotBrushRegion(maskCtx, p.x * scale, p.y * scale, displayRadius * scale);
+    beginStroke(p.x, p.y);
+    pendingTouch = {
+      // The touch's own starting position, in raw screen pixels — what
+      // `exceedsTouchSlop` measures ongoing movement against.
+      clientX: t.clientX,
+      clientY: t.clientY,
+      overlaySnap: overlaySnap,
+      maskSnap: maskSnap,
+      timer: setTimeout(function () {
+        pendingTouch = null; // window passed with no second finger — the dab stands
+      }, PINCH_DETECT_DELAY_MS),
+    };
+  }
+
+  function handleTouchMove(evt) {
+    if (evt.touches.length >= 2) {
+      evt.preventDefault();
+      undoRevocableDab();
+      updatePinch(evt.touches[0], evt.touches[1]);
+      return;
+    }
+    if (multiTouchActive) return;
+    evt.preventDefault();
+    var t = evt.touches[0];
+    moveCursor(t.clientX, t.clientY);
+    if (
+      pendingTouch &&
+      !exceedsTouchSlop(t.clientX, t.clientY, pendingTouch.clientX, pendingTouch.clientY)
+    ) {
+      // Still within natural finger tremor for a held-still touch — not
+      // yet a deliberate drag, so leave the dab revocable rather than
+      // confirming it (and don't bother repainting on top of it either,
+      // since this hasn't moved anywhere meaningful yet).
+      return;
+    }
+    // Either genuinely moved past the dead zone (a real drag — the
+    // initial dab is no longer revocable past this point, even if a
+    // second finger shows up later) or there was no pending dab to
+    // reconsider in the first place.
+    cancelPendingTouch();
+    var p = pointFromClient(t.clientX, t.clientY);
+    continueStroke(p.x, p.y);
+  }
+
+  function handleTouchEnd(evt) {
+    if (evt.touches.length === 0) {
+      // Released without a second finger ever showing up — the dab was
+      // never undone, so it just stands as-is; nothing to do here beyond
+      // stopping the now-moot timer.
+      cancelPendingTouch();
+      multiTouchActive = false;
+      pinch = null;
+      hideCursor();
+      endStroke();
+    } else if (evt.touches.length === 1) {
+      // Dropped from two fingers to one — the pinch is over, but stay
+      // latched in `multiTouchActive` until that last finger lifts too.
+      pinch = null;
+    }
+  }
+
+  displayCanvas.addEventListener("touchstart", handleTouchStart, { passive: false });
+  displayCanvas.addEventListener("touchmove", handleTouchMove, { passive: false });
+  window.addEventListener("touchend", handleTouchEnd);
+  window.addEventListener("touchcancel", handleTouchEnd);
+
   brushSizeInput.addEventListener("input", updateCursorSize);
   window.addEventListener("resize", updateCursorSize);
 
