@@ -16,7 +16,7 @@ import re
 import time
 import uuid
 from collections import Counter
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -633,6 +633,19 @@ async def _run_reporting_errors(
         return None
 
 
+def _post_process_keyboard_with_extra_rows(
+    result_id: str, extra_keyboard_rows: list[list[InlineKeyboardButton]] | None
+) -> InlineKeyboardMarkup:
+    """`_post_process_keyboard(result_id)` plus any `extra_keyboard_rows`
+    appended below its own — shared by `_send_and_store_result`/
+    `_send_and_store_bot_result` so both send the same keyboard shape for a
+    given `result_id`/`extra_keyboard_rows` pair."""
+    keyboard = _post_process_keyboard(result_id)
+    if not extra_keyboard_rows:
+        return keyboard
+    return InlineKeyboardMarkup(list(keyboard.inline_keyboard) + extra_keyboard_rows)
+
+
 async def _send_and_store_result(
     message: Message,
     chat_id: int,
@@ -651,11 +664,7 @@ async def _send_and_store_result(
     `postprocess_callback`'s `HAND_REDO_CALLBACK_KIND` branch) can pass one
     in instead. Returns whichever id was actually used."""
     result_id = result_id or uuid.uuid4().hex[:12]
-    reply_markup = _post_process_keyboard(result_id)
-    if extra_keyboard_rows:
-        reply_markup = InlineKeyboardMarkup(
-            list(reply_markup.inline_keyboard) + extra_keyboard_rows
-        )
+    reply_markup = _post_process_keyboard_with_extra_rows(result_id, extra_keyboard_rows)
     sent = await _send_result_image(message, img.data, img.filename, reply_markup)
     storage.store_pending_result(
         result_id,
@@ -688,11 +697,7 @@ async def _send_and_store_bot_result(
     chat's General topic otherwise. `result_id`/`extra_keyboard_rows` mirror
     `_send_and_store_result`'s — see there."""
     result_id = result_id or uuid.uuid4().hex[:12]
-    reply_markup = _post_process_keyboard(result_id)
-    if extra_keyboard_rows:
-        reply_markup = InlineKeyboardMarkup(
-            list(reply_markup.inline_keyboard) + extra_keyboard_rows
-        )
+    reply_markup = _post_process_keyboard_with_extra_rows(result_id, extra_keyboard_rows)
     if len(img.data) <= TELEGRAM_PHOTO_SIZE_LIMIT:
         sent = await bot.send_photo(
             chat_id,
@@ -808,6 +813,30 @@ async def _run_hand_drawn_post_process(
     return generated
 
 
+async def _send_hand_drawn_result_with_redo(
+    send: Callable[..., Awaitable[str]],
+    storage: Storage,
+    source_file_id: str,
+    source_filename: str,
+    mask_bytes: bytes,
+    generated: GeneratedImage,
+) -> None:
+    """Send a `post_process(kind="hand_drawn")` result with a "🔁 Redo (same
+    mask)" button attached, and persist what that button needs to run it
+    again (`storage.py`'s `inpaint_redo`) — shared by `_process_one_inpaint_job`
+    and `postprocess_callback`'s `HAND_REDO_CALLBACK_KIND` branch, which
+    differ only in *how* they send (`send` is `_send_and_store_bot_result`
+    or `_send_and_store_result`, already bound to everything but `img`,
+    `result_id` and `extra_keyboard_rows`)."""
+    new_result_id = uuid.uuid4().hex[:12]
+    await send(
+        generated,
+        result_id=new_result_id,
+        extra_keyboard_rows=[[_hand_redo_button(new_result_id)]],
+    )
+    storage.store_inpaint_redo(new_result_id, source_file_id, source_filename, mask_bytes)
+
+
 async def _process_one_inpaint_job(
     application: Application,
     settings: Settings,
@@ -874,18 +903,15 @@ async def _process_one_inpaint_job(
     )
     if generated is None:
         return
-    new_result_id = uuid.uuid4().hex[:12]
-    await _send_and_store_bot_result(
-        application.bot,
-        chat_id,
+    await _send_hand_drawn_result_with_redo(
+        lambda img, **kw: _send_and_store_bot_result(
+            application.bot, chat_id, storage, img, message_thread_id=message_thread_id, **kw
+        ),
         storage,
+        pending["file_id"],
+        pending["filename"],
+        result["mask"],
         generated,
-        message_thread_id=message_thread_id,
-        result_id=new_result_id,
-        extra_keyboard_rows=[[_hand_redo_button(new_result_id)]],
-    )
-    storage.store_inpaint_redo(
-        new_result_id, pending["file_id"], pending["filename"], result["mask"]
     )
 
 
@@ -1829,11 +1855,11 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 "That mask has expired — draw a new one with 🖌️ Draw Mask."
             )
             return
-        tg_file = await context.bot.get_file(redo["source_file_id"])
-        source_bytes = bytes(await tg_file.download_as_bytearray())
         status_message = await query.message.reply_text(
             "Refining hand (drawn mask)…", disable_notification=True
         )
+        tg_file = await context.bot.get_file(redo["source_file_id"])
+        source_bytes = bytes(await tg_file.download_as_bytearray())
         generated = await _run_hand_drawn_post_process(
             client,
             status_message,
@@ -1844,17 +1870,15 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         if generated is None:
             return
-        new_result_id = uuid.uuid4().hex[:12]
-        await _send_and_store_result(
-            query.message,
-            pending["chat_id"],
+        await _send_hand_drawn_result_with_redo(
+            lambda img, **kw: _send_and_store_result(
+                query.message, pending["chat_id"], storage, img, **kw
+            ),
             storage,
+            redo["source_file_id"],
+            redo["source_filename"],
+            redo["mask_png"],
             generated,
-            result_id=new_result_id,
-            extra_keyboard_rows=[[_hand_redo_button(new_result_id)]],
-        )
-        storage.store_inpaint_redo(
-            new_result_id, redo["source_file_id"], redo["source_filename"], redo["mask_png"]
         )
         return
 
