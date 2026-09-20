@@ -74,6 +74,10 @@
   button:disabled {
     opacity: 0.5;
   }
+  #erase-btn.active {
+    background: var(--accent);
+    color: #fff;
+  }
   #button-row {
     display: flex;
     gap: 10px;
@@ -92,6 +96,7 @@
   <div id="controls">
     <label for="brush-size">Brush</label>
     <input type="range" id="brush-size" min="8" max="120" value="36" />
+    <button id="erase-btn" type="button">🧹 Erase</button>
   </div>
   <div id="button-row">
     <button id="clear-btn">Clear</button>
@@ -119,6 +124,7 @@
   var brushSizeInput = document.getElementById("brush-size");
   var clearBtn = document.getElementById("clear-btn");
   var doneBtn = document.getElementById("done-btn");
+  var eraseBtn = document.getElementById("erase-btn");
 
   // Full-resolution mask, offscreen — this is what actually gets
   // submitted. Kept at the source image's own pixel dimensions so the
@@ -127,8 +133,20 @@
   var maskCanvas = document.createElement("canvas");
   var maskCtx = maskCanvas.getContext("2d");
 
+  // Selection highlight, offscreen, at displayCanvas's resolution — kept
+  // fully *opaque* (solid red, no alpha) so overlapping dabs within one
+  // stroke can't compound each other's transparency. `renderDisplay`
+  // composites this whole layer onto the visible canvas at one flat
+  // BRUSH_OPACITY each redraw, so the highlight always reads as a single
+  // consistent opacity regardless of how many times a spot was painted
+  // over.
+  var overlayCanvas = document.createElement("canvas");
+  var overlayCtx = overlayCanvas.getContext("2d");
+  var BRUSH_OPACITY = 0.8;
+
   var image = new Image();
   var drawing = false;
+  var erasing = false;
   var scale = 1; // maskCanvas pixels per displayCanvas pixel
 
   function setStatus(text) {
@@ -147,27 +165,60 @@
     };
   }
 
-  function paintAt(x, y) {
+  function renderDisplay() {
+    // Full redraw rather than incremental blending — drawImage covers
+    // every pixel (displayCanvas is sized exactly to match), so this
+    // discards whatever alpha-blended history was on the visible canvas
+    // and rebuilds it from the source image plus the current overlay at
+    // one flat opacity, every time.
+    displayCtx.drawImage(image, 0, 0, displayCanvas.width, displayCanvas.height);
+    displayCtx.save();
+    displayCtx.globalAlpha = BRUSH_OPACITY;
+    displayCtx.drawImage(overlayCanvas, 0, 0);
+    displayCtx.restore();
+  }
+
+  function eraseAt(x, y) {
     var displayRadius = Number(brushSizeInput.value) / 2;
-    displayCtx.beginPath();
-    displayCtx.fillStyle = "rgba(255, 45, 45, 0.55)";
-    displayCtx.arc(x, y, displayRadius, 0, Math.PI * 2);
-    displayCtx.fill();
+    overlayCtx.save();
+    overlayCtx.globalCompositeOperation = "destination-out";
+    overlayCtx.beginPath();
+    overlayCtx.arc(x, y, displayRadius, 0, Math.PI * 2);
+    overlayCtx.fill();
+    overlayCtx.restore();
+
+    maskCtx.beginPath();
+    maskCtx.fillStyle = "#000";
+    maskCtx.arc(x * scale, y * scale, displayRadius * scale, 0, Math.PI * 2);
+    maskCtx.fill();
+
+    renderDisplay();
+  }
+
+  function paintAt(x, y) {
+    if (erasing) {
+      eraseAt(x, y);
+      return;
+    }
+    var displayRadius = Number(brushSizeInput.value) / 2;
+    overlayCtx.beginPath();
+    overlayCtx.fillStyle = "#ff2d2d";
+    overlayCtx.arc(x, y, displayRadius, 0, Math.PI * 2);
+    overlayCtx.fill();
 
     maskCtx.beginPath();
     maskCtx.fillStyle = "#fff";
     maskCtx.arc(x * scale, y * scale, displayRadius * scale, 0, Math.PI * 2);
     maskCtx.fill();
-  }
 
-  function redrawImage() {
-    displayCtx.drawImage(image, 0, 0, displayCanvas.width, displayCanvas.height);
+    renderDisplay();
   }
 
   function resetMask() {
     maskCtx.fillStyle = "#000";
     maskCtx.fillRect(0, 0, maskCanvas.width, maskCanvas.height);
-    redrawImage();
+    overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+    renderDisplay();
   }
 
   function onPointerDown(evt) {
@@ -196,6 +247,12 @@
   window.addEventListener("touchend", onPointerUp);
 
   clearBtn.addEventListener("click", resetMask);
+
+  eraseBtn.addEventListener("click", function () {
+    erasing = !erasing;
+    eraseBtn.classList.toggle("active", erasing);
+    eraseBtn.textContent = erasing ? "🖌️ Brush" : "🧹 Erase";
+  });
 
   doneBtn.addEventListener("click", function () {
     doneBtn.disabled = true;
@@ -235,6 +292,8 @@
     );
     displayCanvas.width = Math.round(image.naturalWidth * displayScale);
     displayCanvas.height = Math.round(image.naturalHeight * displayScale);
+    overlayCanvas.width = displayCanvas.width;
+    overlayCanvas.height = displayCanvas.height;
     maskCanvas.width = image.naturalWidth;
     maskCanvas.height = image.naturalHeight;
     scale = image.naturalWidth / displayCanvas.width;
