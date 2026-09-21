@@ -28,11 +28,13 @@ from comfytelegram.workflows import (
     HandDetailerParams,
     ManualHandDetailerParams,
     PostProcessBaseParams,
+    TiledRefineParams,
     UpscaleParams,
     build_face_detailer,
     build_hand_detailer,
     build_hand_detailer_drawn_mask,
     build_hand_detailer_manual,
+    build_tiled_refine,
     build_txt2img,
     build_upscale,
 )
@@ -162,35 +164,59 @@ async def _run_graph(
     # aimed at a client that isn't connected yet, so submitting first can
     # lose the terminal event of a fast job and hang here forever. See
     # `ComfyClient.connect_events`.
+    history: dict[str, Any] | None = None
     async with client.connect_events(client_id=client_id) as events:
         prompt_id = await client.queue_prompt(prompt_graph, client_id=client_id)
 
         watcher = events.watch(prompt_id).__aiter__()
-        done = False
-        while not done:
-            try:
-                progress = await asyncio.wait_for(
-                    watcher.__anext__(), timeout=_WS_EVENT_FALLBACK_SECONDS
-                )
-            except StopAsyncIteration:
-                break
-            except TimeoutError:
-                # See _WS_EVENT_FALLBACK_SECONDS — the terminal event may
-                # simply never come; /history tells us definitively whether
-                # the job is actually still running.
-                history = await client.get_history(prompt_id)
-                if history is not None and history.get("status", {}).get("completed"):
-                    done = True
-                continue
-            if on_progress is not None:
-                await on_progress(progress)
-            if progress.done:
-                done = True
+        watcher_active = True
+        completed = False
+        while not completed:
+            progress = None
+            if watcher_active:
+                try:
+                    progress = await asyncio.wait_for(
+                        watcher.__anext__(), timeout=_WS_EVENT_FALLBACK_SECONDS
+                    )
+                except StopAsyncIteration:
+                    watcher_active = False
+                except TimeoutError:
+                    pass
+                else:
+                    if on_progress is not None:
+                        await on_progress(progress)
+                    if not progress.done:
+                        continue
+            else:
+                # Once the watcher stops being trustworthy (below), keep
+                # checking on the same cadence a lost event would use
+                # rather than hammering /history in a tight loop.
+                await asyncio.sleep(_WS_EVENT_FALLBACK_SECONDS)
 
-    history = await client.get_history(prompt_id)
-    if history is None:
-        raise ComfyUIError(f"No history entry for prompt {prompt_id} after completion")
+            # /history is the sole source of truth for completion — a lost
+            # terminal event (watcher ran dry or timed out with nothing,
+            # the original reason for this fallback) and a *premature* one
+            # both need corroborating, not trusting outright. Verified
+            # against a live server: a job whose leading nodes were all
+            # `execution_cached` fired `executing{node: null}` on the
+            # websocket within milliseconds of being queued, roughly 90
+            # seconds before its actual (non-cached) work finished and
+            # `/history` agreed the job was complete — trusting that event
+            # alone reported a job that went on to succeed as failed.
+            history = await client.get_history(prompt_id)
+            completed = history is not None and bool(history.get("status", {}).get("completed"))
+            if progress is not None and progress.done and not completed:
+                # Confirmed premature: `JobEvents.watch` already returned
+                # after yielding this, so there's nothing left to await on
+                # it — fall back to polling /history like a lost event.
+                watcher_active = False
 
+    # The loop above only ever exits with `completed` True, which requires
+    # `history` to be a real dict (see its assignment above) — there's no
+    # "give up" path left; a job ComfyUI hasn't finished is worth waiting
+    # for indefinitely rather than reporting a false failure (see the
+    # comment above on the premature-terminal-event case this replaced).
+    assert history is not None
     status = history.get("status", {})
     if status.get("status_str") == "error":
         raise ComfyUIError(f"Job {prompt_id} failed: {status}")
@@ -255,7 +281,7 @@ async def generate(
 
 async def post_process(
     client: ComfyClient,
-    kind: Literal["upscale", "face", "hand", "hand_manual", "hand_drawn"],
+    kind: Literal["upscale", "homogenize", "face", "hand", "hand_manual", "hand_drawn"],
     source_image: bytes,
     source_filename: str,
     full_params: GenerationParams,
@@ -266,7 +292,14 @@ async def post_process(
     on_progress: ProgressCallback | None = None,
 ) -> GeneratedImage:
     """Upload a previously-generated image and run one post-processing stage
-    on it. For `kind="face"`/`"hand"`, the returned `GeneratedImage.unchanged`
+    on it. `kind="homogenize"` is the same UltimateSDUpscale tiled img2img
+    pass as `"upscale"`, but at `TiledRefineParams.upscale_by=1.0` — no
+    resolution change, just a lower-denoise pass over the whole image to
+    blend seams left behind by independent Face/Hand Detail patches (each
+    of those only ever sees its own crop, at its own denoise/seed).
+    `unchanged` is always False for it too, the same as `"upscale"` — there's
+    no detection step to have found nothing. For `kind="face"`/`"hand"`, the
+    returned `GeneratedImage.unchanged`
     is True if Impact Pack's bbox detector found nothing to refine — the
     node just passes the source through as-is in that case rather than
     erroring, which otherwise looks like a successful (but pointless)
@@ -293,6 +326,10 @@ async def post_process(
         if base_params.upscale_denoise is not None:
             upscale_params = replace(upscale_params, denoise=base_params.upscale_denoise)
         prompt_graph, save_node_id = build_upscale(uploaded_name, base_params, upscale_params)
+    elif kind == "homogenize":
+        prompt_graph, save_node_id = build_tiled_refine(
+            uploaded_name, base_params, TiledRefineParams()
+        )
     elif kind == "face":
         prompt_graph, save_node_id, detection_node_id = build_face_detailer(
             uploaded_name, base_params, FaceDetailerParams()

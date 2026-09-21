@@ -150,12 +150,23 @@ def test_post_process_keyboard_scopes_every_button_to_result_id():
     keyboard = _post_process_keyboard("abc123")
     callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
     assert "pp:upscale:abc123" in callback_data
+    assert "pp:homogenize:abc123" in callback_data
     assert "pp:face:abc123" in callback_data
     assert "pp:hand:abc123" in callback_data
     assert "pp:analyze_only:abc123" in callback_data
     assert f"pp:{ANALYZE_PROMPT_CALLBACK_KIND}:abc123" in callback_data
     assert "pp:deep_analyze:abc123" in callback_data
     assert "pp:show_prompt:abc123" in callback_data
+
+
+def test_post_process_keyboard_puts_tiled_passes_above_detailers():
+    """The tiled whole-image passes (upscale/homogenize) get their own row,
+    with the region detailers (face/hand) on the row below — see
+    `_TILED_PASS_KINDS`/`_DETAILER_KINDS`."""
+    keyboard = _post_process_keyboard("abc123")
+    rows = [[b.callback_data for b in row] for row in keyboard.inline_keyboard]
+    assert rows[0] == ["pp:upscale:abc123", "pp:homogenize:abc123"]
+    assert rows[1] == ["pp:face:abc123", "pp:hand:abc123"]
 
 
 def test_upscale_confirm_keyboard_scopes_both_buttons_to_result_id():

@@ -67,11 +67,13 @@ T = TypeVar("T")
 
 POSTPROCESS_KEYBOARD_LABELS = {
     "upscale": "🔍 Upscale 4x",
+    "homogenize": "🧵 Homogenize",
     "face": "✨ Face Detail",
     "hand": "🖐️ Hand Detail",
 }
 POSTPROCESS_STATUS_LABELS = {
     "upscale": "Upscaling",
+    "homogenize": "Homogenizing",
     "face": "Refining face",
     "hand": "Refining hand",
 }
@@ -211,26 +213,44 @@ _MAIN_KEYBOARD = ReplyKeyboardMarkup(
 _STREAMING_KEYBOARD = ReplyKeyboardMarkup([["/stop"]], resize_keyboard=True)
 
 
+#: `_post_process_keyboard`'s top two rows, split whole-image tiled passes
+#: (upscale/homogenize) from region detailers (face/hand) — keeping each pair
+#: on its own row instead of one row of four now that there are two of each,
+#: since a `POSTPROCESS_KEYBOARD_LABELS`-wide single row was getting cramped
+#: on a phone screen.
+_TILED_PASS_KINDS = ("upscale", "homogenize")
+_DETAILER_KINDS = ("face", "hand")
+
+
 def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
-    """The keyboard attached to a generated/post-processed image: one
-    button per `POSTPROCESS_KEYBOARD_LABELS` entry plus Analyze Image (image
-    analysis, prompt only, no generation), Analyze Prompt (a `/tagcheck`-
-    style tag-health check on the prompt this image was built from — see
-    `postprocess_callback`'s `ANALYZE_PROMPT_CALLBACK_KIND` branch), Deep
-    Analyze (image analysis via the bigger `analyze_caption_deep` model),
-    and Show Prompt (a debugging button that dumps the exact
-    positive/negative prompt this image was generated with, folded
-    character and profile prefixes included, plus a second reply with just
-    the text the user typed — see `postprocess_callback`'s
-    `SHOW_PROMPT_CALLBACK_KIND` branch), all scoped to `result_id` (see
-    `storage.py`'s `pending_result`). "🖐️ Hand Detail" doesn't post-process
-    on this tap alone — see `postprocess_callback`'s `"hand"` branch for the
-    auto/manual choice it replies with instead."""
+    """The keyboard attached to a generated/post-processed image: a row of
+    whole-image tiled passes (`_TILED_PASS_KINDS`: upscale, homogenize),
+    then a row of region detailers (`_DETAILER_KINDS`: face, hand) below
+    them, then Analyze Image (image analysis, prompt only, no generation),
+    Analyze Prompt (a `/tagcheck`-style tag-health check on the prompt this
+    image was built from — see `postprocess_callback`'s
+    `ANALYZE_PROMPT_CALLBACK_KIND` branch), Deep Analyze (image analysis via
+    the bigger `analyze_caption_deep` model), and Show Prompt (a debugging
+    button that dumps the exact positive/negative prompt this image was
+    generated with, folded character and profile prefixes included, plus a
+    second reply with just the text the user typed — see
+    `postprocess_callback`'s `SHOW_PROMPT_CALLBACK_KIND` branch), all scoped
+    to `result_id` (see `storage.py`'s `pending_result`). "🖐️ Hand Detail"
+    doesn't post-process on this tap alone — see `postprocess_callback`'s
+    `"hand"` branch for the auto/manual choice it replies with instead."""
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(label, callback_data=f"pp:{kind}:{result_id}")
-                for kind, label in POSTPROCESS_KEYBOARD_LABELS.items()
+                InlineKeyboardButton(
+                    POSTPROCESS_KEYBOARD_LABELS[kind], callback_data=f"pp:{kind}:{result_id}"
+                )
+                for kind in _TILED_PASS_KINDS
+            ],
+            [
+                InlineKeyboardButton(
+                    POSTPROCESS_KEYBOARD_LABELS[kind], callback_data=f"pp:{kind}:{result_id}"
+                )
+                for kind in _DETAILER_KINDS
             ],
             [
                 InlineKeyboardButton(
@@ -1614,14 +1634,16 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     tag-health check on that same prompt instead, if this image's
     checkpoint profile is tag-trained and tag data is imported — see
     `ANALYZE_PROMPT_CALLBACK_KIND`), or
-    `"upscale"`/`"face"`/`"hand"` (download the source image and run that
-    post-processing stage on it). A fresh `"upscale"` tap on an image
-    already at or beyond `UPSCALE_CONFIRM_THRESHOLD_PX` doesn't upscale
+    `"upscale"`/`"homogenize"`/`"face"`/`"hand"` (download the source image
+    and run that post-processing stage on it). A fresh `"upscale"` tap on an
+    image already at or beyond `UPSCALE_CONFIRM_THRESHOLD_PX` doesn't upscale
     immediately — it downloads just far enough to measure the image, then
     replies with a "this is already large — continue?" prompt
     (`_upscale_confirm_keyboard`) instead, which comes back as either
     `UPSCALE_CONFIRM_CALLBACK_KIND` (proceed) or
-    `UPSCALE_CANCEL_CALLBACK_KIND` (abort). A `"face"`/`"hand"` result whose
+    `UPSCALE_CANCEL_CALLBACK_KIND` (abort) — `"homogenize"` has no such gate,
+    since it never changes the image's pixel dimensions (see
+    `generation.post_process`'s `TiledRefineParams` branch). A `"face"`/`"hand"` result whose
     detector found nothing to refine (`GeneratedImage.unchanged`, see
     `post_process`) isn't sent or stored at all — it's pixel-identical to
     what's already on screen, so re-posting it would just be noise — a

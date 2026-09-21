@@ -318,6 +318,36 @@ class UpscaleParams:
     filename_prefix: str = "comfytelegram_upscaled"
 
 
+@dataclass
+class TiledRefineParams:
+    """Same UltimateSDUpscale tiled-img2img shape as `UpscaleParams` (see
+    `_build_tiled_upscale`), but `upscale_by` is fixed at 1.0: resolution
+    stays unchanged. Backs "🧵 Homogenize" — for smoothing over the visibly
+    different regions Face/Hand Detail passes leave behind (each patch has
+    its own denoise/seed and only sees its own crop), by re-running the
+    *whole* image through one consistent tiled pass instead of patching
+    regions independently. Smaller default tile size than `UpscaleParams`
+    too — at 1x, a 2048px tile would cover most or all of a typical
+    1024-2048px generation, leaving nothing to actually tile across — and a
+    lower default `denoise`, since the goal is blending existing content,
+    not adding new detail the way the 4x upscale pass does."""
+
+    upscale_model: str = "RealESRGAN_x4.pth"
+    upscale_by: float = 1.0
+    steps: int = 20
+    cfg: float = 5.0
+    sampler_name: str = "euler_ancestral"
+    scheduler: str = "normal"
+    denoise: float = 0.15
+    seed: int | None = None
+    tile_width: int = 768
+    tile_height: int = 768
+    mask_blur: int = 16
+    tile_padding: int = 32
+    tiled_decode: bool = True
+    filename_prefix: str = "comfytelegram_homogenized"
+
+
 def build_upscale(
     source_filename: str,
     base: PostProcessBaseParams,
@@ -326,7 +356,34 @@ def build_upscale(
     """Build the 4x UltimateSDUpscale post-processing graph. Returns
     (prompt_dict, save_image_node_id). `source_filename` must already exist
     in ComfyUI's `input` directory (upload it first via
-    `ComfyClient.upload_image`)."""
+    `ComfyClient.upload_image`). See `_build_tiled_upscale` for the shared
+    graph shape behind this and `build_tiled_refine`."""
+    return _build_tiled_upscale(source_filename, base, params)
+
+
+def build_tiled_refine(
+    source_filename: str,
+    base: PostProcessBaseParams,
+    params: TiledRefineParams,
+) -> tuple[dict[str, Any], str]:
+    """Build the "🧵 Homogenize" post-processing graph — the same
+    UltimateSDUpscale tiled-img2img pass as `build_upscale`, just run at
+    `params.upscale_by=1.0` (see `TiledRefineParams`) so the output stays
+    the same resolution as the source. See `_build_tiled_upscale`."""
+    return _build_tiled_upscale(source_filename, base, params)
+
+
+def _build_tiled_upscale(
+    source_filename: str,
+    base: PostProcessBaseParams,
+    params: UpscaleParams | TiledRefineParams,
+) -> tuple[dict[str, Any], str]:
+    """Shared graph shape behind `build_upscale` and `build_tiled_refine` —
+    an UltimateSDUpscale tiled img2img pass over the whole image, differing
+    only in `params.upscale_by` (4x vs. 1x) and the rest of `params`'s
+    tunables (see `TiledRefineParams`). Returns (prompt_dict,
+    save_image_node_id). `source_filename` must already exist in ComfyUI's
+    `input` directory (upload it first via `ComfyClient.upload_image`)."""
     g = PromptGraph()
 
     load = g.add("LoadImage", {"image": source_filename}, title="Source Image")

@@ -7,7 +7,7 @@ import pytest
 from PIL import Image
 
 from comfytelegram import generation
-from comfytelegram.comfy_client import JobProgress
+from comfytelegram.comfy_client import ComfyUIError, JobProgress
 from comfytelegram.generation import (
     _detailer_found_nothing,
     _to_post_process_base,
@@ -246,6 +246,46 @@ async def test_post_process_upscale_never_flags_unchanged():
 
 
 @pytest.mark.asyncio
+async def test_post_process_homogenize_never_flags_unchanged():
+    """Same reasoning as the "upscale" case above — no detection-check node
+    for this kind either."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    result = await post_process(client, "homogenize", source, "source.png", params)
+
+    assert result.unchanged is False
+
+
+@pytest.mark.asyncio
+async def test_post_process_homogenize_runs_at_upscale_by_one():
+    """The whole point of "🧵 Homogenize" is a tiled img2img pass with no
+    resolution change — `TiledRefineParams.upscale_by` must stay 1.0
+    regardless of the profile's `upscale_denoise` (that override is
+    documented as `"upscale"`-only, see `GenerationParams.upscale_denoise`,
+    and shouldn't leak into this separate, lower-denoise pass)."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        upscale_denoise=0.9,
+    )
+
+    await post_process(client, "homogenize", source, "source.png", params)
+
+    refine_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "UltimateSDUpscale"
+    )
+    assert refine_node["inputs"]["upscale_by"] == 1.0
+    assert refine_node["inputs"]["denoise"] != 0.9
+
+
+@pytest.mark.asyncio
 async def test_post_process_upscale_honors_profile_upscale_denoise():
     """A profile's `defaults.upscale_denoise` (e.g. furrytoonmix_illustrious.json,
     tuned alongside its `tile_controlnet`) must actually reach the queued
@@ -328,6 +368,72 @@ async def test_run_graph_falls_back_to_history_when_websocket_event_is_lost(monk
     )
 
     assert result.data == source
+
+
+@pytest.mark.asyncio
+async def test_run_graph_keeps_polling_past_a_premature_terminal_event(monkeypatch):
+    """Reproduces a real, observed failure: ComfyUI fired the terminal
+    `executing{node: null}` websocket event within milliseconds of a job
+    being queued — right after its leading, already-`execution_cached`
+    nodes — while the job's actual (non-cached, GPU-bound) work went on to
+    take roughly 90 more seconds. Trusting that event outright reported a
+    job that later succeeded as an instant failure. `_run_graph` must
+    corroborate a `done` event against `/history` and, if it disagrees,
+    keep polling on the same cadence a lost event would use instead of
+    giving up."""
+    monkeypatch.setattr(generation, "_WS_EVENT_FALLBACK_SECONDS", 0)
+
+    class _PrematureDoneEvents:
+        async def watch(self, prompt_id: str):
+            yield JobProgress(prompt_id=prompt_id, node_id=None, value=None, max=None, done=True)
+
+    class _StubPrematureDoneClient(_StubUploadingComfyClient):
+        def __init__(self, output_bytes: bytes) -> None:
+            super().__init__(output_bytes)
+            self.history_calls = 0
+
+        @asynccontextmanager
+        async def connect_events(self, *, client_id: str):
+            self.connected_client_id = client_id
+            yield _PrematureDoneEvents()
+
+        async def get_history(self, prompt_id: str) -> dict | None:
+            self.history_calls += 1
+            if self.history_calls < 3:
+                return {"status": {"status_str": "running", "completed": False}}
+            return await super().get_history(prompt_id)
+
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubPrematureDoneClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    result = await post_process(client, "upscale", source, "source.png", params)
+
+    assert result.data == source
+    assert client.history_calls >= 3
+
+
+@pytest.mark.asyncio
+async def test_run_graph_still_raises_when_the_job_itself_errors():
+    """A job that ComfyUI genuinely finishes with an error must still be
+    reported as one — the premature-terminal-event fix above only defers
+    judgment until `/history` actually says the job is complete, it
+    doesn't suppress a real failure once it is."""
+
+    class _StubErroringClient(_StubUploadingComfyClient):
+        async def get_history(self, prompt_id: str) -> dict | None:
+            return {"status": {"status_str": "error", "completed": True}, "outputs": {}}
+
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubErroringClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    with pytest.raises(ComfyUIError, match="failed"):
+        await post_process(client, "upscale", source, "source.png", params)
 
 
 @pytest.mark.asyncio

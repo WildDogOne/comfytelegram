@@ -6,12 +6,14 @@ from comfytelegram.workflows.builder import (
     LoraSpec,
     ManualHandDetailerParams,
     PostProcessBaseParams,
+    TiledRefineParams,
     UpscaleParams,
     _resolve_seed,
     build_face_detailer,
     build_hand_detailer,
     build_hand_detailer_drawn_mask,
     build_hand_detailer_manual,
+    build_tiled_refine,
     build_txt2img,
     build_upscale,
 )
@@ -159,6 +161,48 @@ def test_build_upscale_honors_explicit_seed():
     prompt, _save_id = build_upscale("uploaded.png", base, UpscaleParams(seed=777))
     upscale_node = next(n for n in prompt.values() if n["class_type"] == "UltimateSDUpscale")
     assert upscale_node["inputs"]["seed"] == 777
+
+
+def test_build_tiled_refine_defaults_to_upscale_by_one():
+    base = PostProcessBaseParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+    )
+    prompt, save_id = build_tiled_refine("uploaded.png", base, TiledRefineParams())
+
+    refine_node = next(n for n in prompt.values() if n["class_type"] == "UltimateSDUpscale")
+    assert refine_node["inputs"]["upscale_by"] == 1.0
+    assert prompt[save_id]["inputs"]["images"] == [
+        next(nid for nid, n in prompt.items() if n["class_type"] == "UltimateSDUpscale"),
+        0,
+    ]
+
+
+def test_build_tiled_refine_honors_explicit_seed():
+    base = PostProcessBaseParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+    )
+    prompt, _save_id = build_tiled_refine("uploaded.png", base, TiledRefineParams(seed=777))
+    refine_node = next(n for n in prompt.values() if n["class_type"] == "UltimateSDUpscale")
+    assert refine_node["inputs"]["seed"] == 777
+
+
+def test_build_tiled_refine_with_tile_controlnet_wires_apply_between_prompt_and_refine():
+    base = PostProcessBaseParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        tile_controlnet_strength=0.55,
+    )
+    prompt, _save_id = build_tiled_refine("uploaded.png", base, TiledRefineParams())
+
+    types = _class_types(prompt)
+    assert types.count("ControlNetLoader") == 1
+    assert types.count("ControlNetApplyAdvanced") == 1
 
 
 def test_build_face_detailer_honors_explicit_seed():
