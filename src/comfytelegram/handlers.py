@@ -99,6 +99,12 @@ HAND_DRAW_CALLBACK_KIND = "hand_draw"
 #: (kind="hand_drawn")` again for a fresh seed/result, without having to
 #: redraw the mask from scratch. See `storage.py`'s `inpaint_redo`.
 HAND_REDO_CALLBACK_KIND = "hand_redo"
+#: "🔁 x4" next to "🔁 Redo (same mask)" — runs `HAND_REDO_CALLBACK_KIND`'s
+#: exact same re-run four times in a row (same source/mask, four fresh
+#: seeds) instead of one, for pushing out a batch of quick revisions to
+#: pick from without four separate taps. See `postprocess_callback`'s
+#: `HAND_REDO4_CALLBACK_KIND`/`FIX_REDO4_CALLBACK_KIND` branch.
+HAND_REDO4_CALLBACK_KIND = "hand_redo4"
 #: General-purpose counterpart to `HAND_DRAW_CALLBACK_KIND`/
 #: `HAND_REDO_CALLBACK_KIND` — "🩹 Fix Artifact" on `_post_process_keyboard`
 #: itself rather than behind `_hand_mode_keyboard`'s submenu, since there's
@@ -111,27 +117,34 @@ HAND_REDO_CALLBACK_KIND = "hand_redo"
 #: end up used, via `storage.py`'s `inpaint_job.kind` column.
 FIX_DRAW_CALLBACK_KIND = "fix_draw"
 FIX_REDO_CALLBACK_KIND = "fix_redo"
+FIX_REDO4_CALLBACK_KIND = "fix_redo4"
 
 #: What `storage.py`'s `inpaint_job.kind`/a drawn-mask redo tap actually
 #: means in terms of `generation.post_process`'s API — looked up by
 #: `_process_one_inpaint_job` (from the stored job row) and
-#: `postprocess_callback`'s `HAND_REDO_CALLBACK_KIND`/`FIX_REDO_CALLBACK_KIND`
-#: branch (from which callback fired) so both ends of the drawn-mask flow
-#: share one place that knows "hand" means `post_process(kind="hand_drawn")`
-#: plus a "Refining hand" label and `HAND_REDO_CALLBACK_KIND`'s redo button,
-#: while "fix" means `"fix_drawn")`/"Fixing artifact"/`FIX_REDO_CALLBACK_KIND`.
+#: `postprocess_callback`'s `HAND_REDO_CALLBACK_KIND`/`FIX_REDO_CALLBACK_KIND`/
+#: `HAND_REDO4_CALLBACK_KIND`/`FIX_REDO4_CALLBACK_KIND` branches (from which
+#: callback fired) so all four ends of the drawn-mask flow share one place
+#: that knows "hand" means `post_process(kind="hand_drawn")` plus a
+#: "Refining hand" label and `HAND_REDO_CALLBACK_KIND`/`HAND_REDO4_CALLBACK_KIND`'s
+#: redo buttons, while "fix" means `"fix_drawn")`/"Fixing artifact"/
+#: `FIX_REDO_CALLBACK_KIND`/`FIX_REDO4_CALLBACK_KIND`.
 _DRAWN_MASK_KINDS: dict[str, dict[str, str]] = {
     "hand": {
         "post_process_kind": "hand_drawn",
         "label": "Refining hand",
         "redo_callback_kind": HAND_REDO_CALLBACK_KIND,
+        "redo4_callback_kind": HAND_REDO4_CALLBACK_KIND,
     },
     "fix": {
         "post_process_kind": "fix_drawn",
         "label": "Fixing artifact",
         "redo_callback_kind": FIX_REDO_CALLBACK_KIND,
+        "redo4_callback_kind": FIX_REDO4_CALLBACK_KIND,
     },
 }
+#: How many revisions "🔁 x4" produces in one tap.
+DRAWN_MASK_REDO4_COUNT = 4
 #: Timeout for every outbound call to inpaint_relay — it's a small,
 #: same-purpose-built service the bot fully controls the deployment of, so
 #: a slow/unreachable relay should fail fast rather than hang a poller tick
@@ -396,6 +409,16 @@ def _drawn_mask_redo_button(result_id: str, redo_callback_kind: str) -> InlineKe
     came from rather than always assuming hand."""
     return InlineKeyboardButton(
         "🔁 Redo (same mask)", callback_data=f"pp:{redo_callback_kind}:{result_id}"
+    )
+
+
+def _drawn_mask_redo4_button(result_id: str, redo4_callback_kind: str) -> InlineKeyboardButton:
+    """Sits next to `_drawn_mask_redo_button` in the same row — runs
+    `DRAWN_MASK_REDO4_COUNT` redos in one tap instead of one. `redo4_callback_kind`
+    is `HAND_REDO4_CALLBACK_KIND` or `FIX_REDO4_CALLBACK_KIND` (see
+    `_DRAWN_MASK_KINDS`)."""
+    return InlineKeyboardButton(
+        f"🔁 x{DRAWN_MASK_REDO4_COUNT}", callback_data=f"pp:{redo4_callback_kind}:{result_id}"
     )
 
 
@@ -913,23 +936,85 @@ async def _send_drawn_mask_result_with_redo(
     generated: GeneratedImage,
     *,
     redo_callback_kind: str,
+    redo4_callback_kind: str,
 ) -> None:
-    """Send a `post_process(kind="hand_drawn"/"fix_drawn")` result with a
-    "🔁 Redo (same mask)" button attached, and persist what that button
-    needs to run it again (`storage.py`'s `inpaint_redo`) — shared by
+    """Send a `post_process(kind="hand_drawn"/"fix_drawn")` result with
+    "🔁 Redo (same mask)"/"🔁 x4" buttons attached (one row), and persist what
+    they need to run again (`storage.py`'s `inpaint_redo`) — shared by
     `_process_one_inpaint_job` and `postprocess_callback`'s
-    `HAND_REDO_CALLBACK_KIND`/`FIX_REDO_CALLBACK_KIND` branch, which differ
-    only in *how* they send (`send` is `_send_and_store_bot_result` or
-    `_send_and_store_result`, already bound to everything but `img`,
-    `result_id` and `extra_keyboard_rows`) and which redo button
-    (`redo_callback_kind`, from `_DRAWN_MASK_KINDS`) the result should carry."""
+    `HAND_REDO_CALLBACK_KIND`/`FIX_REDO_CALLBACK_KIND`/
+    `HAND_REDO4_CALLBACK_KIND`/`FIX_REDO4_CALLBACK_KIND` branches, which
+    differ only in *how* they send (`send` is `_send_and_store_bot_result`
+    or `_send_and_store_result`, already bound to everything but `img`,
+    `result_id` and `extra_keyboard_rows`) and which redo buttons
+    (`redo_callback_kind`/`redo4_callback_kind`, from `_DRAWN_MASK_KINDS`)
+    the result should carry. Every result carries both, including each of
+    the `DRAWN_MASK_REDO4_COUNT` results a "🔁 x4" tap itself produces — the
+    chain never drops back to single-redo-only."""
     new_result_id = uuid.uuid4().hex[:12]
     await send(
         generated,
         result_id=new_result_id,
-        extra_keyboard_rows=[[_drawn_mask_redo_button(new_result_id, redo_callback_kind)]],
+        extra_keyboard_rows=[
+            [
+                _drawn_mask_redo_button(new_result_id, redo_callback_kind),
+                _drawn_mask_redo4_button(new_result_id, redo4_callback_kind),
+            ]
+        ],
     )
     storage.store_inpaint_redo(new_result_id, source_file_id, source_filename, mask_bytes)
+
+
+async def _run_one_drawn_mask_redo(
+    reply_message: Message,
+    client: ComfyClient,
+    storage: Storage,
+    chat_id: int,
+    full_params: GenerationParams,
+    redo: dict[str, Any],
+    drawn_mask_kind: dict[str, str],
+    profiles: list[ModelProfile],
+    source_bytes: bytes,
+) -> bool:
+    """One "🔁 Redo (same mask)"/"🔁 x4" iteration: its own status message,
+    `post_process` call, and result send (with fresh redo buttons of its
+    own, so the chain keeps going indefinitely either way) — shared by
+    `postprocess_callback`'s `HAND_REDO_CALLBACK_KIND`/`FIX_REDO_CALLBACK_KIND`/
+    `HAND_REDO4_CALLBACK_KIND`/`FIX_REDO4_CALLBACK_KIND` branch, which calls
+    this once or `DRAWN_MASK_REDO4_COUNT` times depending on which button
+    was tapped. `source_bytes` is downloaded once by the caller and reused
+    across every iteration, rather than re-fetched per call. Returns True on
+    success, False on failure (already reported into that iteration's own
+    status message by `_run_reporting_errors`) — the caller stops the loop
+    on the first False rather than continuing to burn ComfyUI time on
+    a source/mask combination that just failed."""
+    status_message = await reply_message.reply_text(
+        f"{drawn_mask_kind['label']} (drawn mask)…", disable_notification=True
+    )
+    generated = await _run_drawn_mask_post_process(
+        client,
+        status_message,
+        source_bytes,
+        redo["source_filename"],
+        full_params,
+        redo["mask_png"],
+        post_process_kind=drawn_mask_kind["post_process_kind"],
+        label=drawn_mask_kind["label"],
+        profiles=profiles,
+    )
+    if generated is None:
+        return False
+    await _send_drawn_mask_result_with_redo(
+        lambda img, **kw: _send_and_store_result(reply_message, chat_id, storage, img, **kw),
+        storage,
+        redo["source_file_id"],
+        redo["source_filename"],
+        redo["mask_png"],
+        generated,
+        redo_callback_kind=drawn_mask_kind["redo_callback_kind"],
+        redo4_callback_kind=drawn_mask_kind["redo4_callback_kind"],
+    )
+    return True
 
 
 async def _process_one_inpaint_job(
@@ -1019,6 +1104,7 @@ async def _process_one_inpaint_job(
         result["mask"],
         generated,
         redo_callback_kind=drawn_mask_kind["redo_callback_kind"],
+        redo4_callback_kind=drawn_mask_kind["redo4_callback_kind"],
     )
 
 
@@ -1966,8 +2052,14 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             uploads_in_progress.discard(result_id)
         return
 
-    if kind in (HAND_REDO_CALLBACK_KIND, FIX_REDO_CALLBACK_KIND):
-        is_hand = kind == HAND_REDO_CALLBACK_KIND
+    if kind in (
+        HAND_REDO_CALLBACK_KIND,
+        FIX_REDO_CALLBACK_KIND,
+        HAND_REDO4_CALLBACK_KIND,
+        FIX_REDO4_CALLBACK_KIND,
+    ):
+        is_hand = kind in (HAND_REDO_CALLBACK_KIND, HAND_REDO4_CALLBACK_KIND)
+        is_redo4 = kind in (HAND_REDO4_CALLBACK_KIND, FIX_REDO4_CALLBACK_KIND)
         drawn_mask_kind = _DRAWN_MASK_KINDS["hand" if is_hand else "fix"]
         redo = storage.get_inpaint_redo(result_id)
         if redo is None:
@@ -1976,35 +2068,26 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"That mask has expired — draw a new one with {redo_button}."
             )
             return
-        status_message = await query.message.reply_text(
-            f"{drawn_mask_kind['label']} (drawn mask)…", disable_notification=True
-        )
         tg_file = await context.bot.get_file(redo["source_file_id"])
         source_bytes = bytes(await tg_file.download_as_bytearray())
-        generated = await _run_drawn_mask_post_process(
-            client,
-            status_message,
-            source_bytes,
-            redo["source_filename"],
-            full_params,
-            redo["mask_png"],
-            post_process_kind=drawn_mask_kind["post_process_kind"],
-            label=drawn_mask_kind["label"],
-            profiles=context.bot_data["profiles"],
-        )
-        if generated is None:
-            return
-        await _send_drawn_mask_result_with_redo(
-            lambda img, **kw: _send_and_store_result(
-                query.message, pending["chat_id"], storage, img, **kw
-            ),
-            storage,
-            redo["source_file_id"],
-            redo["source_filename"],
-            redo["mask_png"],
-            generated,
-            redo_callback_kind=drawn_mask_kind["redo_callback_kind"],
-        )
+        # "🔁 x4" runs the same iteration DRAWN_MASK_REDO4_COUNT times instead
+        # of once, reusing the one source download above across all of them.
+        # Stops at the first failure rather than continuing to spend ComfyUI
+        # time on a source/mask combination that just failed.
+        for _ in range(DRAWN_MASK_REDO4_COUNT if is_redo4 else 1):
+            ok = await _run_one_drawn_mask_redo(
+                query.message,
+                client,
+                storage,
+                pending["chat_id"],
+                full_params,
+                redo,
+                drawn_mask_kind,
+                context.bot_data["profiles"],
+                source_bytes,
+            )
+            if not ok:
+                break
         return
 
     if kind == HAND_AUTO_CALLBACK_KIND:

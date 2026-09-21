@@ -10,7 +10,9 @@ from comfytelegram.generation import GeneratedImage
 from comfytelegram.handlers import (
     _MAIN_KEYBOARD,
     ANALYZE_PROMPT_CALLBACK_KIND,
+    DRAWN_MASK_REDO4_COUNT,
     FIX_DRAW_CALLBACK_KIND,
+    FIX_REDO4_CALLBACK_KIND,
     FIX_REDO_CALLBACK_KIND,
     HAND_AUTO_CALLBACK_KIND,
     HAND_DRAW_CALLBACK_KIND,
@@ -19,6 +21,7 @@ from comfytelegram.handlers import (
     HAND_POINT_GRID_SIZE,
     HAND_POINT_GRID_SIZE_FINE,
     HAND_POINT_PREVIEW_MAX_DIM,
+    HAND_REDO4_CALLBACK_KIND,
     HAND_REDO_CALLBACK_KIND,
     SHOW_PROMPT_CALLBACK_KIND,
     TAGCHECK_TOKEN_LIMIT,
@@ -1135,6 +1138,18 @@ async def test_hand_redo_reruns_post_process_with_the_stored_source_and_mask():
     ]
     assert len(redo_buttons) == 1
     assert redo_buttons[0].callback_data == f"pp:{HAND_REDO_CALLBACK_KIND}:{new_result_id_args[0]}"
+    # "🔁 x4" rides along in the same row as every redo result, including
+    # ones produced by a single "🔁 Redo (same mask)" tap.
+    redo4_buttons = [
+        b
+        for row in keyboard.inline_keyboard
+        for b in row
+        if b.callback_data.startswith(f"pp:{HAND_REDO4_CALLBACK_KIND}:")
+    ]
+    assert len(redo4_buttons) == 1
+    assert (
+        redo4_buttons[0].callback_data == f"pp:{HAND_REDO4_CALLBACK_KIND}:{new_result_id_args[0]}"
+    )
 
 
 @pytest.mark.asyncio
@@ -1177,6 +1192,124 @@ async def test_fix_redo_reruns_post_process_with_fix_drawn_kind():
         if b.callback_data.startswith(f"pp:{FIX_REDO_CALLBACK_KIND}:")
     ]
     assert len(redo_buttons) == 1
+    redo4_buttons = [
+        b
+        for row in keyboard.inline_keyboard
+        for b in row
+        if b.callback_data.startswith(f"pp:{FIX_REDO4_CALLBACK_KIND}:")
+    ]
+    assert len(redo4_buttons) == 1
+
+
+@pytest.mark.asyncio
+async def test_hand_redo4_runs_post_process_four_times_reusing_one_source_download():
+    query = AsyncMock()
+    query.data = f"pp:{HAND_REDO4_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    storage.get_inpaint_redo.return_value = {
+        "source_file_id": "presource123",
+        "source_filename": "presource.png",
+        "mask_png": b"stored-mask-bytes",
+    }
+    context = _postprocess_context(storage, profile)
+
+    def _redone(i: int) -> GeneratedImage:
+        return GeneratedImage(
+            data=f"redone{i}".encode(),
+            filename="out.png",
+            full_params=GenerationParams(
+                checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+            ),
+            unchanged=False,
+        )
+
+    with patch(
+        "comfytelegram.handlers.post_process",
+        new=AsyncMock(side_effect=[_redone(i) for i in range(DRAWN_MASK_REDO4_COUNT)]),
+    ) as post_process_mock:
+        await postprocess_callback(update, context)
+
+    assert post_process_mock.await_count == DRAWN_MASK_REDO4_COUNT
+    # the source image is downloaded once and reused across all four runs,
+    # not re-fetched per iteration.
+    context.bot.get_file.assert_awaited_once_with("presource123")
+    assert query.message.reply_photo.await_count == DRAWN_MASK_REDO4_COUNT
+    assert storage.store_inpaint_redo.call_count == DRAWN_MASK_REDO4_COUNT
+
+
+@pytest.mark.asyncio
+async def test_fix_redo4_uses_fix_drawn_kind_four_times():
+    query = AsyncMock()
+    query.data = f"pp:{FIX_REDO4_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    storage.get_inpaint_redo.return_value = {
+        "source_file_id": "presource123",
+        "source_filename": "presource.png",
+        "mask_png": b"stored-mask-bytes",
+    }
+    context = _postprocess_context(storage, profile)
+
+    redone = GeneratedImage(
+        data=b"redone",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch(
+        "comfytelegram.handlers.post_process", new=AsyncMock(return_value=redone)
+    ) as post_process_mock:
+        await postprocess_callback(update, context)
+
+    assert post_process_mock.await_count == DRAWN_MASK_REDO4_COUNT
+    assert all(call.args[1] == "fix_drawn" for call in post_process_mock.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_redo4_stops_after_first_failure_instead_of_running_the_rest():
+    query = AsyncMock()
+    query.data = f"pp:{HAND_REDO4_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    storage.get_inpaint_redo.return_value = {
+        "source_file_id": "presource123",
+        "source_filename": "presource.png",
+        "mask_png": b"stored-mask-bytes",
+    }
+    context = _postprocess_context(storage, profile)
+
+    redone = GeneratedImage(
+        data=b"redone",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    # succeeds once, then fails — the loop must not attempt a 3rd/4th run.
+    with patch(
+        "comfytelegram.handlers.post_process",
+        new=AsyncMock(side_effect=[redone, ComfyUIError("boom")]),
+    ) as post_process_mock:
+        await postprocess_callback(update, context)
+
+    assert post_process_mock.await_count == 2
+    assert query.message.reply_photo.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -1223,6 +1356,30 @@ async def test_fix_redo_reports_expired_mask_instead_of_running_post_process():
     post_process_mock.assert_not_called()
     query.message.reply_text.assert_awaited_once_with(
         "That mask has expired — draw a new one with 🩹 Fix Artifact."
+    )
+
+
+@pytest.mark.asyncio
+async def test_hand_redo4_reports_expired_mask_instead_of_running_post_process():
+    # Also confirms the "hand" vs "fix" label lookup still resolves
+    # correctly for a *_redo4 kind, not just the single-redo ones.
+    query = AsyncMock()
+    query.data = f"pp:{HAND_REDO4_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    storage.get_inpaint_redo.return_value = None
+    context = _postprocess_context(storage, profile)
+
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock()) as post_process_mock:
+        await postprocess_callback(update, context)
+
+    post_process_mock.assert_not_called()
+    query.message.reply_text.assert_awaited_once_with(
+        "That mask has expired — draw a new one with 🖌️ Draw Mask."
     )
 
 
