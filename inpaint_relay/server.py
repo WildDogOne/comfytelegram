@@ -30,6 +30,8 @@ Two trust boundaries:
 from __future__ import annotations
 
 import base64
+import io
+import logging
 import os
 import secrets
 import time
@@ -38,6 +40,9 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
+from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -52,11 +57,37 @@ JOB_TTL_SECONDS = float(os.environ.get("INPAINT_RELAY_JOB_TTL_SECONDS", "1800"))
 
 @dataclass
 class Job:
+    #: Re-encoded (see `_to_display_jpeg`) purely for faster delivery to the
+    #: mask editor's <canvas> — never the thing anything gets generated
+    #: from. `image_content_type` names what it actually got encoded as,
+    #: since re-encoding falls back to serving the original bytes verbatim
+    #: (still PNG) if Pillow can't decode them for whatever reason.
     image: bytes
+    image_content_type: str
     created_at: float = field(default_factory=time.time)
     status: str = "pending"  # "pending" -> "submitted"
     mask: bytes | None = None
     init_data: str | None = None
+
+
+def _to_display_jpeg(source: bytes) -> bytes:
+    """Re-encode `source` as a quality-85 JPEG at its *original* pixel
+    dimensions — dropping only what JPEG-vs-PNG compression itself drops,
+    never resizing — purely so `GET /jobs/{token}/image` has far fewer
+    bytes to ship to the phone opening the mask editor. Safe to do
+    unconditionally: this copy is only ever drawn onto the editor's
+    on-screen `<canvas>` for visual reference while the user paints: the
+    mask they draw is submitted as its own separate grayscale PNG
+    (`POST /jobs/{token}/mask`), sized off `image.naturalWidth/Height` in
+    the browser (unchanged by re-encoding, since dimensions aren't
+    touched), and comfytelegram composites that mask against *its own*
+    original full-quality PNG upload, never this relay's copy — so nothing
+    downstream ever sees this image's compression artifacts."""
+    with Image.open(io.BytesIO(source)) as im:
+        rgb = im.convert("RGB")
+        buf = io.BytesIO()
+        rgb.save(buf, format="JPEG", quality=85)
+        return buf.getvalue()
 
 
 app = FastAPI(title="inpaint-relay")
@@ -108,8 +139,15 @@ async def create_job(request: Request) -> dict[str, str]:
     image = await request.body()
     if not image:
         raise HTTPException(status_code=400, detail="Empty request body")
+    try:
+        display_image = _to_display_jpeg(image)
+        content_type = "image/jpeg"
+    except Exception:
+        logger.warning("Couldn't re-encode uploaded image as JPEG; serving it as-is", exc_info=True)
+        display_image = image
+        content_type = "image/png"
     token = secrets.token_urlsafe(24)
-    _jobs[token] = Job(image=image)
+    _jobs[token] = Job(image=display_image, image_content_type=content_type)
     return {"token": token}
 
 
@@ -132,7 +170,7 @@ async def job_image(token: str) -> Response:
     job = _jobs.get(token)
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown or expired job")
-    return Response(content=job.image, media_type="image/png")
+    return Response(content=job.image, media_type=job.image_content_type)
 
 
 @app.post("/jobs/{token}/mask")
