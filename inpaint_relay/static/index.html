@@ -140,6 +140,7 @@
   var token = location.pathname.split("/").filter(Boolean).pop();
 
   var statusEl = document.getElementById("status");
+  var canvasWrap = document.getElementById("canvas-wrap");
   var displayCanvas = document.getElementById("display-canvas");
   var displayCtx = displayCanvas.getContext("2d");
   var brushSizeInput = document.getElementById("brush-size");
@@ -716,7 +717,21 @@
     // stays responsive on a large source image — it's just for drawing,
     // not the final output, and `scale` maps every stroke back up to
     // maskCanvas's full source-image resolution regardless of this cap.
-    var maxDisplayDim = 900;
+    // The cap used to be a flat 900px, which meant a 4k source image sat
+    // roughly 4.5x downscaled even at rest — and since pinch/wheel zoom
+    // (`view.zoom`, up to MAX_ZOOM) is a CSS `transform: scale()` applied
+    // on top of that same fixed raster rather than a redraw at higher
+    // detail, zooming in just stretched those same soft pixels further and
+    // went blocky fast. Sizing the cap off the actual viewport instead
+    // (times device pixel ratio, times MAX_ZOOM) gives the raster enough
+    // real detail to stay crisp all the way to full pinch zoom on whatever
+    // screen this happens to be open on, while still bounding memory/redraw
+    // cost on a small phone screen the same way the old flat cap did.
+    var viewportPxAtMaxZoom =
+      Math.max(canvasWrap.clientWidth, canvasWrap.clientHeight) *
+      (window.devicePixelRatio || 1) *
+      MAX_ZOOM;
+    var maxDisplayDim = Math.min(4096, Math.max(900, viewportPxAtMaxZoom));
     var displayScale = Math.min(
       1,
       maxDisplayDim / Math.max(image.naturalWidth, image.naturalHeight)
