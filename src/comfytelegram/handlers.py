@@ -1967,11 +1967,13 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if kind in (HAND_REDO_CALLBACK_KIND, FIX_REDO_CALLBACK_KIND):
-        drawn_mask_kind = _DRAWN_MASK_KINDS["hand" if kind == HAND_REDO_CALLBACK_KIND else "fix"]
+        is_hand = kind == HAND_REDO_CALLBACK_KIND
+        drawn_mask_kind = _DRAWN_MASK_KINDS["hand" if is_hand else "fix"]
         redo = storage.get_inpaint_redo(result_id)
         if redo is None:
+            redo_button = "🖌️ Draw Mask" if is_hand else "🩹 Fix Artifact"
             await query.message.reply_text(
-                "That mask has expired — draw a new one with 🖌️ Draw Mask/🩹 Fix Artifact."
+                f"That mask has expired — draw a new one with {redo_button}."
             )
             return
         status_message = await query.message.reply_text(

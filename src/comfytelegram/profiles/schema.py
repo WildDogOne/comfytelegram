@@ -142,17 +142,24 @@ class ModelProfile(BaseModel):
     anima_lllite_inpaint_patch: str | None = Field(
         None,
         description=(
-            "loader='split' only: filename of a ModelPatchLoader-compatible "
-            "ControlNet-LLLite inpainting patch (e.g. Anima's "
-            "'anima-lllite-inpainting-v2.safetensors', in ComfyUI's "
-            "models/model_patches) applied via AnimaLLLiteApply before the "
-            "'🩹 Fix Artifact' removal pass samples, so it's actually "
-            "inpainting-aware instead of running plain noise-masked img2img. "
+            "loader='split' only: weights filename for ETN_control_load/"
+            "ETN_control_apply (comfyui-tooling-nodes — the same node pack "
+            "krita-ai-diffusion itself uses for this weight format), e.g. "
+            "Anima's 'anima-lllite-inpainting-v2.safetensors', staged under "
+            "ComfyUI's models/controlnet/ (a plain ControlNetLoader scans "
+            "the same folder). Applied before the '🩹 Fix Artifact' removal "
+            "pass samples, so it's actually inpainting-aware instead of "
+            "running plain noise-masked img2img. Do NOT stage this under "
+            "models/model_patches/ for ComfyUI core's ModelPatchLoader/"
+            "AnimaLLLiteApply instead — that's a different, unrelated "
+            "mechanism that also lists this file in its dropdown without "
+            "actually being able to interpret it (confirmed against a live "
+            "server: wiring those core nodes produced very poor results). "
             "Unset (the default) skips the branch entirely."
         ),
     )
     anima_lllite_inpaint_patch_strength: float = Field(
-        1.0, description="anima_lllite_inpaint_patch only: AnimaLLLiteApply's strength"
+        1.0, description="anima_lllite_inpaint_patch only: ETN_control_apply's strength"
     )
 
     fix_artifact_checkpoint: str | None = Field(

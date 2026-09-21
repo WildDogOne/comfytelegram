@@ -1196,8 +1196,33 @@ async def test_hand_redo_reports_expired_mask_instead_of_running_post_process():
         await postprocess_callback(update, context)
 
     post_process_mock.assert_not_called()
+    # Names only the hand flow's own button, not both — a fix-kind redo
+    # (FIX_REDO_CALLBACK_KIND) hits the same code path and must name
+    # "🩹 Fix Artifact" instead; see the sibling test below.
     query.message.reply_text.assert_awaited_once_with(
-        "That mask has expired — draw a new one with 🖌️ Draw Mask/🩹 Fix Artifact."
+        "That mask has expired — draw a new one with 🖌️ Draw Mask."
+    )
+
+
+@pytest.mark.asyncio
+async def test_fix_redo_reports_expired_mask_instead_of_running_post_process():
+    query = AsyncMock()
+    query.data = f"pp:{FIX_REDO_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    storage.get_inpaint_redo.return_value = None
+    context = _postprocess_context(storage, profile)
+
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock()) as post_process_mock:
+        await postprocess_callback(update, context)
+
+    post_process_mock.assert_not_called()
+    query.message.reply_text.assert_awaited_once_with(
+        "That mask has expired — draw a new one with 🩹 Fix Artifact."
     )
 
 

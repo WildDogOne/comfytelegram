@@ -1245,49 +1245,16 @@ def _build_drawn_mask_detailer(
     for the hand-detail variant, where the masked region should be corrected
     against the subject prompt, not structurally erased first.
 
-    Within that same `content_aware_fill` branch, `base.anima_lllite_inpaint_patch`
-    (set — currently only by the Anima profiles) additionally patches
-    `model_ref` via `ETN_control_load`+`ETN_control_apply`
-    (`comfyui-tooling-nodes` — the same node pack `krita-ai-diffusion` itself
-    uses for this exact weight format, per its `apply_controlnet_lllite`;
-    *not* ComfyUI core's `ModelPatchLoader`+`AnimaLLLiteApply`, which is an
-    unrelated, superficially similar mechanism that also lists this file in
-    its dropdown without actually being able to interpret it correctly —
-    confirmed by a first pass wired against those core nodes producing very
-    poor results) before it reaches `DetailerForEach`, so the diffusion
-    refine pass that follows the MAT/LaMa prefill is itself inpainting-aware
-    (conditioned on the drawn mask directly) instead of plain noise-masked
-    img2img on a checkpoint that's never seen a masked hole. Its `image`
-    input is `detailer_image` (the MAT/LaMa-filled image), not the raw
-    `load` source — confirmed against `comfyui-tooling-nodes`' own
-    `ETN_control_apply` implementation: whether it blanks the masked region
-    of the RGB before using it as structural conditioning depends on an
-    `inpaint_masked_input` flag baked into the *weights file's own
-    metadata*, which this graph has no way to inspect or trust, so a second
-    pass wired with the raw source image reliably reconstructed the exact
-    object the mask was drawn over — the ControlNet was reading its
-    literal, undamaged pixels as "this is what belongs here" structural
-    guidance. Feeding the already-erased image instead removes that signal
-    regardless of what the metadata says. No SDXL/SD1.5 equivalent is wired
-    in yet — those need either a custom Impact Pack `detailer_hook` for the
-    Fooocus inpaint patch, or an inpaint ControlNet through the
-    `tile_controlnet`-style path instead.
-
-    Two more deltas in that same Anima branch, both matched against
-    `krita-ai-diffusion`'s own `workflow.inpaint()` rather than guessed:
-    `model_ref` is wrapped in a `DifferentialDiffusion` node (krita applies
-    this unconditionally before any inpaint operation), and the local
-    `denoise` used by `DetailerForEach` below is forced to `1.0` regardless
-    of `params.denoise` — krita's own `detect_inpaint` only turns on this
-    ControlNet-conditioned inpaint path for Anima at all when generation
-    strength is `1.0`, and testing confirmed why: at the params' own default
-    (0.75) the masked region came back almost entirely untouched for this
-    arch/sampler combination. Even matching krita's approach this closely,
-    results on stylized/illustrated content are inconsistent — this weight
-    file behaves like a general "fill this hole with something plausible"
-    model rather than a specialized "erase to background" one, so it can
-    still invent a *different* object in the masked region instead of
-    leaving it blank. Known and accepted for now rather than solved.
+    This function is only actually reached with `content_aware_fill=True`
+    when `build_fix_drawn_mask` did *not* route to `_build_anima_fix_drawn_mask`
+    instead — i.e. `base.loader == "split" and base.anima_lllite_inpaint_patch`
+    is guaranteed false here, since that exact condition is what sends the
+    call there first. No Anima-specific ControlNet patching happens in this
+    function for that reason; see `_build_anima_fix_drawn_mask` for that
+    entire pipeline instead. No SDXL/SD1.5 equivalent is wired in at all yet
+    for this fallback — that would need either a custom Impact Pack
+    `detailer_hook` for the Fooocus inpaint patch, or an inpaint ControlNet
+    through the `tile_controlnet`-style path.
 
     Same downstream shape as `build_hand_detailer_manual` (`MaskToSEGS` ->
     `DetailerForEach`) and the same reasoning for skipping a detection-check
@@ -1319,51 +1286,6 @@ def _build_drawn_mask_detailer(
             title="Content-Aware Fill",
         )
         detailer_image = (prefilled, 0)
-
-        if base.loader == "split" and base.anima_lllite_inpaint_patch:
-            # krita-ai-diffusion applies this unconditionally before any
-            # inpaint operation (`w.differential_diffusion(model)`) — it
-            # changes how `DetailerForEach`'s noise_mask is interpreted so
-            # the masked region actually gets fully re-sampled rather than
-            # staying anchored to the (here: content-aware-filled) input
-            # latent. Scoped to this branch, not applied generally, since
-            # it's only been verified for this exact path.
-            diff_diffusion_model = g.add(
-                "DifferentialDiffusion", {"model": list(model_ref)}, title="Differential Diffusion"
-            )
-            model_ref = (diff_diffusion_model, 0)
-            # krita-ai-diffusion only engages this ControlNet-conditioned
-            # inpaint path for Anima at all when its generation strength is
-            # 1.0 (`detect_inpaint`'s `use_inpaint_model = strength == 1.0`
-            # for Arch.anima) — confirmed necessary by testing too: at 0.75
-            # the masked region came back almost untouched for this arch.
-            denoise = 1.0
-            control_load = g.add(
-                "ETN_control_load",
-                {"model": list(model_ref), "weights": base.anima_lllite_inpaint_patch},
-                title="Load Anima Inpaint ControlNet (LLLite)",
-            )
-            patched_model = g.add(
-                "ETN_control_apply",
-                {
-                    "model": [control_load, 0],
-                    "control_net": [control_load, 1],
-                    # The already-content-aware-filled image (object erased),
-                    # not the raw source — see this function's docstring for
-                    # why: whether the node itself blanks the masked region
-                    # before using it as structural conditioning depends on a
-                    # metadata flag baked into the weights file, which we
-                    # can't verify from here, so the object's shape must
-                    # already be gone from what we hand it regardless.
-                    "image": list(detailer_image),
-                    "strength": base.anima_lllite_inpaint_patch_strength,
-                    "start_percent": 0.0,
-                    "end_percent": 1.0,
-                    "mask": [mask, 0],
-                },
-                title="Apply Anima Inpaint ControlNet (LLLite)",
-            )
-            model_ref = (patched_model, 0)
 
     segs = g.add(
         "MaskToSEGS",

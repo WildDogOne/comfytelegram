@@ -631,6 +631,42 @@ async def test_post_process_fix_drawn_without_override_profile_keeps_own_checkpo
 
 
 @pytest.mark.asyncio
+async def test_post_process_fix_drawn_anima_own_checkpoint_without_override_still_gets_prompt():
+    """No profile sets fix_artifact_checkpoint (so no override_base matches),
+    but this image's own checkpoint already has loader='split' and
+    anima_lllite_inpaint_patch set — build_fix_drawn_mask's routing check
+    only looks at those two fields, so it still routes to
+    _build_anima_fix_drawn_mask regardless of the missing override. That
+    pipeline documents it expects a non-blank positive prompt; the old
+    unconditional `positive_prompt=""` fallback would have silently
+    violated that."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="anima_unet.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+        loader="split",
+        clip_name="qwen_3_06b_base.safetensors",
+        vae_name="qwen_image_vae.safetensors",
+        anima_lllite_inpaint_patch="anima-lllite-inpainting-v2.safetensors",
+    )
+
+    await post_process(
+        client, "fix_drawn", source, "source.png", params, mask_bytes=mask, profiles=[]
+    )
+
+    texts = {
+        n["inputs"]["text"]
+        for n in client.queued_graph.values()
+        if n["class_type"] == "CLIPTextEncode"
+    }
+    assert "" not in texts
+    assert "a fox" not in texts
+
+
+@pytest.mark.asyncio
 async def test_post_process_fix_drawn_clears_positive_prompt():
     """The original positive prompt describes the whole scene, including
     whatever the user just drew a mask over to remove — conditioning the

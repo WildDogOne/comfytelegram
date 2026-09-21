@@ -466,6 +466,17 @@ async def post_process(
         if override_base is not None:
             fix_base_params = override_base
             checkpoint_source = "fix_artifact_checkpoint override"
+        elif base_params.loader == "split" and base_params.anima_lllite_inpaint_patch:
+            # No fix_artifact_checkpoint override matched, but this image's
+            # own checkpoint already has the Anima lllite patch configured
+            # — build_fix_drawn_mask's own routing check (loader=="split"
+            # and anima_lllite_inpaint_patch set) will still send this to
+            # _build_anima_fix_drawn_mask, which documents that it expects a
+            # non-blank positive prompt. A blank one here would silently
+            # reproduce the "masked region came back almost untouched"
+            # regression that whole prompt exists to avoid.
+            fix_base_params = replace(base_params, positive_prompt="background scenery")
+            checkpoint_source = "image's own checkpoint"
         else:
             fix_base_params = replace(base_params, positive_prompt="")
             checkpoint_source = "image's own checkpoint"
