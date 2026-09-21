@@ -45,7 +45,10 @@ Files starting with `_` are ignored (reserved for docs/schema files).
   "vae_name": "",                      // "split" only: VAELoader's filename
   "model_sampling_shift": null,        // "split" only: shift for a ModelSamplingAuraFlow node (omit/null to skip it)
   "tile_controlnet": null,             // ControlNet Tile model filename for the upscale pass (omit/null to skip it) — see below
-  "tile_controlnet_strength": 0.4      // ControlNetApplyAdvanced's strength for tile_controlnet
+  "tile_controlnet_strength": 0.4,     // ControlNetApplyAdvanced's strength for tile_controlnet
+  "anima_lllite_inpaint_patch": null,  // "split" (Anima) only: ETN_control_load weights filename for the "🩹 Fix Artifact" pass (omit/null to skip it) — see below
+  "anima_lllite_inpaint_patch_strength": 1.0, // ETN_control_apply's strength for anima_lllite_inpaint_patch
+  "fix_artifact_checkpoint": null      // exact filename "🩹 Fix Artifact" always uses instead of the image's own checkpoint (omit/null to keep using each image's own) — see below
 }
 ```
 
@@ -122,3 +125,66 @@ The two are meant to be tuned together: `furrytoonmix_illustrious.json`
 sets `upscale_denoise: 0.5` (up from the conservative `0.2` the base
 UpscaleParams default mirrors from `sample.json`) precisely because it
 also has a `tile_controlnet` staged to anchor that extra denoise.
+
+### `anima_lllite_inpaint_patch` — making "🩹 Fix Artifact" actually inpainting-aware
+
+`"loader": "split"` only. Without this, "🩹 Fix Artifact"/"🖌️ Draw Mask"
+runs plain noise-masked img2img on a checkpoint that was never trained on
+"here's a masked hole, infer what belongs there" — it just has to hope the
+denoise pass reconstructs something plausible, which is why results can be
+hit-or-miss (sometimes it cleanly erases the marked region, sometimes it
+reconstructs a nicer-looking version of the very thing you masked out).
+Setting `anima_lllite_inpaint_patch` to an Anima LLLite inpainting weights
+filename (staged under ComfyUI's `models/controlnet/` — `ETN_control_load`
+scans the same folder a plain `ControlNetLoader` does) patches the model
+via `ETN_control_load`+`ETN_control_apply` (`comfyui-tooling-nodes`, Acly's
+own node pack — the *same one `krita-ai-diffusion` itself uses* for this
+exact weight format, via its own `apply_controlnet_lllite`) before that
+diffusion pass, conditioned directly on the source image and the drawn
+mask, instead of relying on generic img2img. **Do not** point this at
+ComfyUI core's `ModelPatchLoader`/`AnimaLLLiteApply` pair instead — despite
+the similar name and despite also listing this same file in its own
+dropdown, it's a different, unrelated mechanism that can't actually
+interpret this weight format; a first pass wired against those core nodes
+produced very poor results (confirmed by cross-checking krita-ai-diffusion's
+own source, which uses `ETN_control_load`/`ETN_control_apply` specifically).
+`anima_lllite_inpaint_patch_strength` tunes how strongly the patch holds.
+No SDXL/SD1.5 equivalent exists yet — see `fix_artifact_checkpoint` below
+for how checkpoints without one are handled in the meantime.
+
+### `fix_artifact_checkpoint` — routing "🩹 Fix Artifact" to a checkpoint that can actually inpaint
+
+Most checkpoints have no inpainting-aware path wired at all (see
+`anima_lllite_inpaint_patch` above) — running "🩹 Fix Artifact" on an image
+from one of them is a coin flip regardless of how the pass itself is
+tuned. Setting `fix_artifact_checkpoint` on a profile makes "🩹 Fix
+Artifact" **always** load that exact checkpoint filename (plus that
+profile's `loader`/`clip_name`/`clip_type`/`vae_name`/
+`model_sampling_shift`/`loras`/`negative_prompt_prefix`/
+`anima_lllite_inpaint_patch`) instead of the image's own original one —
+regardless of which checkpoint the image was actually generated with.
+`anima_aesthetic.json` sets this to `anima_aestheticV11.safetensors`, so
+"🩹 Fix Artifact" on *any* image (furrytoonmix, SDXL, whatever) routes
+through Anima Aesthetic + its lllite inpainting patch.
+
+Unlike `match` (a glob matched against whatever checkpoint the user
+picked), this is a literal filename — it names the exact file to switch
+*to*, not which profile applies to a file you already have. Only set it
+on one profile; if several do, the first one in file-load order wins.
+The positive prompt is still forced empty for this pass either way — see
+`generation.post_process`'s `fix_drawn` branch — so the removed content
+isn't reconstructed from a text description regardless of which
+checkpoint ends up handling it.
+
+Trade-off worth knowing: the source image's own checkpoint and the
+`fix_artifact_checkpoint` one can be completely different architectures
+(Anima's AuraFlow-style 2B model vs. an SDXL/Illustrious checkpoint like
+furrytoonmix). A clean removal is the goal, but the patched region is
+rendered by a *different* model than the rest of the image, so it can
+carry a slightly different color grade/lineweight/rendering style than
+its surroundings — a different failure mode than the "reconstructs the
+removed thing" problem this is meant to fix, not a strictly better result
+in every case. The bot logs which checkpoint a given "🩹 Fix Artifact" run
+actually used (`Fix Artifact: checkpoint=... (fix_artifact_checkpoint
+override / image's own checkpoint) ...`), so this is easy to confirm
+against real results rather than guessing.

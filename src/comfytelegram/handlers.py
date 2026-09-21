@@ -18,7 +18,7 @@ import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
@@ -99,6 +99,39 @@ HAND_DRAW_CALLBACK_KIND = "hand_draw"
 #: (kind="hand_drawn")` again for a fresh seed/result, without having to
 #: redraw the mask from scratch. See `storage.py`'s `inpaint_redo`.
 HAND_REDO_CALLBACK_KIND = "hand_redo"
+#: General-purpose counterpart to `HAND_DRAW_CALLBACK_KIND`/
+#: `HAND_REDO_CALLBACK_KIND` — "🩹 Fix Artifact" on `_post_process_keyboard`
+#: itself rather than behind `_hand_mode_keyboard`'s submenu, since there's
+#: no auto-detect/tap-a-point alternative for an arbitrary unwanted region
+#: the way there is for a hand. Shares the exact same relay upload/poll/
+#: redo machinery as the hand-drawn flow — see `_process_one_inpaint_job`,
+#: `_run_drawn_mask_post_process`, `_send_drawn_mask_result_with_redo` —
+#: differing only in which `post_process` kind ("fix_drawn" vs
+#: "hand_drawn") and `DrawnMaskFixParams`/`DrawnMaskHandDetailerParams`
+#: end up used, via `storage.py`'s `inpaint_job.kind` column.
+FIX_DRAW_CALLBACK_KIND = "fix_draw"
+FIX_REDO_CALLBACK_KIND = "fix_redo"
+
+#: What `storage.py`'s `inpaint_job.kind`/a drawn-mask redo tap actually
+#: means in terms of `generation.post_process`'s API — looked up by
+#: `_process_one_inpaint_job` (from the stored job row) and
+#: `postprocess_callback`'s `HAND_REDO_CALLBACK_KIND`/`FIX_REDO_CALLBACK_KIND`
+#: branch (from which callback fired) so both ends of the drawn-mask flow
+#: share one place that knows "hand" means `post_process(kind="hand_drawn")`
+#: plus a "Refining hand" label and `HAND_REDO_CALLBACK_KIND`'s redo button,
+#: while "fix" means `"fix_drawn")`/"Fixing artifact"/`FIX_REDO_CALLBACK_KIND`.
+_DRAWN_MASK_KINDS: dict[str, dict[str, str]] = {
+    "hand": {
+        "post_process_kind": "hand_drawn",
+        "label": "Refining hand",
+        "redo_callback_kind": HAND_REDO_CALLBACK_KIND,
+    },
+    "fix": {
+        "post_process_kind": "fix_drawn",
+        "label": "Fixing artifact",
+        "redo_callback_kind": FIX_REDO_CALLBACK_KIND,
+    },
+}
 #: Timeout for every outbound call to inpaint_relay — it's a small,
 #: same-purpose-built service the bot fully controls the deployment of, so
 #: a slow/unreachable relay should fail fast rather than hang a poller tick
@@ -225,19 +258,32 @@ _DETAILER_KINDS = ("face", "hand")
 def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
     """The keyboard attached to a generated/post-processed image: a row of
     whole-image tiled passes (`_TILED_PASS_KINDS`: upscale, homogenize),
-    then a row of region detailers (`_DETAILER_KINDS`: face, hand) below
-    them, then Analyze Image (image analysis, prompt only, no generation),
-    Analyze Prompt (a `/tagcheck`-style tag-health check on the prompt this
-    image was built from — see `postprocess_callback`'s
-    `ANALYZE_PROMPT_CALLBACK_KIND` branch), Deep Analyze (image analysis via
-    the bigger `analyze_caption_deep` model), and Show Prompt (a debugging
-    button that dumps the exact positive/negative prompt this image was
-    generated with, folded character and profile prefixes included, plus a
-    second reply with just the text the user typed — see
-    `postprocess_callback`'s `SHOW_PROMPT_CALLBACK_KIND` branch), all scoped
-    to `result_id` (see `storage.py`'s `pending_result`). "🖐️ Hand Detail"
-    doesn't post-process on this tap alone — see `postprocess_callback`'s
-    `"hand"` branch for the auto/manual choice it replies with instead."""
+    then a row of region detailers (`_DETAILER_KINDS`: face, hand), then
+    "🩹 Fix Artifact" (`FIX_DRAW_CALLBACK_KIND` — draw a freehand mask over
+    any unwanted region and inpaint over it; unlike face/hand there's no
+    auto-detector for an arbitrary artifact, so this jumps straight to the
+    WebApp mask editor instead of a submenu — see `postprocess_callback`'s
+    `FIX_DRAW_CALLBACK_KIND` branch) on its own row, then Analyze Image
+    (image analysis, prompt only, no generation), Analyze Prompt (a
+    `/tagcheck`-style tag-health check on the prompt this image was built
+    from — see `postprocess_callback`'s `ANALYZE_PROMPT_CALLBACK_KIND`
+    branch), Deep Analyze (image analysis via the bigger
+    `analyze_caption_deep` model), and Show Prompt (a debugging button that
+    dumps the exact positive/negative prompt this image was generated with,
+    folded character and profile prefixes included, plus a second reply
+    with just the text the user typed — see `postprocess_callback`'s
+    `SHOW_PROMPT_CALLBACK_KIND` branch), all scoped to `result_id` (see
+    `storage.py`'s `pending_result`). "🖐️ Hand Detail" doesn't post-process
+    on this tap alone — see `postprocess_callback`'s `"hand"` branch for the
+    auto/manual choice it replies with instead. "🩹 Fix Artifact" is shown
+    unconditionally even when `Settings.inpaint_relay_url` isn't configured
+    (unlike `_hand_mode_keyboard`'s "🖌️ Draw Mask" row, which is) — this
+    keyboard has no access to `Settings` (see the many callers of
+    `_send_and_store_result`/`_send_and_store_bot_result` that would
+    otherwise all need to thread it through just for this) — so
+    `postprocess_callback`'s `FIX_DRAW_CALLBACK_KIND` branch checks and
+    reports "not configured" at tap time instead, the same guard
+    `HAND_DRAW_CALLBACK_KIND` already has for the same reason."""
     return InlineKeyboardMarkup(
         [
             [
@@ -251,6 +297,11 @@ def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
                     POSTPROCESS_KEYBOARD_LABELS[kind], callback_data=f"pp:{kind}:{result_id}"
                 )
                 for kind in _DETAILER_KINDS
+            ],
+            [
+                InlineKeyboardButton(
+                    "🩹 Fix Artifact", callback_data=f"pp:{FIX_DRAW_CALLBACK_KIND}:{result_id}"
+                )
             ],
             [
                 InlineKeyboardButton(
@@ -337,11 +388,14 @@ def _hand_mode_keyboard(result_id: str, settings: Settings) -> InlineKeyboardMar
     return InlineKeyboardMarkup([row])
 
 
-def _hand_redo_button(result_id: str) -> InlineKeyboardButton:
+def _drawn_mask_redo_button(result_id: str, redo_callback_kind: str) -> InlineKeyboardButton:
     """The extra keyboard row `_send_and_store_result`/`_send_and_store_bot_result`
-    attach to a "🖌️ Draw Mask" result — see `HAND_REDO_CALLBACK_KIND`."""
+    attach to a "🖌️ Draw Mask"/"🩹 Fix Artifact" result — `redo_callback_kind`
+    is `HAND_REDO_CALLBACK_KIND` or `FIX_REDO_CALLBACK_KIND` (see
+    `_DRAWN_MASK_KINDS`), so the button re-runs the same drawn-mask flow it
+    came from rather than always assuming hand."""
     return InlineKeyboardButton(
-        "🔁 Redo (same mask)", callback_data=f"pp:{HAND_REDO_CALLBACK_KIND}:{result_id}"
+        "🔁 Redo (same mask)", callback_data=f"pp:{redo_callback_kind}:{result_id}"
     )
 
 
@@ -567,6 +621,8 @@ def _serialize_generation_params(params: GenerationParams) -> dict[str, Any]:
         "model_sampling_shift": params.model_sampling_shift,
         "tile_controlnet": params.tile_controlnet,
         "tile_controlnet_strength": params.tile_controlnet_strength,
+        "anima_lllite_inpaint_patch": params.anima_lllite_inpaint_patch,
+        "anima_lllite_inpaint_patch_strength": params.anima_lllite_inpaint_patch_strength,
         "upscale_denoise": params.upscale_denoise,
         "raw_positive_prompt": params.raw_positive_prompt,
         "raw_negative_prompt": params.raw_negative_prompt,
@@ -599,6 +655,8 @@ def _deserialize_generation_params(data: dict[str, Any]) -> GenerationParams:
         model_sampling_shift=data.get("model_sampling_shift"),
         tile_controlnet=data.get("tile_controlnet"),
         tile_controlnet_strength=data.get("tile_controlnet_strength", 0.4),
+        anima_lllite_inpaint_patch=data.get("anima_lllite_inpaint_patch"),
+        anima_lllite_inpaint_patch_strength=data.get("anima_lllite_inpaint_patch_strength", 1.0),
         upscale_denoise=data.get("upscale_denoise"),
         raw_positive_prompt=data.get("raw_positive_prompt", ""),
         raw_negative_prompt=data.get("raw_negative_prompt", ""),
@@ -802,30 +860,43 @@ async def _relay_delete_job(settings: Settings, token: str) -> None:
         logger.warning("Failed to delete inpaint_relay job %s", token, exc_info=True)
 
 
-async def _run_hand_drawn_post_process(
+async def _run_drawn_mask_post_process(
     client: ComfyClient,
     status_message: Message,
     source_bytes: bytes,
     source_filename: str,
     full_params: GenerationParams,
     mask_bytes: bytes,
+    *,
+    post_process_kind: Literal["hand_drawn", "fix_drawn"],
+    label: str,
+    profiles: list[ModelProfile],
 ) -> GeneratedImage | None:
     """Shared by `_process_one_inpaint_job` (a freshly submitted mask) and
-    `postprocess_callback`'s `HAND_REDO_CALLBACK_KIND` branch (re-running a
-    previously drawn one against a fresh seed — see storage.py's
-    `inpaint_redo` — for when a detailer result comes out badly and
-    redrawing the whole mask from scratch would be overkill) — both need
+    `postprocess_callback`'s `HAND_REDO_CALLBACK_KIND`/`FIX_REDO_CALLBACK_KIND`
+    branch (re-running a previously drawn one against a fresh seed — see
+    storage.py's `inpaint_redo` — for when a detailer result comes out badly
+    and redrawing the whole mask from scratch would be overkill) — both need
     the exact same `post_process` call, status-message error reporting, and
-    status-message cleanup around it. Returns None on failure (already
-    reported into `status_message` by `_run_reporting_errors`); callers
-    should treat that as "stop here", same as `_run_reporting_errors`
-    itself."""
+    status-message cleanup around it. `post_process_kind`/`label` come from
+    `_DRAWN_MASK_KINDS` ("hand" vs "fix"). `profiles` only matters for
+    `post_process_kind="fix_drawn"` — see `generation.
+    _fix_artifact_override_base` — passed through unconditionally since
+    "hand_drawn" ignores it. Returns None on failure (already reported into
+    `status_message` by `_run_reporting_errors`); callers should treat that
+    as "stop here", same as `_run_reporting_errors` itself."""
     generated = await _run_reporting_errors(
         status_message,
-        "Refining hand",
-        "hand-drawn post-processing",
+        label,
+        "drawn-mask post-processing",
         post_process(
-            client, "hand_drawn", source_bytes, source_filename, full_params, mask_bytes=mask_bytes
+            client,
+            post_process_kind,
+            source_bytes,
+            source_filename,
+            full_params,
+            mask_bytes=mask_bytes,
+            profiles=profiles,
         ),
     )
     if generated is not None:
@@ -833,26 +904,30 @@ async def _run_hand_drawn_post_process(
     return generated
 
 
-async def _send_hand_drawn_result_with_redo(
+async def _send_drawn_mask_result_with_redo(
     send: Callable[..., Awaitable[str]],
     storage: Storage,
     source_file_id: str,
     source_filename: str,
     mask_bytes: bytes,
     generated: GeneratedImage,
+    *,
+    redo_callback_kind: str,
 ) -> None:
-    """Send a `post_process(kind="hand_drawn")` result with a "🔁 Redo (same
-    mask)" button attached, and persist what that button needs to run it
-    again (`storage.py`'s `inpaint_redo`) — shared by `_process_one_inpaint_job`
-    and `postprocess_callback`'s `HAND_REDO_CALLBACK_KIND` branch, which
-    differ only in *how* they send (`send` is `_send_and_store_bot_result`
-    or `_send_and_store_result`, already bound to everything but `img`,
-    `result_id` and `extra_keyboard_rows`)."""
+    """Send a `post_process(kind="hand_drawn"/"fix_drawn")` result with a
+    "🔁 Redo (same mask)" button attached, and persist what that button
+    needs to run it again (`storage.py`'s `inpaint_redo`) — shared by
+    `_process_one_inpaint_job` and `postprocess_callback`'s
+    `HAND_REDO_CALLBACK_KIND`/`FIX_REDO_CALLBACK_KIND` branch, which differ
+    only in *how* they send (`send` is `_send_and_store_bot_result` or
+    `_send_and_store_result`, already bound to everything but `img`,
+    `result_id` and `extra_keyboard_rows`) and which redo button
+    (`redo_callback_kind`, from `_DRAWN_MASK_KINDS`) the result should carry."""
     new_result_id = uuid.uuid4().hex[:12]
     await send(
         generated,
         result_id=new_result_id,
-        extra_keyboard_rows=[[_hand_redo_button(new_result_id)]],
+        extra_keyboard_rows=[[_drawn_mask_redo_button(new_result_id, redo_callback_kind)]],
     )
     storage.store_inpaint_redo(new_result_id, source_file_id, source_filename, mask_bytes)
 
@@ -868,15 +943,18 @@ async def _process_one_inpaint_job(
     outstanding job: check the relay, and if a mask has been drawn,
     validate it actually came from Telegram (see `auth.
     validate_webapp_init_data` — the relay itself can't check this, since
-    it never holds the bot token) before running it through
-    `post_process(kind="hand_drawn")` and posting the result. Every path
-    past that validation step (including failure) sends *something* into
-    the chat — this runs unattended, so silently dropping a job on error
-    would leave someone staring at the "Draw over the area..." message
-    forever with no idea whether it worked."""
+    it never holds the bot token) before running it through `post_process`
+    and posting the result — `job["kind"]` ("hand" or "fix", see
+    `storage.py`'s `inpaint_job.kind`) resolves via `_DRAWN_MASK_KINDS` to
+    which `post_process` kind, status label, and redo button apply. Every
+    path past that validation step (including failure) sends *something*
+    into the chat — this runs unattended, so silently dropping a job on
+    error would leave someone staring at the "Draw over the area..."
+    message forever with no idea whether it worked."""
     token = job["token"]
     chat_id = job["chat_id"]
     message_thread_id = job["message_thread_id"]
+    drawn_mask_kind = _DRAWN_MASK_KINDS[job["kind"]]
     result = await _relay_poll_result(settings, token)
     if result is None:
         return  # still pending, or the relay lost track of it — try again next tick
@@ -910,7 +988,7 @@ async def _process_one_inpaint_job(
 
     status_message = await application.bot.send_message(
         chat_id,
-        "Refining hand (drawn mask)…",
+        f"{drawn_mask_kind['label']} (drawn mask)…",
         disable_notification=True,
         message_thread_id=message_thread_id,
     )
@@ -918,12 +996,20 @@ async def _process_one_inpaint_job(
     tg_file = await application.bot.get_file(pending["file_id"])
     source_bytes = bytes(await tg_file.download_as_bytearray())
 
-    generated = await _run_hand_drawn_post_process(
-        client, status_message, source_bytes, pending["filename"], full_params, result["mask"]
+    generated = await _run_drawn_mask_post_process(
+        client,
+        status_message,
+        source_bytes,
+        pending["filename"],
+        full_params,
+        result["mask"],
+        post_process_kind=drawn_mask_kind["post_process_kind"],
+        label=drawn_mask_kind["label"],
+        profiles=application.bot_data["profiles"],
     )
     if generated is None:
         return
-    await _send_hand_drawn_result_with_redo(
+    await _send_drawn_mask_result_with_redo(
         lambda img, **kw: _send_and_store_bot_result(
             application.bot, chat_id, storage, img, message_thread_id=message_thread_id, **kw
         ),
@@ -932,6 +1018,7 @@ async def _process_one_inpaint_job(
         pending["filename"],
         result["mask"],
         generated,
+        redo_callback_kind=drawn_mask_kind["redo_callback_kind"],
     )
 
 
@@ -1663,7 +1750,11 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     `inpaint_redo` — a fresh call gets a fresh seed automatically (see
     `DrawnMaskHandDetailerParams.seed`'s default), so a bad detailer result
     doesn't require redrawing the whole mask just to try again. Alerts
-    instead if `result_id` has expired (see `PENDING_RESULT_TTL_SECONDS`)."""
+    instead if `result_id` has expired (see `PENDING_RESULT_TTL_SECONDS`).
+    `FIX_DRAW_CALLBACK_KIND`/`FIX_REDO_CALLBACK_KIND` ("🩹 Fix Artifact")
+    mirror `HAND_DRAW_CALLBACK_KIND`/`HAND_REDO_CALLBACK_KIND` exactly, just
+    for `post_process(kind="fix_drawn")` (general-purpose artifact removal)
+    instead of a hand — see `_DRAWN_MASK_KINDS`."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
@@ -1812,10 +1903,11 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    if kind == HAND_DRAW_CALLBACK_KIND:
+    if kind in (HAND_DRAW_CALLBACK_KIND, FIX_DRAW_CALLBACK_KIND):
         if not settings.inpaint_relay_url:
             await query.message.reply_text("Mask drawing isn't configured on this bot.")
             return
+        job_kind = "hand" if kind == HAND_DRAW_CALLBACK_KIND else "fix"
         # Uploading a large source image to a remote relay host can take a
         # few seconds, with nothing on screen to show for it in the
         # meantime — long enough that a user unsure whether their tap
@@ -1849,7 +1941,11 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
                 return
             storage.store_inpaint_job(
-                token, result_id, pending["chat_id"], query.message.message_thread_id
+                token,
+                result_id,
+                pending["chat_id"],
+                query.message.message_thread_id,
+                kind=job_kind,
             )
             await status_message.edit_text(
                 "Draw over the area to fix, then tap Done in the editor:",
@@ -1870,29 +1966,33 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             uploads_in_progress.discard(result_id)
         return
 
-    if kind == HAND_REDO_CALLBACK_KIND:
+    if kind in (HAND_REDO_CALLBACK_KIND, FIX_REDO_CALLBACK_KIND):
+        drawn_mask_kind = _DRAWN_MASK_KINDS["hand" if kind == HAND_REDO_CALLBACK_KIND else "fix"]
         redo = storage.get_inpaint_redo(result_id)
         if redo is None:
             await query.message.reply_text(
-                "That mask has expired — draw a new one with 🖌️ Draw Mask."
+                "That mask has expired — draw a new one with 🖌️ Draw Mask/🩹 Fix Artifact."
             )
             return
         status_message = await query.message.reply_text(
-            "Refining hand (drawn mask)…", disable_notification=True
+            f"{drawn_mask_kind['label']} (drawn mask)…", disable_notification=True
         )
         tg_file = await context.bot.get_file(redo["source_file_id"])
         source_bytes = bytes(await tg_file.download_as_bytearray())
-        generated = await _run_hand_drawn_post_process(
+        generated = await _run_drawn_mask_post_process(
             client,
             status_message,
             source_bytes,
             redo["source_filename"],
             full_params,
             redo["mask_png"],
+            post_process_kind=drawn_mask_kind["post_process_kind"],
+            label=drawn_mask_kind["label"],
+            profiles=context.bot_data["profiles"],
         )
         if generated is None:
             return
-        await _send_hand_drawn_result_with_redo(
+        await _send_drawn_mask_result_with_redo(
             lambda img, **kw: _send_and_store_result(
                 query.message, pending["chat_id"], storage, img, **kw
             ),
@@ -1901,6 +2001,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             redo["source_filename"],
             redo["mask_png"],
             generated,
+            redo_callback_kind=drawn_mask_kind["redo_callback_kind"],
         )
         return
 

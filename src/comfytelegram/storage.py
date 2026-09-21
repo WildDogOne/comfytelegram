@@ -119,6 +119,7 @@ CREATE TABLE IF NOT EXISTS inpaint_job (
     result_id TEXT NOT NULL,
     chat_id INTEGER NOT NULL,
     message_thread_id INTEGER,
+    kind TEXT NOT NULL DEFAULT 'hand',
     created_at REAL NOT NULL
 );
 
@@ -159,6 +160,7 @@ class Storage:
         # own guarded ALTER TABLE instead.
         self._add_column_if_missing("derived_prompt", "negative_prompt", "TEXT NOT NULL DEFAULT ''")
         self._add_column_if_missing("inpaint_job", "message_thread_id", "INTEGER")
+        self._add_column_if_missing("inpaint_job", "kind", "TEXT NOT NULL DEFAULT 'hand'")
         #: Last `_prune()` sweep time per table — see PRUNE_INTERVAL_SECONDS.
         self._last_prune: dict[str, float] = {}
 
@@ -450,7 +452,12 @@ class Storage:
         }
 
     def store_inpaint_job(
-        self, token: str, result_id: str, chat_id: int, message_thread_id: int | None = None
+        self,
+        token: str,
+        result_id: str,
+        chat_id: int,
+        message_thread_id: int | None = None,
+        kind: str = "hand",
     ) -> None:
         """Record that `token` (an inpaint_relay job id — see
         `handlers.py`'s `hand_draw_callback`) is waiting on a freehand mask
@@ -458,17 +465,24 @@ class Storage:
         in-memory dict so a bot restart doesn't strand a job the relay still
         has pending — `poll_inpaint_jobs` reloads outstanding tokens from
         here on every tick. `message_thread_id` is the forum topic (if any)
-        the "🖌️ Draw Mask" tap happened in — the poller has no `Message` to
-        reply to (it isn't handling an update), so this is what lets it
-        still send the eventual result into the right topic instead of the
-        chat's General one; see `handlers.py`'s `_process_one_inpaint_job`."""
+        the "🖌️ Draw Mask"/"🩹 Fix Artifact" tap happened in — the poller has
+        no `Message` to reply to (it isn't handling an update), so this is
+        what lets it still send the eventual result into the right topic
+        instead of the chat's General one; see `handlers.py`'s
+        `_process_one_inpaint_job`. `kind` ("hand" or "fix") is what the
+        drawn mask is for — the relay itself is generic and doesn't care,
+        but the poller needs it once the mask comes back to know whether to
+        run `post_process(kind="hand_drawn")` or `kind="fix_drawn")` and
+        which status label/redo button to use. Defaults to "hand" so a row
+        written before this field existed still resolves to its original
+        behavior."""
         self._prune_inpaint_jobs()
         with self._conn:
             self._conn.execute(
                 "INSERT OR REPLACE INTO inpaint_job "
-                "(token, result_id, chat_id, message_thread_id, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (token, result_id, chat_id, message_thread_id, time.time()),
+                "(token, result_id, chat_id, message_thread_id, kind, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (token, result_id, chat_id, message_thread_id, kind, time.time()),
             )
 
     def list_inpaint_jobs(self) -> list[dict[str, Any]]:
@@ -476,7 +490,7 @@ class Storage:
         check against the relay each tick."""
         self._prune_inpaint_jobs()
         rows = self._conn.execute(
-            "SELECT token, result_id, chat_id, message_thread_id FROM inpaint_job"
+            "SELECT token, result_id, chat_id, message_thread_id, kind FROM inpaint_job"
         ).fetchall()
         return [
             {
@@ -484,8 +498,9 @@ class Storage:
                 "result_id": result_id,
                 "chat_id": chat_id,
                 "message_thread_id": message_thread_id,
+                "kind": kind,
             }
-            for token, result_id, chat_id, message_thread_id in rows
+            for token, result_id, chat_id, message_thread_id, kind in rows
         ]
 
     def delete_inpaint_job(self, token: str) -> None:

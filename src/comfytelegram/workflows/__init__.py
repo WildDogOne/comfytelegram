@@ -1,4 +1,5 @@
 from comfytelegram.workflows.builder import (
+    DrawnMaskFixParams,
     DrawnMaskHandDetailerParams,
     FaceDetailerParams,
     GenerationParams,
@@ -9,6 +10,7 @@ from comfytelegram.workflows.builder import (
     TiledRefineParams,
     UpscaleParams,
     build_face_detailer,
+    build_fix_drawn_mask,
     build_hand_detailer,
     build_hand_detailer_drawn_mask,
     build_hand_detailer_manual,
@@ -18,6 +20,7 @@ from comfytelegram.workflows.builder import (
 )
 
 __all__ = [
+    "DrawnMaskFixParams",
     "DrawnMaskHandDetailerParams",
     "FaceDetailerParams",
     "GenerationParams",
@@ -28,6 +31,7 @@ __all__ = [
     "TiledRefineParams",
     "UpscaleParams",
     "build_face_detailer",
+    "build_fix_drawn_mask",
     "build_hand_detailer",
     "build_hand_detailer_drawn_mask",
     "build_hand_detailer_manual",

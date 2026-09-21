@@ -161,6 +161,7 @@ def test_inpaint_job_roundtrip_carries_message_thread_id(storage: Storage):
         "result_id": "result1",
         "chat_id": 42,
         "message_thread_id": 827915,
+        "kind": "hand",
     }
 
 
@@ -172,6 +173,15 @@ def test_inpaint_job_message_thread_id_defaults_to_none(storage: Storage):
     assert job["message_thread_id"] is None
 
 
+def test_inpaint_job_roundtrip_carries_kind(storage: Storage):
+    # "🩹 Fix Artifact" shares the same relay/poller machinery as "🖌️ Draw
+    # Mask" — `kind` is what `_process_one_inpaint_job` uses to tell which
+    # post_process kind/label/redo button applies once the mask comes back.
+    storage.store_inpaint_job("tok1", "result1", 42, kind="fix")
+    (job,) = storage.list_inpaint_jobs()
+    assert job["kind"] == "fix"
+
+
 def test_delete_inpaint_job_removes_it(storage: Storage):
     storage.store_inpaint_job("tok1", "result1", 42)
     storage.delete_inpaint_job("tok1")
@@ -180,10 +190,11 @@ def test_delete_inpaint_job_removes_it(storage: Storage):
 
 def test_inpaint_job_message_thread_id_column_is_added_to_a_pre_existing_table(tmp_path: Path):
     # Reproduces a real deployed database: `inpaint_job` already existed
-    # (created before `message_thread_id` was added), so `CREATE TABLE IF
-    # NOT EXISTS` is a no-op against it and the column needs its own
-    # guarded ALTER TABLE — see Storage.__init__'s _add_column_if_missing
-    # calls and CLAUDE.md's storage.py note on this exact pattern.
+    # (created before `message_thread_id`/`kind` were added), so `CREATE
+    # TABLE IF NOT EXISTS` is a no-op against it and each new column needs
+    # its own guarded ALTER TABLE — see Storage.__init__'s
+    # _add_column_if_missing calls and CLAUDE.md's storage.py note on this
+    # exact pattern.
     db_path = tmp_path / "state.sqlite3"
     s1 = Storage(db_path)
     with s1._conn:
@@ -198,7 +209,13 @@ def test_inpaint_job_message_thread_id_column_is_added_to_a_pre_existing_table(t
     s2 = Storage(db_path)
     s2.store_inpaint_job("tok1", "result1", 42, message_thread_id=5)
     assert s2.list_inpaint_jobs() == [
-        {"token": "tok1", "result_id": "result1", "chat_id": 42, "message_thread_id": 5}
+        {
+            "token": "tok1",
+            "result_id": "result1",
+            "chat_id": 42,
+            "message_thread_id": 5,
+            "kind": "hand",
+        }
     ]
     s2.close()
 

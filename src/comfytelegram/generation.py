@@ -20,8 +20,9 @@ import numpy as np
 from PIL import Image
 
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
-from comfytelegram.profiles import ModelProfile, resolve_generation_params
+from comfytelegram.profiles import ModelProfile, join_nonempty, resolve_generation_params
 from comfytelegram.workflows import (
+    DrawnMaskFixParams,
     DrawnMaskHandDetailerParams,
     FaceDetailerParams,
     GenerationParams,
@@ -31,6 +32,7 @@ from comfytelegram.workflows import (
     TiledRefineParams,
     UpscaleParams,
     build_face_detailer,
+    build_fix_drawn_mask,
     build_hand_detailer,
     build_hand_detailer_drawn_mask,
     build_hand_detailer_manual,
@@ -123,8 +125,84 @@ def _to_post_process_base(params: GenerationParams) -> PostProcessBaseParams:
         model_sampling_shift=params.model_sampling_shift,
         tile_controlnet=params.tile_controlnet,
         tile_controlnet_strength=params.tile_controlnet_strength,
+        anima_lllite_inpaint_patch=params.anima_lllite_inpaint_patch,
+        anima_lllite_inpaint_patch_strength=params.anima_lllite_inpaint_patch_strength,
         upscale_denoise=params.upscale_denoise,
     )
+
+
+def _fix_artifact_override_base(profiles: list[ModelProfile]) -> PostProcessBaseParams | None:
+    """`kind="fix_drawn"` support: if a profile sets `fix_artifact_checkpoint`
+    (currently only Anima Aesthetic), "🩹 Fix Artifact" always runs against
+    *that* profile's checkpoint/loader/clip/vae/LoRAs/anima_lllite_inpaint_patch
+    instead of the image's own original checkpoint — see
+    `ModelProfile.fix_artifact_checkpoint`'s docstring for why (most
+    checkpoints have no inpainting-aware path wired at all yet, so their
+    removal results are unreliable regardless of tuning). `None` if no
+    profile has it set, in which case the caller falls back to the image's
+    own checkpoint as before. First match wins if more than one profile sets
+    it, same "first match wins" convention `profiles.loader.resolve_profile`
+    uses for `match` globs.
+
+    The positive prompt is the profile's own `positive_prompt_prefix` plus
+    "background scenery" — not blank. Matched against a real
+    krita-ai-diffusion "remove object" job pulled from this server's own
+    `/history`: its positive prompt was `"<style's quality prefix>,
+    background scenery"`, exactly `prepare_prompts()`'s documented fallback
+    (`if cond.positive == "" and inpaint is InpaintMode.remove_object:
+    cond.positive = "background scenery"`) merged with the style prompt — a
+    genuinely blank prompt was this bot's own choice, not krita's."""
+    profile = next((p for p in profiles if p.fix_artifact_checkpoint), None)
+    if profile is None:
+        return None
+    return PostProcessBaseParams(
+        checkpoint=profile.fix_artifact_checkpoint,
+        positive_prompt=join_nonempty([profile.positive_prompt_prefix, "background scenery"]),
+        negative_prompt=profile.negative_prompt_prefix,
+        loras=[lora.to_spec() for lora in profile.loras if lora.default_enabled],
+        clip_skip=profile.defaults.clip_skip if profile.defaults.clip_skip is not None else -1,
+        loader=profile.loader,
+        clip_name=profile.clip_name,
+        clip_type=profile.clip_type,
+        vae_name=profile.vae_name,
+        model_sampling_shift=profile.model_sampling_shift,
+        tile_controlnet=profile.tile_controlnet,
+        tile_controlnet_strength=profile.tile_controlnet_strength,
+        anima_lllite_inpaint_patch=profile.anima_lllite_inpaint_patch,
+        anima_lllite_inpaint_patch_strength=profile.anima_lllite_inpaint_patch_strength,
+        upscale_denoise=None,
+    )
+
+
+def _fix_drawn_work_size(
+    image_size: tuple[int, int], params: DrawnMaskFixParams
+) -> tuple[int, int]:
+    """`build_fix_drawn_mask`'s `work_size` — `image_size` downscaled
+    (preserving aspect ratio) so its longest side is at most
+    `params.work_max_size`, or `image_size` unchanged if it's already
+    smaller. Only `_build_anima_fix_drawn_mask` actually resizes with this,
+    but it's computed unconditionally here since it's cheap and
+    `build_fix_drawn_mask` needs the value regardless of which path it ends
+    up taking.
+
+    A *crop*-based predecessor of this (bounding a region around the drawn
+    mask's own bbox instead of downscaling the whole image) was tried
+    first and rejected: confirmed on a real removal case pulled from this
+    server's own `/history` that cropping away the surrounding scene
+    starves the diffusion pass of context it needs to correctly continue
+    "this is fabric" into the masked hole — it painted a literal window
+    showing background through the masked garment instead, regardless of
+    seed/checkpoint/prompt tried. A resize keeps the whole scene, just
+    smaller — matching krita-ai-diffusion's own `scale_to_initial`
+    approach, and the actual root problem this exists for is a runaway
+    30-step diffusion pass over a raw, un-cropped 4096x4096 photo with
+    nothing bounding the resolution — solved just as well by a resize."""
+    img_w, img_h = image_size
+    longest = max(img_w, img_h)
+    if longest <= params.work_max_size:
+        return (img_w, img_h)
+    scale = params.work_max_size / longest
+    return (round(img_w * scale), round(img_h * scale))
 
 
 #: How long `_run_graph` waits for a websocket event before checking
@@ -281,7 +359,9 @@ async def generate(
 
 async def post_process(
     client: ComfyClient,
-    kind: Literal["upscale", "homogenize", "face", "hand", "hand_manual", "hand_drawn"],
+    kind: Literal[
+        "upscale", "homogenize", "face", "hand", "hand_manual", "hand_drawn", "fix_drawn"
+    ],
     source_image: bytes,
     source_filename: str,
     full_params: GenerationParams,
@@ -290,6 +370,7 @@ async def post_process(
     box_size_frac: float | None = None,
     mask_bytes: bytes | None = None,
     on_progress: ProgressCallback | None = None,
+    profiles: list[ModelProfile] | None = None,
 ) -> GeneratedImage:
     """Upload a previously-generated image and run one post-processing stage
     on it. `kind="homogenize"` is the same UltimateSDUpscale tiled img2img
@@ -315,7 +396,19 @@ async def post_process(
     density; ignored for every other `kind`. `kind="hand_drawn"` also skips
     detection, inpainting a freehand mask instead (required for this kind —
     see `build_hand_detailer_drawn_mask`, backing the Telegram WebApp mask
-    editor); `unchanged` is always False for it too, for the same reason."""
+    editor); `unchanged` is always False for it too, for the same reason.
+    `kind="fix_drawn"` is the general-purpose "🩹 Fix Artifact" counterpart to
+    `"hand_drawn"` — same freehand-drawn-mask requirement (`mask_bytes`) and
+    the same `unchanged=False` reasoning, just built via
+    `build_fix_drawn_mask`/`DrawnMaskFixParams` (higher denoise/crop_factor,
+    since removing an arbitrary artifact needs more creative latitude than
+    a hand touch-up) instead of the hand-tuned graph — for painting over any
+    unwanted region (a stray object, a background glitch, a watermark)
+    rather than just a hand. `profiles`, if given, is only consulted for
+    `kind="fix_drawn"` — see `_fix_artifact_override_base` — to run that
+    pass against a fixed, known-inpainting-aware checkpoint regardless of
+    which one the image was originally generated with; every other `kind`
+    ignores it entirely and keeps using the image's own checkpoint."""
     base_params = _to_post_process_base(full_params)
     upload = await client.upload_image(source_image, filename=source_filename)
     uploaded_name = upload["name"]
@@ -354,6 +447,59 @@ async def post_process(
         mask_upload = await client.upload_image(mask_bytes, filename=f"mask_{source_filename}")
         prompt_graph, save_node_id = build_hand_detailer_drawn_mask(
             uploaded_name, mask_upload["name"], base_params, DrawnMaskHandDetailerParams()
+        )
+    elif kind == "fix_drawn":
+        assert mask_bytes is not None, "fix_drawn requires mask_bytes"
+        mask_upload = await client.upload_image(mask_bytes, filename=f"mask_{source_filename}")
+        # Removal, not refinement: the original positive prompt describes the
+        # whole scene, including whatever the user just marked for deletion,
+        # so conditioning the inpaint on it steers the model toward a nicer
+        # version of the exact thing being removed instead of erasing it.
+        # When there's no fix_artifact_checkpoint override, drop it entirely
+        # and let the fill be driven by `build_fix_drawn_mask`'s
+        # content-aware fill pass and the surrounding image context instead.
+        # The override path composes its own prompt in
+        # `_fix_artifact_override_base` instead — "<profile prefix>,
+        # background scenery", matched against a real krita-ai-diffusion job
+        # (a genuinely blank prompt was this bot's own choice, not krita's).
+        override_base = _fix_artifact_override_base(profiles) if profiles else None
+        if override_base is not None:
+            fix_base_params = override_base
+            checkpoint_source = "fix_artifact_checkpoint override"
+        else:
+            fix_base_params = replace(base_params, positive_prompt="")
+            checkpoint_source = "image's own checkpoint"
+        fix_params = DrawnMaskFixParams()
+        if fix_base_params.loader == "split" and fix_base_params.anima_lllite_inpaint_patch:
+            engaged_reason = (
+                f"patch={fix_base_params.anima_lllite_inpaint_patch!r} "
+                f"strength={fix_base_params.anima_lllite_inpaint_patch_strength}"
+            )
+        elif fix_base_params.loader != "split":
+            engaged_reason = f"skipped (loader={fix_base_params.loader!r}, not 'split')"
+        else:
+            engaged_reason = "skipped (anima_lllite_inpaint_patch not set on this profile)"
+        image_size = Image.open(io.BytesIO(source_image)).size
+        work_size = _fix_drawn_work_size(image_size, fix_params)
+        logger.info(
+            "Fix Artifact: checkpoint=%s (%s) loader=%s fill_model=%s anima_lllite_patch: %s "
+            "positive_prompt=%r work_size=%s (image_size=%s)",
+            fix_base_params.checkpoint,
+            checkpoint_source,
+            fix_base_params.loader,
+            fix_params.fill_model,
+            engaged_reason,
+            fix_base_params.positive_prompt,
+            work_size,
+            image_size,
+        )
+        prompt_graph, save_node_id = build_fix_drawn_mask(
+            uploaded_name,
+            mask_upload["name"],
+            fix_base_params,
+            fix_params,
+            image_size=image_size,
+            work_size=work_size,
         )
     else:
         raise ValueError(f"Unknown post-processing kind: {kind}")

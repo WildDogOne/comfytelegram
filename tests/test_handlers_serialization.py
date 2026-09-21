@@ -45,6 +45,10 @@ def test_generation_params_roundtrip_through_serialization():
     assert restored.model_sampling_shift == params.model_sampling_shift
     assert restored.tile_controlnet == params.tile_controlnet
     assert restored.tile_controlnet_strength == params.tile_controlnet_strength
+    assert restored.anima_lllite_inpaint_patch == params.anima_lllite_inpaint_patch
+    assert (
+        restored.anima_lllite_inpaint_patch_strength == params.anima_lllite_inpaint_patch_strength
+    )
     assert restored.upscale_denoise == params.upscale_denoise
     assert restored.raw_positive_prompt == params.raw_positive_prompt
     assert restored.raw_negative_prompt == params.raw_negative_prompt
@@ -61,6 +65,20 @@ def test_tile_controlnet_params_roundtrip_through_serialization():
     restored = _deserialize_generation_params(_serialize_generation_params(params))
     assert restored.tile_controlnet == "xinsir_tile_sdxl.safetensors"
     assert restored.tile_controlnet_strength == 0.55
+
+
+def test_anima_lllite_inpaint_patch_params_roundtrip_through_serialization():
+    params = GenerationParams(
+        checkpoint="anima_unet.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+        loader="split",
+        anima_lllite_inpaint_patch="anima-lllite-inpainting-v2.safetensors",
+        anima_lllite_inpaint_patch_strength=0.8,
+    )
+    restored = _deserialize_generation_params(_serialize_generation_params(params))
+    assert restored.anima_lllite_inpaint_patch == "anima-lllite-inpainting-v2.safetensors"
+    assert restored.anima_lllite_inpaint_patch_strength == 0.8
 
 
 def test_upscale_denoise_roundtrips_through_serialization():

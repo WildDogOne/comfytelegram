@@ -1,5 +1,6 @@
 import asyncio
 import io
+import logging
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
@@ -10,12 +11,13 @@ from comfytelegram import generation
 from comfytelegram.comfy_client import ComfyUIError, JobProgress
 from comfytelegram.generation import (
     _detailer_found_nothing,
+    _fix_drawn_work_size,
     _to_post_process_base,
     generate,
     post_process,
 )
 from comfytelegram.profiles import ModelProfile, ProfileDefaults
-from comfytelegram.workflows import GenerationParams, LoraSpec
+from comfytelegram.workflows import DrawnMaskFixParams, GenerationParams, LoraSpec
 
 
 def _solid_png(width: int, height: int, color: tuple[int, int, int]) -> bytes:
@@ -28,6 +30,33 @@ def _solid_mask_png(width: int, height: int, value: int) -> bytes:
     buf = io.BytesIO()
     Image.new("L", (width, height), value).save(buf, format="PNG")
     return buf.getvalue()
+
+
+def test_fix_drawn_work_size_downscales_preserving_aspect_ratio():
+    # A first version of _build_anima_fix_drawn_mask sampled the *entire*
+    # source image with no resize or crop at all — clocked running a full
+    # 30-step diffusion pass over a raw 4096x4096 source for what should be
+    # a small, localized fix. A *cropped*-region predecessor of this was
+    # tried next and rejected (see _build_anima_fix_drawn_mask's docstring):
+    # cropping away the surrounding scene starved the diffusion pass of the
+    # context it needs, confirmed on a real removal case. This instead
+    # downscales the whole image, keeping the full scene.
+    params = DrawnMaskFixParams()
+    w, h = _fix_drawn_work_size((4096, 2048), params)
+
+    assert max(w, h) == params.work_max_size
+    assert w / h == pytest.approx(4096 / 2048)
+
+
+def test_fix_drawn_work_size_leaves_small_images_unchanged():
+    params = DrawnMaskFixParams()
+    assert _fix_drawn_work_size((800, 600), params) == (800, 600)
+
+
+def test_fix_drawn_work_size_boundary_equals_max_size_unchanged():
+    params = DrawnMaskFixParams()
+    size = (params.work_max_size, params.work_max_size)
+    assert _fix_drawn_work_size(size, params) == size
 
 
 class _StubComfyClient:
@@ -466,6 +495,176 @@ async def test_post_process_hand_drawn_requires_mask_bytes():
         await post_process(client, "hand_drawn", source, "source.png", params)
 
 
+@pytest.mark.asyncio
+async def test_post_process_fix_drawn_never_flags_unchanged():
+    """Same reasoning as `hand_drawn` — a freehand-drawn mask has no
+    detection-check node (see `build_fix_drawn_mask`), so it's never
+    reported as "nothing detected"."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    result = await post_process(client, "fix_drawn", source, "source.png", params, mask_bytes=mask)
+
+    assert result.unchanged is False
+    mask_load = next(n for n in client.queued_graph.values() if n["class_type"] == "LoadImageMask")
+    assert mask_load["inputs"]["image"] == "mask_source.png"
+    detailer = next(n for n in client.queued_graph.values() if n["class_type"] == "DetailerForEach")
+    assert detailer["inputs"]["denoise"] == DrawnMaskFixParams().denoise
+
+
+@pytest.mark.asyncio
+async def test_post_process_fix_drawn_logs_whether_anima_lllite_patch_engaged(caplog):
+    """The graph itself doesn't make it obvious from the outside whether
+    `anima_lllite_inpaint_patch` actually fired for a given run (e.g. a
+    stale `full_params` from before a profile added the field, vs. a
+    checkpoint that never had it configured) — this log line is what lets
+    that be confirmed from the bot's own logs instead of guessing."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    caplog.set_level(logging.INFO, logger="comfytelegram.generation")
+
+    caplog.clear()
+    unset_params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+    await post_process(client, "fix_drawn", source, "source.png", unset_params, mask_bytes=mask)
+    assert "skipped (loader='checkpoint', not 'split')" in caplog.text
+
+    caplog.clear()
+    engaged_params = GenerationParams(
+        checkpoint="anima_unet.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        loader="split",
+        anima_lllite_inpaint_patch="anima-lllite-inpainting-v2.safetensors",
+        anima_lllite_inpaint_patch_strength=0.8,
+    )
+    await post_process(client, "fix_drawn", source, "source.png", engaged_params, mask_bytes=mask)
+    assert "patch='anima-lllite-inpainting-v2.safetensors'" in caplog.text
+    assert "strength=0.8" in caplog.text
+
+
+def _fix_artifact_override_profile() -> ModelProfile:
+    return ModelProfile(
+        match=["anima*aesthetic*"],
+        display_name="Anima Aesthetic",
+        loader="split",
+        clip_name="qwen_3_06b_base.safetensors",
+        clip_type="stable_diffusion",
+        vae_name="qwen_image_vae.safetensors",
+        model_sampling_shift=3.0,
+        anima_lllite_inpaint_patch="anima-lllite-inpainting-v2.safetensors",
+        anima_lllite_inpaint_patch_strength=1.0,
+        fix_artifact_checkpoint="anima_aestheticV11.safetensors",
+        negative_prompt_prefix="worst quality, low quality",
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_process_fix_drawn_uses_fix_artifact_checkpoint_override():
+    """A furrytoonmix-generated image's own checkpoint has no inpainting-aware
+    path wired — "🩹 Fix Artifact" should switch to whichever profile sets
+    `fix_artifact_checkpoint` (Anima Aesthetic) instead, regardless of what
+    generated the image."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+    )
+
+    await post_process(
+        client,
+        "fix_drawn",
+        source,
+        "source.png",
+        params,
+        mask_bytes=mask,
+        profiles=[_fix_artifact_override_profile()],
+    )
+
+    unet = next(n for n in client.queued_graph.values() if n["class_type"] == "UNETLoader")
+    assert unet["inputs"]["unet_name"] == "anima_aestheticV11.safetensors"
+    class_types = [n["class_type"] for n in client.queued_graph.values()]
+    assert "CheckpointLoaderSimple" not in class_types
+    # positive_prompt is "<profile prefix>, background scenery" (no prefix
+    # set on this profile, so just "background scenery") — not blank, and
+    # not the original furrytoonmix image's "a fox"; negative comes from
+    # the override profile too, not the original image's "blurry".
+    texts = {
+        n["inputs"]["text"]
+        for n in client.queued_graph.values()
+        if n["class_type"] == "CLIPTextEncode"
+    }
+    assert "background scenery" in texts
+    assert "worst quality, low quality" in texts
+    assert "blurry" not in texts
+    assert "a fox" not in texts
+
+
+@pytest.mark.asyncio
+async def test_post_process_fix_drawn_without_override_profile_keeps_own_checkpoint():
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+    )
+
+    await post_process(
+        client, "fix_drawn", source, "source.png", params, mask_bytes=mask, profiles=[]
+    )
+
+    ckpt = next(
+        n for n in client.queued_graph.values() if n["class_type"] == "CheckpointLoaderSimple"
+    )
+    assert ckpt["inputs"]["ckpt_name"] == "furrytoonmix_xlIllustriousV2.safetensors"
+
+
+@pytest.mark.asyncio
+async def test_post_process_fix_drawn_clears_positive_prompt():
+    """The original positive prompt describes the whole scene, including
+    whatever the user just drew a mask over to remove — conditioning the
+    inpaint on it steers the model toward a nicer version of the exact
+    content being removed instead of erasing it, so `fix_drawn` must not
+    forward it into the graph's `CLIPTextEncode`."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt="blurry"
+    )
+
+    await post_process(client, "fix_drawn", source, "source.png", params, mask_bytes=mask)
+
+    encodes = [n for n in client.queued_graph.values() if n["class_type"] == "CLIPTextEncode"]
+    texts = {n["inputs"]["text"] for n in encodes}
+    assert "a fox" not in texts
+    assert "" in texts
+    assert "blurry" in texts
+
+
+@pytest.mark.asyncio
+async def test_post_process_fix_drawn_requires_mask_bytes():
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    with pytest.raises(AssertionError):
+        await post_process(client, "fix_drawn", source, "source.png", params)
+
+
 def test_to_post_process_base_carries_only_the_relevant_fields():
     params = GenerationParams(
         checkpoint="ckpt.safetensors",
@@ -533,6 +732,25 @@ def test_to_post_process_base_carries_tile_controlnet_fields():
 
     assert base.tile_controlnet == "xinsir_tile_sdxl.safetensors"
     assert base.tile_controlnet_strength == 0.55
+
+
+def test_to_post_process_base_carries_anima_lllite_inpaint_patch_fields():
+    """Without this, "🩹 Fix Artifact" on an Anima checkpoint with the patch
+    configured would lose it, since build_fix_drawn_mask only sees
+    PostProcessBaseParams, not the original GenerationParams."""
+    params = GenerationParams(
+        checkpoint="anima-aesthetic-v1.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+        loader="split",
+        anima_lllite_inpaint_patch="anima-lllite-inpainting-v2.safetensors",
+        anima_lllite_inpaint_patch_strength=0.8,
+    )
+
+    base = _to_post_process_base(params)
+
+    assert base.anima_lllite_inpaint_patch == "anima-lllite-inpainting-v2.safetensors"
+    assert base.anima_lllite_inpaint_patch_strength == 0.8
 
 
 def test_to_post_process_base_carries_upscale_denoise():

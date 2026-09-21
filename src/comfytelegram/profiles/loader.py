@@ -128,6 +128,8 @@ def resolve_generation_params(
             "model_sampling_shift": profile.model_sampling_shift,
             "tile_controlnet": profile.tile_controlnet,
             "tile_controlnet_strength": profile.tile_controlnet_strength,
+            "anima_lllite_inpaint_patch": profile.anima_lllite_inpaint_patch,
+            "anima_lllite_inpaint_patch_strength": profile.anima_lllite_inpaint_patch_strength,
         }
     else:
         positive_prompt = user_prompt

@@ -109,6 +109,7 @@ def test_resolve_generation_params_defaults_to_checkpoint_loader_without_profile
     assert params.vae_name == ""
     assert params.model_sampling_shift is None
     assert params.tile_controlnet is None
+    assert params.anima_lllite_inpaint_patch is None
     assert params.upscale_denoise is None
 
 
@@ -150,6 +151,36 @@ def test_resolve_generation_params_carries_split_loader_fields_from_profile():
     assert params.clip_type == "stable_diffusion"
     assert params.vae_name == "qwen_image_vae.safetensors"
     assert params.model_sampling_shift == 3.0
+
+
+def test_resolve_generation_params_carries_anima_lllite_inpaint_patch_from_profile():
+    profile = ModelProfile(
+        match=["anima*"],
+        display_name="Anima Test",
+        loader="split",
+        anima_lllite_inpaint_patch="anima-lllite-inpainting-v2.safetensors",
+        anima_lllite_inpaint_patch_strength=0.8,
+    )
+    params = resolve_generation_params("anima-aesthetic-v1.safetensors", "a fox", profile)
+    assert params.anima_lllite_inpaint_patch == "anima-lllite-inpainting-v2.safetensors"
+    assert params.anima_lllite_inpaint_patch_strength == 0.8
+
+
+def test_fix_artifact_checkpoint_defaults_to_none():
+    profile = ModelProfile(match=["*ckpt*"], display_name="X")
+    assert profile.fix_artifact_checkpoint is None
+
+
+def test_anima_aesthetic_profile_sets_fix_artifact_checkpoint(profiles):
+    """The Fix Artifact button should always route to Anima Aesthetic
+    regardless of which checkpoint generated the image being fixed — see
+    generation._fix_artifact_override_base. If this ever stops matching the
+    staged UNET filename, "🩹 Fix Artifact" would silently start rejecting
+    every request with a ComfyUI "value not in list" error."""
+    anima = next(p for p in profiles if p.display_name == "Anima Aesthetic")
+    assert anima.fix_artifact_checkpoint == "anima_aestheticV11.safetensors"
+    assert anima.loader == "split"
+    assert anima.anima_lllite_inpaint_patch == "anima-lllite-inpainting-v2.safetensors"
 
 
 def test_resolve_generation_params_appends_extra_negative():

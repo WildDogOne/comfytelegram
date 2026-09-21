@@ -10,6 +10,8 @@ from comfytelegram.generation import GeneratedImage
 from comfytelegram.handlers import (
     _MAIN_KEYBOARD,
     ANALYZE_PROMPT_CALLBACK_KIND,
+    FIX_DRAW_CALLBACK_KIND,
+    FIX_REDO_CALLBACK_KIND,
     HAND_AUTO_CALLBACK_KIND,
     HAND_DRAW_CALLBACK_KIND,
     HAND_MANUAL_CALLBACK_KIND,
@@ -153,6 +155,7 @@ def test_post_process_keyboard_scopes_every_button_to_result_id():
     assert "pp:homogenize:abc123" in callback_data
     assert "pp:face:abc123" in callback_data
     assert "pp:hand:abc123" in callback_data
+    assert "pp:fix_draw:abc123" in callback_data
     assert "pp:analyze_only:abc123" in callback_data
     assert f"pp:{ANALYZE_PROMPT_CALLBACK_KIND}:abc123" in callback_data
     assert "pp:deep_analyze:abc123" in callback_data
@@ -167,6 +170,7 @@ def test_post_process_keyboard_puts_tiled_passes_above_detailers():
     rows = [[b.callback_data for b in row] for row in keyboard.inline_keyboard]
     assert rows[0] == ["pp:upscale:abc123", "pp:homogenize:abc123"]
     assert rows[1] == ["pp:face:abc123", "pp:hand:abc123"]
+    assert rows[2] == ["pp:fix_draw:abc123"]
 
 
 def test_upscale_confirm_keyboard_scopes_both_buttons_to_result_id():
@@ -977,7 +981,35 @@ async def test_hand_draw_shows_an_uploading_status_before_the_editor_button():
     button = edit_call.kwargs["reply_markup"].inline_keyboard[0][0]
     assert button.web_app.url == "https://inpaint.example.com/jobs/tok1"
     storage.store_inpaint_job.assert_called_once_with(
-        "tok1", "abc123", 1, query.message.message_thread_id
+        "tok1", "abc123", 1, query.message.message_thread_id, kind="hand"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fix_draw_stores_the_job_with_fix_kind():
+    """ "🩹 Fix Artifact" shares `HAND_DRAW_CALLBACK_KIND`'s upload/relay
+    machinery — the only difference is `inpaint_job.kind`, which
+    `_process_one_inpaint_job` later reads to run `post_process
+    (kind="fix_drawn")` instead of `"hand_drawn")`."""
+    query = AsyncMock()
+    query.data = f"pp:{FIX_DRAW_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    context.bot_data["settings"] = _settings(inpaint_relay_url="https://inpaint.example.com")
+
+    status_message = AsyncMock()
+    query.message.reply_text.return_value = status_message
+
+    with patch("comfytelegram.handlers._relay_create_job", new=AsyncMock(return_value="tok1")):
+        await postprocess_callback(update, context)
+
+    storage.store_inpaint_job.assert_called_once_with(
+        "tok1", "abc123", 1, query.message.message_thread_id, kind="fix"
     )
 
 
@@ -1106,6 +1138,48 @@ async def test_hand_redo_reruns_post_process_with_the_stored_source_and_mask():
 
 
 @pytest.mark.asyncio
+async def test_fix_redo_reruns_post_process_with_fix_drawn_kind():
+    query = AsyncMock()
+    query.data = f"pp:{FIX_REDO_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    storage.get_inpaint_redo.return_value = {
+        "source_file_id": "presource123",
+        "source_filename": "presource.png",
+        "mask_png": b"stored-mask-bytes",
+    }
+    context = _postprocess_context(storage, profile)
+
+    redone = GeneratedImage(
+        data=b"redone",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock(return_value=redone)) as mock:
+        await postprocess_callback(update, context)
+
+    args, kwargs = mock.await_args
+    assert args[1] == "fix_drawn"
+    assert kwargs["mask_bytes"] == b"stored-mask-bytes"
+
+    keyboard = query.message.reply_photo.await_args.kwargs["reply_markup"]
+    redo_buttons = [
+        b
+        for row in keyboard.inline_keyboard
+        for b in row
+        if b.callback_data.startswith(f"pp:{FIX_REDO_CALLBACK_KIND}:")
+    ]
+    assert len(redo_buttons) == 1
+
+
+@pytest.mark.asyncio
 async def test_hand_redo_reports_expired_mask_instead_of_running_post_process():
     query = AsyncMock()
     query.data = f"pp:{HAND_REDO_CALLBACK_KIND}:abc123"
@@ -1123,7 +1197,7 @@ async def test_hand_redo_reports_expired_mask_instead_of_running_post_process():
 
     post_process_mock.assert_not_called()
     query.message.reply_text.assert_awaited_once_with(
-        "That mask has expired — draw a new one with 🖌️ Draw Mask."
+        "That mask has expired — draw a new one with 🖌️ Draw Mask/🩹 Fix Artifact."
     )
 
 
@@ -1155,7 +1229,13 @@ async def test_process_one_inpaint_job_stores_a_redoable_row_and_attaches_redo_b
         inpaint_relay_url="https://inpaint.example.com", inpaint_relay_shared_secret="shh"
     )
     client = MagicMock()
-    job = {"token": "tok1", "chat_id": 42, "message_thread_id": None, "result_id": "abc123"}
+    job = {
+        "token": "tok1",
+        "chat_id": 42,
+        "message_thread_id": None,
+        "result_id": "abc123",
+        "kind": "hand",
+    }
 
     refined = GeneratedImage(
         data=b"refined",
@@ -1195,6 +1275,76 @@ async def test_process_one_inpaint_job_stores_a_redoable_row_and_attaches_redo_b
     ]
     assert len(redo_buttons) == 1
     assert redo_buttons[0].callback_data == f"pp:{HAND_REDO_CALLBACK_KIND}:{result_id}"
+
+
+@pytest.mark.asyncio
+async def test_process_one_inpaint_job_fix_kind_runs_fix_drawn_post_process():
+    from comfytelegram.handlers import _process_one_inpaint_job
+
+    storage = MagicMock()
+    storage.get_pending_result.return_value = {
+        "chat_id": 42,
+        "file_id": "presource123",
+        "filename": "presource.png",
+        "base_params": _serialize_generation_params(
+            GenerationParams(
+                checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+            )
+        ),
+    }
+
+    status_message = AsyncMock()
+    application = MagicMock()
+    application.bot.send_message = AsyncMock(return_value=status_message)
+    application.bot.get_file = AsyncMock(
+        return_value=MagicMock(download_as_bytearray=AsyncMock(return_value=bytearray(b"orig")))
+    )
+    application.bot.send_photo = AsyncMock(return_value=MagicMock())
+
+    settings = _settings(
+        inpaint_relay_url="https://inpaint.example.com", inpaint_relay_shared_secret="shh"
+    )
+    client = MagicMock()
+    job = {
+        "token": "tok1",
+        "chat_id": 42,
+        "message_thread_id": None,
+        "result_id": "abc123",
+        "kind": "fix",
+    }
+
+    refined = GeneratedImage(
+        data=b"refined",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+
+    with (
+        patch(
+            "comfytelegram.handlers._relay_poll_result",
+            new=AsyncMock(return_value={"mask": b"drawn-mask-bytes", "init_data": "raw-init-data"}),
+        ),
+        patch("comfytelegram.handlers.validate_webapp_init_data", return_value={"user": "1"}),
+        patch("comfytelegram.handlers._relay_delete_job", new=AsyncMock()),
+        patch("comfytelegram.handlers.post_process", new=AsyncMock(return_value=refined)) as mock,
+    ):
+        await _process_one_inpaint_job(application, settings, storage, client, job)
+
+    assert mock.await_args.args[1] == "fix_drawn"
+    application.bot.send_message.assert_awaited_once()
+    assert "Fixing artifact" in application.bot.send_message.await_args.args[1]
+
+    keyboard = application.bot.send_photo.await_args.kwargs["reply_markup"]
+    redo_buttons = [
+        b
+        for row in keyboard.inline_keyboard
+        for b in row
+        if b.callback_data.startswith(f"pp:{FIX_REDO_CALLBACK_KIND}:")
+    ]
+    assert len(redo_buttons) == 1
 
 
 def test_hand_mode_keyboard_scopes_both_buttons_to_result_id():

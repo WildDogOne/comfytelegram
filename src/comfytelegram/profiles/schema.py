@@ -138,3 +138,42 @@ class ModelProfile(BaseModel):
     tile_controlnet_strength: float = Field(
         0.4, description="tile_controlnet only: ControlNetApplyAdvanced's strength"
     )
+
+    anima_lllite_inpaint_patch: str | None = Field(
+        None,
+        description=(
+            "loader='split' only: filename of a ModelPatchLoader-compatible "
+            "ControlNet-LLLite inpainting patch (e.g. Anima's "
+            "'anima-lllite-inpainting-v2.safetensors', in ComfyUI's "
+            "models/model_patches) applied via AnimaLLLiteApply before the "
+            "'🩹 Fix Artifact' removal pass samples, so it's actually "
+            "inpainting-aware instead of running plain noise-masked img2img. "
+            "Unset (the default) skips the branch entirely."
+        ),
+    )
+    anima_lllite_inpaint_patch_strength: float = Field(
+        1.0, description="anima_lllite_inpaint_patch only: AnimaLLLiteApply's strength"
+    )
+
+    fix_artifact_checkpoint: str | None = Field(
+        None,
+        description=(
+            "If set, '🩹 Fix Artifact' always loads THIS exact checkpoint filename "
+            "(plus this profile's loader/clip_name/clip_type/vae_name/"
+            "model_sampling_shift/loras/negative_prompt_prefix/"
+            "anima_lllite_inpaint_patch) instead of the image's own original "
+            "checkpoint — for a checkpoint that's actually inpainting-aware (e.g. "
+            "an Anima profile with anima_lllite_inpaint_patch set), when the "
+            "image's own checkpoint has no inpainting-aware path wired at all yet "
+            "and produces unreliable removal results regardless of tuning. Unlike "
+            "'match', this is a literal filename, not a glob — 'match' picks which "
+            "profile applies to a checkpoint you already have; this instead names "
+            "which exact installed file to switch to. The positive prompt is still "
+            "forced empty for this pass either way (see generation.post_process's "
+            "'fix_drawn' branch) — style/subject continuity for the patched region "
+            "comes from the content-aware fill and (if configured) the inpainting "
+            "patch, not the prompt. At most one profile should set this; if "
+            "several do, the first one in load order wins. Unset (the default) "
+            "keeps '🩹 Fix Artifact' on each image's own checkpoint."
+        ),
+    )
