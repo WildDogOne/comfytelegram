@@ -4,7 +4,7 @@
   "description": "Anima's aesthetic-finetuned checkpoint — a 2B AuraFlow-style diffusion model with a Qwen-3 0.6B text encoder, loaded via UNETLoader/CLIPLoader/VAELoader instead of a single checkpoint file. er_sde sampler is the published default (softer/thinner lines with euler_ancestral instead, if preferred). Verified against this install's live /object_info: matches the staged anima_aestheticV11.safetensors UNET (and correctly excludes anima-base-v1.0.safetensors), clip_name/vae_name below are both present too.",
   "loader": "split",
   "clip_name": "qwen_3_06b_base.safetensors",
-  "clip_type": "stable_diffusion",
+  "clip_type": "omnigen2",
   "vae_name": "qwen_image_vae.safetensors",
   "model_sampling_shift": 3.0,
   "anima_lllite_inpaint_patch": "anima-lllite-inpainting-v2.safetensors",
