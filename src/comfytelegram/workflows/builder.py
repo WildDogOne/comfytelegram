@@ -19,7 +19,7 @@ face-detail packs), not ones that just add convenience widgets.
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 NodeRef = tuple[str, int]
@@ -838,9 +838,16 @@ class DrawnMaskFixParams:
     #: often reconstructed a cleaner-looking version of the very thing being
     #: masked out instead of erasing it.
     fill_model: str = "MAT_Places512_G_fp16.safetensors"
-    #: `_build_anima_fix_drawn_mask` only — all four below mirror a real
-    #: krita job's own values exactly (captured from /history, not guessed).
-    #: The drawn mask is grown+blurred (`INPAINT_ExpandMask`) then stabilized
+    #: `_build_anima_fix_drawn_mask` only — defaults mirror a real krita
+    #: job's own values exactly (captured from /history, not guessed), for a
+    #: mask with a ~350px bounding-box diagonal. `generation.post_process`
+    #: overrides `mask_grow`/`mask_blur`/`blend` per call instead of using
+    #: these defaults directly — see `_dynamic_fix_mask_params` — since
+    #: krita computes them from each job's own drawn-mask size rather than
+    #: using one fixed value for every mask; these three stay as the
+    #: fallback for direct callers (tests, `scripts/smoke_test*.py`) that
+    #: build a graph without going through that sizing step. The drawn mask
+    #: is grown+blurred (`INPAINT_ExpandMask`) then stabilized
     #: (`INPAINT_StabilizeMask`) into the "main" mask used for the ControlNet
     #: condition, the sampler's noise mask, and the post-sample color-match
     #: exclusion — a raw, unprocessed mask left a visible seam at its edges.
@@ -851,15 +858,37 @@ class DrawnMaskFixParams:
     #: for the content-aware fill step — krita keeps this one tight so MAT
     #: doesn't get asked to erase more than necessary.
     fill_mask_grow: int = 4
+    #: `_build_anima_fix_drawn_mask` only — krita's `workflow.py` never
+    #: reuses the grow+blur+stabilize "denoise" mask (this dataclass's
+    #: `mask_grow`/`mask_blur`, feeding the ControlNet condition/noise mask/
+    #: color-match exclusion) for its *final* compositing step. It builds a
+    #: second, separate mask instead (`denoise_to_compositing_mask` in
+    #: krita's `workflow.py`, confirmed against the same captured job as the
+    #: rest of this dataclass): `ThresholdMask(grow_mask, 0.0)` re-binarizes
+    #: away the wide diffusion-time blur, then `INPAINT_ShrinkMask(shrink=
+    #: blend//2, blur=blend)` re-shrinks and re-blurs it with its own,
+    #: narrower falloff — built from the grow+blur mask *before*
+    #: `INPAINT_StabilizeMask`, not after. A first version of this pipeline
+    #: skipped that and pasted the final result back through the stabilized
+    #: denoise mask directly, which still carried the full `mask_blur`
+    #: falloff into the composite — a soft, wide halo at the edit boundary
+    #: instead of krita's tighter, purpose-built blend edge.
+    blend: int = 25
     #: `_build_anima_fix_drawn_mask` only — the longest side (in px) the
     #: *entire* source image is downscaled to before sampling, matching
     #: krita's own `scale_to_initial`/`ScaledExtent` (its working resolution
     #: is decoupled from the canvas's native one; ours wasn't, and a first
     #: version of this pipeline sampled a raw, un-cropped 4096x4096 source
     #: directly, which was clocked running full 30-step diffusion over it).
-    #: `generation.post_process` computes the actual `(work_w, work_h)` from
-    #: this and the real image size, preserving aspect ratio and never
-    #: upscaling past the source's own resolution. An *earlier* version of
+    #: `generation._fix_drawn_geometry` computes the actual `(work_w,
+    #: work_h)` from this and the *context crop* (not the whole image — see
+    #: `context_scale`), preserving aspect ratio and never upscaling past
+    #: the source's own resolution. 1024 rather than something larger
+    #: because that's the pixel budget krita caps an inpaint pass at
+    #: (`CheckpointResolution.compute(..., inpaint=True)` yields a
+    #: 1024x1024 maximum), and because with `context_scale` deciding the
+    #: field of view it's the *ratio* of region to frame that matters here,
+    #: not the frame's absolute size. An *earlier* version of
     #: this fix cropped to a region around the mask instead of downscaling
     #: the whole image — cheaper, but wrong: it throws away the surrounding
     #: scene context the model otherwise uses to infer "this is fabric,
@@ -868,7 +897,73 @@ class DrawnMaskFixParams:
     #: around the mask, the diffusion pass painted a literal window showing
     #: background *through* the hoodie; sampling the whole (downscaled)
     #: image instead, same mask, same seed, it didn't.
-    work_max_size: int = 1280
+    work_max_size: int = 1024
+    #: How much larger than the region being repaired pass 1's field of view
+    #: is. The whole point of `FixDrawnGeometry.context_crop` — see its
+    #: docstring for the measurement that set this. krita's canvas in a
+    #: captured "remove object" job was ~1560px around a 768px region, so
+    #: 2.0 puts this bot's first pass at the same region-to-frame ratio
+    #: krita's runs at (~49%) instead of the ~16% it had when it downscaled
+    #: the whole 4096x4096 frame. Larger values give the model more
+    #: surrounding scene to continue from but spend the pass's fixed
+    #: resolution budget on pixels further from the repair.
+    context_scale: float = 2.0
+    #: `_build_anima_fix_drawn_mask` only — the model `ImageUpscaleWithModel`
+    #: uses to bring the color-matched, working-resolution result back up
+    #: toward the source's own resolution, before the final exact-size
+    #: `ImageScale`. Same default as `UpscaleParams`/`TiledRefineParams`'s
+    #: own 4x pass. Plugging a plain Lanczos `ImageScale` straight from
+    #: `work_max_size` (e.g. 1280) up to a large source (e.g. 4096, a
+    #: >3x stretch) produced visibly soft/blocky results wherever the
+    #: composited patch met native-resolution surrounding pixels — Lanczos
+    #: only interpolates existing pixels, it doesn't synthesize the texture
+    #: detail a trained upscale model does, and 4096px sources (already
+    #: 4x-upscaled once) make that gap between "diffused-then-interpolated"
+    #: and "native" pixels obvious.
+    result_upscale_model: str = "RealESRGAN_x4.pth"
+    #: `_build_anima_fix_drawn_mask`'s hi-res second pass (see
+    #: `generation._fix_drawn_refine_region` for when it runs at all, and
+    #: this module's `_build_anima_refine_pass`): the denoise that pass
+    #: samples the upscaled crop at.
+    #:
+    #: This is krita's `strength`, and it is *not* a `BasicScheduler`
+    #: denoise — the two are not interchangeable and conflating them is
+    #: what made an earlier version of this pass hallucinate. krita builds
+    #: a full `steps`-long schedule at denoise 1.0 and then throws away the
+    #: front of it (`SplitSigmas(step=round(steps * (1 - strength)))`,
+    #: taking `low_sigmas`), so strength 0.4 over 30 steps means "start at
+    #: sigma 18 of 30 and run the remaining 12". Asking `BasicScheduler`
+    #: for `denoise=0.65` instead builds a *longer* schedule and keeps more
+    #: of its noisy end — verified against a real removal on this server,
+    #: that started at sigma 10 of 30 rather than 18, and the pass stopped
+    #: refining the storefront behind the erased subject and invented a
+    #: flat red panel and a picture frame in its place. See
+    #: `_build_anima_refine_pass` for the `SplitSigmas` wiring that
+    #: reproduces krita's schedule exactly.
+    refine_denoise: float = 0.4
+    #: The upscale model this pass's starting image is built with. krita
+    #: uses its *quality* upscaler here (`UpscalerName.default`) rather
+    #: than the fast one, and on this install that resolved to this file —
+    #: taken from the same captured job as the rest of this pass, not
+    #: `result_upscale_model`'s RealESRGAN, which is tuned for photos.
+    refine_upscale_model: str = "4x_NMKD-Superscale-SP_178000_G.pth"
+    #: Longest side (px) the refine crop is sampled at. Unlike
+    #: `work_max_size` this bounds a *crop* around the mask rather than the
+    #: whole frame, so it can afford to be larger — the crop is typically a
+    #: fraction of the source's own area. Caps cost on a mask drawn across
+    #: most of a very large image, where the crop approaches the full frame.
+    refine_max_size: int = 1536
+    #: How much larger than pass 1's own crop this pass is allowed to
+    #: sample. krita never asks its refine pass for a big jump: in a
+    #: captured 4096x4096 removal it went from a 504x536 crop of the
+    #: initial pass to 768x816, a 1.52x step, and left the rest of the way
+    #: to canvas resolution to a plain resize (`scale_to_target`). Going
+    #: straight to the crop's full native size instead is a ~3.2x jump on a
+    #: 4096 source, which is more than a 12-step pass at
+    #: `refine_denoise` can rebuild — it comes back soft, and turning the
+    #: strength up to compensate makes it invent content instead. Capping
+    #: the jump keeps the pass in the regime krita actually uses it in.
+    refine_max_upscale: float = 2.0
 
 
 def build_hand_detailer_drawn_mask(
@@ -893,6 +988,8 @@ def build_fix_drawn_mask(
     *,
     image_size: tuple[int, int],
     work_size: tuple[int, int],
+    context_crop: tuple[int, int, int, int] | None = None,
+    refine_region: tuple[tuple[int, int, int, int], tuple[int, int]] | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Build a general-purpose "🩹 Fix Artifact" graph from a freehand-drawn
     mask. `image_size` is the real source image's own (width, height);
@@ -917,13 +1014,25 @@ def build_fix_drawn_mask(
     mask instead of the whole (downscaled) scene, which starved the model
     of the surrounding context it needs to know what to continue.
 
+    `refine_region` (`generation._fix_drawn_refine_region`, Anima path only)
+    turns on the hi-res second pass — `((x, y, w, h), (refine_w, refine_h))`,
+    the region around the mask to re-diffuse in `image_size`'s own pixel
+    space plus the resolution to do it at. `None` skips that pass entirely.
+
     Otherwise (no inpainting-aware path for this checkpoint at all) falls
     back to the same graph shape as `build_hand_detailer_drawn_mask` plus a
     `DrawnMaskFixParams.fill_model` content-aware fill pass — see
     `_build_drawn_mask_detailer`'s `content_aware_fill`."""
     if base.loader == "split" and base.anima_lllite_inpaint_patch:
         return _build_anima_fix_drawn_mask(
-            source_filename, mask_filename, base, params, image_size, work_size
+            source_filename,
+            mask_filename,
+            base,
+            params,
+            image_size,
+            work_size,
+            context_crop,
+            refine_region,
         )
     return _build_drawn_mask_detailer(
         source_filename, mask_filename, base, params, label="Fix", content_aware_fill=True
@@ -937,6 +1046,8 @@ def _build_anima_fix_drawn_mask(
     params: DrawnMaskFixParams,
     image_size: tuple[int, int],
     work_size: tuple[int, int],
+    context_crop: tuple[int, int, int, int] | None = None,
+    refine_region: tuple[tuple[int, int, int, int], tuple[int, int]] | None = None,
 ) -> tuple[dict[str, Any], str]:
     """ "🩹 Fix Artifact" for a split-loader (Anima) checkpoint with
     `anima_lllite_inpaint_patch` set — a hand-built pipeline instead of
@@ -968,6 +1079,12 @@ def _build_anima_fix_drawn_mask(
       main mask — corrects color/exposure drift between the freshly
       sampled patch and its surroundings that `DetailerForEach` never did,
       which was showing up as a visibly mismatched, muddy patch.
+    - The final composite is masked through a *second*, separately built
+      mask (`DrawnMaskFixParams.blend`), not the same grow+blur+stabilize
+      mask used for the noise mask/ControlNet condition/color-match
+      exclusion above — krita's `denoise_to_compositing_mask` never reuses
+      that one either. Reusing it here instead left a soft, wide halo at
+      the edit boundary from the wider blur diffusion-time masking wants.
     - It samples over the *whole* image, not a small crop around the mask.
       This turned out to be the one that mattered most: an earlier version
       of this function cropped to a region around the mask instead (cheaper
@@ -995,6 +1112,17 @@ def _build_anima_fix_drawn_mask(
       a full 30-step pass over a raw, un-cropped 4096x4096 source — also
       wrong, just for runtime instead of quality.)
 
+    - When `refine_region` is given, everything above is only *pass 1*: a
+      second sampler pass then re-diffuses a crop around the mask at a
+      higher resolution (`_build_anima_refine_pass`). krita does the same
+      whenever its initial resolution came out below the desired one
+      (`workflow.inpaint`'s `refinement_scaling` branch), which for any
+      source large enough to hit `work_max_size` is always — so the
+      single-pass version of this function was only ever faithful to
+      krita's *small-canvas* case, and on a 4096x4096 source produced
+      exactly the "looks like it was generated small and scaled up" result
+      that it was. See `generation._fix_drawn_refine_region`.
+
     krita's own graph ends by handing a small patch + mask back to its
     Krita-side client, which pastes it onto the canvas layer itself — this
     bot has no such client, so this graph instead scales the color-matched
@@ -1012,25 +1140,62 @@ def _build_anima_fix_drawn_mask(
     g = PromptGraph()
     work_w, work_h = work_size
     full_w, full_h = image_size
+    if context_crop is None:
+        context_crop = (0, 0, full_w, full_h)
+    ctx_x, ctx_y, ctx_w, ctx_h = context_crop
+    is_full_frame = context_crop == (0, 0, full_w, full_h)
 
     load = g.add("LoadImage", {"image": source_filename}, title="Source Image")
     raw_mask_full = g.add(
         "LoadImageMask", {"image": mask_filename, "channel": "red"}, title="Drawn Mask"
     )
+    # Pass 1 runs on a region around the mark, not the whole frame — see
+    # `generation.FixDrawnGeometry`. The image and the mask are cropped to
+    # the same region before being scaled down together, so everything
+    # downstream of here works in one consistent "context" space.
+    context_ref: NodeRef = (load, 0)
+    if not is_full_frame:
+        context_ref = (
+            g.add(
+                "ImageCrop",
+                {
+                    "image": [load, 0],
+                    "x": ctx_x,
+                    "y": ctx_y,
+                    "width": ctx_w,
+                    "height": ctx_h,
+                },
+                title="Crop Source To Context Region",
+            ),
+            0,
+        )
     load_small = g.add(
         "ImageScale",
         {
-            "image": [load, 0],
+            "image": list(context_ref),
             "width": work_w,
             "height": work_h,
             "upscale_method": "lanczos",
             "crop": "disabled",
         },
-        title="Downscale Source To Working Resolution",
+        title="Downscale Context To Working Resolution",
     )
-    raw_mask_full_img = g.add(
+    raw_mask_full_img_uncropped = g.add(
         "MaskToImage", {"mask": [raw_mask_full, 0]}, title="Drawn Mask As Image"
     )
+    raw_mask_full_img = raw_mask_full_img_uncropped
+    if not is_full_frame:
+        raw_mask_full_img = g.add(
+            "ImageCrop",
+            {
+                "image": [raw_mask_full_img_uncropped, 0],
+                "x": ctx_x,
+                "y": ctx_y,
+                "width": ctx_w,
+                "height": ctx_h,
+            },
+            title="Crop Drawn Mask To Context Region",
+        )
     raw_mask_small_img = g.add(
         "ImageScale",
         {
@@ -1046,7 +1211,17 @@ def _build_anima_fix_drawn_mask(
         "ImageToMask", {"image": [raw_mask_small_img, 0], "channel": "red"}, title="Drawn Mask"
     )
 
-    model_ref, _clip_ref, vae_ref, positive, negative = _build_model_clip_vae(g, base)
+    # `model_sampling_shift=None` regardless of what `base`'s own profile
+    # sets it to — the captured krita job this whole function replicates has
+    # no `ModelSamplingAuraFlow` node at all, and krita's own
+    # `load_checkpoint_with_lora` (its `workflow.py`) never applies one for
+    # Anima in *any* workflow, inpaint or otherwise; it's specific to this
+    # bot's own `build_txt2img`/`build_upscale`. Passing it through
+    # unchanged here silently diverged from the graph shape this function
+    # exists to match.
+    model_ref, _clip_ref, vae_ref, positive, negative = _build_model_clip_vae(
+        g, replace(base, model_sampling_shift=None)
+    )
     diff_diffusion = g.add(
         "DifferentialDiffusion", {"model": list(model_ref)}, title="Differential Diffusion"
     )
@@ -1166,47 +1341,142 @@ def _build_anima_fix_drawn_mask(
         title="Color Match",
     )
 
-    # Scale the small refined result, and the mask it's composited through,
-    # back up to the source's own resolution — the one place besides `load`
-    # itself that this graph touches full resolution again. Explicit
-    # width/height (not ImageCompositeMasked's own resize_source) so the
-    # mask is guaranteed to match source's resolution too, not just the
-    # image.
-    result_full = g.add(
-        "ImageScale",
-        {
-            "image": [color_matched, 0],
-            "width": full_w,
-            "height": full_h,
-            "upscale_method": "lanczos",
-            "crop": "disabled",
-        },
-        title="Upscale Result To Source Resolution",
+    # The *compositing* mask is its own thing, not a reuse of `main_mask` —
+    # krita's `denoise_to_compositing_mask` rebuilds it from the grow+blur
+    # mask *before* stabilization: threshold away the wide diffusion-time
+    # blur, then re-shrink/re-blur with a separate, narrower falloff (see
+    # `DrawnMaskFixParams.blend`). Pasting through the stabilized `main_mask`
+    # directly instead left a soft, wide halo at the edit boundary.
+    compositing_mask_thresholded = g.add(
+        "ThresholdMask", {"mask": [grown_mask, 0], "value": 0.0}, title="Threshold Mask"
     )
-    main_mask_img = g.add("MaskToImage", {"mask": [main_mask, 0]}, title="Main Mask As Image")
-    main_mask_full_img = g.add(
+    compositing_mask: NodeRef = (
+        g.add(
+            "INPAINT_ShrinkMask",
+            {
+                "mask": [compositing_mask_thresholded, 0],
+                "shrink": params.blend // 2,
+                "blur": params.blend,
+                "blur_type": "gaussian",
+            },
+            title="Shrink Mask For Compositing",
+        ),
+        0,
+    )
+
+    if refine_region is None:
+        # Single pass: scale the whole working-resolution result, and the
+        # mask it's composited through, back up to the source's own
+        # resolution. A trained upscale model first (same one
+        # `build_upscale`'s 4x pass uses), then an exact-size Lanczos resize
+        # — a bare Lanczos stretch straight from `work_size` looked visibly
+        # soft/blocky next to native-resolution surrounding pixels (see
+        # `DrawnMaskFixParams.result_upscale_model`). Explicit width/height
+        # (not ImageCompositeMasked's own resize_source) so the mask is
+        # guaranteed to match the source's resolution too, not just the
+        # image.
+        upscale_model = g.add(
+            "UpscaleModelLoader",
+            {"model_name": params.result_upscale_model},
+            title="Result Upscale Model",
+        )
+        result_model_upscaled = g.add(
+            "ImageUpscaleWithModel",
+            {"upscale_model": [upscale_model, 0], "image": [color_matched, 0]},
+            title="Model-Upscale Result",
+        )
+        result_ref: NodeRef = (
+            g.add(
+                "ImageScale",
+                {
+                    "image": [result_model_upscaled, 0],
+                    "width": ctx_w,
+                    "height": ctx_h,
+                    "upscale_method": "lanczos",
+                    "crop": "disabled",
+                },
+                title="Resize Result To Context Resolution",
+            ),
+            0,
+        )
+        # Pass 1 only ever saw `context_crop`, so that's what gets pasted
+        # back, at its own offset in the source.
+        paste_x, paste_y = ctx_x, ctx_y
+        mask_w, mask_h = ctx_w, ctx_h
+    else:
+        full_crop, refine_size = refine_region
+        # `full_crop` is in the source's space; pass 1 works in the context
+        # crop's space, so shift before scaling.
+        work_crop = _scale_crop(
+            (full_crop[0] - ctx_x, full_crop[1] - ctx_y, full_crop[2], full_crop[3]),
+            (ctx_w, ctx_h),
+            work_size,
+        )
+        result_ref = _build_anima_refine_pass(
+            g,
+            base,
+            params,
+            pass1_result=(color_matched, 0),
+            prefilled=(prefilled, 0),
+            source_image=(load, 0),
+            main_mask=(main_mask, 0),
+            control_load=control_load,
+            vae_ref=vae_ref,
+            positive=positive,
+            negative=negative,
+            sampler_select=sampler_select,
+            seed=seed,
+            work_crop=work_crop,
+            full_crop=full_crop,
+            refine_size=refine_size,
+        )
+        # Only the crop gets pasted back, so the compositing mask is cropped
+        # to match — in working space, where it was built — and then scaled
+        # to the crop's own full-resolution size.
+        compositing_mask = (
+            g.add(
+                "CropMask",
+                {
+                    "mask": list(compositing_mask),
+                    "x": work_crop[0],
+                    "y": work_crop[1],
+                    "width": work_crop[2],
+                    "height": work_crop[3],
+                },
+                title="Crop Compositing Mask To Refine Region",
+            ),
+            0,
+        )
+        paste_x, paste_y, mask_w, mask_h = full_crop
+
+    compositing_mask_img = g.add(
+        "MaskToImage", {"mask": list(compositing_mask)}, title="Compositing Mask As Image"
+    )
+    compositing_mask_full_img = g.add(
         "ImageScale",
         {
-            "image": [main_mask_img, 0],
-            "width": full_w,
-            "height": full_h,
+            "image": [compositing_mask_img, 0],
+            "width": mask_w,
+            "height": mask_h,
             "upscale_method": "bilinear",
             "crop": "disabled",
         },
-        title="Upscale Main Mask To Source Resolution",
+        title="Upscale Compositing Mask To Source Resolution",
     )
-    main_mask_full = g.add(
-        "ImageToMask", {"image": [main_mask_full_img, 0], "channel": "red"}, title="Main Mask"
+    compositing_mask_full = g.add(
+        "ImageToMask",
+        {"image": [compositing_mask_full_img, 0], "channel": "red"},
+        title="Compositing Mask",
     )
     composited = g.add(
         "ImageCompositeMasked",
         {
             "destination": [load, 0],
-            "source": [result_full, 0],
-            "x": 0,
-            "y": 0,
+            "source": list(result_ref),
+            "x": paste_x,
+            "y": paste_y,
             "resize_source": False,
-            "mask": [main_mask_full, 0],
+            "mask": [compositing_mask_full, 0],
         },
         title="Composite Onto Source",
     )
@@ -1217,6 +1487,281 @@ def _build_anima_fix_drawn_mask(
         title="Save Image",
     )
     return g.as_prompt(), save
+
+
+def _scale_crop(
+    crop: tuple[int, int, int, int],
+    from_size: tuple[int, int],
+    to_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """An `(x, y, w, h)` crop converted from one resolution space to another,
+    clamped to stay inside `to_size`."""
+    x, y, w, h = crop
+    from_w, from_h = from_size
+    to_w, to_h = to_size
+    scale_x, scale_y = to_w / from_w, to_h / from_h
+    new_x = max(0, min(to_w - 1, int(x * scale_x)))
+    new_y = max(0, min(to_h - 1, int(y * scale_y)))
+    return (
+        new_x,
+        new_y,
+        max(1, min(to_w - new_x, round(w * scale_x))),
+        max(1, min(to_h - new_y, round(h * scale_y))),
+    )
+
+
+def _build_anima_refine_pass(
+    g: PromptGraph,
+    base: PostProcessBaseParams,
+    params: DrawnMaskFixParams,
+    *,
+    pass1_result: NodeRef,
+    prefilled: NodeRef,
+    source_image: NodeRef,
+    main_mask: NodeRef,
+    control_load: str,
+    vae_ref: NodeRef,
+    positive: str,
+    negative: str,
+    sampler_select: str,
+    seed: int,
+    work_crop: tuple[int, int, int, int],
+    full_crop: tuple[int, int, int, int],
+    refine_size: tuple[int, int],
+) -> NodeRef:
+    """`_build_anima_fix_drawn_mask`'s hi-res second pass, mirroring krita's
+    own `refinement_scaling` branch (`workflow.inpaint`): crop pass 1's
+    result to the masked region, upscale it, and re-diffuse it at
+    `refine_size` with the inpaint ControlNet re-applied — this time against
+    the *source's own native-resolution pixels* for that region rather than
+    the downscaled working copy, so the model has real detail to match.
+
+    `work_crop` is the region in pass 1's working resolution, `full_crop` the
+    same region in the source image's own resolution. Returns the refined
+    image at `full_crop`'s size, ready to composite back at its offset.
+
+    Sampling the tail of the schedule rather than all of it is what keeps
+    this a detail pass: the content was decided by pass 1, which saw the
+    whole scene. See `DrawnMaskFixParams.refine_denoise` for why that tail
+    is cut with `SplitSigmas` rather than `BasicScheduler`'s `denoise`.
+
+    `control_load` is pass 1's own `ETN_control_load` node, reused rather
+    than loaded again — krita wires both of its `ETN_control_apply` nodes
+    to a single load too. Its MODEL output is the
+    differential-diffusion-wrapped model from *before* pass 1's patch
+    (krita's `model_orig`), so re-applying the control here against this
+    pass's own image and mask doesn't stack two patches."""
+    work_x, work_y, work_w, work_h = work_crop
+    full_x, full_y, full_w, full_h = full_crop
+    refine_w, refine_h = refine_size
+
+    pass1_crop = g.add(
+        "ImageCrop",
+        {
+            "image": list(pass1_result),
+            "x": work_x,
+            "y": work_y,
+            "width": work_w,
+            "height": work_h,
+        },
+        title="Crop Result To Refine Region",
+    )
+    refine_upscale_model = g.add(
+        "UpscaleModelLoader",
+        {"model_name": params.refine_upscale_model},
+        title="Refine Upscale Model",
+    )
+    upscaled = g.add(
+        "ImageUpscaleWithModel",
+        {"upscale_model": [refine_upscale_model, 0], "image": [pass1_crop, 0]},
+        title="Model-Upscale Refine Region",
+    )
+    refine_base = g.add(
+        "ImageScale",
+        {
+            "image": [upscaled, 0],
+            "width": refine_w,
+            "height": refine_h,
+            "upscale_method": "lanczos",
+            "crop": "disabled",
+        },
+        title="Resize Refine Region To Refine Resolution",
+    )
+
+    cropped_mask = g.add(
+        "CropMask",
+        {
+            "mask": list(main_mask),
+            "x": work_x,
+            "y": work_y,
+            "width": work_w,
+            "height": work_h,
+        },
+        title="Crop Main Mask To Refine Region",
+    )
+    cropped_mask_img = g.add(
+        "MaskToImage", {"mask": [cropped_mask, 0]}, title="Refine Mask As Image"
+    )
+    refine_mask_img = g.add(
+        "ImageScale",
+        {
+            "image": [cropped_mask_img, 0],
+            "width": refine_w,
+            "height": refine_h,
+            "upscale_method": "bilinear",
+            "crop": "disabled",
+        },
+        title="Resize Refine Mask",
+    )
+    refine_mask = g.add(
+        "ImageToMask", {"image": [refine_mask_img, 0], "channel": "red"}, title="Refine Mask"
+    )
+
+    # The ControlNet condition for this pass comes from the *source's* own
+    # native pixels for this region (krita's `images.hires_image`, an
+    # `Image.crop(canvas, target_bounds)` of the untouched canvas), not from
+    # pass 1's upscaled output — that's the whole point of the pass.
+    hires_crop = g.add(
+        "ImageCrop",
+        {
+            "image": list(source_image),
+            "x": full_x,
+            "y": full_y,
+            "width": full_w,
+            "height": full_h,
+        },
+        title="Crop Source To Refine Region",
+    )
+    hires_ref: NodeRef = (hires_crop, 0)
+    if (full_w, full_h) != (refine_w, refine_h):
+        hires_ref = (
+            g.add(
+                "ImageScale",
+                {
+                    "image": [hires_crop, 0],
+                    "width": refine_w,
+                    "height": refine_h,
+                    "upscale_method": "lanczos",
+                    "crop": "disabled",
+                },
+                title="Resize Source Refine Region",
+            ),
+            0,
+        )
+
+    patched_model = g.add(
+        "ETN_control_apply",
+        {
+            "model": [control_load, 0],
+            "control_net": [control_load, 1],
+            "image": list(hires_ref),
+            "strength": base.anima_lllite_inpaint_patch_strength,
+            "start_percent": 0.0,
+            "end_percent": 1.0,
+            "mask": [refine_mask, 0],
+        },
+        title="Apply Anima Inpaint ControlNet (Refine)",
+    )
+
+    latent = g.add(
+        "VAEEncode", {"vae": list(vae_ref), "pixels": [refine_base, 0]}, title="VAE Encode (Refine)"
+    )
+    masked_latent = g.add(
+        "SetLatentNoiseMask",
+        {"samples": [latent, 0], "mask": [refine_mask, 0]},
+        title="Set Latent Noise Mask (Refine)",
+    )
+    guider = g.add(
+        "CFGGuider",
+        {
+            "model": [patched_model, 0],
+            "positive": [positive, 0],
+            "negative": [negative, 0],
+            "cfg": params.cfg,
+        },
+        title="CFG Guider (Refine)",
+    )
+    # A full-length schedule at denoise 1.0, with its front discarded by
+    # SplitSigmas — krita's `apply_strength`/`start_at_step` exactly (see
+    # `DrawnMaskFixParams.refine_denoise`). `BasicScheduler`'s own `denoise`
+    # is a different operation and lands on a noisier starting sigma.
+    scheduler = g.add(
+        "BasicScheduler",
+        {
+            "model": [patched_model, 0],
+            "scheduler": params.scheduler,
+            "steps": params.steps,
+            "denoise": 1.0,
+        },
+        title="Scheduler (Refine)",
+    )
+    split = g.add(
+        "SplitSigmas",
+        {
+            "sigmas": [scheduler, 0],
+            "step": round(params.steps * (1 - params.refine_denoise)),
+        },
+        title="Split Sigmas (Refine)",
+    )
+    noise = g.add("RandomNoise", {"noise_seed": seed}, title="Random Noise (Refine)")
+    sampled = g.add(
+        "SamplerCustomAdvanced",
+        {
+            "noise": [noise, 0],
+            "guider": [guider, 0],
+            "sampler": [sampler_select, 0],
+            # SplitSigmas outputs (high_sigmas, low_sigmas); the tail is 1.
+            "sigmas": [split, 1],
+            "latent_image": [masked_latent, 0],
+        },
+        title="Sample (Refine)",
+    )
+    decoded = g.add(
+        "VAEDecode", {"vae": list(vae_ref), "samples": [sampled, 1]}, title="VAE Decode (Refine)"
+    )
+    # Matched against the *content-aware-filled* image cropped to this
+    # region — the same reference pass 1 colour-matched against, which is
+    # what krita uses here too (its `input_cropped`). Referencing pass 1's
+    # own output instead would let any colour drift it introduced compound.
+    # The reference being a different size than the target is fine and is
+    # what krita does as well: only its colour statistics are read.
+    prefilled_crop = g.add(
+        "ImageCrop",
+        {
+            "image": list(prefilled),
+            "x": work_x,
+            "y": work_y,
+            "width": work_w,
+            "height": work_h,
+        },
+        title="Crop Filled Image To Refine Region",
+    )
+    color_matched = g.add(
+        "INPAINT_ColorMatch",
+        {
+            "target": [decoded, 0],
+            "reference": [prefilled_crop, 0],
+            "exclude_mask": [refine_mask, 0],
+            "strength": 1.0,
+        },
+        title="Color Match (Refine)",
+    )
+    if (refine_w, refine_h) == (full_w, full_h):
+        return (color_matched, 0)
+    return (
+        g.add(
+            "ImageScale",
+            {
+                "image": [color_matched, 0],
+                "width": full_w,
+                "height": full_h,
+                "upscale_method": "lanczos",
+                "crop": "disabled",
+            },
+            title="Resize Refine Result To Source Resolution",
+        ),
+        0,
+    )
 
 
 def _build_drawn_mask_detailer(

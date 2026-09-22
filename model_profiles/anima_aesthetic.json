@@ -8,7 +8,9 @@
   "vae_name": "qwen_image_vae.safetensors",
   "model_sampling_shift": 3.0,
   "anima_lllite_inpaint_patch": "anima-lllite-inpainting-v2.safetensors",
-  "fix_artifact_checkpoint": "anima_aestheticV11.safetensors",
+  "fix_artifact_checkpoint": "anima-base-v1.0.safetensors",
+  "fix_artifact_positive_prefix": "masterpiece, best quality, score_7, highres, safe",
+  "fix_artifact_negative_prefix": "worst quality, low quality, score_1, score_2, score_3, artist name",
   "defaults": {
     "cfg": 4.0,
     "steps": 30,

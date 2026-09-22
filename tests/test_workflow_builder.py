@@ -520,6 +520,10 @@ def _anima_fix_base() -> PostProcessBaseParams:
         loader="split",
         clip_name="qwen_3_06b_base.safetensors",
         vae_name="qwen_image_vae.safetensors",
+        # Set like a real profile's (anima_aesthetic.json) would be for
+        # normal generation — `_build_anima_fix_drawn_mask` must ignore this
+        # regardless, see its own test's `ModelSamplingAuraFlow` assertion.
+        model_sampling_shift=3.0,
         anima_lllite_inpaint_patch="anima-lllite-inpainting-v2.safetensors",
         anima_lllite_inpaint_patch_strength=0.8,
     )
@@ -568,6 +572,12 @@ def test_build_anima_fix_drawn_mask_matches_krita_graph_shape():
 
     load_id = id_of("LoadImage")
     mask_id = id_of("LoadImageMask")
+
+    # No ModelSamplingAuraFlow node, even though `base` sets
+    # model_sampling_shift=3.0 (a real profile's value for *normal*
+    # generation) — the captured krita job has no such node, and krita's
+    # own `workflow.py` never applies one for Anima in any workflow.
+    assert "ModelSamplingAuraFlow" not in _class_types(prompt)
 
     # Everything through sampling works on the *whole* source downscaled to
     # work_size, not a crop around the mask (and not the raw, un-cropped
@@ -669,22 +679,46 @@ def test_build_anima_fix_drawn_mask_matches_krita_graph_shape():
     assert colormatch["inputs"]["reference"][0] == id_of("INPAINT_InpaintWithModel")
     assert colormatch["inputs"]["exclude_mask"][0] == main_mask_id
 
+    # Result is model-upscaled (not a bare Lanczos stretch — that looked
+    # visibly soft/blocky next to native-resolution surrounding pixels)
+    # before the final exact-size resize back to the source's resolution.
+    model_upscale = node_of("ImageUpscaleWithModel")
+    assert model_upscale["inputs"]["image"][0] == id_of("INPAINT_ColorMatch")
+    upscale_model_loader = node_of("UpscaleModelLoader")
+    assert model_upscale["inputs"]["upscale_model"][0] == id_of("UpscaleModelLoader")
+    assert upscale_model_loader["inputs"]["model_name"] == DrawnMaskFixParams().result_upscale_model
+
     result_upscale = next(
         n
         for n in prompt.values()
         if n["class_type"] == "ImageScale"
-        and n["inputs"]["image"][0] == id_of("INPAINT_ColorMatch")
+        and n["inputs"]["image"][0] == id_of("ImageUpscaleWithModel")
     )
     assert (result_upscale["inputs"]["width"], result_upscale["inputs"]["height"]) == (4096, 4096)
     result_upscale_id = next(
         k
         for k, n in prompt.items()
         if n["class_type"] == "ImageScale"
-        and n["inputs"]["image"][0] == id_of("INPAINT_ColorMatch")
+        and n["inputs"]["image"][0] == id_of("ImageUpscaleWithModel")
     )
 
+    # The final composite is masked through its *own* mask chain — threshold
+    # away the wide diffusion-time blur, then a separate shrink/blur with
+    # `DrawnMaskFixParams.blend` — built from the grow+blur mask, not from
+    # the stabilized `main_mask_id` used for noise-masking/ControlNet/
+    # color-match above (krita's `denoise_to_compositing_mask` never reuses
+    # that one either).
+    threshold = node_of("ThresholdMask")
+    assert threshold["inputs"]["mask"][0] == id_of("INPAINT_ExpandMask")
+    assert threshold["inputs"]["value"] == 0.0
+    shrink = node_of("INPAINT_ShrinkMask")
+    assert shrink["inputs"]["mask"][0] == id_of("ThresholdMask")
+    assert shrink["inputs"]["shrink"] == DrawnMaskFixParams().blend // 2
+    assert shrink["inputs"]["blur"] == DrawnMaskFixParams().blend
+    compositing_mask_id = id_of("INPAINT_ShrinkMask")
+
     assert any(
-        n["class_type"] == "MaskToImage" and n["inputs"]["mask"][0] == main_mask_id
+        n["class_type"] == "MaskToImage" and n["inputs"]["mask"][0] == compositing_mask_id
         for n in prompt.values()
     )
     main_mask_full_id = next(
@@ -697,6 +731,108 @@ def test_build_anima_fix_drawn_mask_matches_krita_graph_shape():
     assert composite["inputs"]["mask"][0] == main_mask_full_id
     assert (composite["inputs"]["x"], composite["inputs"]["y"]) == (0, 0)
     assert prompt[save_id]["inputs"]["images"][0] == id_of("ImageCompositeMasked")
+    # Single pass unless a refine_region is given.
+    assert len([n for n in prompt.values() if n["class_type"] == "SamplerCustomAdvanced"]) == 1
+
+
+def test_build_anima_fix_drawn_mask_refine_pass_matches_krita_two_pass_shape():
+    # krita runs two diffusion passes whenever the initial resolution came
+    # out below the desired one (resolution.prepare_diffusion_input's "Do 2
+    # passes" branch, then workflow.inpaint's refinement_scaling branch):
+    # crop to the masked region, upscale it, re-diffuse at strength 0.4
+    # against the *source's* native pixels. Everything asserted here is
+    # checked against that branch of krita's own workflow.py.
+    params = DrawnMaskFixParams(seed=888)
+    prompt, save_id = build_fix_drawn_mask(
+        "uploaded.png",
+        "mask_uploaded.png",
+        _anima_fix_base(),
+        params,
+        image_size=(4096, 4096),
+        work_size=(1280, 1280),
+        refine_region=((1643, 1743, 800, 912), (800, 912)),
+    )
+
+    def nodes_of(class_type: str) -> list[dict]:
+        return [n for n in prompt.values() if n["class_type"] == class_type]
+
+    def id_of(class_type: str) -> str:
+        return next(k for k, n in prompt.items() if n["class_type"] == class_type)
+
+    samplers = nodes_of("SamplerCustomAdvanced")
+    assert len(samplers) == 2
+
+    # Both passes share a single ETN_control_load, wired to the
+    # differential-diffusion model rather than to pass 1's already-patched
+    # one (krita starts this pass from its `model_orig` and wires both of
+    # its ETN_control_apply nodes to one load) — otherwise two control
+    # patches would stack.
+    control_loads = nodes_of("ETN_control_load")
+    assert len(control_loads) == 1
+    diff_id = id_of("DifferentialDiffusion")
+    assert control_loads[0]["inputs"]["model"][0] == diff_id
+    control_load_id = id_of("ETN_control_load")
+    applies = nodes_of("ETN_control_apply")
+    assert len(applies) == 2
+    assert all(n["inputs"]["model"] == [control_load_id, 0] for n in applies)
+    assert all(n["inputs"]["control_net"] == [control_load_id, 1] for n in applies)
+
+    # The refine pass's schedule is krita's start_at_step, built with
+    # SplitSigmas over a full-length denoise-1.0 schedule — not
+    # BasicScheduler's own `denoise`, which lands on a noisier sigma and
+    # made this pass invent content instead of refining it.
+    split = next(iter(nodes_of("SplitSigmas")))
+    assert split["inputs"]["step"] == round(params.steps * (1 - params.refine_denoise))
+    split_id = id_of("SplitSigmas")
+    refine_sampler = next(n for n in samplers if n["inputs"]["sigmas"][0] == split_id)
+    assert refine_sampler["inputs"]["sigmas"] == [split_id, 1]  # low_sigmas
+
+    # Its ControlNet condition is a crop of the *source* image at full
+    # resolution (krita's `images.hires_image`), not of pass 1's output.
+    load_id = id_of("LoadImage")
+    source_crop = next(n for n in nodes_of("ImageCrop") if n["inputs"]["image"][0] == load_id)
+    assert (source_crop["inputs"]["x"], source_crop["inputs"]["y"]) == (1643, 1743)
+    assert (source_crop["inputs"]["width"], source_crop["inputs"]["height"]) == (800, 912)
+
+    # Pass 1's result is cropped in *working* space — the same region scaled
+    # by work_size/image_size (1280/4096 = 0.3125).
+    colormatch_ids = [k for k, n in prompt.items() if n["class_type"] == "INPAINT_ColorMatch"]
+    assert len(colormatch_ids) == 2
+    result_crop = next(
+        n for n in nodes_of("ImageCrop") if n["inputs"]["image"][0] in colormatch_ids
+    )
+    assert (result_crop["inputs"]["x"], result_crop["inputs"]["y"]) == (513, 544)
+    assert (result_crop["inputs"]["width"], result_crop["inputs"]["height"]) == (250, 285)
+
+    # Both schedules are full-length at denoise 1.0 — the refine pass is
+    # shortened by SplitSigmas above, not by a reduced denoise.
+    schedulers = nodes_of("BasicScheduler")
+    assert len(schedulers) == 2
+    assert all(n["inputs"]["denoise"] == 1.0 for n in schedulers)
+    assert all(n["inputs"]["steps"] == params.steps for n in schedulers)
+
+    # Its starting image is built with the quality upscale model krita uses
+    # for this pass, not the photo-tuned one the single-pass path uses.
+    refine_upscaler = next(
+        n
+        for n in nodes_of("UpscaleModelLoader")
+        if n["inputs"]["model_name"] == params.refine_upscale_model
+    )
+    assert refine_upscaler["inputs"]["model_name"] != params.result_upscale_model
+
+    # Only the refined crop is pasted back, at its own offset, through a
+    # compositing mask cropped to match.
+    composite = next(iter(nodes_of("ImageCompositeMasked")))
+    assert composite["inputs"]["destination"][0] == load_id
+    assert (composite["inputs"]["x"], composite["inputs"]["y"]) == (1643, 1743)
+    assert prompt[save_id]["inputs"]["images"][0] == id_of("ImageCompositeMasked")
+
+    # The whole frame is never upscaled back to 4096 in this path — only the
+    # crop is, which is the entire point.
+    assert not any(
+        n["inputs"].get("width") == 4096 and n["inputs"].get("height") == 4096
+        for n in nodes_of("ImageScale")
+    )
 
 
 def test_build_fix_drawn_mask_skips_anima_lllite_patch_when_unset():

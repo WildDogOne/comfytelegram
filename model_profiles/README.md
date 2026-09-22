@@ -88,12 +88,19 @@ separate UNET/text-encoder/VAE files loaded through
   `/model` list, so both kinds of model show up together.
 - `clip_name`/`clip_type` point at the separate text-encoder file (Anima
   uses a Qwen-3 0.6B encoder, staged under `models/text_encoders/`, loaded
-  with `clip_type: "stable_diffusion"` despite not being a CLIP model —
-  that's just the `CLIPLoader` bucket the Anima authors' own workflow uses).
+  with `clip_type: "omnigen2"` despite not being an OmniGen2 model — that's
+  just the `CLIPLoader` bucket krita-ai-diffusion's own `workflow.py` uses
+  for this exact text encoder (`case Arch.anima: clip = w.load_clip(...,
+  type="omnigen2")`); `"stable_diffusion"` loads without erroring but is
+  the wrong wrapper and was silently producing worse text conditioning.
 - `vae_name` points at the separate VAE file (`models/vae/`).
 - `model_sampling_shift`, if set, inserts a `ModelSamplingAuraFlow` node
   right after the UNET load — Anima's AuraFlow-style sampling shift.
   Leave it `null`/omitted for split architectures that don't need that node.
+  "🩹 Fix Artifact"'s dedicated Anima pipeline (`_build_anima_fix_drawn_mask`)
+  always ignores this field regardless of what a profile sets it to — a
+  real krita "remove object" job's own graph has no such node at all, and
+  krita's own `workflow.py` never applies one for Anima in any workflow.
 
 `cfg`/`steps`/`sampler_name`/`scheduler`/`width`/`height` all still work the
 normal way through `defaults` — Anima Aesthetic and Anima Turbo just want
@@ -159,13 +166,17 @@ Most checkpoints have no inpainting-aware path wired at all (see
 from one of them is a coin flip regardless of how the pass itself is
 tuned. Setting `fix_artifact_checkpoint` on a profile makes "🩹 Fix
 Artifact" **always** load that exact checkpoint filename (plus that
-profile's `loader`/`clip_name`/`clip_type`/`vae_name`/
-`model_sampling_shift`/`loras`/`negative_prompt_prefix`/
-`anima_lllite_inpaint_patch`) instead of the image's own original one —
+profile's `loader`/`clip_name`/`clip_type`/`vae_name`/`loras`/
+`negative_prompt_prefix`/`anima_lllite_inpaint_patch` — *not*
+`model_sampling_shift`, which the dedicated Anima fix-drawn-mask pipeline
+always ignores; see below) instead of the image's own original one —
 regardless of which checkpoint the image was actually generated with.
-`anima_aesthetic.json` sets this to `anima_aestheticV11.safetensors`, so
-"🩹 Fix Artifact" on *any* image (furrytoonmix, SDXL, whatever) routes
-through Anima Aesthetic + its lllite inpainting patch.
+`anima_aesthetic.json` sets this to `anima-base-v1.0.safetensors` — the
+plain base checkpoint, not the aesthetic finetune this profile otherwise
+loads for normal generation, matched against a real krita-ai-diffusion
+"remove object" job pulled from this server's own `/history` — so "🩹 Fix
+Artifact" on *any* image (furrytoonmix, SDXL, whatever) routes through
+Anima's base checkpoint + its lllite inpainting patch.
 
 Unlike `match` (a glob matched against whatever checkpoint the user
 picked), this is a literal filename — it names the exact file to switch

@@ -178,7 +178,7 @@ def test_anima_aesthetic_profile_sets_fix_artifact_checkpoint(profiles):
     staged UNET filename, "🩹 Fix Artifact" would silently start rejecting
     every request with a ComfyUI "value not in list" error."""
     anima = next(p for p in profiles if p.display_name == "Anima Aesthetic")
-    assert anima.fix_artifact_checkpoint == "anima_aestheticV11.safetensors"
+    assert anima.fix_artifact_checkpoint == "anima-base-v1.0.safetensors"
     assert anima.loader == "split"
     assert anima.anima_lllite_inpaint_patch == "anima-lllite-inpainting-v2.safetensors"
 
@@ -228,7 +228,9 @@ def test_resolve_generation_params_defaults_raw_prompt_to_empty():
 
 
 def test_lora_default_to_spec_drops_default_enabled_flag():
-    lora = LoraDefault(name="a.safetensors", strength_model=0.8, strength_clip=0.9, default_enabled=False)
+    lora = LoraDefault(
+        name="a.safetensors", strength_model=0.8, strength_clip=0.9, default_enabled=False
+    )
     spec = lora.to_spec()
     assert spec.name == "a.safetensors"
     assert spec.strength_model == 0.8
@@ -246,3 +248,23 @@ def test_resolve_generation_params_only_applies_default_enabled_loras():
     )
     params = resolve_generation_params("ckpt.safetensors", "a fox", profile)
     assert [lora.name for lora in params.loras] == ["on.safetensors"]
+
+
+def test_anima_aesthetic_profile_overrides_fix_artifact_prompts(profiles):
+    """The removal pass wants different conditioning than ordinary generation
+    — these mirror a real krita "remove object" job's own style prompt, which
+    carries booru score tags the generation prefix deliberately doesn't. They
+    must not leak into normal generation, which keeps its own prefixes."""
+    anima = next(p for p in profiles if p.display_name == "Anima Aesthetic")
+    assert anima.fix_artifact_positive_prefix == "masterpiece, best quality, score_7, highres, safe"
+    assert anima.fix_artifact_negative_prefix == (
+        "worst quality, low quality, score_1, score_2, score_3, artist name"
+    )
+    assert anima.positive_prompt_prefix == "masterpiece, best quality"
+    assert anima.negative_prompt_prefix == "worst quality, low quality"
+
+
+def test_fix_artifact_prompt_overrides_default_to_none():
+    profile = ModelProfile(match=["*ckpt*"], display_name="X")
+    assert profile.fix_artifact_positive_prefix is None
+    assert profile.fix_artifact_negative_prefix is None

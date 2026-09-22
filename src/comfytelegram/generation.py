@@ -157,8 +157,19 @@ def _fix_artifact_override_base(profiles: list[ModelProfile]) -> PostProcessBase
         return None
     return PostProcessBaseParams(
         checkpoint=profile.fix_artifact_checkpoint,
-        positive_prompt=join_nonempty([profile.positive_prompt_prefix, "background scenery"]),
-        negative_prompt=profile.negative_prompt_prefix,
+        positive_prompt=join_nonempty(
+            [
+                profile.fix_artifact_positive_prefix
+                if profile.fix_artifact_positive_prefix is not None
+                else profile.positive_prompt_prefix,
+                "background scenery",
+            ]
+        ),
+        negative_prompt=(
+            profile.fix_artifact_negative_prefix
+            if profile.fix_artifact_negative_prefix is not None
+            else profile.negative_prompt_prefix
+        ),
         loras=[lora.to_spec() for lora in profile.loras if lora.default_enabled],
         clip_skip=profile.defaults.clip_skip if profile.defaults.clip_skip is not None else -1,
         loader=profile.loader,
@@ -174,35 +185,191 @@ def _fix_artifact_override_base(profiles: list[ModelProfile]) -> PostProcessBase
     )
 
 
-def _fix_drawn_work_size(
-    image_size: tuple[int, int], params: DrawnMaskFixParams
-) -> tuple[int, int]:
-    """`build_fix_drawn_mask`'s `work_size` — `image_size` downscaled
-    (preserving aspect ratio) so its longest side is at most
-    `params.work_max_size`, or `image_size` unchanged if it's already
-    smaller. Only `_build_anima_fix_drawn_mask` actually resizes with this,
-    but it's computed unconditionally here since it's cheap and
-    `build_fix_drawn_mask` needs the value regardless of which path it ends
-    up taking.
+#: krita-ai-diffusion's own defaults for the settings `calc_selection_pre_process`
+#: (`ai_diffusion/model/model.py`) reads — confirmed against this server's own
+#: `/history` for a real krita job: a drawn mask with bounding-box diagonal
+#: ~750px produced feather=75/grow=41/blend=25 there, which is exactly what
+#: this formula reproduces for these constants at `strength=1.0` (a "remove
+#: object" job is always full-strength, hence no `strength` parameter here).
+_SELECTION_FEATHER_PCT = 10
+_SELECTION_MIN_TRANSITION_PX = 32
+_SELECTION_GROW_OFFSET_PX = 4
+_SELECTION_BLEND_CAP_PX = 25
 
-    A *crop*-based predecessor of this (bounding a region around the drawn
-    mask's own bbox instead of downscaling the whole image) was tried
-    first and rejected: confirmed on a real removal case pulled from this
-    server's own `/history` that cropping away the surrounding scene
-    starves the diffusion pass of context it needs to correctly continue
-    "this is fabric" into the masked hole — it painted a literal window
-    showing background through the masked garment instead, regardless of
-    seed/checkpoint/prompt tried. A resize keeps the whole scene, just
-    smaller — matching krita-ai-diffusion's own `scale_to_initial`
-    approach, and the actual root problem this exists for is a runaway
-    30-step diffusion pass over a raw, un-cropped 4096x4096 photo with
-    nothing bounding the resolution — solved just as well by a resize."""
-    img_w, img_h = image_size
-    longest = max(img_w, img_h)
-    if longest <= params.work_max_size:
-        return (img_w, img_h)
-    scale = params.work_max_size / longest
-    return (round(img_w * scale), round(img_h * scale))
+
+def _mask_bbox(mask_bytes: bytes) -> tuple[int, int, int, int] | None:
+    """The drawn mask's own marked-pixel bounding box, or None if nothing is
+    marked at all."""
+    return Image.open(io.BytesIO(mask_bytes)).convert("L").getbbox()
+
+
+def _bbox_diagonal(bbox: tuple[int, int, int, int] | None) -> float:
+    if bbox is None:
+        return 0.0
+    return ((bbox[2] - bbox[0]) ** 2 + (bbox[3] - bbox[1]) ** 2) ** 0.5
+
+
+def _native_fix_mask_params(diagonal: float) -> tuple[int, int, int]:
+    """krita's `calc_selection_pre_process` formula, in the source image's own
+    (un-downscaled) pixel units."""
+    feather = max(int(_SELECTION_FEATHER_PCT / 100 * diagonal), _SELECTION_MIN_TRANSITION_PX)
+    grow = _SELECTION_GROW_OFFSET_PX + feather // 2
+    blend = min(_SELECTION_BLEND_CAP_PX, grow + feather // 2)
+    return grow, feather, blend
+
+
+#: Diffusion resolutions should be a multiple of this — same constant, and
+#: the same reason ("required latent compression factor, or to avoid border
+#: artifacts with UNET models"), as krita's own `resolution.diffusion_multiple`.
+_DIFFUSION_MULTIPLE = 16
+#: Extra padding around the drawn mask's bounding box for the hi-res refine
+#: crop, on top of the mask's own grow+feather: krita's `selection_padding`
+#: default (6%) of the bbox's longest side, never less than 16px.
+_REFINE_PAD_FRAC = 0.06
+_REFINE_MIN_PAD = 16
+#: Smallest refine crop worth cropping to — krita's own checkpoint-resolution
+#: floor for a diffusion pass is 256 too.
+_REFINE_MIN_SIZE = 256
+#: How much more resolution the second pass has to actually gain over what
+#: the first pass already had for that region before it's worth running.
+_REFINE_MIN_GAIN = 1.25
+
+
+def _snap_down(value: int, multiple: int = _DIFFUSION_MULTIPLE) -> int:
+    return max(multiple, (value // multiple) * multiple)
+
+
+def _expand_axis(lo: int, hi: int, minimum: int, limit: int) -> tuple[int, int]:
+    """Grow `(lo, hi)` to at least `minimum` long, staying inside `[0, limit]`."""
+    minimum = min(minimum, limit)
+    if hi - lo >= minimum:
+        return lo, hi
+    lo = max(0, lo - (minimum - (hi - lo)) // 2)
+    hi = min(limit, lo + minimum)
+    return max(0, hi - minimum), hi
+
+
+def _expand_about_centre(
+    bounds: tuple[int, int, int, int], scale: float, limits: tuple[int, int]
+) -> tuple[int, int, int, int]:
+    """`bounds` grown by `scale` around its own centre, clamped inside
+    `limits` and kept a multiple of `_DIFFUSION_MULTIPLE`."""
+    x, y, w, h = bounds
+    lim_w, lim_h = limits
+    new_w = min(_snap_down(lim_w), _snap_down(round(w * scale)))
+    new_h = min(_snap_down(lim_h), _snap_down(round(h * scale)))
+    new_x = max(0, min(lim_w - new_w, x + w // 2 - new_w // 2))
+    new_y = max(0, min(lim_h - new_h, y + h // 2 - new_h // 2))
+    return (new_x, new_y, new_w, new_h)
+
+
+def _scale_to_max(size: tuple[int, int], max_size: int) -> tuple[int, int]:
+    """`size` fitted inside `max_size` on its longest side, preserving aspect
+    ratio and snapped to `_DIFFUSION_MULTIPLE`. Never upscales."""
+    w, h = size
+    scale = min(1.0, max_size / max(w, h))
+    return (_snap_down(round(w * scale)), _snap_down(round(h * scale)))
+
+
+@dataclass
+class FixDrawnGeometry:
+    """Every resolution/region decision `build_fix_drawn_mask` needs for the
+    Anima path, derived from the drawn mask itself.
+
+    The load-bearing one is `context_crop`. Pass 1 used to downscale the
+    *whole* source to `work_max_size`, which on a 4096x4096 image left the
+    region actually being repaired occupying only ~200px of the pass — far
+    too few to resolve what it was supposed to continue, so it produced
+    something vague and no amount of second-pass refinement could recover
+    detail that had never been decided. Measured against a real krita
+    "remove object" job for the same edit: krita's first pass gave the
+    region 504x536 of its 1024 pass (49% of the frame), this bot's gave it
+    205x215 of 1280 (16%) — a 2.5x difference in the linear resolution of
+    the only part that matters. krita gets that ratio because its canvas is
+    only about twice the size of the region; this reproduces it directly by
+    cropping a `DrawnMaskFixParams.context_scale` multiple of the region out
+    of the source and running pass 1 on *that* instead of the whole frame.
+
+    This is deliberately a partial reversal of an earlier finding that
+    cropping "starves the model of scene context". That still holds for a
+    *tight* crop around the mask — the version that painted a window through
+    a garment cropped to barely more than the mask itself. A crop at twice
+    the region's size is a different thing, and is the proportion krita
+    itself works at."""
+
+    #: Region of the source image pass 1 actually sees, as (x, y, w, h).
+    context_crop: tuple[int, int, int, int]
+    #: Resolution pass 1 samples `context_crop` at.
+    work_size: tuple[int, int]
+    #: Mask grow/blur/blend, in `work_size`'s pixel space.
+    mask_grow: int
+    mask_blur: int
+    blend: int
+    #: The hi-res second pass, as ((x, y, w, h) in the *source image's* own
+    #: space, (width, height) to sample it at), or None to skip it — which
+    #: is what happens when pass 1 already resolved the region well enough
+    #: that a second pass couldn't beat it, the same condition krita's
+    #: `ScaledExtent.refinement_scaling` reports as `none`.
+    refine_region: tuple[tuple[int, int, int, int], tuple[int, int]] | None
+
+
+def _fix_drawn_geometry(
+    mask_bytes: bytes, image_size: tuple[int, int], params: DrawnMaskFixParams
+) -> FixDrawnGeometry:
+    """Work out `FixDrawnGeometry` for one "🩹 Fix Artifact" job."""
+    full_w, full_h = image_size
+    bbox = _mask_bbox(mask_bytes)
+    grow_n, feather_n, blend_n = _native_fix_mask_params(_bbox_diagonal(bbox))
+
+    if bbox is None:
+        # Nothing marked — nothing to centre a crop on, so fall back to the
+        # whole frame and skip the second pass.
+        work_size = _scale_to_max(image_size, params.work_max_size)
+        scale = work_size[0] / full_w if full_w else 1.0
+        return FixDrawnGeometry(
+            context_crop=(0, 0, full_w, full_h),
+            work_size=work_size,
+            mask_grow=max(0, round(grow_n * scale)),
+            mask_blur=max(1, round(feather_n * scale)),
+            blend=max(2, round(blend_n * scale)),
+            refine_region=None,
+        )
+
+    # The region to repair: the mark plus its own grow/feather falloff plus
+    # krita's selection padding. This is krita's `target_bounds`.
+    x0, y0, x1, y1 = bbox
+    pad = grow_n + feather_n + max(_REFINE_MIN_PAD, round(_REFINE_PAD_FRAC * max(x1 - x0, y1 - y0)))
+    x0, x1 = _expand_axis(max(0, x0 - pad), min(full_w, x1 + pad), _REFINE_MIN_SIZE, full_w)
+    y0, y1 = _expand_axis(max(0, y0 - pad), min(full_h, y1 + pad), _REFINE_MIN_SIZE, full_h)
+    target = (x0, y0, _snap_down(x1 - x0), _snap_down(y1 - y0))
+
+    context_crop = _expand_about_centre(target, params.context_scale, image_size)
+    work_size = _scale_to_max((context_crop[2], context_crop[3]), params.work_max_size)
+    scale = work_size[0] / context_crop[2]
+
+    # What pass 1 gives the region, in its own pixel space. The second pass
+    # is only worth running if it can beat that by a real margin.
+    target_longest = max(target[2], target[3])
+    pass1_longest = target_longest * scale
+    refine_scale = min(
+        1.0,
+        params.refine_max_size / target_longest,
+        pass1_longest * params.refine_max_upscale / target_longest,
+    )
+    refine_w = _snap_down(round(target[2] * refine_scale))
+    refine_h = _snap_down(round(target[3] * refine_scale))
+    refine_region = None
+    if max(refine_w, refine_h) > pass1_longest * _REFINE_MIN_GAIN:
+        refine_region = (target, (refine_w, refine_h))
+
+    return FixDrawnGeometry(
+        context_crop=context_crop,
+        work_size=work_size,
+        mask_grow=max(0, round(grow_n * scale)),
+        mask_blur=max(1, round(feather_n * scale)),
+        blend=max(2, round(blend_n * scale)),
+        refine_region=refine_region,
+    )
 
 
 #: How long `_run_graph` waits for a websocket event before checking
@@ -491,18 +658,38 @@ async def post_process(
         else:
             engaged_reason = "skipped (anima_lllite_inpaint_patch not set on this profile)"
         image_size = Image.open(io.BytesIO(source_image)).size
-        work_size = _fix_drawn_work_size(image_size, fix_params)
+        geometry = _fix_drawn_geometry(mask_bytes, image_size, fix_params)
+        is_anima = fix_base_params.loader == "split" and fix_base_params.anima_lllite_inpaint_patch
+        if is_anima:
+            fix_params = replace(
+                fix_params,
+                mask_grow=geometry.mask_grow,
+                mask_blur=geometry.mask_blur,
+                blend=geometry.blend,
+            )
+        region_longest = max(geometry.context_crop[2], geometry.context_crop[3])
         logger.info(
             "Fix Artifact: checkpoint=%s (%s) loader=%s fill_model=%s anima_lllite_patch: %s "
-            "positive_prompt=%r work_size=%s (image_size=%s)",
+            "positive_prompt=%r context=%s -> work_size=%s (image_size=%s) "
+            "mask_grow=%s mask_blur=%s blend=%s refine=%s",
             fix_base_params.checkpoint,
             checkpoint_source,
             fix_base_params.loader,
             fix_params.fill_model,
             engaged_reason,
             fix_base_params.positive_prompt,
-            work_size,
+            geometry.context_crop,
+            geometry.work_size,
             image_size,
+            fix_params.mask_grow,
+            fix_params.mask_blur,
+            fix_params.blend,
+            (
+                f"crop={geometry.refine_region[0]} at {geometry.refine_region[1]} "
+                f"strength={fix_params.refine_denoise}"
+                if geometry.refine_region
+                else f"skipped (pass 1 already resolves it at ~{region_longest}px)"
+            ),
         )
         prompt_graph, save_node_id = build_fix_drawn_mask(
             uploaded_name,
@@ -510,7 +697,9 @@ async def post_process(
             fix_base_params,
             fix_params,
             image_size=image_size,
-            work_size=work_size,
+            work_size=geometry.work_size,
+            context_crop=geometry.context_crop,
+            refine_region=geometry.refine_region,
         )
     else:
         raise ValueError(f"Unknown post-processing kind: {kind}")

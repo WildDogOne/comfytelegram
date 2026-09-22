@@ -71,7 +71,9 @@ def test_pending_result_prune_is_rate_limited(storage: Storage):
     """A prune sweep shouldn't re-run on every single store — see
     PRUNE_INTERVAL_SECONDS. A stale row should survive a store that
     immediately follows a just-ran sweep."""
-    storage.store_pending_result("old", 1, "FILE_ID", "out.png", {})  # first sweep runs (cache was empty)
+    storage.store_pending_result(
+        "old", 1, "FILE_ID", "out.png", {}
+    )  # first sweep runs (cache was empty)
     storage._conn.execute(
         "UPDATE pending_result SET created_at = ? WHERE result_id = ?",
         (time.time() - 999999999, "old"),

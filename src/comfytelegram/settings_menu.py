@@ -87,7 +87,9 @@ FieldMeta = NumericFieldMeta | EnumFieldMeta | TextFieldMeta
 
 FIELDS: list[FieldMeta] = [
     NumericFieldMeta("cfg", "CFG", step=0.5, presets=(3.0, 4.0, 5.0, 6.0, 7.0, 8.0)),
-    NumericFieldMeta("steps", "Steps", step=5, presets=(15, 20, 25, 30, 40, 50), is_int=True, min_value=1),
+    NumericFieldMeta(
+        "steps", "Steps", step=5, presets=(15, 20, 25, 30, 40, 50), is_int=True, min_value=1
+    ),
     EnumFieldMeta(
         "sampler_name",
         "Sampler",
@@ -106,8 +108,12 @@ FIELDS: list[FieldMeta] = [
     ),
     EnumFieldMeta("scheduler", "Scheduler"),
     NumericFieldMeta("clip_skip", "Clip Skip", step=1, presets=(-1, -2, -3), is_int=True),
-    NumericFieldMeta("width", "Width", step=64, presets=(512, 768, 1024, 1280), is_int=True, min_value=64),
-    NumericFieldMeta("height", "Height", step=64, presets=(512, 768, 1024, 1280), is_int=True, min_value=64),
+    NumericFieldMeta(
+        "width", "Width", step=64, presets=(512, 768, 1024, 1280), is_int=True, min_value=64
+    ),
+    NumericFieldMeta(
+        "height", "Height", step=64, presets=(512, 768, 1024, 1280), is_int=True, min_value=64
+    ),
     NumericFieldMeta("batch_size", "Batch", step=1, presets=(1, 2, 3, 4), is_int=True, min_value=1),
     TextFieldMeta("positive_prompt_prefix", "Default Positive"),
     TextFieldMeta("negative_prompt_prefix", "Default Negative"),
@@ -179,7 +185,9 @@ def _curate(choices: list[str], preferred: tuple[str, ...], max_items: int = 12)
     if not preferred:
         return choices[:max_items]
     curated = [c for c in preferred if c in choices]
-    if len(curated) < 4:  # curation missed most of what the server actually has — show the raw list instead
+    if (
+        len(curated) < 4
+    ):  # curation missed most of what the server actually has — show the raw list instead
         return choices[:max_items]
     return curated[:max_items]
 
@@ -237,12 +245,15 @@ def _numeric_submenu_keyboard(meta: NumericFieldMeta, value: Any) -> InlineKeybo
     return InlineKeyboardMarkup(rows)
 
 
-def _enum_submenu_keyboard(meta: EnumFieldMeta, current: Any, choices: list[str]) -> InlineKeyboardMarkup:
+def _enum_submenu_keyboard(
+    meta: EnumFieldMeta, current: Any, choices: list[str]
+) -> InlineKeyboardMarkup:
     """An enum field's submenu: a grid of `choices` (curated via `_curate`,
     current value •-marked), then Custom value and the Back/Reset nav row."""
     choice_buttons = [
         InlineKeyboardButton(
-            f"{'• ' if choice == current else ''}{choice}", callback_data=f"st:v:{meta.key}:{choice}"
+            f"{'• ' if choice == current else ''}{choice}",
+            callback_data=f"st:v:{meta.key}:{choice}",
         )
         for choice in _curate(choices, meta.preferred)
     ]
@@ -299,7 +310,11 @@ async def _safe_edit_message(query, text: str, reply_markup: InlineKeyboardMarku
 
 
 async def _render_field_submenu(
-    query, context: ContextTypes.DEFAULT_TYPE, checkpoint: str, profile: ModelProfile | None, meta: FieldMeta
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    checkpoint: str,
+    profile: ModelProfile | None,
+    meta: FieldMeta,
 ) -> None:
     """Edit `query`'s message in place to show `meta`'s field submenu —
     numeric/enum/text keyboard depending on `meta`'s type (enum choices are
@@ -332,7 +347,9 @@ def _resolve_effective_profile(
     return apply_profile_override(base_profile, checkpoint, override_fields), override_fields
 
 
-async def _show_home(query, context: ContextTypes.DEFAULT_TYPE, chat_id: int, checkpoint: str) -> None:
+async def _show_home(
+    query, context: ContextTypes.DEFAULT_TYPE, chat_id: int, checkpoint: str
+) -> None:
     """Re-resolve the effective profile and edit `query`'s message in place
     to show the `/settings` home screen."""
     profile, override_fields = _resolve_effective_profile(context, chat_id, checkpoint)
@@ -366,7 +383,8 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     profile, override_fields = _resolve_effective_profile(context, chat_id, checkpoint)
     await update.effective_message.reply_text(
-        _home_text(checkpoint, profile), reply_markup=_home_keyboard(checkpoint, profile, override_fields)
+        _home_text(checkpoint, profile),
+        reply_markup=_home_keyboard(checkpoint, profile, override_fields),
     )
 
 
@@ -435,7 +453,9 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await _safe_edit_message(
             query,
             f"⚙️ Settings › {meta.label}\n\nSend the new value as a message.",
-            InlineKeyboardMarkup([[InlineKeyboardButton("↩ Cancel", callback_data=f"st:f:{field}")]]),
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("↩ Cancel", callback_data=f"st:f:{field}")]]
+            ),
         )
         return
 
@@ -502,6 +522,7 @@ async def handle_custom_value_message(update: Update, context: ContextTypes.DEFA
         reply_markup=None,
     )
     await message.reply_text(
-        _home_text(checkpoint, profile), reply_markup=_home_keyboard(checkpoint, profile, override_fields)
+        _home_text(checkpoint, profile),
+        reply_markup=_home_keyboard(checkpoint, profile, override_fields),
     )
     return True

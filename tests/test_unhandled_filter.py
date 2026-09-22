@@ -73,7 +73,5 @@ def test_rich_message_prompts_are_left_to_the_real_handler():
     """A multi-paragraph "rich message" has `text=None`, so the old
     `filters.TEXT`-based complement claimed it and the bot answered "I
     didn't understand that" to an ordinary prompt."""
-    message = _message(
-        None, rich_message={"blocks": [{"type": "paragraph", "text": "a red fox"}]}
-    )
+    message = _message(None, rich_message={"blocks": [{"type": "paragraph", "text": "a red fox"}]})
     assert _caught(message) is False

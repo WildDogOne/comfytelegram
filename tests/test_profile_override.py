@@ -27,7 +27,10 @@ def test_override_synthesizes_profile_when_none_matched():
 
 def test_override_routes_prompt_prefixes_onto_profile_not_defaults():
     profile = ModelProfile(
-        match=["*ckpt*"], display_name="X", positive_prompt_prefix="masterpiece", defaults=ProfileDefaults(cfg=5.0)
+        match=["*ckpt*"],
+        display_name="X",
+        positive_prompt_prefix="masterpiece",
+        defaults=ProfileDefaults(cfg=5.0),
     )
     result = apply_profile_override(
         profile, "ckpt.safetensors", {"positive_prompt_prefix": "best quality", "cfg": 8.0}
@@ -39,6 +42,8 @@ def test_override_routes_prompt_prefixes_onto_profile_not_defaults():
 
 
 def test_override_synthesizes_profile_for_negative_prompt_prefix_only():
-    result = apply_profile_override(None, "unknown.safetensors", {"negative_prompt_prefix": "blurry"})
+    result = apply_profile_override(
+        None, "unknown.safetensors", {"negative_prompt_prefix": "blurry"}
+    )
     assert result is not None
     assert result.negative_prompt_prefix == "blurry"

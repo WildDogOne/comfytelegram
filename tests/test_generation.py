@@ -10,8 +10,11 @@ from PIL import Image
 from comfytelegram import generation
 from comfytelegram.comfy_client import ComfyUIError, JobProgress
 from comfytelegram.generation import (
+    _bbox_diagonal,
     _detailer_found_nothing,
-    _fix_drawn_work_size,
+    _fix_drawn_geometry,
+    _mask_bbox,
+    _native_fix_mask_params,
     _to_post_process_base,
     generate,
     post_process,
@@ -32,31 +35,105 @@ def _solid_mask_png(width: int, height: int, value: int) -> bytes:
     return buf.getvalue()
 
 
-def test_fix_drawn_work_size_downscales_preserving_aspect_ratio():
-    # A first version of _build_anima_fix_drawn_mask sampled the *entire*
-    # source image with no resize or crop at all — clocked running a full
-    # 30-step diffusion pass over a raw 4096x4096 source for what should be
-    # a small, localized fix. A *cropped*-region predecessor of this was
-    # tried next and rejected (see _build_anima_fix_drawn_mask's docstring):
-    # cropping away the surrounding scene starved the diffusion pass of the
-    # context it needs, confirmed on a real removal case. This instead
-    # downscales the whole image, keeping the full scene.
+def _rect_mask_png(width: int, height: int, box: tuple[int, int, int, int]) -> bytes:
+    """A mask with a marked-white rectangle (`box`, PIL's `(x0, y0, x1, y1)`)
+    on an otherwise-black background — for tests that need a specific
+    bounding-box size instead of `_solid_mask_png`'s whole-image mark."""
+    from PIL import ImageDraw
+
+    img = Image.new("L", (width, height), 0)
+    ImageDraw.Draw(img).rectangle(box, fill=255)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_fix_drawn_geometry_crops_context_around_the_mask():
+    # Pass 1 must see a region proportional to the mark, not the whole
+    # frame — on a 4096x4096 source, downscaling everything left the region
+    # being repaired at ~200px of the pass, far too few to resolve what it
+    # was meant to continue. See FixDrawnGeometry's docstring.
+    mask = _rect_mask_png(4096, 4096, (1800, 1900, 2300, 2500))
     params = DrawnMaskFixParams()
-    w, h = _fix_drawn_work_size((4096, 2048), params)
+    geo = _fix_drawn_geometry(mask, (4096, 4096), params)
 
-    assert max(w, h) == params.work_max_size
-    assert w / h == pytest.approx(4096 / 2048)
+    cx, cy, cw, ch = geo.context_crop
+    assert (cw, ch) != (4096, 4096)  # not the whole frame
+    # The mark, plus its grow/feather falloff, has to be inside it.
+    grow, feather, _blend = _native_fix_mask_params(_bbox_diagonal(_mask_bbox(mask)))
+    assert cx <= 1800 - (grow + feather)
+    assert cy <= 1900 - (grow + feather)
+    assert cx + cw >= 2300 + (grow + feather)
+    assert cy + ch >= 2500 + (grow + feather)
+    assert cw % 16 == 0 and ch % 16 == 0
 
 
-def test_fix_drawn_work_size_leaves_small_images_unchanged():
+def test_fix_drawn_geometry_gives_the_region_a_krita_like_share_of_pass_one():
+    # The measurement that motivated context cropping: krita's first pass
+    # gave the repaired region ~49% of its frame, this bot's gave it ~16%.
+    mask = _rect_mask_png(4096, 4096, (1800, 1900, 2300, 2500))
+    geo = _fix_drawn_geometry(mask, (4096, 4096), DrawnMaskFixParams())
+
+    work_w, _work_h = geo.work_size
+    scale = work_w / geo.context_crop[2]
+    # The region here is the refine target when there is one, else the crop
+    # the mask sits in; either way measure the mask's own padded extent.
+    region = geo.refine_region[0] if geo.refine_region else geo.context_crop
+    share = max(region[2], region[3]) * scale / work_w
+    assert 0.35 < share < 0.65
+
+
+def test_fix_drawn_geometry_work_size_is_bounded_and_snapped():
+    mask = _rect_mask_png(4096, 4096, (1000, 1000, 3000, 3000))
     params = DrawnMaskFixParams()
-    assert _fix_drawn_work_size((800, 600), params) == (800, 600)
+    geo = _fix_drawn_geometry(mask, (4096, 4096), params)
+    w, h = geo.work_size
+    assert max(w, h) <= params.work_max_size
+    assert w % 16 == 0 and h % 16 == 0
 
 
-def test_fix_drawn_work_size_boundary_equals_max_size_unchanged():
-    params = DrawnMaskFixParams()
-    size = (params.work_max_size, params.work_max_size)
-    assert _fix_drawn_work_size(size, params) == size
+def test_fix_drawn_geometry_empty_mask_falls_back_to_whole_frame():
+    mask = _solid_mask_png(4096, 4096, 0)
+    geo = _fix_drawn_geometry(mask, (4096, 4096), DrawnMaskFixParams())
+    assert geo.context_crop == (0, 0, 4096, 4096)
+    assert geo.refine_region is None
+
+
+def test_fix_drawn_geometry_mask_params_are_in_work_space():
+    # grow/feather are computed from the mask at native resolution (krita
+    # applies them before downscaling) and then scaled into the space the
+    # graph actually applies them in.
+    mask = _rect_mask_png(4096, 4096, (1800, 1900, 2300, 2500))
+    geo = _fix_drawn_geometry(mask, (4096, 4096), DrawnMaskFixParams())
+    grow_n, feather_n, _blend_n = _native_fix_mask_params(_bbox_diagonal(_mask_bbox(mask)))
+    scale = geo.work_size[0] / geo.context_crop[2]
+    assert geo.mask_grow == max(0, round(grow_n * scale))
+    assert geo.mask_blur == max(1, round(feather_n * scale))
+
+
+def test_fix_drawn_geometry_skips_refine_when_pass_one_already_resolves_it():
+    # With the context crop in place pass 1 often already renders the region
+    # near its native size, and a second pass has nothing to add — the same
+    # condition krita's ScaledExtent.refinement_scaling reports as `none`.
+    mask = _rect_mask_png(1000, 1000, (400, 400, 600, 600))
+    geo = _fix_drawn_geometry(mask, (1000, 1000), DrawnMaskFixParams())
+    assert geo.refine_region is None
+
+
+def test_fix_drawn_geometry_refine_region_covers_the_feathered_mask():
+    mask = _rect_mask_png(8192, 8192, (3600, 3800, 4600, 5000))
+    geo = _fix_drawn_geometry(mask, (8192, 8192), DrawnMaskFixParams())
+    if geo.refine_region is None:
+        pytest.skip("no refine pass for this geometry")
+    (x, y, w, h), (rw, rh) = geo.refine_region
+    grow, feather, _blend = _native_fix_mask_params(_bbox_diagonal(_mask_bbox(mask)))
+    assert x <= 3600 - (grow + feather)
+    assert x + w >= 4600 + (grow + feather)
+    assert w % 16 == 0 and h % 16 == 0
+    assert rw % 16 == 0 and rh % 16 == 0
+    # The refine region always sits inside what pass 1 actually saw.
+    cx, cy, cw, ch = geo.context_crop
+    assert x >= cx and y >= cy and x + w <= cx + cw and y + h <= cy + ch
 
 
 class _StubComfyClient:
@@ -549,6 +626,52 @@ async def test_post_process_fix_drawn_logs_whether_anima_lllite_patch_engaged(ca
     assert "strength=0.8" in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_post_process_fix_drawn_sizes_mask_grow_from_drawn_mask_not_fixed_default():
+    """The Anima path used to run every "🩹 Fix Artifact" job through the
+    same fixed `DrawnMaskFixParams.mask_grow`/`mask_blur`/`blend` regardless
+    of how big the actual drawn mark was — krita-ai-diffusion computes these
+    per job from the mark's own bounding-box size instead
+    (`_dynamic_fix_mask_params`). A small mark and a huge one on the same
+    image size should come out with different `INPAINT_ExpandMask.grow`."""
+    source = _solid_png(2000, 2000, (255, 0, 0))
+    small_mask = _rect_mask_png(2000, 2000, (975, 975, 1025, 1025))  # 50x50
+    huge_mask = _rect_mask_png(2000, 2000, (100, 100, 1900, 1900))  # 1800x1800
+    params = GenerationParams(
+        checkpoint="anima_unet.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        loader="split",
+        anima_lllite_inpaint_patch="anima-lllite-inpainting-v2.safetensors",
+        anima_lllite_inpaint_patch_strength=1.0,
+    )
+
+    small_client = _StubUploadingComfyClient(source)
+    await post_process(
+        small_client, "fix_drawn", source, "source.png", params, mask_bytes=small_mask
+    )
+    small_grow = next(
+        n["inputs"]["grow"]
+        for n in small_client.queued_graph.values()
+        if n["class_type"] == "INPAINT_ExpandMask" and n["inputs"]["blur"] > 0
+    )
+
+    huge_client = _StubUploadingComfyClient(source)
+    await post_process(huge_client, "fix_drawn", source, "source.png", params, mask_bytes=huge_mask)
+    huge_grow = next(
+        n["inputs"]["grow"]
+        for n in huge_client.queued_graph.values()
+        if n["class_type"] == "INPAINT_ExpandMask" and n["inputs"]["blur"] > 0
+    )
+
+    assert huge_grow > small_grow
+    # Neither should just be DrawnMaskFixParams()'s static fallback default —
+    # both jobs' marks differ enough in size from the one krita reference
+    # job that default was captured from.
+    assert small_grow != DrawnMaskFixParams().mask_grow
+    assert huge_grow != DrawnMaskFixParams().mask_grow
+
+
 def _fix_artifact_override_profile() -> ModelProfile:
     return ModelProfile(
         match=["anima*aesthetic*"],
@@ -560,7 +683,7 @@ def _fix_artifact_override_profile() -> ModelProfile:
         model_sampling_shift=3.0,
         anima_lllite_inpaint_patch="anima-lllite-inpainting-v2.safetensors",
         anima_lllite_inpaint_patch_strength=1.0,
-        fix_artifact_checkpoint="anima_aestheticV11.safetensors",
+        fix_artifact_checkpoint="anima-base-v1.0.safetensors",
         negative_prompt_prefix="worst quality, low quality",
     )
 
@@ -591,7 +714,7 @@ async def test_post_process_fix_drawn_uses_fix_artifact_checkpoint_override():
     )
 
     unet = next(n for n in client.queued_graph.values() if n["class_type"] == "UNETLoader")
-    assert unet["inputs"]["unet_name"] == "anima_aestheticV11.safetensors"
+    assert unet["inputs"]["unet_name"] == "anima-base-v1.0.safetensors"
     class_types = [n["class_type"] for n in client.queued_graph.values()]
     assert "CheckpointLoaderSimple" not in class_types
     # positive_prompt is "<profile prefix>, background scenery" (no prefix
@@ -818,3 +941,65 @@ async def test_generate_overrides_force_batch_size_regardless_of_profile_default
 
     assert len(images) == 1
     assert images[0].full_params.batch_size == 1
+
+
+@pytest.mark.asyncio
+async def test_post_process_fix_drawn_uses_fix_artifact_prompt_overrides():
+    """When a profile sets the fix-artifact-only prompts, the removal pass
+    uses those rather than the profile's generation prefixes — and still
+    appends "background scenery"."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    profile = _fix_artifact_override_profile()
+    profile.positive_prompt_prefix = "generation only"
+    profile.negative_prompt_prefix = "generation negative"
+    profile.fix_artifact_positive_prefix = "removal quality tags"
+    profile.fix_artifact_negative_prefix = "removal negative"
+    params = GenerationParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+    )
+
+    await post_process(
+        client, "fix_drawn", source, "source.png", params, mask_bytes=mask, profiles=[profile]
+    )
+
+    texts = [
+        n["inputs"]["text"]
+        for n in client.queued_graph.values()
+        if n["class_type"] == "CLIPTextEncode"
+    ]
+    assert "removal quality tags, background scenery" in texts
+    assert "removal negative" in texts
+    assert not any("generation only" in t for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_post_process_fix_drawn_falls_back_to_generation_prefixes():
+    """Without the fix-artifact-only prompts set, the removal pass keeps
+    using the profile's normal prefixes — the previous behaviour."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    profile = _fix_artifact_override_profile()
+    profile.positive_prompt_prefix = "generation only"
+    profile.negative_prompt_prefix = "generation negative"
+    params = GenerationParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+    )
+
+    await post_process(
+        client, "fix_drawn", source, "source.png", params, mask_bytes=mask, profiles=[profile]
+    )
+
+    texts = [
+        n["inputs"]["text"]
+        for n in client.queued_graph.values()
+        if n["class_type"] == "CLIPTextEncode"
+    ]
+    assert "generation only, background scenery" in texts
+    assert "generation negative" in texts

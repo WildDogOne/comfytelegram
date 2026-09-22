@@ -68,8 +68,24 @@ _CATEGORY_CHARACTER = 4
 # a multi-word separator, so don't turn it into a space like every other tag.
 _KAOMOJI = frozenset(
     {
-        "0_0", "(o)_(o)", "+_+", "+_-", "._.", "<o>_<o>", "<|>_<|>", "=_=",
-        ">_<", "3_3", "6_9", "@_@", "^_^", "o_o", "u_u", "x_x", "|_|", "||_||",
+        "0_0",
+        "(o)_(o)",
+        "+_+",
+        "+_-",
+        "._.",
+        "<o>_<o>",
+        "<|>_<|>",
+        "=_=",
+        ">_<",
+        "3_3",
+        "6_9",
+        "@_@",
+        "^_^",
+        "o_o",
+        "u_u",
+        "x_x",
+        "|_|",
+        "||_||",
     }
 )
 
@@ -86,22 +102,53 @@ _KAOMOJI = frozenset(
 _NOISE_TAGS = frozenset(
     {
         # watermarks / logos / framing
-        "watermark", "sample_watermark", "signature", "dated", "logo",
-        "patreon_logo", "pixiv_logo", "border", "letterboxed",
+        "watermark",
+        "sample_watermark",
+        "signature",
+        "dated",
+        "logo",
+        "patreon_logo",
+        "pixiv_logo",
+        "border",
+        "letterboxed",
         # attribution
-        "artist_name", "character_name", "copyright_name", "web_address",
-        "company_name", "pixiv_id",
+        "artist_name",
+        "character_name",
+        "copyright_name",
+        "web_address",
+        "company_name",
+        "pixiv_id",
         # site usernames
-        "twitter_username", "patreon_username", "weibo_username",
-        "fanbox_username", "deviantart_username", "instagram_username",
-        "pixiv_username", "facebook_username", "tumblr_username",
+        "twitter_username",
+        "patreon_username",
+        "weibo_username",
+        "fanbox_username",
+        "deviantart_username",
+        "instagram_username",
+        "pixiv_username",
+        "facebook_username",
+        "tumblr_username",
         "gumroad_username",
         # on-image text
-        "english_text", "chinese_text", "korean_text", "text_focus",
-        "engrish_text", "romaji_text", "text_background", "russian_text",
-        "mixed-language_text", "simplified_chinese_text", "german_text",
-        "french_text", "wall_of_text", "thai_text", "traditional_chinese_text",
-        "colored_text", "spanish_text", "text_messaging", "censored_text",
+        "english_text",
+        "chinese_text",
+        "korean_text",
+        "text_focus",
+        "engrish_text",
+        "romaji_text",
+        "text_background",
+        "russian_text",
+        "mixed-language_text",
+        "simplified_chinese_text",
+        "german_text",
+        "french_text",
+        "wall_of_text",
+        "thai_text",
+        "traditional_chinese_text",
+        "colored_text",
+        "spanish_text",
+        "text_messaging",
+        "censored_text",
         "italian_text",
     }
 )
@@ -159,7 +206,11 @@ def select_tags(tags: list[tuple[str, int, float]], threshold: float) -> str:
     the ~370MB ONNX file — see `_run_wd14` for the part that actually needs
     it."""
     general = sorted(
-        (t for t in tags if t[1] == _CATEGORY_GENERAL and t[2] >= threshold and t[0] not in _NOISE_TAGS),
+        (
+            t
+            for t in tags
+            if t[1] == _CATEGORY_GENERAL and t[2] >= threshold and t[0] not in _NOISE_TAGS
+        ),
         key=lambda t: -t[2],
     )
     character = sorted(

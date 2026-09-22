@@ -31,7 +31,12 @@ def test_select_tags_empty_when_nothing_meets_threshold():
 
 
 def test_select_tags_excludes_noise_tags():
-    tags = [("1girl", 0, 0.9), ("watermark", 0, 0.85), ("artist_name", 0, 0.8), ("signature", 0, 0.7)]
+    tags = [
+        ("1girl", 0, 0.9),
+        ("watermark", 0, 0.85),
+        ("artist_name", 0, 0.8),
+        ("signature", 0, 0.7),
+    ]
     assert select_tags(tags, threshold=0.35) == "1girl"
 
 

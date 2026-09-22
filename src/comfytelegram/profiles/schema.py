@@ -184,3 +184,28 @@ class ModelProfile(BaseModel):
             "keeps '🩹 Fix Artifact' on each image's own checkpoint."
         ),
     )
+
+    fix_artifact_positive_prefix: str | None = Field(
+        None,
+        description=(
+            "'🩹 Fix Artifact' only: quality tags to put in front of "
+            "'background scenery' for that pass, instead of this profile's "
+            "normal positive_prompt_prefix. Exists because a removal pass wants "
+            "different conditioning than ordinary generation — matched against a "
+            "real krita-ai-diffusion 'remove object' job on this server, whose "
+            "style prompt carried booru score tags this profile's generation "
+            "prefix deliberately does not. Unset (the default) falls back to "
+            "positive_prompt_prefix."
+        ),
+    )
+    fix_artifact_negative_prefix: str | None = Field(
+        None,
+        description=(
+            "'🩹 Fix Artifact' only: the negative prompt for that pass, instead "
+            "of this profile's normal negative_prompt_prefix. Same reasoning as "
+            "fix_artifact_positive_prefix — the captured krita job's negative "
+            "prompt suppressed low-score output and stray text/signatures, which "
+            "is exactly what a removal pass tends to hallucinate into the hole. "
+            "Unset (the default) falls back to negative_prompt_prefix."
+        ),
+    )
