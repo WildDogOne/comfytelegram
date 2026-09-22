@@ -79,6 +79,14 @@
     background: var(--accent);
     color: #fff;
   }
+  #autofill-btn {
+    opacity: 0.5;
+  }
+  #autofill-btn.active {
+    background: var(--accent);
+    color: #fff;
+    opacity: 1;
+  }
   #brush-cursor {
     position: fixed;
     left: 0;
@@ -117,6 +125,7 @@
   <div id="controls">
     <label for="brush-size">Brush</label>
     <input type="range" id="brush-size" min="8" max="120" value="36" />
+    <button id="autofill-btn" type="button" class="active">🪣 Fill</button>
     <button id="erase-btn" type="button">🧹 Erase</button>
   </div>
   <div id="button-row">
@@ -147,7 +156,20 @@
   var clearBtn = document.getElementById("clear-btn");
   var doneBtn = document.getElementById("done-btn");
   var eraseBtn = document.getElementById("erase-btn");
+  var autofillBtn = document.getElementById("autofill-btn");
   var brushCursor = document.getElementById("brush-cursor");
+
+  // On by default (matches the button's own initial "active" class in the
+  // markup) — `detectAndFillEnclosedAreas` checks this before doing any
+  // work, so toggling off just stops future strokes from triggering it.
+  // Anything already auto-filled before toggling off is left as-is, same
+  // as toggling erase mode doesn't undo prior painting.
+  var autoFillEnabled = true;
+
+  autofillBtn.addEventListener("click", function () {
+    autoFillEnabled = !autoFillEnabled;
+    autofillBtn.classList.toggle("active", autoFillEnabled);
+  });
 
   // Full-resolution mask, offscreen — this is what actually gets
   // submitted. Kept at the source image's own pixel dimensions so the
@@ -166,6 +188,30 @@
   var overlayCanvas = document.createElement("canvas");
   var overlayCtx = overlayCanvas.getContext("2d");
   var BRUSH_OPACITY = 0.8;
+
+  // Auto-fill-enclosed-area scratch canvases. `overlayCanvas` can be up to
+  // 4096px on a side (see `image.onload`), and running a flood fill at that
+  // resolution after every stroke would be slow enough to feel like lag —
+  // so `detectAndFillEnclosedAreas` instead flood-fills a small fixed-size
+  // downscaled copy of it (`fillDetectCanvas`) and upscales whatever it
+  // finds back onto the real `maskCanvas`/`overlayCanvas`. `fillShapeCanvas`
+  // is a reused scratch buffer for that upscale step, sized to match
+  // `fillDetectCanvas` each call — it holds one shape at a time (first the
+  // white one drawn onto `maskCanvas`, then the red one drawn onto
+  // `overlayCanvas`), never both at once, so one canvas covers both.
+  var fillDetectCanvas = document.createElement("canvas");
+  var fillDetectCtx = fillDetectCanvas.getContext("2d");
+  var fillShapeCanvas = document.createElement("canvas");
+  var fillShapeCtx = fillShapeCanvas.getContext("2d");
+  var FILL_DETECT_MAX_DIM = 400;
+  // Above this alpha, a detection-grid cell counts as a "wall" pixel a
+  // stroke actually painted. Comfortably below full opacity (255) so a
+  // thin brush line surviving the downscale into `fillDetectCanvas` (which
+  // partially averages it with its unpainted neighbors, same as scaling
+  // down any other image) still reads as painted instead of vanishing —
+  // while still safely above anti-aliasing noise on an otherwise-unpainted
+  // pixel.
+  var FILL_ALPHA_THRESHOLD = 32;
 
   var image = new Image();
   var drawing = false;
@@ -479,7 +525,158 @@
   }
 
   function endStroke() {
+    // Guards against the several call sites (`onPointerUp`, `startPan`
+    // ending a stroke pre-emptively, ...) that call this even when nothing
+    // was actually being drawn — without it, every one of those would
+    // trigger a needless flood-fill pass.
+    if (!drawing) return;
     drawing = false;
+    detectAndFillEnclosedAreas();
+  }
+
+  // Flood fill from every edge cell of a `painted` grid (1 = wall,
+  // 0 = open), 4-directionally, using an explicit array-backed queue
+  // (never recursion — `w * h` can be up to `FILL_DETECT_MAX_DIM`
+  // squared, well past what the call stack could take one frame per
+  // cell). Returns a same-size `reachable` grid: 1 for every open cell the
+  // fill actually reached from an edge. Any open cell *not* set in the
+  // result was walled off from every edge — i.e. enclosed by painted
+  // pixels — which is exactly what "closing a loop" means here.
+  function floodFillFromBorder(painted, w, h) {
+    var reachable = new Uint8Array(w * h);
+    var queue = new Int32Array(w * h);
+    var qTail = 0;
+
+    function tryPush(idx) {
+      if (!painted[idx] && !reachable[idx]) {
+        reachable[idx] = 1;
+        queue[qTail++] = idx;
+      }
+    }
+
+    for (var x = 0; x < w; x++) {
+      tryPush(x);
+      tryPush((h - 1) * w + x);
+    }
+    for (var y = 0; y < h; y++) {
+      tryPush(y * w);
+      tryPush(y * w + (w - 1));
+    }
+
+    var qHead = 0;
+    while (qHead < qTail) {
+      var idx = queue[qHead++];
+      var cx = idx % w;
+      var cy = (idx - cx) / w;
+      if (cx > 0) tryPush(idx - 1);
+      if (cx < w - 1) tryPush(idx + 1);
+      if (cy > 0) tryPush(idx - w);
+      if (cy < h - 1) tryPush(idx + w);
+    }
+
+    return reachable;
+  }
+
+  // Grows `mask` by one cell in every 4-connected direction (a single
+  // morphological dilation pass). `detectAndFillEnclosedAreas` runs this a
+  // couple of times over the enclosed region it finds before upscaling it,
+  // because that region is defined as everything the flood fill *didn't*
+  // reach — which by construction stops one cell short of the stroke
+  // itself (the stroke is the wall the fill got blocked by, not part of
+  // the open area). Left ungrown, upscaling that shape back onto the
+  // full-resolution canvases would land its edge a little inside the
+  // stroke's own inner edge instead of under it, leaving a thin ring of
+  // bare source image visible between the two. Growing first means the
+  // upscaled fill overlaps the stroke instead of just meeting it — outside
+  // the loop entirely (past the two or so cells' width this eats into
+  // "reachable from edge" territory) has no wall to grow into and is
+  // unaffected.
+  function dilate(mask, w, h) {
+    var grown = new Uint8Array(mask.length);
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        var idx = y * w + x;
+        if (
+          mask[idx] ||
+          (x > 0 && mask[idx - 1]) ||
+          (x < w - 1 && mask[idx + 1]) ||
+          (y > 0 && mask[idx - w]) ||
+          (y < h - 1 && mask[idx + w])
+        ) {
+          grown[idx] = 1;
+        }
+      }
+    }
+    return grown;
+  }
+  var FILL_GROW_PASSES = 2;
+
+  // Runs after every completed stroke (paint or erase). Downscales the
+  // current selection highlight into `fillDetectCanvas`, flood-fills it
+  // from the edges, and paints solid fill into any pocket that turned out
+  // enclosed — the "grab a closed circle, its interior fills in too"
+  // feature. Erasing part of an already-filled loop's boundary does *not*
+  // retroactively un-fill its interior (this only ever adds paint, same as
+  // an ordinary brush dab would) — the eraser still works on that interior
+  // directly if that's ever needed.
+  function detectAndFillEnclosedAreas() {
+    if (!autoFillEnabled) return;
+    var detectScale = Math.min(
+      1,
+      FILL_DETECT_MAX_DIM / Math.max(overlayCanvas.width, overlayCanvas.height)
+    );
+    var w = Math.max(1, Math.round(overlayCanvas.width * detectScale));
+    var h = Math.max(1, Math.round(overlayCanvas.height * detectScale));
+    fillDetectCanvas.width = w;
+    fillDetectCanvas.height = h;
+    fillDetectCtx.clearRect(0, 0, w, h);
+    fillDetectCtx.drawImage(overlayCanvas, 0, 0, w, h);
+
+    var alpha = fillDetectCtx.getImageData(0, 0, w, h).data;
+    var painted = new Uint8Array(w * h);
+    for (var i = 0; i < painted.length; i++) {
+      painted[i] = alpha[i * 4 + 3] > FILL_ALPHA_THRESHOLD ? 1 : 0;
+    }
+
+    var reachableFromEdge = floodFillFromBorder(painted, w, h);
+
+    var enclosed = new Uint8Array(w * h);
+    var foundAny = false;
+    for (var j = 0; j < painted.length; j++) {
+      if (painted[j] || reachableFromEdge[j]) continue;
+      enclosed[j] = 1;
+      foundAny = true;
+    }
+    if (!foundAny) return;
+    for (var pass = 0; pass < FILL_GROW_PASSES; pass++) {
+      enclosed = dilate(enclosed, w, h);
+    }
+
+    var maskFill = new ImageData(w, h);
+    var overlayFill = new ImageData(w, h);
+    for (var j = 0; j < enclosed.length; j++) {
+      if (!enclosed[j]) continue;
+      var o = j * 4;
+      maskFill.data[o] = 255;
+      maskFill.data[o + 1] = 255;
+      maskFill.data[o + 2] = 255;
+      maskFill.data[o + 3] = 255;
+      overlayFill.data[o] = 255;
+      overlayFill.data[o + 1] = 45;
+      overlayFill.data[o + 2] = 45;
+      overlayFill.data[o + 3] = 255;
+    }
+
+    fillShapeCanvas.width = w;
+    fillShapeCanvas.height = h;
+
+    fillShapeCtx.putImageData(maskFill, 0, 0);
+    maskCtx.drawImage(fillShapeCanvas, 0, 0, maskCanvas.width, maskCanvas.height);
+
+    fillShapeCtx.putImageData(overlayFill, 0, 0);
+    overlayCtx.drawImage(fillShapeCanvas, 0, 0, overlayCanvas.width, overlayCanvas.height);
+
+    renderDisplay();
   }
 
   // Middle- or right-button drag pans instead of drawing — desktop's
