@@ -81,7 +81,9 @@ CREATE TABLE IF NOT EXISTS pending_result (
     file_id TEXT NOT NULL,
     filename TEXT NOT NULL,
     base_params_json TEXT NOT NULL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    detail_prompt TEXT,
+    detail_negative_prompt TEXT
 );
 
 CREATE TABLE IF NOT EXISTS character (
@@ -161,6 +163,8 @@ class Storage:
         self._add_column_if_missing("derived_prompt", "negative_prompt", "TEXT NOT NULL DEFAULT ''")
         self._add_column_if_missing("inpaint_job", "message_thread_id", "INTEGER")
         self._add_column_if_missing("inpaint_job", "kind", "TEXT NOT NULL DEFAULT 'hand'")
+        self._add_column_if_missing("pending_result", "detail_prompt", "TEXT")
+        self._add_column_if_missing("pending_result", "detail_negative_prompt", "TEXT")
         #: Last `_prune()` sweep time per table — see PRUNE_INTERVAL_SECONDS.
         self._last_prune: dict[str, float] = {}
 
@@ -244,37 +248,76 @@ class Storage:
         return current
 
     def store_pending_result(
-        self, result_id: str, chat_id: int, file_id: str, filename: str, base_params: dict[str, Any]
+        self,
+        result_id: str,
+        chat_id: int,
+        file_id: str,
+        filename: str,
+        base_params: dict[str, Any],
+        detail_prompt: str | None = None,
+        detail_negative_prompt: str | None = None,
     ) -> None:
         """Record what a post-processing/regenerate button (result_id) refers
         to: the Telegram file_id to re-download the source image from, and
         the full resolved generation params (already a plain dict — see
         handlers.py's (de)serialization helpers) needed to build the next
         graph, whether that's an upscale/face-detail pass or a fresh
-        "🔁 Regenerate" run."""
+        "🔁 Regenerate" run. `detail_prompt`/`detail_negative_prompt` are the
+        optional per-image detailer prompt override (see `set_detail_prompt`);
+        callers pass the source image's own when storing a derived result, so
+        an override set once follows the image down a chain of passes."""
         self._prune("pending_result")
         with self._conn:
             self._conn.execute(
                 "INSERT OR REPLACE INTO pending_result "
-                "(result_id, chat_id, file_id, filename, base_params_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (result_id, chat_id, file_id, filename, json.dumps(base_params), time.time()),
+                "(result_id, chat_id, file_id, filename, base_params_json, created_at, "
+                "detail_prompt, detail_negative_prompt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    result_id,
+                    chat_id,
+                    file_id,
+                    filename,
+                    json.dumps(base_params),
+                    time.time(),
+                    detail_prompt,
+                    detail_negative_prompt,
+                ),
             )
+
+    def set_detail_prompt(self, result_id: str, positive: str | None, negative: str | None) -> bool:
+        """Override (or, with `None`/`None`, clear) the prompt the region
+        detailers condition on for `result_id` — see handlers.py's
+        `DETAIL_PROMPT_CALLBACK_KIND`. Kept as its own column rather than
+        rewritten into `base_params_json` because that blob also drives
+        whole-image passes (upscale/homogenize) and "🐛 Show Prompt", none of
+        which should see a prompt written for one small masked region.
+        Returns False if the row has expired out from under the button."""
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE pending_result SET detail_prompt = ?, detail_negative_prompt = ? "
+                "WHERE result_id = ?",
+                (positive, negative, result_id),
+            )
+        return cursor.rowcount > 0
 
     def get_pending_result(self, result_id: str) -> dict[str, Any] | None:
         """The row `store_pending_result` wrote for `result_id`, or None if
         it doesn't exist (never stored, or pruned past its TTL)."""
         row = self._conn.execute(
-            "SELECT chat_id, file_id, filename, base_params_json FROM pending_result WHERE result_id = ?",
+            "SELECT chat_id, file_id, filename, base_params_json, detail_prompt, "
+            "detail_negative_prompt FROM pending_result WHERE result_id = ?",
             (result_id,),
         ).fetchone()
         if row is None:
             return None
-        chat_id, file_id, filename, base_params_json = row
+        chat_id, file_id, filename, base_params_json, detail_prompt, detail_negative_prompt = row
         return {
             "chat_id": chat_id,
             "file_id": file_id,
             "filename": filename,
             "base_params": json.loads(base_params_json),
+            "detail_prompt": detail_prompt,
+            "detail_negative_prompt": detail_negative_prompt,
         }
 
     def _prune(self, table: str, ttl_seconds: float = PENDING_RESULT_TTL_SECONDS) -> None:

@@ -4,12 +4,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from PIL import Image
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 
 from comfytelegram.comfy_client import ComfyUIError
 from comfytelegram.generation import GeneratedImage
 from comfytelegram.handlers import (
     _MAIN_KEYBOARD,
     ANALYZE_PROMPT_CALLBACK_KIND,
+    BACK_CALLBACK_KIND,
+    DETAIL_PROMPT_CALLBACK_KIND,
     DRAWN_MASK_REDO4_COUNT,
     FIX_DRAW_CALLBACK_KIND,
     FIX_REDO4_CALLBACK_KIND,
@@ -23,6 +27,7 @@ from comfytelegram.handlers import (
     HAND_POINT_PREVIEW_MAX_DIM,
     HAND_REDO4_CALLBACK_KIND,
     HAND_REDO_CALLBACK_KIND,
+    MORE_CALLBACK_KIND,
     SHOW_PROMPT_CALLBACK_KIND,
     TAGCHECK_TOKEN_LIMIT,
     TELEGRAM_PHOTO_SIZE_LIMIT,
@@ -152,28 +157,74 @@ def test_raw_prompt_copy_text_is_positive_only_without_a_negative():
 
 
 def test_post_process_keyboard_scopes_every_button_to_result_id():
-    keyboard = _post_process_keyboard("abc123")
-    callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    """Across both pages — a button that lost its result_id would act on
+    the wrong image, which no amount of page shuffling should make
+    possible."""
+    callback_data = [
+        b.callback_data
+        for page in (1, 2)
+        for row in _post_process_keyboard("abc123", page).inline_keyboard
+        for b in row
+    ]
     assert "pp:upscale:abc123" in callback_data
     assert "pp:homogenize:abc123" in callback_data
     assert "pp:face:abc123" in callback_data
     assert "pp:hand:abc123" in callback_data
     assert "pp:fix_draw:abc123" in callback_data
+    assert f"pp:{DETAIL_PROMPT_CALLBACK_KIND}:abc123" in callback_data
+    assert "pp:archive:abc123" in callback_data
     assert "pp:analyze_only:abc123" in callback_data
     assert f"pp:{ANALYZE_PROMPT_CALLBACK_KIND}:abc123" in callback_data
     assert "pp:deep_analyze:abc123" in callback_data
     assert "pp:show_prompt:abc123" in callback_data
 
 
-def test_post_process_keyboard_puts_tiled_passes_above_detailers():
-    """The tiled whole-image passes (upscale/homogenize) get their own row,
-    with the region detailers (face/hand) on the row below — see
-    `_TILED_PASS_KINDS`/`_DETAILER_KINDS`."""
-    keyboard = _post_process_keyboard("abc123")
-    rows = [[b.callback_data for b in row] for row in keyboard.inline_keyboard]
-    assert rows[0] == ["pp:upscale:abc123", "pp:homogenize:abc123"]
-    assert rows[1] == ["pp:face:abc123", "pp:hand:abc123"]
-    assert rows[2] == ["pp:fix_draw:abc123", "pp:archive:abc123"]
+def test_post_process_keyboard_page_one_is_the_working_set():
+    """Page 1 pairs like with like: the two whole-frame operations, then
+    the two detailers, then the two read/export buttons, then the toggle.
+    Everything on it either starts a ComfyUI run or hands back the image —
+    see `_post_process_keyboard`."""
+    rows = [
+        [b.callback_data for b in row] for row in _post_process_keyboard("abc123").inline_keyboard
+    ]
+    assert rows == [
+        ["pp:upscale:abc123", "pp:fix_draw:abc123"],
+        # Three wide, uniquely: "✏️ Detail Prompt" retargets the two
+        # detailers next to it, so it belongs on their row.
+        ["pp:face:abc123", "pp:hand:abc123", f"pp:{DETAIL_PROMPT_CALLBACK_KIND}:abc123"],
+        ["pp:archive:abc123", "pp:show_prompt:abc123"],
+        [f"pp:{MORE_CALLBACK_KIND}:abc123"],
+    ]
+
+
+def test_post_process_keyboard_page_two_holds_the_rest_and_a_way_back():
+    rows = [
+        [b.callback_data for b in row]
+        for row in _post_process_keyboard("abc123", page=2).inline_keyboard
+    ]
+    assert rows == [
+        ["pp:homogenize:abc123", "pp:analyze_only:abc123"],
+        ["pp:deep_analyze:abc123", f"pp:{ANALYZE_PROMPT_CALLBACK_KIND}:abc123"],
+        [f"pp:{BACK_CALLBACK_KIND}:abc123"],
+    ]
+
+
+def test_post_process_keyboard_pages_share_no_buttons():
+    """A button on both pages would be a maintenance trap — the split has
+    to be a partition, not an overlap."""
+    page_one = {
+        b.callback_data for row in _post_process_keyboard("abc123").inline_keyboard for b in row
+    }
+    page_two = {
+        b.callback_data
+        for row in _post_process_keyboard("abc123", page=2).inline_keyboard
+        for b in row
+    }
+    shared = (page_one & page_two) - {
+        f"pp:{MORE_CALLBACK_KIND}:abc123",
+        f"pp:{BACK_CALLBACK_KIND}:abc123",
+    }
+    assert shared == set()
 
 
 def test_upscale_confirm_keyboard_scopes_both_buttons_to_result_id():
@@ -1722,3 +1773,96 @@ async def test_hand_point_density_callback_alerts_on_an_expired_result():
     query.answer.assert_awaited_once_with(
         "That result has expired — generate a new image.", show_alert=True
     )
+
+
+def _page_toggle_context():
+    storage = MagicMock()
+    storage.get_pending_result.return_value = {
+        "base_params": _serialize_generation_params(
+            GenerationParams(checkpoint="ckpt", positive_prompt="a fox", negative_prompt="")
+        ),
+        "chat_id": 1,
+        "file_id": "file123",
+        "filename": "source.png",
+        "detail_prompt": None,
+        "detail_negative_prompt": None,
+    }
+    context = MagicMock()
+    context.bot_data = {
+        "settings": MagicMock(allowed_user_ids=None),
+        "storage": storage,
+        "comfy_client": MagicMock(),
+        "profiles": [],
+    }
+    return context
+
+
+@pytest.mark.asyncio
+async def test_more_button_flips_the_keyboard_in_place():
+    """The page toggle edits reply markup only — most of these messages are
+    photos, whose *text* Telegram won't let us edit at all."""
+    query = AsyncMock()
+    query.data = f"pp:{MORE_CALLBACK_KIND}:abc123"
+    query.message.reply_markup = _post_process_keyboard("abc123")
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    await postprocess_callback(update, _page_toggle_context())
+
+    query.edit_message_text.assert_not_awaited()
+    markup = query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+    rows = [[b.callback_data for b in row] for row in markup.inline_keyboard]
+    assert rows == [
+        [b.callback_data for b in row]
+        for row in _post_process_keyboard("abc123", page=2).inline_keyboard
+    ]
+
+
+@pytest.mark.asyncio
+async def test_page_flip_keeps_the_drawn_mask_redo_buttons():
+    """A drawn-mask result's redo row can't be rebuilt from storage — the
+    `inpaint_redo` row doesn't record which kind produced it — so the flip
+    has to carry it across from the keyboard on screen."""
+    redo_row = [
+        InlineKeyboardButton(
+            "🔁 Redo (same mask)", callback_data=f"pp:{HAND_REDO_CALLBACK_KIND}:abc123"
+        ),
+        InlineKeyboardButton("🔁 x4", callback_data=f"pp:{HAND_REDO4_CALLBACK_KIND}:abc123"),
+    ]
+    query = AsyncMock()
+    query.data = f"pp:{MORE_CALLBACK_KIND}:abc123"
+    query.message.reply_markup = InlineKeyboardMarkup(
+        list(_post_process_keyboard("abc123").inline_keyboard) + [redo_row]
+    )
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    await postprocess_callback(update, _page_toggle_context())
+
+    markup = query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+    assert [b.callback_data for b in markup.inline_keyboard[-1]] == [
+        f"pp:{HAND_REDO_CALLBACK_KIND}:abc123",
+        f"pp:{HAND_REDO4_CALLBACK_KIND}:abc123",
+    ]
+    # ...and nothing from page 1 tagged along with it.
+    assert f"pp:{MORE_CALLBACK_KIND}:abc123" not in [
+        b.callback_data for row in markup.inline_keyboard for b in row
+    ]
+
+
+@pytest.mark.asyncio
+async def test_page_flip_swallows_an_unmodified_double_tap():
+    """Two taps on ⋯ More produce a byte-identical keyboard the second
+    time, which Telegram rejects as BadRequest — not a real failure, and
+    not worth routing to the bot-wide error handler."""
+    query = AsyncMock()
+    query.data = f"pp:{BACK_CALLBACK_KIND}:abc123"
+    query.message.reply_markup = _post_process_keyboard("abc123")
+    query.edit_message_reply_markup.side_effect = BadRequest("Message is not modified")
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    await postprocess_callback(update, _page_toggle_context())  # must not raise

@@ -21,6 +21,7 @@ from telegram.ext import (
 from comfytelegram.comfy_client import ComfyClient
 from comfytelegram.handlers import (
     AGAIN_CALLBACK_PREFIX,
+    DETAIL_PROMPT_CANCEL_CALLBACK_DATA,
     GENERATE_FROM_PROMPT_CALLBACK_PREFIX,
     HAND_POINT_CALLBACK_PREFIX,
     HAND_POINT_DENSITY_CALLBACK_PREFIX,
@@ -29,6 +30,7 @@ from comfytelegram.handlers import (
     character_callback,
     character_command,
     characters_command,
+    detail_prompt_cancel_callback,
     document_message,
     generate_from_prompt_callback,
     generate_message,
@@ -294,6 +296,12 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CallbackQueryHandler(character_callback, pattern=r"^char:"))
     application.add_handler(
         CallbackQueryHandler(stream_cancel_callback, pattern=rf"^{STREAM_CANCEL_CALLBACK_DATA}$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            detail_prompt_cancel_callback,
+            pattern=rf"^{DETAIL_PROMPT_CANCEL_CALLBACK_DATA}$",
+        )
     )
     application.add_handler(MessageHandler(filters.PHOTO, photo_message))
     # An image sent as a *file* rather than a photo keeps its bytes intact

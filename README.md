@@ -32,7 +32,9 @@ CLI at runtime.
   Auto-detect or ✋ Tap to mark first, since the YOLO bbox detector often
   can't find a hand at all — tapping a cell on a coarse grid overlay
   inpaints a small mask centered there instead, skipping detection
-  entirely.
+  entirely. ✏️ Detail Prompt retargets what the detailers condition on for
+  one image — they otherwise inherit the whole scene's prompt, which is the
+  wrong thing to re-assert over a crop of one hand.
 - **Image-to-prompt analysis** — 🏷️ Analyze Image runs both a WD14 tagger and a
   Qwen-VL caption via a local Ollama server, regardless of checkpoint, for
   comparing them side by side. See [Image analysis](#image-analysis) below.
@@ -194,7 +196,13 @@ to mark** as before.
 | `/stop` | Stop a running `/stream` |
 | `/start`, `/help` | Show the command summary |
 
-Every generated image comes with inline buttons:
+Every generated image comes with inline buttons, on two pages toggled in
+place by **⋯ More** / **‹ Back** (the keyboard swaps on the same message —
+nothing new is posted to the chat). Page 1 is the working set: 🔍 Upscale
+4x, 🩹 Fix Artifact, then ✨ Face Detail / 🖐️ Hand Detail / ✏️ Detail Prompt
+on one row, then 📥 Download file and 🐛 Show Prompt — plus 🔁 Redo (same
+mask) / 🔁 x4 on a drawn-mask result. Page 2 holds 🧵 Homogenize and the
+three analyzers.
 
 - **🔍 Upscale 4x** / **✨ Face Detail** / **🖐️ Hand Detail** — run that
   post-processing stage on this specific image and send the result (itself
@@ -205,6 +213,24 @@ Every generated image comes with inline buttons:
   `INPAINT_RELAY_URL` is configured — **🖌️ Draw Mask**, which opens a
   Telegram WebApp for drawing a real freehand mask instead of a fixed box.
   See "Freehand mask drawing (🖌️ Draw Mask)" below for what that needs.
+- **✏️ Detail Prompt** — change what the detailers condition on for *this*
+  image, without regenerating it. By default ✨ Face Detail, 🖐️ Hand Detail
+  and 🩹 Fix Artifact inherit the image's whole prompt, which describes the
+  entire scene — refining one hand with it re-asserts the castle and the
+  sunset over a crop containing neither, and there's no way to say
+  "no jewellery, five fingers" about just the region being worked on. Tap
+  it, and the bot replies with the prompt currently in effect (with a
+  **📋 Copy current** button, so you can paste it back and cut it down
+  rather than retyping); send the replacement, using the same `---`
+  separator and inline `-token` negatives a normal prompt takes. It sticks
+  to the image and to anything made from it, so it's set once and then
+  every detailer tap uses it. To clear it, tap **♻️ Reset** on the entry
+  message (typing `reset` also works, but only while the entry is open —
+  once you've sent a prompt you have to tap ✏️ Detail Prompt again first,
+  or the word just becomes your next generation prompt).
+  🔍 Upscale and 🧵 Homogenize deliberately ignore it: they
+  condition the *whole* image, where a region-specific prompt would be
+  wrong everywhere else.
 - **🏷️ Analyze Image** — analyze *this image* with **both** the WD14 tagger and a
   Qwen-VL caption (regardless of the checkpoint's `prompt_style`), replying
   with two separate messages — one per analyzer — each carrying its own

@@ -133,6 +133,29 @@ def _to_post_process_base(params: GenerationParams) -> PostProcessBaseParams:
     )
 
 
+#: The `post_process` kinds a user-supplied detail prompt applies to — the
+#: region detailers only. `"upscale"`/`"homogenize"` deliberately ignore it:
+#: those condition the *whole* image on the prompt, where something written
+#: for one masked region ("two hands, five fingers each") would be actively
+#: wrong everywhere else. See handlers.py's `DETAIL_PROMPT_CALLBACK_KIND`.
+DETAIL_PROMPT_KINDS = ("face", "hand", "hand_manual", "hand_drawn", "fix_drawn")
+
+
+def _apply_detail_prompt(
+    base: PostProcessBaseParams, positive: str | None, negative: str | None
+) -> PostProcessBaseParams:
+    """`base` with the user's detailer prompt override applied. Each side is
+    independent — `None` means "keep what the image was generated with", so
+    overriding only the positive leaves the original negative in place."""
+    if positive is None and negative is None:
+        return base
+    return replace(
+        base,
+        positive_prompt=base.positive_prompt if positive is None else positive,
+        negative_prompt=base.negative_prompt if negative is None else negative,
+    )
+
+
 def _fix_artifact_override_base(profiles: list[ModelProfile]) -> PostProcessBaseParams | None:
     """`kind="fix_drawn"` support: if a profile sets `fix_artifact_checkpoint`
     (currently only Anima Aesthetic), "🩹 Fix Artifact" always runs against
@@ -576,6 +599,8 @@ async def post_process(
     point_frac: tuple[float, float] | None = None,
     box_size_frac: float | None = None,
     mask_bytes: bytes | None = None,
+    detail_prompt: str | None = None,
+    detail_negative_prompt: str | None = None,
     on_progress: ProgressCallback | None = None,
     profiles: list[ModelProfile] | None = None,
 ) -> GeneratedImage:
@@ -615,8 +640,19 @@ async def post_process(
     `kind="fix_drawn"` — see `_fix_artifact_override_base` — to run that
     pass against a fixed, known-inpainting-aware checkpoint regardless of
     which one the image was originally generated with; every other `kind`
-    ignores it entirely and keeps using the image's own checkpoint."""
+    ignores it entirely and keeps using the image's own checkpoint.
+    `detail_prompt`/`detail_negative_prompt` replace the prompt the *region*
+    detailers condition on (`DETAIL_PROMPT_KINDS` — never the whole-image
+    tiled passes), for steering or narrowing a refinement without
+    regenerating the image; each side is independent, and `None` keeps the
+    image's own. For `kind="fix_drawn"` an explicit one also overrides the
+    prompt that branch would otherwise pick for itself (blank, or the
+    `fix_artifact_checkpoint` profile's "background scenery") — the user
+    asked for this region specifically, which is better information than
+    either default."""
     base_params = _to_post_process_base(full_params)
+    if kind in DETAIL_PROMPT_KINDS:
+        base_params = _apply_detail_prompt(base_params, detail_prompt, detail_negative_prompt)
     upload = await client.upload_image(source_image, filename=source_filename)
     uploaded_name = upload["name"]
 
@@ -687,6 +723,9 @@ async def post_process(
         else:
             fix_base_params = replace(base_params, positive_prompt="")
             checkpoint_source = "image's own checkpoint"
+        fix_base_params = _apply_detail_prompt(
+            fix_base_params, detail_prompt, detail_negative_prompt
+        )
         fix_params = DrawnMaskFixParams()
         if fix_base_params.loader == "split" and fix_base_params.anima_lllite_inpaint_patch:
             engaged_reason = (
