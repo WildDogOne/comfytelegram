@@ -2,12 +2,14 @@ import datetime
 from unittest.mock import MagicMock
 
 import pytest
-from telegram import Chat, Message, MessageEntity, User
+from telegram import Chat, Document, Message, MessageEntity, User
 
 from comfytelegram.main import _UNHANDLED_FILTER
 
 
-def _message(text: str | None = None, *, photo=None, sticker=None, **api_kwargs) -> Message:
+def _message(
+    text: str | None = None, *, photo=None, sticker=None, document=None, **api_kwargs
+) -> Message:
     entities = []
     if text is not None and text.startswith("/"):
         entities = [MessageEntity(type="bot_command", offset=0, length=len(text.split()[0]))]
@@ -20,6 +22,7 @@ def _message(text: str | None = None, *, photo=None, sticker=None, **api_kwargs)
         entities=entities,
         photo=photo or (),
         sticker=sticker,
+        document=document,
         api_kwargs=api_kwargs or None,
     )
     message.set_bot(MagicMock())
@@ -75,3 +78,17 @@ def test_rich_message_prompts_are_left_to_the_real_handler():
     didn't understand that" to an ordinary prompt."""
     message = _message(None, rich_message={"blocks": [{"type": "paragraph", "text": "a red fox"}]})
     assert _caught(message) is False
+
+
+def test_an_image_sent_as_a_file_is_claimed_by_the_import_handler():
+    """`document_message` is bound to `filters.Document.IMAGE` — an image
+    sent as a file is the archive round trip's whole input path, so it must
+    not fall through to `_unhandled_message`."""
+    png = Document(file_id="f", file_unique_id="u", file_name="x.png", mime_type="image/png")
+    assert not _caught(_message(document=png))
+
+
+def test_a_non_image_file_is_still_unhandled():
+    """Only images are claimed — a PDF or a zip has nothing to import."""
+    pdf = Document(file_id="f", file_unique_id="u", file_name="x.pdf", mime_type="application/pdf")
+    assert _caught(_message(document=pdf))

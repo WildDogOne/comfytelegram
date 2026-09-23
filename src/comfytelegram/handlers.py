@@ -48,6 +48,19 @@ from comfytelegram.auth import (
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
 from comfytelegram.generation import GeneratedImage, generate, post_process, repeat
 from comfytelegram.message_text import message_text
+from comfytelegram.params_serde import (
+    deserialize_generation_params,
+    serialize_generation_params,
+)
+from comfytelegram.png_metadata import (
+    build_metadata,
+    embed_metadata,
+    extract_comfy_graph,
+    extract_metadata,
+    extract_seed,
+    is_png,
+    summarize_graph,
+)
 from comfytelegram.profiles import (
     ModelProfile,
     apply_profile_override,
@@ -59,7 +72,7 @@ from comfytelegram.settings_menu import _safe_edit_message, handle_custom_value_
 from comfytelegram.storage import Storage
 from comfytelegram.tags import TagDatabase, TagResult, TagSource, category_label
 from comfytelegram.topics import pop_pending, set_pending
-from comfytelegram.workflows import GenerationParams, LoraSpec, ManualHandDetailerParams
+from comfytelegram.workflows import GenerationParams, ManualHandDetailerParams
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +93,16 @@ POSTPROCESS_STATUS_LABELS = {
 ANALYZE_ONLY_CALLBACK_KIND = "analyze_only"
 DEEP_ANALYZE_CALLBACK_KIND = "deep_analyze"
 SHOW_PROMPT_CALLBACK_KIND = "show_prompt"
+#: "📥 Download file" — re-sends this image as a Telegram *document*
+#: rather than a photo. Telegram re-encodes every `sendPhoto` upload to
+#: JPEG and drops all PNG chunks with it, so the copy the user can save
+#: out of the chat normally carries none of the metadata
+#: `png_metadata.embed_metadata` wrote — only the document path
+#: preserves the bytes. That makes this the button that actually enables
+#: archiving: download the file it sends, and re-uploading it later
+#: (again as a file, not a photo) restores the full post-processing
+#: keyboard via `document_message`, no database row required.
+ARCHIVE_CALLBACK_KIND = "archive"
 ANALYZE_PROMPT_CALLBACK_KIND = "analyze_prompt"
 UPSCALE_CONFIRM_CALLBACK_KIND = "upscale_confirmed"
 UPSCALE_CANCEL_CALLBACK_KIND = "upscale_cancelled"
@@ -314,7 +337,10 @@ def _post_process_keyboard(result_id: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     "🩹 Fix Artifact", callback_data=f"pp:{FIX_DRAW_CALLBACK_KIND}:{result_id}"
-                )
+                ),
+                InlineKeyboardButton(
+                    "📥 Download file", callback_data=f"pp:{ARCHIVE_CALLBACK_KIND}:{result_id}"
+                ),
             ],
             [
                 InlineKeyboardButton(
@@ -612,78 +638,13 @@ def _extract_file_id(sent_message: Message) -> str:
     raise ValueError("Sent message has neither a photo nor a document to read a file_id from")
 
 
-def _serialize_generation_params(params: GenerationParams) -> dict[str, Any]:
-    """Flatten a `GenerationParams` into a plain JSON-able dict for
-    `Storage` (deliberately drops `seed` and `filename_prefix` — see
-    `test_serialization_omits_seed_so_regenerate_gets_a_fresh_roll`).
-    Inverse of `_deserialize_generation_params`."""
-    return {
-        "checkpoint": params.checkpoint,
-        "positive_prompt": params.positive_prompt,
-        "negative_prompt": params.negative_prompt,
-        "steps": params.steps,
-        "cfg": params.cfg,
-        "sampler_name": params.sampler_name,
-        "scheduler": params.scheduler,
-        "width": params.width,
-        "height": params.height,
-        "batch_size": params.batch_size,
-        "clip_skip": params.clip_skip,
-        "loras": [
-            {
-                "name": lora.name,
-                "strength_model": lora.strength_model,
-                "strength_clip": lora.strength_clip,
-            }
-            for lora in params.loras
-        ],
-        "loader": params.loader,
-        "clip_name": params.clip_name,
-        "clip_type": params.clip_type,
-        "vae_name": params.vae_name,
-        "model_sampling_shift": params.model_sampling_shift,
-        "tile_controlnet": params.tile_controlnet,
-        "tile_controlnet_strength": params.tile_controlnet_strength,
-        "anima_lllite_inpaint_patch": params.anima_lllite_inpaint_patch,
-        "anima_lllite_inpaint_patch_strength": params.anima_lllite_inpaint_patch_strength,
-        "upscale_denoise": params.upscale_denoise,
-        "raw_positive_prompt": params.raw_positive_prompt,
-        "raw_negative_prompt": params.raw_negative_prompt,
-    }
-
-
-def _deserialize_generation_params(data: dict[str, Any]) -> GenerationParams:
-    """`.get(..., <field default>)` on everything but checkpoint/prompts lets
-    this still read pending_result rows written before the "🔁 Regenerate"
-    button existed (when only the post-processing subset of fields was
-    stored) — those rows just fall back to GenerationParams' own generic
-    defaults for steps/cfg/etc. instead of the exact original values."""
-    return GenerationParams(
-        checkpoint=data["checkpoint"],
-        positive_prompt=data["positive_prompt"],
-        negative_prompt=data["negative_prompt"],
-        steps=data.get("steps", 30),
-        cfg=data.get("cfg", 7.0),
-        sampler_name=data.get("sampler_name", "euler"),
-        scheduler=data.get("scheduler", "normal"),
-        width=data.get("width", 1024),
-        height=data.get("height", 1024),
-        batch_size=data.get("batch_size", 1),
-        clip_skip=data.get("clip_skip", -1),
-        loras=[LoraSpec(**lora) for lora in data.get("loras", [])],
-        loader=data.get("loader", "checkpoint"),
-        clip_name=data.get("clip_name", ""),
-        clip_type=data.get("clip_type", "stable_diffusion"),
-        vae_name=data.get("vae_name", ""),
-        model_sampling_shift=data.get("model_sampling_shift"),
-        tile_controlnet=data.get("tile_controlnet"),
-        tile_controlnet_strength=data.get("tile_controlnet_strength", 0.4),
-        anima_lllite_inpaint_patch=data.get("anima_lllite_inpaint_patch"),
-        anima_lllite_inpaint_patch_strength=data.get("anima_lllite_inpaint_patch_strength", 1.0),
-        upscale_denoise=data.get("upscale_denoise"),
-        raw_positive_prompt=data.get("raw_positive_prompt", ""),
-        raw_negative_prompt=data.get("raw_negative_prompt", ""),
-    )
+#: Moved to `params_serde` so `generation.py` can embed the same dict into
+#: each image's PNG metadata chunk without importing `handlers` (which
+#: imports *it*). Kept under the old private names here because this
+#: module's call sites — and the tests pinning their behaviour — reference
+#: them by those names.
+_serialize_generation_params = serialize_generation_params
+_deserialize_generation_params = deserialize_generation_params
 
 
 def _make_progress_callback(status_message: Message, label: str = "Generating"):
@@ -1786,6 +1747,317 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+#: Telegram's Bot API can't hand a bot any file over 20MB — `getFile`
+#: refuses outright, so an import of, say, a 4x-upscaled PNG simply isn't
+#: possible through the bot API no matter how it's sent. Checked up front
+#: against `Document.file_size` so the user gets a clear explanation
+#: instead of an opaque `getFile` failure.
+IMPORT_MAX_FILE_BYTES = 20 * 1024 * 1024
+
+#: How much of a prompt an import summary prints before eliding. The full
+#: text is always recoverable from the restored keyboard's "🐛 Show Prompt";
+#: this is only about not spending a 4096-character Telegram message on two
+#: prompts before any of the actual settings are visible.
+_IMPORT_PROMPT_PREVIEW = 400
+
+
+def _elide(text: str, limit: int = _IMPORT_PROMPT_PREVIEW) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _import_summary(metadata: dict[str, Any], params: GenerationParams) -> str:
+    """The human-readable "here's what was in that file" reply for a
+    successful import. Deliberately prints the settings rather than just
+    "imported ✅" — the whole point of the round trip is that the file
+    carries them, so showing them is the confirmation that it worked."""
+    lines = ["📥 Imported — this image's own settings are restored.", ""]
+    lines.append(f"Model: {params.checkpoint}")
+    if params.loader == "split":
+        lines.append(f"CLIP/VAE: {params.clip_name or '—'} / {params.vae_name or '—'}")
+    lines.append(
+        f"{params.steps} steps · cfg {params.cfg} · {params.sampler_name}/{params.scheduler}"
+    )
+    lines.append(f"Size: {params.width}×{params.height} · clip skip {params.clip_skip}")
+    if metadata.get("seed") is not None:
+        lines.append(f"Seed: {metadata['seed']}")
+    if params.loras:
+        lines.append(
+            "LoRAs: " + ", ".join(f"{lora.name} @ {lora.strength_model}" for lora in params.loras)
+        )
+    origin = metadata.get("kind")
+    created = metadata.get("created_at")
+    if origin or created:
+        lines.append(f"Origin: {origin or 'unknown'}{f' · {created}' if created else ''}")
+    lines.append("")
+    lines.append(f"Positive:\n{_elide(params.positive_prompt)}")
+    if params.negative_prompt:
+        lines.append(f"\nNegative:\n{_elide(params.negative_prompt)}")
+    return "\n".join(lines)
+
+
+def _foreign_image_summary(summary: dict[str, Any]) -> str:
+    """The reply for a PNG that carries ComfyUI's `prompt` chunk but none of
+    ours — an export from Krita AI Diffusion, a raw ComfyUI run, another
+    bot. Its settings can be read well enough to show and to seed a new
+    generation from, but not well enough to restore post-processing
+    buttons, since those need a full `GenerationParams` this graph can't
+    reconstruct (see `png_metadata`'s module docstring)."""
+    lines = ["🔍 No comfytelegram metadata — but this image has a ComfyUI workflow in it.", ""]
+    if "checkpoint" in summary:
+        lines.append(f"Model: {summary['checkpoint']}")
+    detail = " · ".join(
+        str(part)
+        for part in (
+            f"{summary['steps']} steps" if "steps" in summary else "",
+            f"cfg {summary['cfg']}" if "cfg" in summary else "",
+            summary.get("sampler_name", ""),
+            f"seed {summary['seed']}" if "seed" in summary else "",
+        )
+        if part
+    )
+    if detail:
+        lines.append(detail)
+    return "\n".join(lines)
+
+
+async def document_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Import an image the user uploaded as a *file*, restoring the
+    post-processing keyboard from the metadata embedded in it.
+
+    This is the read side of `png_metadata`: download an image the bot may
+    never have seen (or generated months ago, on a database since wiped),
+    read its `comfytelegram` chunk, write a fresh `pending_result` row from
+    the `params` dict it carries, and reply with the standard
+    `_post_process_keyboard`. Every button then works — upscale, the
+    detailers, "🩹 Fix Artifact", "🔁 Generate Again" — against an image
+    with no prior row of its own. That makes "download for archiving,
+    re-upload when more work is needed" a complete round trip.
+
+    Registered on `filters.Document.IMAGE`, not `filters.PHOTO`, and that
+    distinction is the whole feature: Telegram re-encodes every photo-type
+    upload to JPEG, which strips PNG chunks in both directions. A photo
+    therefore *cannot* carry metadata and is handled by `photo_message`
+    (which analyzes its pixels instead); only the document path preserves
+    the bytes. An image sent as a file with no metadata of ours falls back
+    to `_foreign_image_summary` plus the same tag/caption analysis
+    `photo_message` does, so uploading any image as a file still does
+    something useful.
+    """
+    settings: Settings = context.bot_data["settings"]
+    if await reject_if_unauthorized(update, settings):
+        return
+
+    message = update.effective_message
+    document = message.document
+    chat_id = update.effective_chat.id
+    storage: Storage = context.bot_data["storage"]
+    client: ComfyClient = context.bot_data["comfy_client"]
+
+    if document.file_size and document.file_size > IMPORT_MAX_FILE_BYTES:
+        await message.reply_text(
+            f"That file is {document.file_size / 1_048_576:.1f}MB — Telegram won't let "
+            "a bot download anything over 20MB, so I can't read it. (This is a Bot API "
+            "limit, not a setting.)"
+        )
+        return
+
+    status_message = await message.reply_text("Reading image…", disable_notification=True)
+
+    async def _download() -> bytes:
+        tg_file = await context.bot.get_file(document.file_id)
+        return bytes(await tg_file.download_as_bytearray())
+
+    data = await _run_reporting_errors(status_message, "Import", "document import", _download())
+    if data is None:
+        return
+
+    if not is_png(data):
+        await status_message.edit_text(
+            "That file isn't a PNG, so it can't carry generation metadata. "
+            "Send it as a photo instead if you want it analyzed."
+        )
+        return
+
+    metadata = extract_metadata(data)
+    if metadata is None:
+        await _import_without_metadata(message, status_message, context, data, chat_id)
+        return
+
+    params = _deserialize_generation_params(metadata["params"])
+    result_id = uuid.uuid4().hex[:12]
+    storage.store_pending_result(
+        result_id,
+        chat_id,
+        document.file_id,
+        metadata.get("filename") or document.file_name or "imported.png",
+        metadata["params"],
+    )
+    await status_message.delete()
+
+    text = _import_summary(metadata, params)
+    missing = await _checkpoint_missing_note(client, params.checkpoint)
+    if missing:
+        text += f"\n\n{missing}"
+    await message.reply_text(text, reply_markup=_post_process_keyboard(result_id))
+
+
+async def _checkpoint_missing_note(client: ComfyClient, checkpoint: str) -> str:
+    """A warning line if the imported image's checkpoint isn't installed on
+    this ComfyUI — worth saying up front, since the buttons would otherwise
+    all look live and then fail at submit time on a model that isn't there.
+    Silent (returns "") if ComfyUI can't be reached at all: that's a
+    separate problem the buttons will report in their own way, and guessing
+    "model missing" from it would be wrong."""
+    try:
+        available = await client.list_checkpoints()
+    except (ComfyUIError, aiohttp.ClientError, TimeoutError, OSError):
+        return ""
+    if checkpoint in available:
+        return ""
+    return (
+        f"⚠️ This ComfyUI doesn't have “{checkpoint}” installed — generation "
+        "buttons will fail until it is."
+    )
+
+
+async def _import_without_metadata(
+    message: Message,
+    status_message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    data: bytes,
+    chat_id: int,
+) -> None:
+    """A PNG file with no `comfytelegram` chunk: report whatever ComfyUI's
+    own `prompt` chunk yields (see `png_metadata.summarize_graph`) and
+    otherwise treat it the way `photo_message` treats an uploaded photo —
+    run both analyzers and offer their prompts. Post-processing buttons
+    are deliberately *not* offered: without a full `GenerationParams` there
+    is nothing to rebuild a graph from."""
+    settings: Settings = context.bot_data["settings"]
+    storage: Storage = context.bot_data["storage"]
+    client: ComfyClient = context.bot_data["comfy_client"]
+
+    graph = extract_comfy_graph(data)
+    if graph is not None:
+        summary = summarize_graph(graph)
+        await message.reply_text(_foreign_image_summary(summary))
+        positive = summary.get("positive_prompt")
+        if positive:
+            checkpoint = await _resolve_checkpoint_or_default(
+                message, chat_id, storage, client, context
+            )
+            if checkpoint is not None:
+                await _send_derived_prompt(
+                    message,
+                    storage,
+                    chat_id,
+                    checkpoint,
+                    "🧩 Prompt from the embedded workflow",
+                    positive,
+                    summary.get("negative_prompt", ""),
+                )
+            await status_message.delete()
+            return
+
+    checkpoint = await _resolve_checkpoint_or_default(message, chat_id, storage, client, context)
+    if checkpoint is None:
+        return
+    await status_message.edit_text("Analyzing the image…")
+
+    result = await _run_reporting_errors(
+        status_message, "Analysis", "imported-image analyze", _analyze_both_deep(data, settings)
+    )
+    if result is None:
+        return
+    tags, caption = result
+    caption_positive, caption_negative = caption if caption is not None else (None, "")
+    await status_message.delete()
+    await _send_derived_prompt(message, storage, chat_id, checkpoint, "🏷️ WD14 tags", tags)
+    await _send_derived_prompt(
+        message,
+        storage,
+        chat_id,
+        checkpoint,
+        "💬 Qwen-VL caption (deep)",
+        caption_positive,
+        caption_negative,
+    )
+
+
+#: How long a metadata-bearing archive copy can take to pull back out of
+#: ComfyUI and push to Telegram before we give up — an upscaled PNG can be
+#: tens of megabytes, but an unbounded wait would leave the user staring at
+#: a status message forever if the ComfyUI host has gone away.
+ARCHIVE_SEND_TIMEOUT_SECONDS = 300
+
+
+async def _send_archive_copy(
+    message: Message,
+    client: ComfyClient,
+    pending: dict[str, Any],
+    full_params: GenerationParams,
+) -> None:
+    """Re-send a previously generated image as an uncompressed document, with
+    its generation metadata embedded (see `png_metadata`).
+
+    The copy has to come back out of *ComfyUI*, not from the stored Telegram
+    `file_id`: that file_id points at whatever `_send_result_image` actually
+    sent, which for anything under `TELEGRAM_PHOTO_SIZE_LIMIT` is the
+    JPEG Telegram re-encoded the photo into — the PNG chunks are already
+    gone from it. `pending["filename"]` is the name `SaveImage` wrote in
+    ComfyUI's output directory, so `/view` still has the original bytes as
+    long as that directory hasn't been cleaned out.
+
+    Metadata gets re-embedded here rather than reused, because the file on
+    ComfyUI's disk never had our chunk — `generation._tag_images` stamps
+    the copy in memory on its way to Telegram, leaving the server's own
+    file untouched. The seed is recovered from ComfyUI's `prompt` chunk on
+    the fetched file, which is the only place it survives (see
+    `png_metadata.extract_seed`).
+    """
+    status_message = await message.reply_text("Fetching the original file…")
+
+    async def _fetch_and_send() -> None:
+        data = await client.get_image_bytes(pending["filename"], "", "output")
+        graph = extract_comfy_graph(data)
+        stamped = embed_metadata(
+            data,
+            build_metadata(
+                params=pending["base_params"],
+                kind="archive",
+                filename=pending["filename"],
+                seed=extract_seed(graph) if graph else None,
+                checkpoint=full_params.checkpoint,
+            ),
+        )
+        await message.reply_document(
+            document=io.BytesIO(stamped),
+            filename=pending["filename"],
+            caption=(
+                "Full-quality PNG — this is the copy to save. Its generation "
+                "settings are stored inside the file, so sending it back to me "
+                "as a file (not a photo) restores all its buttons."
+            ),
+        )
+
+    try:
+        await asyncio.wait_for(_fetch_and_send(), timeout=ARCHIVE_SEND_TIMEOUT_SECONDS)
+    except ComfyUIError:
+        logger.warning("Archive copy unavailable for %s", pending["filename"], exc_info=True)
+        await status_message.edit_text(
+            "ComfyUI no longer has the original file for this image — its output "
+            "directory has probably been cleaned since it was generated."
+        )
+        return
+    except (TimeoutError, aiohttp.ClientError):
+        logger.warning("Archive copy failed for %s", pending["filename"], exc_info=True)
+        await status_message.edit_text(
+            "Couldn't fetch the original file from ComfyUI — see the logs."
+        )
+        return
+    await status_message.delete()
+
+
 async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle a `pp:<kind>:<result_id>` tap from `_post_process_keyboard`:
     `kind` is `"analyze_only"` (run *both* analyzers — WD14 tags and
@@ -1857,6 +2129,10 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     client: ComfyClient = context.bot_data["comfy_client"]
     full_params = _deserialize_generation_params(pending["base_params"])
+
+    if kind == ARCHIVE_CALLBACK_KIND:
+        await _send_archive_copy(query.message, client, pending, full_params)
+        return
 
     if kind == SHOW_PROMPT_CALLBACK_KIND:
         negative = full_params.negative_prompt or "(none)"

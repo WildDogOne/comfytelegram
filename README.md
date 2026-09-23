@@ -40,6 +40,12 @@ CLI at runtime.
   own generated images — those use the 🏷️ Analyze Image button instead) and it
   runs the same side-by-side WD14/Qwen-VL analysis, each reply with its own
   🎨 Generate button.
+- **Archive and re-import** — every generated image carries its own full
+  generation settings inside the PNG. Tap **📥 Download file** to get the
+  uncompressed PNG, save it wherever you keep images, and months later send
+  it back to the bot *as a file* — it reads the settings straight out of the
+  image and restores every post-processing button, with no database row
+  needed. See [Archiving and re-importing](#archiving-and-re-importing).
 - **`/settings`** — an in-place inline-keyboard menu to view and override a
   model's generation defaults per chat (steppers + presets for numeric
   fields, a live-populated grid for sampler/scheduler, free text for prompt
@@ -178,6 +184,7 @@ to mark** as before.
 |---|---|
 | *(plain text)* | Generate an image with the current model/settings — prefix any word with `-` (e.g. `-blurry`) to send it as a negative instead of a positive |
 | *(photo upload)* | Analyze the photo with both WD14 tags and a Qwen-VL caption, each with its own 🎨 Generate button |
+| *(PNG sent as a file)* | Re-import a previously generated image from the settings embedded in it, restoring its post-processing buttons |
 | `/model` | Pick a checkpoint (inline keyboard, populated live from ComfyUI) |
 | `/settings` | View/change cfg, steps, sampler, scheduler, clip skip, width, height, batch size, and prompt prefixes for the current model, per chat |
 | `/character save <name> \| <positive> [\| <negative>]` | Save a reusable prompt snippet |
@@ -203,9 +210,55 @@ Every generated image comes with inline buttons:
   with two separate messages — one per analyzer — each carrying its own
   **🎨 Generate** button to start a fresh generation from exactly that
   prompt, so you can compare them and pick one manually.
+- **📥 Download file** — re-send this image as an uncompressed file rather
+  than a chat photo, with its full generation settings embedded in the PNG.
+  This is the one to save for archiving; see below.
 - **🔁 Generate Again** (on the "Done" status message) — re-run the *whole*
   last batch with a fresh seed, for quickly building up more variations
   without retyping the prompt.
+
+## Archiving and re-importing
+
+Every image the bot produces has its complete resolved settings — model,
+both prompts (including the raw text you typed, before profile and
+character prefixes were folded in), steps, cfg, sampler, scheduler,
+dimensions, clip skip, LoRAs and strengths, the split-loader CLIP/VAE
+fields, and the seed — written into a PNG `tEXt` chunk keyed
+`comfytelegram`. It sits alongside the ComfyUI `prompt` chunk that
+`SaveImage` already writes, and it's spliced in as a chunk rather than
+re-encoded, so the pixels are untouched and it costs a couple of hundred
+bytes.
+
+Sending that image back to the bot **as a file** restores it completely:
+the bot reads the chunk, registers the image, and replies with the full
+post-processing keyboard. Upscale, the detailers, 🩹 Fix Artifact and
+🔁 Generate Again all work again, on an image the bot has no stored record
+of — months later, on a fresh database, on a different install of the bot.
+
+**It has to be a file, not a photo, in both directions.** Telegram
+re-encodes every photo-type upload to JPEG, which discards all PNG
+metadata. That's why:
+
+- Saving the image straight out of the chat gives you a stripped JPEG.
+  Use **📥 Download file** to get the real PNG. (It re-fetches the file
+  from ComfyUI's output directory, so it only works while that file is
+  still there.)
+- Re-uploading has to use "send as file" rather than the normal photo
+  path. A photo upload is still analyzed as before, it just can't carry
+  metadata.
+
+Telegram's Bot API also refuses to hand a bot any file over 20MB, so a
+heavily upscaled PNG may be too large to re-import. That's a platform
+limit, not a setting.
+
+A PNG from somewhere else entirely — a raw ComfyUI run, a Krita AI
+Diffusion export, another bot — has no `comfytelegram` chunk, but usually
+does have ComfyUI's own `prompt` chunk. Sent as a file, the bot reads what
+it can out of that workflow (model, prompts, steps, cfg, sampler, seed) and
+offers the prompt with a 🎨 Generate button. It deliberately doesn't offer
+post-processing buttons there: an executed graph doesn't contain enough to
+faithfully rebuild the bot's own generation settings. A file with no
+metadata at all falls back to the usual WD14/Qwen-VL analysis.
 
 ## Image analysis
 

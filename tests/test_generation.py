@@ -19,6 +19,7 @@ from comfytelegram.generation import (
     generate,
     post_process,
 )
+from comfytelegram.png_metadata import extract_metadata
 from comfytelegram.profiles import ModelProfile, ProfileDefaults
 from comfytelegram.workflows import DrawnMaskFixParams, GenerationParams, LoraSpec
 
@@ -443,6 +444,15 @@ async def test_post_process_hand_manual_requires_point_frac():
         await post_process(client, "hand_manual", source, "source.png", params)
 
 
+def _pixels(png: bytes) -> bytes:
+    """A PNG's decoded pixels. Used instead of comparing raw bytes because
+    `generation._tag_images` now stamps every collected image with its own
+    generation metadata chunk (see `png_metadata`), so the bytes that come
+    back out of `post_process` are deliberately not identical to the ones
+    ComfyUI served — the image itself still is."""
+    return Image.open(io.BytesIO(png)).convert("RGB").tobytes()
+
+
 @pytest.mark.asyncio
 async def test_run_graph_falls_back_to_history_when_websocket_event_is_lost(monkeypatch):
     """Reproduces a real, observed failure: ComfyUI can finish and drop a
@@ -473,7 +483,8 @@ async def test_run_graph_falls_back_to_history_when_websocket_event_is_lost(monk
         client, "hand_manual", source, "source.png", params, point_frac=(0.5, 0.5)
     )
 
-    assert result.data == source
+    assert _pixels(result.data) == _pixels(source)
+    assert extract_metadata(result.data)["kind"] == "hand_manual"
 
 
 @pytest.mark.asyncio
@@ -517,7 +528,7 @@ async def test_run_graph_keeps_polling_past_a_premature_terminal_event(monkeypat
 
     result = await post_process(client, "upscale", source, "source.png", params)
 
-    assert result.data == source
+    assert _pixels(result.data) == _pixels(source)
     assert client.history_calls >= 3
 
 

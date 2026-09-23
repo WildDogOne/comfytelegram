@@ -173,7 +173,7 @@ def test_post_process_keyboard_puts_tiled_passes_above_detailers():
     rows = [[b.callback_data for b in row] for row in keyboard.inline_keyboard]
     assert rows[0] == ["pp:upscale:abc123", "pp:homogenize:abc123"]
     assert rows[1] == ["pp:face:abc123", "pp:hand:abc123"]
-    assert rows[2] == ["pp:fix_draw:abc123"]
+    assert rows[2] == ["pp:fix_draw:abc123", "pp:archive:abc123"]
 
 
 def test_upscale_confirm_keyboard_scopes_both_buttons_to_result_id():

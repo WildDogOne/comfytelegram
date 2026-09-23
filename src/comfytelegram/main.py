@@ -29,6 +29,7 @@ from comfytelegram.handlers import (
     character_callback,
     character_command,
     characters_command,
+    document_message,
     generate_from_prompt_callback,
     generate_message,
     hand_point_callback,
@@ -78,7 +79,8 @@ _COMMANDS = (
 #: Matches exactly the messages none of the real handlers can claim: a
 #: `/command` that isn't one of `_COMMANDS` (`filters.COMMAND` keeps it out
 #: of `generate_message`, and no `CommandHandler` wants it), or a message
-#: that's neither text nor a photo (a sticker, a voice note, a document).
+#: that's neither text, a photo, nor an image sent as a file (a sticker, a
+#: voice note, a PDF).
 #: Both used to be dropped in total silence — no reply, no log line, the
 #: bot simply appearing to ignore you. Pairs with `TEXT_CONTENT` rather
 #: than `filters.TEXT` so it stays the exact complement of the real
@@ -86,7 +88,7 @@ _COMMANDS = (
 _UNHANDLED_FILTER = (
     filters.COMMAND
     & ~filters.Regex(rf"^/({'|'.join(name for name, _, _ in _COMMANDS)})(@\w+)?(\s|$)")
-) | ~(TEXT_CONTENT | filters.PHOTO)
+) | ~(TEXT_CONTENT | filters.PHOTO | filters.Document.IMAGE)
 
 
 async def _log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -228,6 +230,27 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
             logger.exception("Failed to notify the chat about the error")
 
 
+#: Seconds allowed to push one image's bytes to Telegram before
+#: python-telegram-bot gives up on the upload. PTB's own default is 20
+#: (`HTTPXRequest.media_write_timeout`), which a 4x-upscaled PNG reliably
+#: blows past: those land around 19-20MB, so 20 seconds demands a sustained
+#: ~8 Mbit/s uplink for the whole transfer and anything slower dies
+#: mid-body with `httpx.WriteTimeout` -> `telegram.error.TimedOut`. Seen
+#: live, twice in a row on the same upscale — and it's an expensive way to
+#: fail, because the ComfyUI run had already finished: ~3 minutes of GPU
+#: work, then the result thrown away at the last step with nothing stored
+#: and nothing sent. Generous rather than tuned, since the only thing this
+#: bounds is a genuinely dead connection: a working upload that happens to
+#: be slow should finish, not get cut off.
+MEDIA_WRITE_TIMEOUT_SECONDS = 600
+
+#: Seconds allowed for Telegram's *response* to any one request. PTB
+#: defaults to 5, which is fine for an ordinary API call but tight right
+#: after a large `sendDocument` body has gone up, since the server still
+#: has to ingest and store the file before it answers.
+READ_TIMEOUT_SECONDS = 60
+
+
 def build_application(settings: Settings) -> Application:
     """Construct the python-telegram-bot `Application`: load profiles, open
     `Storage`, register every command/callback/message handler, but don't
@@ -238,6 +261,8 @@ def build_application(settings: Settings) -> Application:
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
         .concurrent_updates(True)
+        .media_write_timeout(MEDIA_WRITE_TIMEOUT_SECONDS)
+        .read_timeout(READ_TIMEOUT_SECONDS)
         .build()
     )
     application.bot_data["settings"] = settings
@@ -271,6 +296,10 @@ def build_application(settings: Settings) -> Application:
         CallbackQueryHandler(stream_cancel_callback, pattern=rf"^{STREAM_CANCEL_CALLBACK_DATA}$")
     )
     application.add_handler(MessageHandler(filters.PHOTO, photo_message))
+    # An image sent as a *file* rather than a photo keeps its bytes intact
+    # (Telegram re-encodes photos to JPEG), so it may still carry the
+    # generation metadata `png_metadata` embeds — see `document_message`.
+    application.add_handler(MessageHandler(filters.Document.IMAGE, document_message))
     application.add_handler(MessageHandler(TEXT_CONTENT & ~filters.COMMAND, generate_message))
 
     # Group -1 runs before the real handlers and, being its own group,

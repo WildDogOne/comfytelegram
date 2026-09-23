@@ -20,6 +20,8 @@ import numpy as np
 from PIL import Image
 
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
+from comfytelegram.params_serde import serialize_generation_params
+from comfytelegram.png_metadata import build_metadata, embed_metadata, extract_seed
 from comfytelegram.profiles import ModelProfile, join_nonempty, resolve_generation_params
 from comfytelegram.workflows import (
     DrawnMaskFixParams,
@@ -478,6 +480,43 @@ async def _run_graph(
     return list(zip(data_list, (img["filename"] for img in images))), history
 
 
+def _tag_images(
+    raw: list[tuple[bytes, str]],
+    params: GenerationParams,
+    *,
+    kind: str,
+    graph: dict[str, Any],
+) -> list[tuple[bytes, str]]:
+    """Stamp each just-collected image with its own generation metadata.
+
+    Done here, at the single point every image passes through on its way
+    out of ComfyUI, rather than at send time in `handlers.py` — that way
+    the >10MB document fallback, the inpaint poller's background sends and
+    `scripts/smoke_test*.py` all get it without each remembering to. It has
+    to happen per run rather than once per image file, too: a
+    post-processing pass loads a previous image back into ComfyUI and
+    `SaveImage` writes an entirely fresh PNG, so whatever chunk the source
+    carried is already gone by the time the bytes come back here.
+
+    `graph` is the API-format graph that was actually submitted, read only
+    for the seed — `params.seed` is normally None, since the builders roll
+    the real value at build time (see `png_metadata.extract_seed`).
+    Embedding never raises; see `embed_metadata`.
+    """
+    seed = extract_seed(graph)
+    serialized = serialize_generation_params(params)
+    return [
+        (
+            embed_metadata(
+                data,
+                build_metadata(params=serialized, kind=kind, filename=name, seed=seed),
+            ),
+            name,
+        )
+        for data, name in raw
+    ]
+
+
 async def generate(
     client: ComfyClient,
     checkpoint: str,
@@ -521,6 +560,7 @@ async def generate(
     )
 
     raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
+    raw = _tag_images(raw, params, kind="txt2img", graph=prompt_graph)
     return [GeneratedImage(data=data, filename=name, full_params=params) for data, name in raw]
 
 
@@ -706,7 +746,7 @@ async def post_process(
 
     logger.info("Submitting post-process (%s) on %s", kind, uploaded_name)
     raw, history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
-    data, filename = raw[0]
+    data, filename = _tag_images(raw, full_params, kind=kind, graph=prompt_graph)[0]
     unchanged = detection_node_id is not None and await _detailer_found_nothing(
         client, history, detection_node_id
     )
@@ -735,6 +775,7 @@ async def repeat(
     )
 
     raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
+    raw = _tag_images(raw, fresh_params, kind="repeat", graph=prompt_graph)
     return [
         GeneratedImage(data=data, filename=name, full_params=fresh_params) for data, name in raw
     ]
