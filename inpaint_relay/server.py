@@ -30,7 +30,6 @@ Two trust boundaries:
 from __future__ import annotations
 
 import base64
-import io
 import logging
 import os
 import secrets
@@ -40,7 +39,6 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
-from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -57,11 +55,14 @@ JOB_TTL_SECONDS = float(os.environ.get("INPAINT_RELAY_JOB_TTL_SECONDS", "1800"))
 
 @dataclass
 class Job:
-    #: Re-encoded (see `_to_display_jpeg`) purely for faster delivery to the
-    #: mask editor's <canvas> — never the thing anything gets generated
-    #: from. `image_content_type` names what it actually got encoded as,
-    #: since re-encoding falls back to serving the original bytes verbatim
-    #: (still PNG) if Pillow can't decode them for whatever reason.
+    #: Exactly the bytes comfytelegram uploaded, served back verbatim to
+    #: the mask editor's <canvas> — never the thing anything gets generated
+    #: from. Compression happens on the *bot* side before upload (see its
+    #: `handlers._to_display_jpeg`), not here: this relay used to re-encode
+    #: on arrival, which meant a ~19MB PNG crossed the internet only to be
+    #: discarded at this end. `image_content_type` is sniffed from the
+    #: bytes rather than trusted from the request, since it's what the
+    #: browser is told to decode them as.
     image: bytes
     image_content_type: str
     created_at: float = field(default_factory=time.time)
@@ -70,24 +71,27 @@ class Job:
     init_data: str | None = None
 
 
-def _to_display_jpeg(source: bytes) -> bytes:
-    """Re-encode `source` as a quality-85 JPEG at its *original* pixel
-    dimensions — dropping only what JPEG-vs-PNG compression itself drops,
-    never resizing — purely so `GET /jobs/{token}/image` has far fewer
-    bytes to ship to the phone opening the mask editor. Safe to do
-    unconditionally: this copy is only ever drawn onto the editor's
-    on-screen `<canvas>` for visual reference while the user paints: the
-    mask they draw is submitted as its own separate grayscale PNG
-    (`POST /jobs/{token}/mask`), sized off `image.naturalWidth/Height` in
-    the browser (unchanged by re-encoding, since dimensions aren't
-    touched), and comfytelegram composites that mask against *its own*
-    original full-quality PNG upload, never this relay's copy — so nothing
-    downstream ever sees this image's compression artifacts."""
-    with Image.open(io.BytesIO(source)) as im:
-        rgb = im.convert("RGB")
-        buf = io.BytesIO()
-        rgb.save(buf, format="JPEG", quality=85)
-        return buf.getvalue()
+#: Magic-byte prefixes for the image formats comfytelegram can upload,
+#: mapped to what `GET /jobs/{token}/image` should claim they are.
+_IMAGE_SIGNATURES = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"RIFF", "image/webp"),
+)
+
+
+def _sniff_content_type(image: bytes) -> str:
+    """The media type to serve `image` back as, read from its own leading
+    bytes rather than from the upload's `Content-Type` header — the header
+    is a claim, these are the file. Falls back to
+    `application/octet-stream`, which browsers refuse to render as an
+    image, making a wrong guess visible immediately instead of producing a
+    silently blank editor canvas."""
+    for signature, content_type in _IMAGE_SIGNATURES:
+        if image.startswith(signature):
+            return content_type
+    logger.warning("Uploaded image matched no known signature; serving it untyped")
+    return "application/octet-stream"
 
 
 app = FastAPI(title="inpaint-relay")
@@ -134,20 +138,19 @@ def _prune_expired_jobs() -> None:
 @app.post("/jobs", dependencies=[Depends(require_shared_secret)])
 async def create_job(request: Request) -> dict[str, str]:
     """comfytelegram pushes the source image here (raw bytes body) and gets
-    back an unguessable token to build the WebApp button's URL from."""
+    back an unguessable token to build the WebApp button's URL from.
+
+    Stored and later served verbatim — comfytelegram compresses before
+    uploading (`handlers._to_display_jpeg`), so there is nothing useful
+    left to do to these bytes here. Doing it the other way round, as this
+    did originally, meant re-encoding a ~19MB PNG that had already spent
+    the whole upload crossing the internet."""
     _prune_expired_jobs()
     image = await request.body()
     if not image:
         raise HTTPException(status_code=400, detail="Empty request body")
-    try:
-        display_image = _to_display_jpeg(image)
-        content_type = "image/jpeg"
-    except Exception:
-        logger.warning("Couldn't re-encode uploaded image as JPEG; serving it as-is", exc_info=True)
-        display_image = image
-        content_type = "image/png"
     token = secrets.token_urlsafe(24)
-    _jobs[token] = Job(image=display_image, image_content_type=content_type)
+    _jobs[token] = Job(image=image, image_content_type=_sniff_content_type(image))
     return {"token": token}
 
 

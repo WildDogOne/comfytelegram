@@ -26,6 +26,13 @@ the bot itself.
 - Does not persist anything to disk — a restart drops every in-flight job.
   That's fine for its purpose (a job only needs to live for as long as
   someone's actively drawing).
+- Does **not** touch the image it's given. It stores the upload verbatim
+  and serves it back with a media type sniffed from the bytes' own magic
+  number. comfytelegram compresses before uploading (a quality-85 JPEG at
+  the source's original pixel dimensions), which is the right end to do it
+  at: re-encoding here, as this used to, meant a ~19MB PNG spent the whole
+  upload crossing the internet only to be thrown away on arrival. That's
+  also why this service has no image library among its dependencies.
 
 ## Running it
 

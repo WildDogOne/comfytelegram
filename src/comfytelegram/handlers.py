@@ -168,11 +168,25 @@ _DRAWN_MASK_KINDS: dict[str, dict[str, str]] = {
 }
 #: How many revisions "🔁 x4" produces in one tap.
 DRAWN_MASK_REDO4_COUNT = 4
-#: Timeout for every outbound call to inpaint_relay — it's a small,
-#: same-purpose-built service the bot fully controls the deployment of, so
-#: a slow/unreachable relay should fail fast rather than hang a poller tick
-#: or a button tap.
+#: Timeout for the *small* outbound calls to inpaint_relay (poll, delete) —
+#: it's a small, same-purpose-built service the bot fully controls the
+#: deployment of, so a slow/unreachable relay should fail fast rather than
+#: hang a poller tick or a button tap. These carry no request body worth
+#: mentioning, so a short total is exactly right for them.
 _INPAINT_RELAY_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
+#: `_relay_create_job`'s own timeout, which the short one above is *not*
+#: right for: that POST's body is a full-resolution source PNG, routinely
+#: ~20MB after an upscale, going to a relay on a different, public host.
+#: `total` covers uploading the body too, so a 15s total demanded ~10
+#: Mbit/s sustained and otherwise aborted mid-upload — seen live as
+#: `asyncio.CancelledError` here and `starlette.requests.ClientDisconnect`
+#: in the relay's log, three taps in a row, each failing at exactly 15.000s.
+#: `connect` stays short so a genuinely unreachable relay still fails fast
+#: (the property the shared timeout was really there for); `total` is
+#: generous because the only thing it now bounds is an upload that has
+#: stopped making progress.
+_INPAINT_RELAY_UPLOAD_TIMEOUT = aiohttp.ClientTimeout(total=300, connect=15)
 #: Default grid resolution for "✋ Tap to mark" (see `_draw_hand_point_grid`/
 #: `_hand_point_keyboard`) — coarse enough to keep the keyboard to
 #: `HAND_POINT_GRID_SIZE` rows of `HAND_POINT_GRID_SIZE` buttons each. A hand
@@ -786,17 +800,67 @@ async def _send_and_store_bot_result(
     return result_id
 
 
+#: JPEG quality for the mask editor's reference copy — see
+#: `_to_display_jpeg`. High enough that the user is painting over something
+#: that looks like the real image, low enough to be worth the round trip.
+_RELAY_DISPLAY_JPEG_QUALITY = 85
+
+
+def _to_display_jpeg(source: bytes) -> bytes:
+    """Re-encode a source image as a JPEG at its *original* pixel
+    dimensions, for `_relay_create_job` to upload instead of the raw PNG.
+
+    Dimensions are deliberately untouched: the mask editor sizes its mask
+    canvas off `image.naturalWidth/Height`, and `post_process` scales that
+    mask to the real image, so resizing here would silently change the
+    geometry the mask comes back in. Compression is free of downstream
+    consequences, though — this copy is only ever drawn on the editor's
+    canvas as a visual reference while painting. The mask returns as its
+    own grayscale PNG, and `_process_one_inpaint_job` composites it against
+    the full-quality original re-downloaded from `pending_result`'s
+    `file_id`, never against anything the relay holds.
+
+    Worth doing because the difference is not marginal: a 4096x4096 upscale
+    is ~19MB as PNG and ~2.4MB at this quality, an 8x cut on an upload
+    crossing the public internet to the relay's host. That upload timing
+    out mid-body is exactly what `_INPAINT_RELAY_UPLOAD_TIMEOUT` exists to
+    document. Returns `source` unchanged if Pillow can't decode it — an
+    oversized upload is much better than no mask editor at all.
+    """
+    try:
+        with Image.open(io.BytesIO(source)) as im:
+            buf = io.BytesIO()
+            im.convert("RGB").save(buf, format="JPEG", quality=_RELAY_DISPLAY_JPEG_QUALITY)
+    except Exception:
+        logger.warning("Couldn't re-encode source as JPEG; uploading it as-is", exc_info=True)
+        return source
+    return buf.getvalue()
+
+
 async def _relay_create_job(settings: Settings, image_bytes: bytes) -> str:
     """POST the source image to inpaint_relay's `POST /jobs`, returning the
     job token it assigns. Raises on any HTTP/network failure — the caller
     (`postprocess_callback`'s `HAND_DRAW_CALLBACK_KIND` branch) reports that
-    back to the chat like any other post-processing error."""
+    back to the chat like any other post-processing error.
+
+    The image is compressed here (`_to_display_jpeg`) rather than on the
+    relay, which is where this used to happen: the relay re-encoded on
+    arrival, so the full PNG crossed the internet only to be thrown away at
+    the far end. Encoding first makes the upload ~8x smaller for the same
+    bytes served to the editor. `Content-Type` tells the relay what it
+    actually got, since it no longer re-encodes and has to serve this copy
+    back verbatim."""
+    payload = _to_display_jpeg(image_bytes)
+    content_type = "image/jpeg" if payload is not image_bytes else "image/png"
     async with (
-        aiohttp.ClientSession(timeout=_INPAINT_RELAY_TIMEOUT) as session,
+        aiohttp.ClientSession(timeout=_INPAINT_RELAY_UPLOAD_TIMEOUT) as session,
         session.post(
             f"{settings.inpaint_relay_url}/jobs",
-            data=image_bytes,
-            headers={"Authorization": f"Bearer {settings.inpaint_relay_shared_secret}"},
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {settings.inpaint_relay_shared_secret}",
+                "Content-Type": content_type,
+            },
         ) as resp,
     ):
         resp.raise_for_status()
