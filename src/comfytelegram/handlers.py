@@ -2282,7 +2282,9 @@ async def _send_archive_copy(
     the fetched file, which is the only place it survives (see
     `png_metadata.extract_seed`).
     """
-    status_message = await message.reply_text("Fetching the original file…")
+    status_message = await message.reply_text(
+        "Fetching the original file…", disable_notification=True
+    )
 
     async def _fetch_and_send() -> None:
         data = await client.get_image_bytes(pending["filename"], "", "output")
