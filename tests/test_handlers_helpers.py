@@ -31,16 +31,20 @@ from comfytelegram.handlers import (
     SHOW_PROMPT_CALLBACK_KIND,
     TAGCHECK_TOKEN_LIMIT,
     TELEGRAM_PHOTO_SIZE_LIMIT,
+    UPSCALE_CUSTOM_CALLBACK_KIND,
+    UPSCALE_DEFAULTS_CALLBACK_KIND,
     _again_keyboard,
     _characters_keyboard,
     _checkpoint_labels,
     _consume_awaiting_character_edit,
     _consume_awaiting_character_rename,
+    _consume_awaiting_upscale_custom,
     _draw_hand_point_grid,
     _extract_file_id,
     _generate_from_prompt_keyboard,
     _hand_mode_keyboard,
     _hand_point_keyboard,
+    _parse_upscale_custom_input,
     _post_process_keyboard,
     _raw_prompt_copy_text,
     _resolve_effective_prompt,
@@ -53,6 +57,7 @@ from comfytelegram.handlers import (
     _tag_results_keyboard,
     _tagcheck_lines,
     _upscale_confirm_keyboard,
+    _upscale_mode_keyboard,
     hand_point_callback,
     hand_point_density_callback,
     postprocess_callback,
@@ -233,6 +238,35 @@ def test_upscale_confirm_keyboard_scopes_both_buttons_to_result_id():
     callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
     assert "pp:upscale_confirmed:abc123" in callback_data
     assert "pp:upscale_cancelled:abc123" in callback_data
+
+
+def test_upscale_mode_keyboard_scopes_both_buttons_to_result_id():
+    keyboard = _upscale_mode_keyboard("abc123")
+    callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert f"pp:{UPSCALE_DEFAULTS_CALLBACK_KIND}:abc123" in callback_data
+    assert f"pp:{UPSCALE_CUSTOM_CALLBACK_KIND}:abc123" in callback_data
+
+
+def test_parse_upscale_custom_input_reads_two_numbers():
+    assert _parse_upscale_custom_input("0.35 0.3", 0.2, 0.4) == (0.35, 0.3)
+
+
+def test_parse_upscale_custom_input_accepts_a_comma():
+    assert _parse_upscale_custom_input("0.35, 0.3", 0.2, 0.4) == (0.35, 0.3)
+
+
+def test_parse_upscale_custom_input_dash_keeps_the_live_default():
+    assert _parse_upscale_custom_input("- 0.3", 0.2, 0.4) == (0.2, 0.3)
+    assert _parse_upscale_custom_input("0.35 -", 0.2, 0.4) == (0.35, 0.4)
+
+
+def test_parse_upscale_custom_input_rejects_wrong_token_count():
+    assert _parse_upscale_custom_input("0.35", 0.2, 0.4) is None
+    assert _parse_upscale_custom_input("0.35 0.3 0.1", 0.2, 0.4) is None
+
+
+def test_parse_upscale_custom_input_rejects_non_numeric_tokens():
+    assert _parse_upscale_custom_input("high low", 0.2, 0.4) is None
 
 
 def test_again_keyboard_scopes_button_to_snapshot_id():
@@ -434,6 +468,149 @@ async def test_consume_awaiting_character_rename_rejects_a_name_already_taken():
     assert await _consume_awaiting_character_rename(update, context) is True
 
     storage.rename_character.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_custom_returns_false_when_not_pending():
+    update = MagicMock()
+    context = MagicMock()
+    context.chat_data = {}
+    context.bot_data = {"storage": MagicMock()}
+
+    assert await _consume_awaiting_upscale_custom(update, context) is False
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_custom_runs_with_the_parsed_override():
+    message = AsyncMock()
+    message.text = "0.35 0.3"
+    message.message_thread_id = None
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = MagicMock()
+    context.chat_data = {"awaiting_upscale_custom": {NO_TOPIC: "abc123"}}
+    context.bot_data = {
+        "storage": storage,
+        "comfy_client": _comfy_client_mock(),
+        "profiles": [profile],
+    }
+    context.bot.get_file = AsyncMock(
+        return_value=MagicMock(download_as_bytearray=AsyncMock(return_value=bytearray(b"orig")))
+    )
+
+    changed_result = GeneratedImage(
+        data=b"upscaled",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch(
+        "comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)
+    ) as post_process_mock:
+        assert await _consume_awaiting_upscale_custom(update, context) is True
+
+    assert "awaiting_upscale_custom" not in context.chat_data
+    post_process_mock.assert_awaited_once()
+    assert post_process_mock.await_args.args[1] == "upscale"
+    assert post_process_mock.await_args.kwargs["upscale_denoise_override"] == 0.35
+    assert post_process_mock.await_args.kwargs["tile_controlnet_strength_override"] == 0.3
+    message.reply_photo.assert_awaited_once()
+    storage.store_pending_result.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_custom_dash_keeps_the_live_default():
+    message = AsyncMock()
+    message.text = "0.35 -"
+    message.message_thread_id = None
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    # No tile_controlnet on this profile — its own field default (0.4) is
+    # what "-" should resolve to (see resolve_live_upscale_defaults).
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = MagicMock()
+    context.chat_data = {"awaiting_upscale_custom": {NO_TOPIC: "abc123"}}
+    context.bot_data = {
+        "storage": storage,
+        "comfy_client": _comfy_client_mock(),
+        "profiles": [profile],
+    }
+    context.bot.get_file = AsyncMock(
+        return_value=MagicMock(download_as_bytearray=AsyncMock(return_value=bytearray(b"orig")))
+    )
+
+    changed_result = GeneratedImage(
+        data=b"upscaled",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch(
+        "comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)
+    ) as post_process_mock:
+        assert await _consume_awaiting_upscale_custom(update, context) is True
+
+    assert post_process_mock.await_args.kwargs["upscale_denoise_override"] == 0.35
+    assert post_process_mock.await_args.kwargs["tile_controlnet_strength_override"] == 0.4
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_custom_rejects_unparseable_input():
+    message = AsyncMock()
+    message.text = "not numbers"
+    message.message_thread_id = None
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = MagicMock()
+    context.chat_data = {"awaiting_upscale_custom": {NO_TOPIC: "abc123"}}
+    context.bot_data = {
+        "storage": storage,
+        "comfy_client": _comfy_client_mock(),
+        "profiles": [profile],
+    }
+
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock()) as post_process_mock:
+        assert await _consume_awaiting_upscale_custom(update, context) is True
+
+    post_process_mock.assert_not_called()
+    message.reply_text.assert_awaited_once()
+    assert "Couldn't read that" in message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_custom_handles_an_expired_result():
+    message = AsyncMock()
+    message.text = "0.35 0.3"
+    message.message_thread_id = None
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    storage = MagicMock()
+    storage.get_pending_result.return_value = None
+    context = MagicMock()
+    context.chat_data = {"awaiting_upscale_custom": {NO_TOPIC: "abc123"}}
+    context.bot_data = {"storage": storage}
+
+    assert await _consume_awaiting_upscale_custom(update, context) is True
+
+    message.reply_text.assert_awaited_once()
+    assert "expired" in message.reply_text.await_args.args[0]
 
 
 def test_extract_file_id_prefers_largest_photo_size():
@@ -985,6 +1162,100 @@ async def test_hand_auto_with_a_real_change_sends_the_image_normally():
     query.message.reply_photo.assert_awaited_once()
     storage.store_pending_result.assert_called_once()
     assert not any("unchanged" in call.args[0] for call in query.message.reply_text.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_upscale_tap_offers_defaults_or_customize_choice():
+    query = AsyncMock()
+    query.data = "pp:upscale:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    context.chat_data = {}
+
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock()) as post_process_mock:
+        await postprocess_callback(update, context)
+
+    post_process_mock.assert_not_called()
+    query.message.reply_text.assert_awaited_once()
+    message_text = query.message.reply_text.await_args.args[0]
+    # This profile has no tile_controlnet configured — the numbers shown
+    # should be the field's own default (0.4) and UpscaleParams' own
+    # denoise default (0.2), from resolve_live_upscale_defaults.
+    assert "denoise 0.2" in message_text
+    assert "tile ControlNet strength 0.4" in message_text
+    keyboard = query.message.reply_text.await_args.kwargs["reply_markup"]
+    callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert f"pp:{UPSCALE_DEFAULTS_CALLBACK_KIND}:abc123" in callback_data
+    assert f"pp:{UPSCALE_CUSTOM_CALLBACK_KIND}:abc123" in callback_data
+
+
+@pytest.mark.asyncio
+async def test_upscale_customize_choice_sets_the_awaiting_flag():
+    query = AsyncMock()
+    query.data = f"pp:{UPSCALE_CUSTOM_CALLBACK_KIND}:abc123"
+    query.message.message_thread_id = None
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    context.chat_data = {}
+
+    await postprocess_callback(update, context)
+
+    assert context.chat_data["awaiting_upscale_custom"][NO_TOPIC] == "abc123"
+    query.message.reply_text.assert_awaited_once()
+    assert "denoise" in query.message.reply_text.await_args.args[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_upscale_defaults_choice_runs_like_a_bare_upscale_tap():
+    query = AsyncMock()
+    query.data = f"pp:{UPSCALE_DEFAULTS_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    context.chat_data = {}
+    # The "upscale" path measures the source image (already-large-image
+    # gate) before post-processing it — needs real PNG bytes, unlike the
+    # face/hand tests this fixture otherwise serves.
+    source_png = io.BytesIO()
+    Image.new("RGB", (64, 64)).save(source_png, format="PNG")
+    context.bot.get_file = AsyncMock(
+        return_value=MagicMock(
+            download_as_bytearray=AsyncMock(return_value=bytearray(source_png.getvalue()))
+        )
+    )
+
+    changed_result = GeneratedImage(
+        data=b"upscaled",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch(
+        "comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)
+    ) as post_process_mock:
+        await postprocess_callback(update, context)
+
+    post_process_mock.assert_awaited_once()
+    assert post_process_mock.await_args.args[1] == "upscale"
+    assert "upscale_denoise_override" not in post_process_mock.await_args.kwargs
+    assert "tile_controlnet_strength_override" not in post_process_mock.await_args.kwargs
+    query.message.reply_photo.assert_awaited_once()
 
 
 @pytest.mark.asyncio

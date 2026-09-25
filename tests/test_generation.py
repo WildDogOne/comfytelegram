@@ -416,6 +416,74 @@ async def test_post_process_upscale_honors_profile_upscale_denoise():
 
 
 @pytest.mark.asyncio
+async def test_post_process_upscale_prefers_live_profile_over_stale_frozen_params():
+    """`params.upscale_denoise`/`tile_controlnet_strength` are whatever the
+    profile said back when this image was generated — if the profile's JSON
+    file was edited since, a same-day "🔍 Upscale 4x" tap should pick up the
+    new values immediately, not the stale ones frozen into `params`."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        tile_controlnet_strength=0.25,
+        upscale_denoise=0.4,
+    )
+    live_profile = ModelProfile(
+        match=["furrytoonmix_*"],
+        display_name="FurryToonMix",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        tile_controlnet_strength=0.4,
+        defaults=ProfileDefaults(upscale_denoise=0.3),
+    )
+
+    await post_process(client, "upscale", source, "source.png", params, profiles=[live_profile])
+
+    upscale_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "UltimateSDUpscale"
+    )
+    controlnet_apply = next(
+        node
+        for node in client.queued_graph.values()
+        if node["class_type"] == "ControlNetApplyAdvanced"
+    )
+    assert upscale_node["inputs"]["denoise"] == 0.3
+    assert controlnet_apply["inputs"]["strength"] == 0.4
+
+
+@pytest.mark.asyncio
+async def test_post_process_upscale_without_matching_profile_keeps_frozen_params():
+    """No shipped profile matches this checkpoint any more (removed, or a
+    foreign/imported image) — fall back to whatever was frozen into `params`
+    at generation time instead of dropping the tile-controlnet branch."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        tile_controlnet_strength=0.25,
+        upscale_denoise=0.4,
+    )
+
+    await post_process(client, "upscale", source, "source.png", params, profiles=[])
+
+    upscale_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "UltimateSDUpscale"
+    )
+    controlnet_apply = next(
+        node
+        for node in client.queued_graph.values()
+        if node["class_type"] == "ControlNetApplyAdvanced"
+    )
+    assert upscale_node["inputs"]["denoise"] == 0.4
+    assert controlnet_apply["inputs"]["strength"] == 0.25
+
+
+@pytest.mark.asyncio
 async def test_post_process_hand_manual_never_flags_unchanged():
     """A manually-marked mask has no detection-check node either (see
     `build_hand_detailer_manual`) — it's never "nothing detected"."""

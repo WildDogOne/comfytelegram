@@ -48,7 +48,13 @@ from comfytelegram.auth import (
     validate_webapp_init_data,
 )
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
-from comfytelegram.generation import GeneratedImage, generate, post_process, repeat
+from comfytelegram.generation import (
+    GeneratedImage,
+    generate,
+    post_process,
+    repeat,
+    resolve_live_upscale_defaults,
+)
 from comfytelegram.message_text import message_text
 from comfytelegram.params_serde import (
     deserialize_generation_params,
@@ -112,6 +118,21 @@ ARCHIVE_CALLBACK_KIND = "archive"
 ANALYZE_PROMPT_CALLBACK_KIND = "analyze_prompt"
 UPSCALE_CONFIRM_CALLBACK_KIND = "upscale_confirmed"
 UPSCALE_CANCEL_CALLBACK_KIND = "upscale_cancelled"
+#: "🔍 Upscale 4x" doesn't upscale immediately either — like "🖐️ Hand
+#: Detail" below, it first asks whether to run with the checkpoint's live
+#: profile defaults (see `resolve_live_upscale_defaults`) or a one-shot
+#: custom denoise/tile-ControlNet-strength for just this image
+#: (`_upscale_mode_keyboard`). `UPSCALE_DEFAULTS_CALLBACK_KIND` is
+#: translated back to plain `"upscale"` right before the shared upscale/
+#: face/hand block, the same way `HAND_AUTO_CALLBACK_KIND` is for `"hand"`,
+#: so it takes the exact path a bare `"upscale"` tap used to (including the
+#: `UPSCALE_CONFIRM_CALLBACK_KIND` already-large-image gate).
+#: `UPSCALE_CUSTOM_CALLBACK_KIND` instead sets the `awaiting_upscale_custom`
+#: one-field flag (see `_consume_awaiting_upscale_custom`) and asks for the
+#: two values as a follow-up message — a one-shot override, never saved
+#: anywhere, unlike a profile's own JSON-file defaults.
+UPSCALE_DEFAULTS_CALLBACK_KIND = "upscale_defaults"
+UPSCALE_CUSTOM_CALLBACK_KIND = "upscale_custom"
 #: "🖐️ Hand Detail" doesn't post-process immediately — it asks auto vs.
 #: manual first (see `_hand_mode_keyboard`), since the YOLO bbox detector
 #: `HAND_AUTO_CALLBACK_KIND` runs often can't find a hand at all.
@@ -501,6 +522,27 @@ def _upscale_confirm_keyboard(result_id: str) -> InlineKeyboardMarkup:
                 ),
                 InlineKeyboardButton(
                     "❌ Cancel", callback_data=f"pp:{UPSCALE_CANCEL_CALLBACK_KIND}:{result_id}"
+                ),
+            ]
+        ]
+    )
+
+
+def _upscale_mode_keyboard(result_id: str) -> InlineKeyboardMarkup:
+    """Attached to "🔍 Upscale 4x"'s first reply — lets the user run with the
+    checkpoint's live profile defaults (`UPSCALE_DEFAULTS_CALLBACK_KIND`) or
+    set a one-shot denoise/tile-ControlNet-strength for just this image
+    (`UPSCALE_CUSTOM_CALLBACK_KIND`). See `postprocess_callback`."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Use Defaults",
+                    callback_data=f"pp:{UPSCALE_DEFAULTS_CALLBACK_KIND}:{result_id}",
+                ),
+                InlineKeyboardButton(
+                    "⚙️ Customize",
+                    callback_data=f"pp:{UPSCALE_CUSTOM_CALLBACK_KIND}:{result_id}",
                 ),
             ]
         ]
@@ -2106,10 +2148,11 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     with live progress, then deliver the result. Defaults to ComfyUI's
     first available checkpoint (and remembers it) if none is selected yet.
     A pending "custom value" `/settings` entry (see
-    `handle_custom_value_message`) or an in-progress `/stream` prompt or
-    character-edit/-rename entry takes priority over treating the text as a
-    prompt. "✏️ Detail Prompt" has no entry here to take priority over —
-    it's a webapp editor now, not a chat follow-up (see
+    `handle_custom_value_message`) or an in-progress `/stream` prompt,
+    character-edit/-rename entry, or "⚙️ Customize" upscale denoise/tile-
+    strength entry (`_consume_awaiting_upscale_custom`) takes priority over
+    treating the text as a prompt. "✏️ Detail Prompt" has no entry here to
+    take priority over — it's a webapp editor now, not a chat follow-up (see
     `DETAIL_PROMPT_CALLBACK_KIND`)."""
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
@@ -2125,6 +2168,9 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if await _consume_awaiting_character_rename(update, context):
+        return
+
+    if await _consume_awaiting_upscale_custom(update, context):
         return
 
     message = update.effective_message
@@ -2559,14 +2605,27 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     checkpoint profile is tag-trained and tag data is imported — see
     `ANALYZE_PROMPT_CALLBACK_KIND`), or
     `"upscale"`/`"homogenize"`/`"face"`/`"hand"` (download the source image
-    and run that post-processing stage on it). A fresh `"upscale"` tap on an
-    image already at or beyond `UPSCALE_CONFIRM_THRESHOLD_PX` doesn't upscale
-    immediately — it downloads just far enough to measure the image, then
-    replies with a "this is already large — continue?" prompt
-    (`_upscale_confirm_keyboard`) instead, which comes back as either
-    `UPSCALE_CONFIRM_CALLBACK_KIND` (proceed) or
-    `UPSCALE_CANCEL_CALLBACK_KIND` (abort) — `"homogenize"` has no such gate,
-    since it never changes the image's pixel dimensions (see
+    and run that post-processing stage on it). A bare `"upscale"` tap
+    doesn't upscale immediately either — it first replies with
+    `_upscale_mode_keyboard`'s "use defaults or customize?" choice (showing
+    the checkpoint's live `resolve_live_upscale_defaults` numbers), since
+    `tile_controlnet_strength`/`upscale_denoise` are tuning knobs worth
+    overriding per image sometimes, unlike everything else post-processing
+    inherits from the original generation. `UPSCALE_DEFAULTS_CALLBACK_KIND`
+    is translated back to plain `"upscale"` right before the block below, so
+    it takes the exact path a bare tap used to; `UPSCALE_CUSTOM_CALLBACK_KIND`
+    instead sets the `awaiting_upscale_custom` flag and asks for a
+    "<denoise> <tile strength>" follow-up message
+    (`_consume_awaiting_upscale_custom`), which runs the upscale itself with
+    those as a one-shot override — never saved, unlike a profile's own
+    defaults. Only *then* does the already-large-image gate apply: a fresh
+    `"upscale"` tap (post-choice) on an image already at or beyond
+    `UPSCALE_CONFIRM_THRESHOLD_PX` doesn't upscale immediately either — it
+    downloads just far enough to measure the image, then replies with a
+    "this is already large — continue?" prompt (`_upscale_confirm_keyboard`)
+    instead, which comes back as either `UPSCALE_CONFIRM_CALLBACK_KIND`
+    (proceed) or `UPSCALE_CANCEL_CALLBACK_KIND` (abort) — `"homogenize"` has
+    no such gate, since it never changes the image's pixel dimensions (see
     `generation.post_process`'s `TiledRefineParams` branch). A `"face"`/`"hand"` result whose
     detector found nothing to refine (`GeneratedImage.unchanged`, see
     `post_process`) isn't sent or stored at all — it's pixel-identical to
@@ -2735,6 +2794,33 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text(
             "Auto-detect usually finds it, but you can mark the hand yourself if it keeps missing:",
             reply_markup=_hand_mode_keyboard(result_id, settings),
+        )
+        return
+
+    if kind == "upscale":
+        # Clears any stale "⚙️ Customize" text-entry flag — reached either
+        # from a fresh tap (nothing pending, a harmless no-op) or from that
+        # prompt's own "↩ Cancel" button, which re-shows this chooser rather
+        # than routing through `_make_cancel_callback`'s dedicated pattern.
+        pop_pending(context.chat_data, "awaiting_upscale_custom", query.message)
+        profiles: list[ModelProfile] = context.bot_data["profiles"]
+        tile_strength, denoise = resolve_live_upscale_defaults(full_params.checkpoint, profiles)
+        await query.message.reply_text(
+            f"🔍 Upscale 4x — current profile defaults: denoise {denoise:g}, "
+            f"tile ControlNet strength {tile_strength:g}.",
+            reply_markup=_upscale_mode_keyboard(result_id),
+        )
+        return
+
+    if kind == UPSCALE_CUSTOM_CALLBACK_KIND:
+        set_pending(context.chat_data, "awaiting_upscale_custom", query.message, result_id)
+        await query.message.reply_text(
+            "Send the denoise and tile ControlNet strength to use for this "
+            "upscale, e.g. `0.35 0.3` (denoise, then tile strength — send `-` "
+            "for either one to keep it at its live default).",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("↩ Cancel", callback_data=f"pp:upscale:{result_id}")]]
+            ),
         )
         return
 
@@ -2908,6 +2994,9 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if kind == HAND_AUTO_CALLBACK_KIND:
         kind = "hand"
 
+    if kind == UPSCALE_DEFAULTS_CALLBACK_KIND:
+        kind = "upscale"
+
     source_bytes: bytes | None = None
     if kind in ("upscale", UPSCALE_CONFIRM_CALLBACK_KIND):
         if kind == UPSCALE_CONFIRM_CALLBACK_KIND:
@@ -2947,7 +3036,14 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 pending["file_id"],
                 on_fallback=_source_fallback_notifier(query.message),
             )
-        return await post_process(client, kind, data, pending["filename"], full_params)
+        return await post_process(
+            client,
+            kind,
+            data,
+            pending["filename"],
+            full_params,
+            profiles=context.bot_data["profiles"],
+        )
 
     result = await _run_reporting_errors(
         status_message, label, "post-processing", _download_and_post_process()
@@ -3342,6 +3438,105 @@ async def _consume_awaiting_character_rename(
 
     storage.rename_character(chat_id, old_name, new_name)
     await message.reply_text(f"Renamed '{old_name}' to '{new_name}'.")
+    return True
+
+
+def _parse_upscale_custom_input(
+    raw: str, default_denoise: float, default_tile_strength: float
+) -> tuple[float, float] | None:
+    """Parse "⚙️ Customize"'s follow-up message: exactly two space/comma
+    separated numbers, denoise then tile ControlNet strength — either one
+    can be `-` to keep it at the live default already shown in the "🔍
+    Upscale 4x" prompt (`resolve_live_upscale_defaults`) instead of typing
+    it back out. Returns None if the text doesn't parse (wrong token count,
+    or a non-numeric, non-`-` token)."""
+    tokens = raw.replace(",", " ").split()
+    if len(tokens) != 2:
+        return None
+
+    def _token(value: str, default: float) -> float | None:
+        if value == "-":
+            return default
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+    denoise = _token(tokens[0], default_denoise)
+    tile_strength = _token(tokens[1], default_tile_strength)
+    if denoise is None or tile_strength is None:
+        return None
+    return denoise, tile_strength
+
+
+async def _consume_awaiting_upscale_custom(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """If this chat is mid-"send the denoise/tile strength" entry (see
+    `postprocess_callback`'s `UPSCALE_CUSTOM_CALLBACK_KIND` branch), consume
+    the incoming text as that one-shot override and run the upscale,
+    returning True. Otherwise return False so the caller (`generate_message`)
+    treats the text as a normal generation prompt instead. Mirrors
+    `_consume_awaiting_stream_prompt`, but runs the post-processing pass
+    itself rather than handing off to a shared starter — there's no other
+    caller for "upscale with an explicit denoise/tile-strength override" to
+    share it with."""
+    message = update.effective_message
+    result_id = pop_pending(context.chat_data, "awaiting_upscale_custom", message)
+    if result_id is None:
+        return False
+
+    storage: Storage = context.bot_data["storage"]
+    pending = storage.get_pending_result(result_id)
+    if pending is None:
+        await message.reply_text("That image has expired — nothing to upscale.")
+        return True
+
+    full_params = _deserialize_generation_params(pending["base_params"])
+    profiles: list[ModelProfile] = context.bot_data["profiles"]
+    tile_default, denoise_default = resolve_live_upscale_defaults(full_params.checkpoint, profiles)
+
+    raw = (message_text(message) or "").strip()
+    parsed = _parse_upscale_custom_input(raw, denoise_default, tile_default)
+    if parsed is None:
+        await message.reply_text(
+            "Couldn't read that — send two numbers, e.g. `0.35 0.3` (denoise, "
+            "then tile ControlNet strength; `-` keeps a value at its live default)."
+        )
+        return True
+    denoise, tile_strength = parsed
+
+    client: ComfyClient = context.bot_data["comfy_client"]
+    label = POSTPROCESS_STATUS_LABELS["upscale"]
+    status_message = await message.reply_text(f"{label}…", disable_notification=True)
+
+    async def _download_and_post_process() -> GeneratedImage:
+        data = await _fetch_source_image(
+            client,
+            context.bot,
+            pending["filename"],
+            pending["file_id"],
+            on_fallback=_source_fallback_notifier(message),
+        )
+        return await post_process(
+            client,
+            "upscale",
+            data,
+            pending["filename"],
+            full_params,
+            profiles=profiles,
+            upscale_denoise_override=denoise,
+            tile_controlnet_strength_override=tile_strength,
+        )
+
+    result = await _run_reporting_errors(
+        status_message, label, "post-processing", _download_and_post_process()
+    )
+    if result is None:
+        return True
+
+    await status_message.delete()
+    await _send_and_store_result(message, pending["chat_id"], storage, result)
     return True
 
 

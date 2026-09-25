@@ -22,7 +22,12 @@ from PIL import Image
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
 from comfytelegram.params_serde import serialize_generation_params
 from comfytelegram.png_metadata import build_metadata, embed_metadata, extract_seed
-from comfytelegram.profiles import ModelProfile, join_nonempty, resolve_generation_params
+from comfytelegram.profiles import (
+    ModelProfile,
+    join_nonempty,
+    resolve_generation_params,
+    resolve_profile,
+)
 from comfytelegram.workflows import (
     DrawnMaskFixParams,
     DrawnMaskHandDetailerParams,
@@ -131,6 +136,65 @@ def _to_post_process_base(params: GenerationParams) -> PostProcessBaseParams:
         anima_lllite_inpaint_patch_strength=params.anima_lllite_inpaint_patch_strength,
         upscale_denoise=params.upscale_denoise,
     )
+
+
+#: `post_process` kinds whose whole-image tiled pass reads
+#: `PostProcessBaseParams.tile_controlnet`/`tile_controlnet_strength`/
+#: `upscale_denoise` — see `_refresh_tunable_defaults`.
+_TILED_UPSCALE_KINDS = ("upscale", "homogenize")
+
+
+def _refresh_tunable_defaults(
+    base: PostProcessBaseParams, profiles: list[ModelProfile] | None
+) -> PostProcessBaseParams:
+    """`tile_controlnet(_strength)`/`upscale_denoise` are tuning knobs meant
+    to be edited in a profile's JSON file over time — unlike checkpoint/
+    LoRAs/prompt, nothing requires them to match what a given image was
+    originally generated with for post-processing to make sense. But `base`
+    was narrowed off `full_params` (`_to_post_process_base`), which froze
+    whatever the profile said *at generation time* — so editing the profile
+    afterward had no effect on that image's own post-processing passes
+    until it was regenerated from scratch (confirmed live: a same-day
+    profile edit to `upscale_denoise`/`tile_controlnet_strength` didn't
+    change the very next "🔍 Upscale 4x" tap on an image generated earlier
+    that day). Re-resolving against the checkpoint's *current* profile here
+    instead means an edited profile takes effect on the next tap, no
+    regeneration needed. Falls back to `base` unchanged if the checkpoint no
+    longer matches any shipped profile (a foreign/imported image, or one
+    whose profile was since removed) or `profiles` wasn't supplied at all."""
+    live_profile = resolve_profile(base.checkpoint, profiles or [])
+    if live_profile is None:
+        return base
+    return replace(
+        base,
+        tile_controlnet=live_profile.tile_controlnet,
+        tile_controlnet_strength=live_profile.tile_controlnet_strength,
+        upscale_denoise=live_profile.defaults.upscale_denoise,
+    )
+
+
+def resolve_live_upscale_defaults(
+    checkpoint: str, profiles: list[ModelProfile]
+) -> tuple[float, float]:
+    """The `(tile_controlnet_strength, upscale_denoise)` pair a "🔍 Upscale
+    4x" tap on `checkpoint` would use right now with no override — the same
+    live-profile resolution `_refresh_tunable_defaults` applies, with
+    `UpscaleParams`'s own 0.2 denoise default filled in when the matched
+    profile (or lack of one) leaves `defaults.upscale_denoise` unset. Used by
+    handlers.py to show the actual numbers in the "use defaults or
+    customize?" prompt that precedes an upscale, instead of a blind "use
+    defaults" button telling the user nothing about what they'd get."""
+    profile = resolve_profile(checkpoint, profiles)
+    # `0.4` mirrors `ModelProfile.tile_controlnet_strength`'s own field
+    # default — read straight off `profile` when one matched rather than
+    # constructing a placeholder `ModelProfile` just to get it back.
+    tile_strength = profile.tile_controlnet_strength if profile is not None else 0.4
+    denoise = (
+        profile.defaults.upscale_denoise
+        if profile is not None and profile.defaults.upscale_denoise is not None
+        else UpscaleParams().denoise
+    )
+    return tile_strength, denoise
 
 
 #: The `post_process` kinds a caller-supplied detail prompt/denoise
@@ -707,6 +771,8 @@ async def post_process(
     detail_prompt: str | None = None,
     detail_negative_prompt: str | None = None,
     denoise: float | None = None,
+    upscale_denoise_override: float | None = None,
+    tile_controlnet_strength_override: float | None = None,
     on_progress: ProgressCallback | None = None,
     profiles: list[ModelProfile] | None = None,
 ) -> GeneratedImage:
@@ -742,11 +808,29 @@ async def post_process(
     since removing an arbitrary artifact needs more creative latitude than
     a hand touch-up) instead of the hand-tuned graph — for painting over any
     unwanted region (a stray object, a background glitch, a watermark)
-    rather than just a hand. `profiles`, if given, is only consulted for
-    `kind="fix_drawn"` — see `_fix_artifact_override_base` — to run that
-    pass against a fixed, known-inpainting-aware checkpoint regardless of
-    which one the image was originally generated with; every other `kind`
-    ignores it entirely and keeps using the image's own checkpoint.
+    rather than just a hand. `profiles`, if given, is consulted for two
+    unrelated things depending on `kind`: `"fix_drawn"` — see
+    `_fix_artifact_override_base` — runs that pass against a fixed,
+    known-inpainting-aware checkpoint regardless of which one the image was
+    originally generated with; `"upscale"`/`"homogenize"` instead re-resolve
+    `tile_controlnet`/`tile_controlnet_strength`/`upscale_denoise` off the
+    checkpoint's *current* profile (see `_refresh_tunable_defaults`) rather
+    than the values frozen into the image at generation time, so editing a
+    profile's JSON file is reflected on the very next tap instead of only
+    on the next fresh generation. Every other `kind` ignores `profiles`
+    entirely and keeps using the image's own checkpoint/values as recorded
+    in `full_params`. `upscale_denoise_override`/`tile_controlnet_strength_override`
+    are `kind="upscale"`'s own one-shot override, applied on top of whatever
+    `profiles` already resolved — handlers.py's "⚙️ Customize" step on the
+    "🔍 Upscale 4x" prompt (see `resolve_live_upscale_defaults`), for a
+    single image where the live profile defaults aren't what's wanted
+    without editing the profile's JSON file for every future image too.
+    `None` (the default for each, independently) keeps whichever value
+    `profiles` resolved for that one. Ignored for every other `kind`,
+    including `"homogenize"` — its `TiledRefineParams` denoise is a fixed
+    low-denoise seam-blend pass by design, with no customize step of its
+    own, though `tile_controlnet_strength_override` would need extending to
+    reach it if that ever changes.
     `detail_prompt`/`detail_negative_prompt`/`denoise` are a one-shot
     override for `kind="hand_drawn"` only (`DETAIL_PROMPT_KINDS` —
     handlers.py's "✏️ Detail Prompt" flow: a freehand mask plus a prompt
@@ -761,6 +845,24 @@ async def post_process(
     base_params = _to_post_process_base(full_params)
     if kind in DETAIL_PROMPT_KINDS:
         base_params = _apply_detail_prompt(base_params, detail_prompt, detail_negative_prompt)
+    if kind in _TILED_UPSCALE_KINDS:
+        base_params = _refresh_tunable_defaults(base_params, profiles)
+    if kind == "upscale" and (
+        upscale_denoise_override is not None or tile_controlnet_strength_override is not None
+    ):
+        base_params = replace(
+            base_params,
+            upscale_denoise=(
+                upscale_denoise_override
+                if upscale_denoise_override is not None
+                else base_params.upscale_denoise
+            ),
+            tile_controlnet_strength=(
+                tile_controlnet_strength_override
+                if tile_controlnet_strength_override is not None
+                else base_params.tile_controlnet_strength
+            ),
+        )
     upload = await client.upload_image(source_image, filename=source_filename)
     uploaded_name = upload["name"]
 
