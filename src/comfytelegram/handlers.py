@@ -70,7 +70,7 @@ from comfytelegram.profiles import (
 )
 from comfytelegram.settings import Settings
 from comfytelegram.settings_menu import _safe_edit_message, handle_custom_value_message
-from comfytelegram.storage import Storage
+from comfytelegram.storage import IMAGE_FORMAT_PNG, Storage
 from comfytelegram.tags import TagDatabase, TagResult, TagSource, category_label
 from comfytelegram.topics import pop_pending, set_pending
 from comfytelegram.workflows import GenerationParams, ManualHandDetailerParams
@@ -741,21 +741,134 @@ async def _download_telegram_file(bot: Bot, file_id: str) -> bytes:
     return bytes(await tg_file.download_as_bytearray())
 
 
+#: `_fetch_source_image`'s user-facing heads-up when it has to fall back to
+#: Telegram's copy — surfaced so a degraded (possibly JPEG-recompressed)
+#: source doesn't look identical to the lossless ComfyUI one it usually
+#: gets, in case the visible quality dip is otherwise puzzling.
+_SOURCE_FALLBACK_NOTICE = (
+    "ℹ️ ComfyUI no longer has the original file for this image — using the "
+    "Telegram copy instead, which may already be JPEG-compressed."
+)
+
+
+async def _fetch_source_image(
+    client: ComfyClient,
+    bot: Bot,
+    filename: str,
+    file_id: str,
+    *,
+    on_fallback: Callable[[], Awaitable[None]] | None = None,
+) -> bytes:
+    """The source-image bytes for a post-processing pass: ComfyUI's own
+    untouched output-directory copy (via `filename`, the same `/view`
+    lookup `_send_archive_copy` uses) when it's still there, falling back
+    to Telegram's `file_id` copy otherwise.
+
+    Tried in that order because `_send_photo_or_document` JPEG-encodes
+    every photo-sized send now — `file_id` is a lossy copy for almost every
+    result, and a chain of post-processing passes on the same session's
+    image (upscale -> face detail -> hand detail, ...) would otherwise
+    compound that recompression at every step. The fallback (rather than
+    treating a missing ComfyUI file as fatal) is what keeps a cleaned-up
+    output directory, or a `document_message`-imported row whose `filename`
+    may belong to an entirely different ComfyUI install, from hard-failing
+    an otherwise-normal post-processing tap — see `_send_archive_copy`'s
+    identical reasoning for why the ComfyUI copy can simply not be there.
+
+    `on_fallback`, when given, is awaited right before that fallback
+    download — every caller passes a closure that surfaces
+    `_SOURCE_FALLBACK_NOTICE` through whatever reply mechanism it has
+    (`query.message.reply_text`, or `bot.send_message` for
+    `_process_one_inpaint_job`'s background task), so a quieter-than-usual
+    result doesn't look like an unexplained regression."""
+    try:
+        return await client.get_image_bytes(filename, "", "output")
+    except (ComfyUIError, aiohttp.ClientError, TimeoutError):
+        if on_fallback is not None:
+            await on_fallback()
+        return await _download_telegram_file(bot, file_id)
+
+
+def _source_fallback_notifier(message: Message) -> Callable[[], Awaitable[None]]:
+    """`_fetch_source_image`'s `on_fallback` for every caller that has a
+    `Message` to reply into (`postprocess_callback`, `hand_point_callback`,
+    `hand_point_density_callback` — all callback-query handlers)."""
+
+    async def _notify() -> None:
+        await message.reply_text(_SOURCE_FALLBACK_NOTICE, disable_notification=True)
+
+    return _notify
+
+
+def _source_fallback_notifier_bot(
+    bot: Bot, chat_id: int, message_thread_id: int | None
+) -> Callable[[], Awaitable[None]]:
+    """`_fetch_source_image`'s `on_fallback` for `_process_one_inpaint_job`,
+    a background task with no `Message` to reply into —
+    `message_thread_id` has to be passed through explicitly for the same
+    reason `_send_and_store_bot_result` does."""
+
+    async def _notify() -> None:
+        await bot.send_message(
+            chat_id,
+            _SOURCE_FALLBACK_NOTICE,
+            message_thread_id=message_thread_id,
+            disable_notification=True,
+        )
+
+    return _notify
+
+
 async def _send_photo_or_document(
     send_photo: Callable[..., Awaitable[Message]],
     send_document: Callable[..., Awaitable[Message]],
     data: bytes,
     filename: str,
     reply_markup: InlineKeyboardMarkup,
+    *,
+    use_jpeg: bool = True,
 ) -> Message:
-    """Send `data` as a photo, falling back to a document when it's too big
-    for Telegram's photo path (see TELEGRAM_PHOTO_SIZE_LIMIT above). Shared
-    by `_send_result_image` (`message.reply_*`) and
+    """Send `data` (raw PNG bytes out of ComfyUI) as a photo, JPEG-encoding
+    it first (`_to_display_jpeg`) so the in-chat copy stays small regardless
+    of resolution — a 4x upscale is ~19MB as PNG and a few MB as JPEG at
+    `_DISPLAY_JPEG_QUALITY`, so this also keeps the overwhelming majority of
+    sends, upscales included, under TELEGRAM_PHOTO_SIZE_LIMIT instead of
+    falling back to the raw-PNG document path every time. That fallback is
+    kept only for the rare case the JPEG re-encode itself still doesn't fit,
+    or Pillow can't decode `data` at all (`_to_display_jpeg` returns it
+    unchanged then).
+
+    `use_jpeg=False` (the chat's `/settings` "🖼️ Display" toggle —
+    `storage.get_image_format`, `IMAGE_FORMAT_PNG` — see
+    `_send_and_store_result`/`_send_and_store_bot_result`) skips the
+    re-encode entirely and sends the original PNG, still subject to the
+    same size-based sendDocument fallback below: for someone running a
+    long, multi-day session who'd rather pay the bandwidth than risk any
+    recompression across a chain of post-processing passes.
+
+    This is display-only — no metadata rides along, since `png_metadata`'s
+    `tEXt` chunk is PNG-specific and this photo may not even be PNG bytes
+    any more (irrespective of `use_jpeg`, since Telegram's own `sendPhoto`
+    re-encodes to JPEG regardless). "📥 Download file"
+    (`_send_archive_copy`) is the metadata-bearing, full-quality copy, and
+    it doesn't use this path at all: it re-fetches the original PNG
+    straight from ComfyUI instead of whatever was actually sent here.
+    Likewise, post-processing sources its next pass's pixels via
+    `_fetch_source_image` (ComfyUI first, this photo's `file_id` only as a
+    fallback) rather than re-downloading what this function sent, so a
+    chain of edits doesn't compound this JPEG recompression at every step
+    even when `use_jpeg` is True.
+
+    Shared by `_send_result_image` (`message.reply_*`) and
     `_send_and_store_bot_result` (`bot.send_*` against a bare chat_id, for
     code with no `Message` to reply into) so the size threshold and
     oversized-file caption live in one place. Returns the sent message —
     callers need it to read back the file_id Telegram assigned, for
     `_store_pending_result`."""
+    if use_jpeg:
+        jpeg = await asyncio.to_thread(_to_display_jpeg, data, _DISPLAY_JPEG_QUALITY)
+        if jpeg is not data and len(jpeg) <= TELEGRAM_PHOTO_SIZE_LIMIT:
+            return await send_photo(photo=io.BytesIO(jpeg), reply_markup=reply_markup)
     if len(data) <= TELEGRAM_PHOTO_SIZE_LIMIT:
         return await send_photo(photo=io.BytesIO(data), reply_markup=reply_markup)
     return await send_document(
@@ -771,6 +884,8 @@ async def _send_result_image(
     data: bytes,
     filename: str,
     reply_markup: InlineKeyboardMarkup,
+    *,
+    use_jpeg: bool = True,
 ) -> Message:
     """`_send_photo_or_document` bound to `message.reply_photo`/
     `reply_document`."""
@@ -780,6 +895,7 @@ async def _send_result_image(
         data,
         filename,
         reply_markup,
+        use_jpeg=use_jpeg,
     )
 
 
@@ -924,7 +1040,10 @@ async def _send_and_store_result(
     whichever id was actually used."""
     result_id = result_id or uuid.uuid4().hex[:12]
     reply_markup = _post_process_keyboard_with_extra_rows(result_id, extra_keyboard_rows)
-    sent = await _send_result_image(message, img.data, img.filename, reply_markup)
+    use_jpeg = storage.get_image_format(chat_id) != IMAGE_FORMAT_PNG
+    sent = await _send_result_image(
+        message, img.data, img.filename, reply_markup, use_jpeg=use_jpeg
+    )
     storage.store_pending_result(
         result_id,
         chat_id,
@@ -975,12 +1094,14 @@ async def _send_and_store_bot_result(
     — see there."""
     result_id = result_id or uuid.uuid4().hex[:12]
     reply_markup = _post_process_keyboard_with_extra_rows(result_id, extra_keyboard_rows)
+    use_jpeg = storage.get_image_format(chat_id) != IMAGE_FORMAT_PNG
     sent = await _send_photo_or_document(
         lambda **kw: bot.send_photo(chat_id, message_thread_id=message_thread_id, **kw),
         lambda **kw: bot.send_document(chat_id, message_thread_id=message_thread_id, **kw),
         img.data,
         img.filename,
         reply_markup,
+        use_jpeg=use_jpeg,
     )
     storage.store_pending_result(
         result_id,
@@ -999,34 +1120,42 @@ async def _send_and_store_bot_result(
 #: that looks like the real image, low enough to be worth the round trip.
 _RELAY_DISPLAY_JPEG_QUALITY = 85
 
+#: JPEG quality for the in-chat display copy of a generated/post-processed
+#: image (`_send_photo_or_document`) — higher than the relay's reference
+#: copy above, since this is the finished artwork the user is actually
+#: judging, not a rough backdrop to paint over.
+_DISPLAY_JPEG_QUALITY = 92
 
-def _to_display_jpeg(source: bytes) -> bytes:
+
+def _to_display_jpeg(source: bytes, quality: int = _RELAY_DISPLAY_JPEG_QUALITY) -> bytes:
     """Re-encode a source image as a JPEG at its *original* pixel
-    dimensions, for `_relay_create_job` to upload instead of the raw PNG.
+    dimensions, at the given `quality` — used both for `_relay_create_job`'s
+    upload to the mask editor and for `_send_photo_or_document`'s in-chat
+    display copy.
 
-    Dimensions are deliberately untouched: the mask editor sizes its mask
-    canvas off `image.naturalWidth/Height`, and `post_process` scales that
-    mask to the real image, so resizing here would silently change the
-    geometry the mask comes back in. Compression is free of downstream
-    consequences, though — this copy is only ever drawn on the editor's
-    canvas as a visual reference while painting. The mask returns as its
-    own grayscale PNG, and `_process_one_inpaint_job` composites it against
-    the full-quality original re-downloaded from `pending_result`'s
-    `file_id`, never against anything the relay holds.
+    Dimensions are deliberately untouched: for the relay, its mask editor
+    sizes its mask canvas off `image.naturalWidth/Height`, and
+    `post_process` scales that mask to the real image, so resizing here
+    would silently change the geometry the mask comes back in — no such
+    constraint applies to the chat-display use, but there's no reason to
+    treat it differently. Either way this copy is never fed back into a
+    ComfyUI graph: the relay mask is composited against the full-quality
+    original re-downloaded from `pending_result`'s `file_id`, and
+    post-processing sources its next pass from `_fetch_source_image`
+    (ComfyUI's own copy first), never from what this function returns.
 
     Worth doing because the difference is not marginal: a 4096x4096 upscale
-    is ~19MB as PNG and ~2.4MB at this quality, an 8x cut on an upload
-    crossing the public internet to the relay's host. That upload timing
-    out mid-body is exactly what `_INPAINT_RELAY_UPLOAD_TIMEOUT` exists to
-    document. Returns `source` unchanged if Pillow can't decode it — an
-    oversized upload is much better than no mask editor at all.
+    is ~19MB as PNG and a low-single-digit number of MB as JPEG at either
+    quality level here. Returns `source` unchanged if Pillow can't decode
+    it — callers treat that as "couldn't re-encode, send the original
+    instead" rather than a hard failure.
     """
     try:
         with Image.open(io.BytesIO(source)) as im:
             buf = io.BytesIO()
-            im.convert("RGB").save(buf, format="JPEG", quality=_RELAY_DISPLAY_JPEG_QUALITY)
+            im.convert("RGB").save(buf, format="JPEG", quality=quality)
     except Exception:
-        logger.warning("Couldn't re-encode source as JPEG; uploading it as-is", exc_info=True)
+        logger.warning("Couldn't re-encode source as JPEG; using it as-is", exc_info=True)
         return source
     return buf.getvalue()
 
@@ -1322,7 +1451,13 @@ async def _process_one_inpaint_job(
     )
     full_params = _deserialize_generation_params(pending["base_params"])
     detail_prompt, detail_negative_prompt = _detail_prompt_of(pending)
-    source_bytes = await _download_telegram_file(application.bot, pending["file_id"])
+    source_bytes = await _fetch_source_image(
+        client,
+        application.bot,
+        pending["filename"],
+        pending["file_id"],
+        on_fallback=_source_fallback_notifier_bot(application.bot, chat_id, message_thread_id),
+    )
 
     generated = await _run_drawn_mask_post_process(
         client,
@@ -2549,7 +2684,13 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         chat_id = pending["chat_id"]
 
         async def _download_and_analyze_both() -> tuple[str | None, tuple[str, str] | None]:
-            source_bytes = await _download_telegram_file(context.bot, pending["file_id"])
+            source_bytes = await _fetch_source_image(
+                client,
+                context.bot,
+                pending["filename"],
+                pending["file_id"],
+                on_fallback=_source_fallback_notifier(query.message),
+            )
             return await _analyze_both(source_bytes, settings)
 
         result = await _run_reporting_errors(
@@ -2572,7 +2713,13 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         chat_id = pending["chat_id"]
 
         async def _download_and_analyze_deep() -> tuple[str, str]:
-            source_bytes = await _download_telegram_file(context.bot, pending["file_id"])
+            source_bytes = await _fetch_source_image(
+                client,
+                context.bot,
+                pending["filename"],
+                pending["file_id"],
+                on_fallback=_source_fallback_notifier(query.message),
+            )
             return await analyze_caption_deep(source_bytes, settings)
 
         caption = await _run_reporting_errors(
@@ -2606,7 +2753,13 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if kind == HAND_MANUAL_CALLBACK_KIND:
-        source_bytes = await _download_telegram_file(context.bot, pending["file_id"])
+        source_bytes = await _fetch_source_image(
+            client,
+            context.bot,
+            pending["filename"],
+            pending["file_id"],
+            on_fallback=_source_fallback_notifier(query.message),
+        )
         gridded = await asyncio.to_thread(_draw_hand_point_grid, source_bytes)
         await query.message.reply_photo(
             photo=io.BytesIO(gridded),
@@ -2642,7 +2795,13 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             status_message = await query.message.reply_text(
                 "Uploading image to the mask editor…", disable_notification=True
             )
-            source_bytes = await _download_telegram_file(context.bot, pending["file_id"])
+            source_bytes = await _fetch_source_image(
+                client,
+                context.bot,
+                pending["filename"],
+                pending["file_id"],
+                on_fallback=_source_fallback_notifier(query.message),
+            )
             try:
                 token = await _relay_create_job(settings, source_bytes)
             except Exception:
@@ -2693,7 +2852,13 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"That mask has expired — draw a new one with {redo_button}."
             )
             return
-        source_bytes = await _download_telegram_file(context.bot, redo["source_file_id"])
+        source_bytes = await _fetch_source_image(
+            client,
+            context.bot,
+            redo["source_filename"],
+            redo["source_file_id"],
+            on_fallback=_source_fallback_notifier(query.message),
+        )
         # "🔁 x4" runs the same iteration DRAWN_MASK_REDO4_COUNT times instead
         # of once, reusing the one source download above across all of them.
         # Stops at the first failure rather than continuing to spend ComfyUI
@@ -2723,7 +2888,13 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if kind in ("upscale", UPSCALE_CONFIRM_CALLBACK_KIND):
         if kind == UPSCALE_CONFIRM_CALLBACK_KIND:
             await _safe_edit_message(query, "Upscaling anyway…", InlineKeyboardMarkup([]))
-        source_bytes = await _download_telegram_file(context.bot, pending["file_id"])
+        source_bytes = await _fetch_source_image(
+            client,
+            context.bot,
+            pending["filename"],
+            pending["file_id"],
+            on_fallback=_source_fallback_notifier(query.message),
+        )
         if kind == "upscale":
             width, height = Image.open(io.BytesIO(source_bytes)).size
             if max(width, height) >= UPSCALE_CONFIRM_THRESHOLD_PX:
@@ -2745,7 +2916,13 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         case that's reused instead of hitting Telegram for it twice."""
         data = source_bytes
         if data is None:
-            data = await _download_telegram_file(context.bot, pending["file_id"])
+            data = await _fetch_source_image(
+                client,
+                context.bot,
+                pending["filename"],
+                pending["file_id"],
+                on_fallback=_source_fallback_notifier(query.message),
+            )
         return await post_process(
             client,
             kind,
@@ -2838,7 +3015,13 @@ async def hand_point_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     status_message = await query.message.reply_text("Refining hand…", disable_notification=True)
 
     async def _download_and_post_process() -> GeneratedImage:
-        data = await _download_telegram_file(context.bot, pending["file_id"])
+        data = await _fetch_source_image(
+            client,
+            context.bot,
+            pending["filename"],
+            pending["file_id"],
+            on_fallback=_source_fallback_notifier(query.message),
+        )
         return await post_process(
             client,
             "hand_manual",
@@ -2889,7 +3072,14 @@ async def hand_point_density_callback(update: Update, context: ContextTypes.DEFA
         return
 
     await query.answer()
-    source_bytes = await _download_telegram_file(context.bot, pending["file_id"])
+    client: ComfyClient = context.bot_data["comfy_client"]
+    source_bytes = await _fetch_source_image(
+        client,
+        context.bot,
+        pending["filename"],
+        pending["file_id"],
+        on_fallback=_source_fallback_notifier(query.message),
+    )
     gridded = await asyncio.to_thread(_draw_hand_point_grid, source_bytes, grid_size)
     await query.message.reply_photo(
         photo=io.BytesIO(gridded),

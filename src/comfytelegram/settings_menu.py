@@ -41,7 +41,7 @@ from comfytelegram.profiles import (
     resolve_profile,
 )
 from comfytelegram.settings import Settings
-from comfytelegram.storage import Storage
+from comfytelegram.storage import IMAGE_FORMAT_JPEG, IMAGE_FORMAT_PNG, Storage
 from comfytelegram.topics import pop_pending, set_pending
 
 
@@ -198,11 +198,27 @@ def _home_text(checkpoint: str, profile: ModelProfile | None) -> str:
     return f"⚙️ Settings · {label}"
 
 
+#: `_home_keyboard`'s "🖼️ Display" toggle button label per
+#: `storage.get_image_format` value — tapping switches straight to the
+#: *other* one (see `settings_callback`'s `imgfmt` action), so the label
+#: shown is always the chat's *current* setting, not the one tapping would
+#: switch to.
+_IMAGE_FORMAT_LABELS = {
+    IMAGE_FORMAT_JPEG: "🖼️ Display: Compressed (JPEG)",
+    IMAGE_FORMAT_PNG: "🖼️ Display: Lossless (PNG)",
+}
+
+
 def _home_keyboard(
-    checkpoint: str, profile: ModelProfile | None, override_fields: dict[str, Any]
+    checkpoint: str,
+    profile: ModelProfile | None,
+    override_fields: dict[str, Any],
+    image_format: str,
 ) -> InlineKeyboardMarkup:
     """The `/settings` home screen: one button per `FIELDS` entry showing
-    its current value (★-marked if overridden), plus Reset-all and Close."""
+    its current value (★-marked if overridden), the chat-wide (not
+    checkpoint-scoped, unlike everything else here) "🖼️ Display" format
+    toggle, then Reset-all and Close."""
     effective = _effective_params(checkpoint, profile)
     buttons = []
     for meta in FIELDS:
@@ -211,6 +227,9 @@ def _home_keyboard(
         label = f"{marker}{meta.label}: {_truncate(_format_value(value))}"
         buttons.append(InlineKeyboardButton(label, callback_data=f"st:f:{meta.key}"))
     rows = _chunk(buttons, 2)
+    rows.append(
+        [InlineKeyboardButton(_IMAGE_FORMAT_LABELS[image_format], callback_data="st:imgfmt")]
+    )
     rows.append([InlineKeyboardButton("🔄 Reset all to model defaults", callback_data="st:ra")])
     rows.append([InlineKeyboardButton("✖ Close", callback_data="st:close")])
     return InlineKeyboardMarkup(rows)
@@ -352,9 +371,12 @@ async def _show_home(
 ) -> None:
     """Re-resolve the effective profile and edit `query`'s message in place
     to show the `/settings` home screen."""
+    storage: Storage = context.bot_data["storage"]
     profile, override_fields = _resolve_effective_profile(context, chat_id, checkpoint)
     await _safe_edit_message(
-        query, _home_text(checkpoint, profile), _home_keyboard(checkpoint, profile, override_fields)
+        query,
+        _home_text(checkpoint, profile),
+        _home_keyboard(checkpoint, profile, override_fields, storage.get_image_format(chat_id)),
     )
 
 
@@ -384,16 +406,19 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     profile, override_fields = _resolve_effective_profile(context, chat_id, checkpoint)
     await update.effective_message.reply_text(
         _home_text(checkpoint, profile),
-        reply_markup=_home_keyboard(checkpoint, profile, override_fields),
+        reply_markup=_home_keyboard(
+            checkpoint, profile, override_fields, storage.get_image_format(chat_id)
+        ),
     )
 
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Dispatch a `st:<action>[:<field>[:<arg>]]` callback: navigate
     home/into a field (`home`/`f`), reset all or one field
-    (`ra`/`r`), start custom-value entry (`c`), step or set a numeric
-    value (`d`/`v`), close the menu, or no-op on the disabled current-value
-    button."""
+    (`ra`/`r`), toggle the chat-wide (not checkpoint-scoped) display-format
+    setting (`imgfmt` — see `storage.get_image_format`/`set_image_format`),
+    start custom-value entry (`c`), step or set a numeric value (`d`/`v`),
+    close the menu, or no-op on the disabled current-value button."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
@@ -427,6 +452,14 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if action == "ra":
         storage.clear_override(chat_id, checkpoint)
         await query.answer("Reset to model defaults.")
+        await _show_home(query, context, chat_id, checkpoint)
+        return
+
+    if action == "imgfmt":
+        current = storage.get_image_format(chat_id)
+        new_format = IMAGE_FORMAT_PNG if current == IMAGE_FORMAT_JPEG else IMAGE_FORMAT_JPEG
+        storage.set_image_format(chat_id, new_format)
+        await query.answer(f"Display format: {new_format.upper()}.")
         await _show_home(query, context, chat_id, checkpoint)
         return
 

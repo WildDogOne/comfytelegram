@@ -60,6 +60,7 @@ from comfytelegram.handlers import (
 )
 from comfytelegram.profiles import ModelProfile
 from comfytelegram.settings import Settings
+from comfytelegram.storage import IMAGE_FORMAT_PNG
 from comfytelegram.tags import TagResult, TagSource
 from comfytelegram.topics import NO_TOPIC
 from comfytelegram.workflows import GenerationParams
@@ -647,6 +648,15 @@ def test_tagcheck_lines_truncates_at_the_token_limit():
     assert lines[-1] == f"…5 more token(s) omitted (limit {TAGCHECK_TOKEN_LIMIT})."
 
 
+def _comfy_client_mock() -> MagicMock:
+    """A `comfy_client` stand-in whose `get_image_bytes` raises `ComfyUIError`
+    — `_fetch_source_image` treats that as "ComfyUI no longer has this
+    file" and falls back to `_download_telegram_file`, which is the source
+    every post-processing test here is actually set up to exercise (via
+    `context.bot.get_file`/`download_as_bytearray`)."""
+    return MagicMock(get_image_bytes=AsyncMock(side_effect=ComfyUIError("no such file")))
+
+
 def _pending_result_mock(
     profile: ModelProfile,
     positive: str,
@@ -691,7 +701,7 @@ async def test_show_prompt_never_runs_a_tag_check():
     context.bot_data = {
         "settings": MagicMock(allowed_user_ids=None, tag_rare_threshold=100),
         "storage": storage,
-        "comfy_client": MagicMock(),
+        "comfy_client": _comfy_client_mock(),
         "profiles": [profile],
         "tags_db": tags_db,
     }
@@ -731,7 +741,7 @@ async def test_show_prompt_second_output_strips_profile_and_character_prompt():
     context.bot_data = {
         "settings": MagicMock(allowed_user_ids=None, tag_rare_threshold=100),
         "storage": storage,
-        "comfy_client": MagicMock(),
+        "comfy_client": _comfy_client_mock(),
         "profiles": [profile],
         "tags_db": tags_db,
     }
@@ -770,7 +780,7 @@ async def test_show_prompt_omits_copy_button_past_telegram_limit():
     context.bot_data = {
         "settings": MagicMock(allowed_user_ids=None, tag_rare_threshold=100),
         "storage": storage,
-        "comfy_client": MagicMock(),
+        "comfy_client": _comfy_client_mock(),
         "profiles": [profile],
         "tags_db": MagicMock(),
     }
@@ -802,7 +812,7 @@ async def test_analyze_prompt_runs_a_tag_check_for_a_tag_style_profile():
     context.bot_data = {
         "settings": MagicMock(allowed_user_ids=None, tag_rare_threshold=100),
         "storage": storage,
-        "comfy_client": MagicMock(),
+        "comfy_client": _comfy_client_mock(),
         "profiles": [profile],
         "tags_db": tags_db,
     }
@@ -834,7 +844,7 @@ async def test_analyze_prompt_reports_unavailable_for_a_natural_language_profile
     context.bot_data = {
         "settings": MagicMock(allowed_user_ids=None, tag_rare_threshold=100),
         "storage": storage,
-        "comfy_client": MagicMock(),
+        "comfy_client": _comfy_client_mock(),
         "profiles": [profile],
         "tags_db": tags_db,
     }
@@ -866,7 +876,7 @@ async def test_analyze_prompt_reports_unavailable_when_no_tag_data_imported():
     context.bot_data = {
         "settings": MagicMock(allowed_user_ids=None, tag_rare_threshold=100),
         "storage": storage,
-        "comfy_client": MagicMock(),
+        "comfy_client": _comfy_client_mock(),
         "profiles": [profile],
         "tags_db": tags_db,
     }
@@ -883,7 +893,7 @@ def _postprocess_context(storage: MagicMock, profile: ModelProfile) -> MagicMock
     context.bot_data = {
         "settings": MagicMock(allowed_user_ids=None),
         "storage": storage,
-        "comfy_client": MagicMock(),
+        "comfy_client": _comfy_client_mock(),
         "profiles": [profile],
     }
     context.bot.get_file = AsyncMock(
@@ -978,6 +988,109 @@ async def test_hand_auto_with_a_real_change_sends_the_image_normally():
 
 
 @pytest.mark.asyncio
+async def test_png_display_preference_skips_jpeg_encoding():
+    """The `/settings` "🖼️ Display" toggle (`storage.get_image_format`) set
+    to `IMAGE_FORMAT_PNG` should send the original bytes untouched, never
+    going through `_to_display_jpeg` at all — see
+    `_send_and_store_result`/`_send_photo_or_document`."""
+    query = AsyncMock()
+    query.data = f"pp:{HAND_AUTO_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    storage.get_image_format.return_value = IMAGE_FORMAT_PNG
+    context = _postprocess_context(storage, profile)
+
+    changed_result = GeneratedImage(
+        data=b"refined-png-bytes",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with (
+        patch("comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)),
+        patch("comfytelegram.handlers._to_display_jpeg") as jpeg_mock,
+    ):
+        await postprocess_callback(update, context)
+
+    jpeg_mock.assert_not_called()
+    query.message.reply_photo.assert_awaited_once()
+    assert query.message.reply_photo.await_args.kwargs["photo"].getvalue() == b"refined-png-bytes"
+
+
+@pytest.mark.asyncio
+async def test_source_fallback_to_telegram_notifies_the_chat():
+    """When ComfyUI no longer has the original file, `_fetch_source_image`
+    falls back to Telegram's (possibly JPEG-recompressed) copy — the chat
+    should be told, so a quieter-than-usual result doesn't look like an
+    unexplained regression."""
+    query = AsyncMock()
+    query.data = f"pp:{HAND_AUTO_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)  # comfy_client always raises ComfyUIError
+
+    changed_result = GeneratedImage(
+        data=b"refined",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)):
+        await postprocess_callback(update, context)
+
+    notices = [
+        call.args[0]
+        for call in query.message.reply_text.await_args_list
+        if "ComfyUI no longer has" in call.args[0]
+    ]
+    assert len(notices) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_source_fallback_notice_when_comfyui_still_has_the_file():
+    query = AsyncMock()
+    query.data = f"pp:{HAND_AUTO_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    context.bot_data["comfy_client"].get_image_bytes = AsyncMock(return_value=b"orig-from-comfyui")
+
+    changed_result = GeneratedImage(
+        data=b"refined",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch(
+        "comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)
+    ) as post_process_mock:
+        await postprocess_callback(update, context)
+
+    assert post_process_mock.await_args.args[2] == b"orig-from-comfyui"
+    assert not any(
+        "ComfyUI no longer has" in call.args[0] for call in query.message.reply_text.await_args_list
+    )
+
+
+@pytest.mark.asyncio
 async def test_hand_manual_sends_a_gridded_photo_with_point_buttons():
     query = AsyncMock()
     query.data = f"pp:{HAND_MANUAL_CALLBACK_KIND}:abc123"
@@ -1026,9 +1139,14 @@ async def test_hand_draw_shows_an_uploading_status_before_the_editor_button():
     with patch("comfytelegram.handlers._relay_create_job", new=AsyncMock(return_value="tok1")):
         await postprocess_callback(update, context)
 
-    query.message.reply_text.assert_awaited_once_with(
-        "Uploading image to the mask editor…", disable_notification=True
-    )
+    # 2 calls: the "Uploading…" status message, then `_fetch_source_image`'s
+    # fallback notice (`_comfy_client_mock` always raises ComfyUIError,
+    # simulating "ComfyUI no longer has this file").
+    assert query.message.reply_text.await_count == 2
+    first_call = query.message.reply_text.await_args_list[0]
+    assert first_call.args == ("Uploading image to the mask editor…",)
+    assert first_call.kwargs == {"disable_notification": True}
+    assert "ComfyUI no longer has" in query.message.reply_text.await_args_list[1].args[0]
     status_message.edit_text.assert_awaited_once()
     edit_call = status_message.edit_text.await_args
     assert "Draw over the area" in edit_call.args[0]
@@ -1088,7 +1206,10 @@ async def test_hand_draw_relay_failure_edits_the_status_message_not_a_new_reply(
     ):
         await postprocess_callback(update, context)
 
-    query.message.reply_text.assert_awaited_once()
+    # 2 calls: the "Uploading…" status message, then `_fetch_source_image`'s
+    # fallback notice — not a 3rd new reply for the relay failure itself,
+    # which is reported via editing status_message instead.
+    assert query.message.reply_text.await_count == 2
     status_message.edit_text.assert_awaited_once_with(
         "Couldn't reach the mask editor server — try again later."
     )
@@ -1461,7 +1582,7 @@ async def test_process_one_inpaint_job_stores_a_redoable_row_and_attaches_redo_b
     settings = _settings(
         inpaint_relay_url="https://inpaint.example.com", inpaint_relay_shared_secret="shh"
     )
-    client = MagicMock()
+    client = _comfy_client_mock()
     job = {
         "token": "tok1",
         "chat_id": 42,
@@ -1537,7 +1658,7 @@ async def test_process_one_inpaint_job_fix_kind_runs_fix_drawn_post_process():
     settings = _settings(
         inpaint_relay_url="https://inpaint.example.com", inpaint_relay_shared_secret="shh"
     )
-    client = MagicMock()
+    client = _comfy_client_mock()
     job = {
         "token": "tok1",
         "chat_id": 42,
@@ -1567,8 +1688,11 @@ async def test_process_one_inpaint_job_fix_kind_runs_fix_drawn_post_process():
         await _process_one_inpaint_job(application, settings, storage, client, job)
 
     assert mock.await_args.args[1] == "fix_drawn"
-    application.bot.send_message.assert_awaited_once()
-    assert "Fixing artifact" in application.bot.send_message.await_args.args[1]
+    # 2 calls: the "Fixing artifact…" status message, then
+    # `_fetch_source_image`'s fallback notice (`_comfy_client_mock` always
+    # raises ComfyUIError, simulating "ComfyUI no longer has this file").
+    assert application.bot.send_message.await_count == 2
+    assert "Fixing artifact" in application.bot.send_message.await_args_list[0].args[1]
 
     keyboard = application.bot.send_photo.await_args.kwargs["reply_markup"]
     redo_buttons = [
@@ -1791,7 +1915,7 @@ def _page_toggle_context():
     context.bot_data = {
         "settings": MagicMock(allowed_user_ids=None),
         "storage": storage,
-        "comfy_client": MagicMock(),
+        "comfy_client": _comfy_client_mock(),
         "profiles": [],
     }
     return context

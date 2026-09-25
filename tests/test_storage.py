@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from comfytelegram.storage import Storage
+from comfytelegram.storage import IMAGE_FORMAT_JPEG, IMAGE_FORMAT_PNG, Storage
 
 
 @pytest.fixture
@@ -33,6 +33,27 @@ def test_checkpoint_survives_reopen(tmp_path: Path):
 
     s2 = Storage(db_path)
     assert s2.get_checkpoint(42) == "furrytoonmix_xlIllustriousV2.safetensors"
+    s2.close()
+
+
+def test_image_format_defaults_to_jpeg(storage: Storage):
+    assert storage.get_image_format(1) == IMAGE_FORMAT_JPEG
+
+
+def test_image_format_roundtrip_and_is_per_chat(storage: Storage):
+    storage.set_image_format(1, IMAGE_FORMAT_PNG)
+    assert storage.get_image_format(1) == IMAGE_FORMAT_PNG
+    assert storage.get_image_format(2) == IMAGE_FORMAT_JPEG
+
+
+def test_image_format_survives_reopen(tmp_path: Path):
+    db_path = tmp_path / "state.sqlite3"
+    s1 = Storage(db_path)
+    s1.set_image_format(42, IMAGE_FORMAT_PNG)
+    s1.close()
+
+    s2 = Storage(db_path)
+    assert s2.get_image_format(42) == IMAGE_FORMAT_PNG
     s2.close()
 
 

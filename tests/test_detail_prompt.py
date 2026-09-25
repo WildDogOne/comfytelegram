@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from test_generation import _solid_png, _StubUploadingComfyClient
 
+from comfytelegram.comfy_client import ComfyUIError
 from comfytelegram.generation import GeneratedImage, post_process
 from comfytelegram.handlers import (
     DETAIL_PROMPT_CALLBACK_KIND,
@@ -194,7 +195,10 @@ def _context(storage, **bot_data):
     context.bot_data = {
         "settings": MagicMock(allowed_user_ids=None),
         "storage": storage,
-        "comfy_client": MagicMock(),
+        # get_image_bytes raises so `_fetch_source_image` falls back to
+        # `_download_telegram_file` — the source these tests actually stub
+        # via `context.bot.get_file`.
+        "comfy_client": MagicMock(get_image_bytes=AsyncMock(side_effect=ComfyUIError("no file"))),
         "profiles": [],
         **bot_data,
     }

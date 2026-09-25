@@ -54,6 +54,16 @@ from typing import Any
 #: people come back to an old result later, not a tight session window.
 PENDING_RESULT_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days
 
+#: `chat_image_format` values — see `get_image_format`/`set_image_format`.
+#: "jpeg" (the default) is what `handlers._send_photo_or_document` uses to
+#: keep the in-chat copy small; "png" opts a chat out of that recompression
+#: entirely, for someone running a long multi-day session who'd rather pay
+#: the bandwidth than risk any generational loss across a chain of
+#: post-processing passes (see `handlers._fetch_source_image`).
+IMAGE_FORMAT_JPEG = "jpeg"
+IMAGE_FORMAT_PNG = "png"
+DEFAULT_IMAGE_FORMAT = IMAGE_FORMAT_JPEG
+
 #: Minimum time between prune sweeps of a given table. `_prune` runs on
 #: every `store_pending_result`/`store_generation_snapshot` call (the hot
 #: path — once per generated/post-processed image), so gating it to at most
@@ -66,6 +76,11 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS chat_checkpoint (
     chat_id INTEGER PRIMARY KEY,
     checkpoint TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chat_image_format (
+    chat_id INTEGER PRIMARY KEY,
+    format TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS profile_override (
@@ -193,6 +208,25 @@ class Storage:
                 "INSERT INTO chat_checkpoint (chat_id, checkpoint) VALUES (?, ?) "
                 "ON CONFLICT(chat_id) DO UPDATE SET checkpoint = excluded.checkpoint",
                 (chat_id, checkpoint),
+            )
+
+    def get_image_format(self, chat_id: int) -> str:
+        """This chat's preferred in-chat display format — `IMAGE_FORMAT_JPEG`
+        (`DEFAULT_IMAGE_FORMAT`) if it's never touched the `/settings`
+        "🖼️ Display" toggle, `IMAGE_FORMAT_PNG` if it has."""
+        row = self._conn.execute(
+            "SELECT format FROM chat_image_format WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        return row[0] if row else DEFAULT_IMAGE_FORMAT
+
+    def set_image_format(self, chat_id: int, image_format: str) -> None:
+        """Persist this chat's preferred in-chat display format, replacing
+        any prior selection."""
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO chat_image_format (chat_id, format) VALUES (?, ?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET format = excluded.format",
+                (chat_id, image_format),
             )
 
     def get_override(self, chat_id: int, checkpoint: str) -> dict[str, Any]:

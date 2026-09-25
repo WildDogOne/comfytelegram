@@ -1,4 +1,7 @@
 from dataclasses import fields as dataclass_fields
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from comfytelegram.profiles import ModelProfile
 from comfytelegram.settings_menu import (
@@ -14,7 +17,9 @@ from comfytelegram.settings_menu import (
     _numeric_submenu_keyboard,
     _text_submenu_keyboard,
     _truncate,
+    settings_callback,
 )
+from comfytelegram.storage import IMAGE_FORMAT_JPEG, IMAGE_FORMAT_PNG, Storage
 from comfytelegram.workflows import GenerationParams
 
 
@@ -75,7 +80,9 @@ def test_numeric_submenu_has_stepper_presets_and_navigation():
 
 
 def test_home_keyboard_marks_overridden_fields():
-    keyboard = _home_keyboard("some_ckpt.safetensors", None, override_fields={"cfg": 8.0})
+    keyboard = _home_keyboard(
+        "some_ckpt.safetensors", None, override_fields={"cfg": 8.0}, image_format=IMAGE_FORMAT_JPEG
+    )
     all_buttons = [b for row in keyboard.inline_keyboard for b in row]
     cfg_button = next(b for b in all_buttons if b.callback_data == "st:f:cfg")
     steps_button = next(b for b in all_buttons if b.callback_data == "st:f:steps")
@@ -84,10 +91,50 @@ def test_home_keyboard_marks_overridden_fields():
 
 
 def test_home_keyboard_has_reset_all_and_close():
-    keyboard = _home_keyboard("some_ckpt.safetensors", None, override_fields={})
+    keyboard = _home_keyboard(
+        "some_ckpt.safetensors", None, override_fields={}, image_format=IMAGE_FORMAT_JPEG
+    )
     all_callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
     assert "st:ra" in all_callback_data
     assert "st:close" in all_callback_data
+
+
+def test_home_keyboard_shows_the_display_format_toggle():
+    keyboard = _home_keyboard(
+        "some_ckpt.safetensors", None, override_fields={}, image_format=IMAGE_FORMAT_JPEG
+    )
+    all_buttons = [b for row in keyboard.inline_keyboard for b in row]
+    toggle = next(b for b in all_buttons if b.callback_data == "st:imgfmt")
+    assert "JPEG" in toggle.text
+
+
+@pytest.mark.asyncio
+async def test_settings_imgfmt_action_flips_and_persists_per_chat(tmp_path):
+    storage = Storage(tmp_path / "state.sqlite3")
+    storage.set_checkpoint(1, "ckpt.safetensors")
+
+    query = AsyncMock()
+    query.data = "st:imgfmt"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_chat.id = 1
+    update.effective_user.id = 1
+    context = MagicMock()
+    context.bot_data = {
+        "settings": MagicMock(allowed_user_ids=None),
+        "storage": storage,
+        "profiles": [],
+    }
+
+    await settings_callback(update, context)
+    assert storage.get_image_format(1) == IMAGE_FORMAT_PNG
+
+    await settings_callback(update, context)
+    assert storage.get_image_format(1) == IMAGE_FORMAT_JPEG
+
+    # a different chat's format is untouched
+    assert storage.get_image_format(2) == IMAGE_FORMAT_JPEG
+    storage.close()
 
 
 def test_truncate_leaves_short_strings_alone():

@@ -188,7 +188,7 @@ to mark** as before.
 | *(photo upload)* | Analyze the photo with both WD14 tags and a Qwen-VL caption, each with its own 🎨 Generate button |
 | *(PNG sent as a file)* | Re-import a previously generated image from the settings embedded in it, restoring its post-processing buttons |
 | `/model` | Pick a checkpoint (inline keyboard, populated live from ComfyUI) |
-| `/settings` | View/change cfg, steps, sampler, scheduler, clip skip, width, height, batch size, and prompt prefixes for the current model, per chat |
+| `/settings` | View/change cfg, steps, sampler, scheduler, clip skip, width, height, batch size, and prompt prefixes for the current model, per chat — plus a chat-wide "🖼️ Display" toggle between compressed (JPEG, default) and lossless (PNG) in-chat images |
 | `/character save <name> \| <positive> [\| <negative>]` | Save a reusable prompt snippet |
 | `/character delete <name>` | Delete one |
 | `/characters` | List saved characters and activate one |
