@@ -732,23 +732,54 @@ def _raw_prompt_copy_text(raw_positive: str, raw_negative: str) -> str:
     return raw_positive
 
 
+async def _download_telegram_file(bot: Bot, file_id: str) -> bytes:
+    """Download a Telegram file's bytes by its `file_id` — the `get_file` +
+    `download_as_bytearray` two-step every post-processing/import entry
+    point below needs before it can hand the source image to ComfyUI or
+    Pillow."""
+    tg_file = await bot.get_file(file_id)
+    return bytes(await tg_file.download_as_bytearray())
+
+
+async def _send_photo_or_document(
+    send_photo: Callable[..., Awaitable[Message]],
+    send_document: Callable[..., Awaitable[Message]],
+    data: bytes,
+    filename: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> Message:
+    """Send `data` as a photo, falling back to a document when it's too big
+    for Telegram's photo path (see TELEGRAM_PHOTO_SIZE_LIMIT above). Shared
+    by `_send_result_image` (`message.reply_*`) and
+    `_send_and_store_bot_result` (`bot.send_*` against a bare chat_id, for
+    code with no `Message` to reply into) so the size threshold and
+    oversized-file caption live in one place. Returns the sent message —
+    callers need it to read back the file_id Telegram assigned, for
+    `_store_pending_result`."""
+    if len(data) <= TELEGRAM_PHOTO_SIZE_LIMIT:
+        return await send_photo(photo=io.BytesIO(data), reply_markup=reply_markup)
+    return await send_document(
+        document=io.BytesIO(data),
+        filename=filename,
+        caption="Sent as a file — too large for Telegram's photo size limit (10MB).",
+        reply_markup=reply_markup,
+    )
+
+
 async def _send_result_image(
     message: Message,
     data: bytes,
     filename: str,
     reply_markup: InlineKeyboardMarkup,
 ) -> Message:
-    """Send a generated image, falling back to a document when it's too big
-    for Telegram's photo path (see TELEGRAM_PHOTO_SIZE_LIMIT above). Returns
-    the sent message — callers need it to read back the file_id Telegram
-    assigned, for `_store_pending_result`."""
-    if len(data) <= TELEGRAM_PHOTO_SIZE_LIMIT:
-        return await message.reply_photo(photo=io.BytesIO(data), reply_markup=reply_markup)
-    return await message.reply_document(
-        document=io.BytesIO(data),
-        filename=filename,
-        caption="Sent as a file — too large for Telegram's photo size limit (10MB).",
-        reply_markup=reply_markup,
+    """`_send_photo_or_document` bound to `message.reply_photo`/
+    `reply_document`."""
+    return await _send_photo_or_document(
+        lambda **kw: message.reply_photo(**kw),
+        lambda **kw: message.reply_document(**kw),
+        data,
+        filename,
+        reply_markup,
     )
 
 
@@ -862,7 +893,10 @@ def _is_redo_button(button: InlineKeyboardButton) -> bool:
     `_REDO_CALLBACK_KINDS`. A `CopyTextButton`/`WebAppInfo` button has no
     `callback_data` at all, hence the None check."""
     data = button.callback_data
-    return bool(data) and data.split(":")[1:2] and data.split(":")[1] in _REDO_CALLBACK_KINDS
+    if not data:
+        return False
+    parts = data.split(":")
+    return len(parts) > 1 and parts[1] in _REDO_CALLBACK_KINDS
 
 
 async def _send_and_store_result(
@@ -941,22 +975,13 @@ async def _send_and_store_bot_result(
     — see there."""
     result_id = result_id or uuid.uuid4().hex[:12]
     reply_markup = _post_process_keyboard_with_extra_rows(result_id, extra_keyboard_rows)
-    if len(img.data) <= TELEGRAM_PHOTO_SIZE_LIMIT:
-        sent = await bot.send_photo(
-            chat_id,
-            photo=io.BytesIO(img.data),
-            reply_markup=reply_markup,
-            message_thread_id=message_thread_id,
-        )
-    else:
-        sent = await bot.send_document(
-            chat_id,
-            document=io.BytesIO(img.data),
-            filename=img.filename,
-            caption="Sent as a file — too large for Telegram's photo size limit (10MB).",
-            reply_markup=reply_markup,
-            message_thread_id=message_thread_id,
-        )
+    sent = await _send_photo_or_document(
+        lambda **kw: bot.send_photo(chat_id, message_thread_id=message_thread_id, **kw),
+        lambda **kw: bot.send_document(chat_id, message_thread_id=message_thread_id, **kw),
+        img.data,
+        img.filename,
+        reply_markup,
+    )
     storage.store_pending_result(
         result_id,
         chat_id,
@@ -1018,8 +1043,11 @@ async def _relay_create_job(settings: Settings, image_bytes: bytes) -> str:
     the far end. Encoding first makes the upload ~8x smaller for the same
     bytes served to the editor. `Content-Type` tells the relay what it
     actually got, since it no longer re-encodes and has to serve this copy
-    back verbatim."""
-    payload = _to_display_jpeg(image_bytes)
+    back verbatim. The decode+encode itself runs off the event loop
+    (`asyncio.to_thread`) — a full-resolution JPEG re-encode is real CPU
+    work, and `concurrent_updates(True)` only actually gets other updates
+    running concurrently if nothing blocks the one event loop thread."""
+    payload = await asyncio.to_thread(_to_display_jpeg, image_bytes)
     content_type = "image/jpeg" if payload is not image_bytes else "image/png"
     async with (
         aiohttp.ClientSession(timeout=_INPAINT_RELAY_UPLOAD_TIMEOUT) as session,
@@ -1294,8 +1322,7 @@ async def _process_one_inpaint_job(
     )
     full_params = _deserialize_generation_params(pending["base_params"])
     detail_prompt, detail_negative_prompt = _detail_prompt_of(pending)
-    tg_file = await application.bot.get_file(pending["file_id"])
-    source_bytes = bytes(await tg_file.download_as_bytearray())
+    source_bytes = await _download_telegram_file(application.bot, pending["file_id"])
 
     generated = await _run_drawn_mask_post_process(
         client,
@@ -1439,6 +1466,34 @@ async def _send_derived_prompt(
         text += f"\n\n🚫 Suggested negative:\n{negative_prompt}"
     await reply_target.reply_text(
         text, reply_markup=_generate_from_prompt_keyboard(prompt_id, prompt)
+    )
+
+
+async def _send_tag_and_caption_prompts(
+    reply_target: Message,
+    storage: Storage,
+    chat_id: int,
+    checkpoint: str,
+    caption_label: str,
+    tags: str | None,
+    caption: tuple[str, str] | None,
+) -> None:
+    """Send the WD14-tags and Qwen-VL-caption derived prompts as a pair via
+    `_send_derived_prompt` — every side-by-side analysis call site
+    (`photo_message`, `_import_without_metadata`, `postprocess_callback`'s
+    `ANALYZE_ONLY_CALLBACK_KIND`) sends this same pair once its `(tags,
+    caption)` result comes back; only `caption_label` differs between them
+    (quick vs. deep vs. imported-image)."""
+    caption_positive, caption_negative = caption if caption is not None else (None, "")
+    await _send_derived_prompt(reply_target, storage, chat_id, checkpoint, "🏷️ WD14 tags", tags)
+    await _send_derived_prompt(
+        reply_target,
+        storage,
+        chat_id,
+        checkpoint,
+        caption_label,
+        caption_positive,
+        caption_negative,
     )
 
 
@@ -1714,16 +1769,11 @@ async def character_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    if action == "edit_cancel":
-        pop_pending(context.chat_data, "awaiting_character_edit", query.message)
-        await query.answer("Cancelled.")
-        await _safe_edit_message(
-            query, "Cancelled — character unchanged.", InlineKeyboardMarkup([])
+    if action in ("edit_cancel", "rename_cancel"):
+        pending_key = (
+            "awaiting_character_edit" if action == "edit_cancel" else "awaiting_character_rename"
         )
-        return
-
-    if action == "rename_cancel":
-        pop_pending(context.chat_data, "awaiting_character_rename", query.message)
+        pop_pending(context.chat_data, pending_key, query.message)
         await query.answer("Cancelled.")
         await _safe_edit_message(
             query, "Cancelled — character unchanged.", InlineKeyboardMarkup([])
@@ -1882,6 +1932,31 @@ def _resolve_effective_prompt(
     return effective_prompt, extra_negative, raw_positive, raw_negative
 
 
+def _resolve_profile_and_prompt(
+    chat_id: int,
+    checkpoint: str,
+    prompt_text: str,
+    storage: Storage,
+    profiles: list[ModelProfile],
+) -> tuple[ModelProfile, str, str, str | None, str | None]:
+    """This chat's profile (with its `/settings` override applied) plus the
+    active character folded into `prompt_text` via `_resolve_effective_prompt`
+    — the shared setup `generate_message` and `_run_stream` both need before
+    calling `generate()`. Returns `(profile, effective_prompt, extra_negative,
+    raw_positive, raw_negative)`."""
+    profile = resolve_profile(checkpoint, profiles)
+    profile = apply_profile_override(profile, checkpoint, storage.get_override(chat_id, checkpoint))
+
+    active_character_name = storage.get_active_character_name(chat_id)
+    character = (
+        storage.get_character(chat_id, active_character_name) if active_character_name else None
+    )
+    effective_prompt, extra_negative, raw_positive, raw_negative = _resolve_effective_prompt(
+        prompt_text, character
+    )
+    return profile, effective_prompt, extra_negative, raw_positive, raw_negative
+
+
 async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle a plain-text message as a generation prompt: resolve this
     chat's checkpoint/profile/override/active-character, run `generate()`
@@ -1924,16 +1999,8 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if checkpoint is None:
         return
 
-    profile = resolve_profile(checkpoint, profiles)
-    override_fields = storage.get_override(chat_id, checkpoint)
-    profile = apply_profile_override(profile, checkpoint, override_fields)
-
-    active_character_name = storage.get_active_character_name(chat_id)
-    character = (
-        storage.get_character(chat_id, active_character_name) if active_character_name else None
-    )
-    effective_prompt, extra_negative, raw_positive, raw_negative = _resolve_effective_prompt(
-        prompt_text, character
+    profile, effective_prompt, extra_negative, raw_positive, raw_negative = (
+        _resolve_profile_and_prompt(chat_id, checkpoint, prompt_text, storage, profiles)
     )
 
     status_message = await message.reply_text("Generating… 0%", disable_notification=True)
@@ -1989,8 +2056,7 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     status_message = await message.reply_text("Analyzing image…", disable_notification=True)
 
     async def _download_and_analyze_both() -> tuple[str | None, tuple[str, str] | None]:
-        tg_file = await context.bot.get_file(message.photo[-1].file_id)
-        source_bytes = bytes(await tg_file.download_as_bytearray())
+        source_bytes = await _download_telegram_file(context.bot, message.photo[-1].file_id)
         return await _analyze_both_deep(source_bytes, settings)
 
     result = await _run_reporting_errors(
@@ -1999,18 +2065,9 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if result is None:
         return
     tags, caption = result
-    caption_positive, caption_negative = caption if caption is not None else (None, "")
     await status_message.delete()
-
-    await _send_derived_prompt(message, storage, chat_id, checkpoint, "🏷️ WD14 tags", tags)
-    await _send_derived_prompt(
-        message,
-        storage,
-        chat_id,
-        checkpoint,
-        "💬 Qwen-VL caption (deep)",
-        caption_positive,
-        caption_negative,
+    await _send_tag_and_caption_prompts(
+        message, storage, chat_id, checkpoint, "💬 Qwen-VL caption (deep)", tags, caption
     )
 
 
@@ -2131,8 +2188,7 @@ async def document_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     status_message = await message.reply_text("Reading image…", disable_notification=True)
 
     async def _download() -> bytes:
-        tg_file = await context.bot.get_file(document.file_id)
-        return bytes(await tg_file.download_as_bytearray())
+        return await _download_telegram_file(context.bot, document.file_id)
 
     data = await _run_reporting_errors(status_message, "Import", "document import", _download())
     if data is None:
@@ -2237,17 +2293,9 @@ async def _import_without_metadata(
     if result is None:
         return
     tags, caption = result
-    caption_positive, caption_negative = caption if caption is not None else (None, "")
     await status_message.delete()
-    await _send_derived_prompt(message, storage, chat_id, checkpoint, "🏷️ WD14 tags", tags)
-    await _send_derived_prompt(
-        message,
-        storage,
-        chat_id,
-        checkpoint,
-        "💬 Qwen-VL caption (deep)",
-        caption_positive,
-        caption_negative,
+    await _send_tag_and_caption_prompts(
+        message, storage, chat_id, checkpoint, "💬 Qwen-VL caption (deep)", tags, caption
     )
 
 
@@ -2501,8 +2549,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         chat_id = pending["chat_id"]
 
         async def _download_and_analyze_both() -> tuple[str | None, tuple[str, str] | None]:
-            tg_file = await context.bot.get_file(pending["file_id"])
-            source_bytes = bytes(await tg_file.download_as_bytearray())
+            source_bytes = await _download_telegram_file(context.bot, pending["file_id"])
             return await _analyze_both(source_bytes, settings)
 
         result = await _run_reporting_errors(
@@ -2511,18 +2558,9 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         if result is None:
             return
         tags, caption = result
-        caption_positive, caption_negative = caption if caption is not None else (None, "")
         await status_message.delete()
-
-        await _send_derived_prompt(query.message, storage, chat_id, checkpoint, "🏷️ WD14 tags", tags)
-        await _send_derived_prompt(
-            query.message,
-            storage,
-            chat_id,
-            checkpoint,
-            "💬 Qwen-VL caption",
-            caption_positive,
-            caption_negative,
+        await _send_tag_and_caption_prompts(
+            query.message, storage, chat_id, checkpoint, "💬 Qwen-VL caption", tags, caption
         )
         return
 
@@ -2534,8 +2572,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         chat_id = pending["chat_id"]
 
         async def _download_and_analyze_deep() -> tuple[str, str]:
-            tg_file = await context.bot.get_file(pending["file_id"])
-            source_bytes = bytes(await tg_file.download_as_bytearray())
+            source_bytes = await _download_telegram_file(context.bot, pending["file_id"])
             return await analyze_caption_deep(source_bytes, settings)
 
         caption = await _run_reporting_errors(
@@ -2569,9 +2606,8 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if kind == HAND_MANUAL_CALLBACK_KIND:
-        tg_file = await context.bot.get_file(pending["file_id"])
-        source_bytes = bytes(await tg_file.download_as_bytearray())
-        gridded = _draw_hand_point_grid(source_bytes)
+        source_bytes = await _download_telegram_file(context.bot, pending["file_id"])
+        gridded = await asyncio.to_thread(_draw_hand_point_grid, source_bytes)
         await query.message.reply_photo(
             photo=io.BytesIO(gridded),
             caption="Tap the cell over the hand:",
@@ -2606,8 +2642,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             status_message = await query.message.reply_text(
                 "Uploading image to the mask editor…", disable_notification=True
             )
-            tg_file = await context.bot.get_file(pending["file_id"])
-            source_bytes = bytes(await tg_file.download_as_bytearray())
+            source_bytes = await _download_telegram_file(context.bot, pending["file_id"])
             try:
                 token = await _relay_create_job(settings, source_bytes)
             except Exception:
@@ -2658,8 +2693,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"That mask has expired — draw a new one with {redo_button}."
             )
             return
-        tg_file = await context.bot.get_file(redo["source_file_id"])
-        source_bytes = bytes(await tg_file.download_as_bytearray())
+        source_bytes = await _download_telegram_file(context.bot, redo["source_file_id"])
         # "🔁 x4" runs the same iteration DRAWN_MASK_REDO4_COUNT times instead
         # of once, reusing the one source download above across all of them.
         # Stops at the first failure rather than continuing to spend ComfyUI
@@ -2689,8 +2723,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if kind in ("upscale", UPSCALE_CONFIRM_CALLBACK_KIND):
         if kind == UPSCALE_CONFIRM_CALLBACK_KIND:
             await _safe_edit_message(query, "Upscaling anyway…", InlineKeyboardMarkup([]))
-        tg_file = await context.bot.get_file(pending["file_id"])
-        source_bytes = bytes(await tg_file.download_as_bytearray())
+        source_bytes = await _download_telegram_file(context.bot, pending["file_id"])
         if kind == "upscale":
             width, height = Image.open(io.BytesIO(source_bytes)).size
             if max(width, height) >= UPSCALE_CONFIRM_THRESHOLD_PX:
@@ -2712,8 +2745,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         case that's reused instead of hitting Telegram for it twice."""
         data = source_bytes
         if data is None:
-            tg_file = await context.bot.get_file(pending["file_id"])
-            data = bytes(await tg_file.download_as_bytearray())
+            data = await _download_telegram_file(context.bot, pending["file_id"])
         return await post_process(
             client,
             kind,
@@ -2806,8 +2838,7 @@ async def hand_point_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     status_message = await query.message.reply_text("Refining hand…", disable_notification=True)
 
     async def _download_and_post_process() -> GeneratedImage:
-        tg_file = await context.bot.get_file(pending["file_id"])
-        data = bytes(await tg_file.download_as_bytearray())
+        data = await _download_telegram_file(context.bot, pending["file_id"])
         return await post_process(
             client,
             "hand_manual",
@@ -2858,9 +2889,8 @@ async def hand_point_density_callback(update: Update, context: ContextTypes.DEFA
         return
 
     await query.answer()
-    tg_file = await context.bot.get_file(pending["file_id"])
-    source_bytes = bytes(await tg_file.download_as_bytearray())
-    gridded = _draw_hand_point_grid(source_bytes, grid_size)
+    source_bytes = await _download_telegram_file(context.bot, pending["file_id"])
+    gridded = await asyncio.to_thread(_draw_hand_point_grid, source_bytes, grid_size)
     await query.message.reply_photo(
         photo=io.BytesIO(gridded),
         caption="Tap the cell over the hand:",
@@ -3186,46 +3216,45 @@ async def _consume_awaiting_detail_prompt(
     return True
 
 
-async def detail_prompt_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the "❌ Cancel" tap on the "send the detail prompt" follow-up
-    (see `_detail_prompt_keyboard`): clears `awaiting_detail_prompt` so the
-    next text message goes back to being a normal generation prompt, and
-    edits the buttons away so a stale tap can't be replayed. Mirrors
-    `stream_cancel_callback`."""
-    query = update.callback_query
-    settings: Settings = context.bot_data["settings"]
-    user_id = update.effective_user.id if update.effective_user else None
-    if await reject_if_unauthorized_callback(query, user_id, settings):
-        return
+def _make_cancel_callback(
+    pending_key: str, cancelled_text: str
+) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]:
+    """Build a "❌ Cancel" callback for a one-shot `awaiting_*` follow-up
+    entry (the same pattern `settings_menu.py`'s custom-value capture and
+    this file's character-edit/-rename/detail-prompt/stream-prompt entries
+    all use): clears `pending_key` so the next text message goes back to
+    being treated as a normal generation prompt, and edits the button away
+    so a stale tap can't be replayed. `detail_prompt_cancel_callback`/
+    `stream_cancel_callback` differ only in which entry they clear and what
+    the edited message says."""
 
-    if not pop_pending(context.chat_data, "awaiting_detail_prompt", query.message):
-        await query.answer("Nothing to cancel.")
-        return
+    async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        settings: Settings = context.bot_data["settings"]
+        user_id = update.effective_user.id if update.effective_user else None
+        if await reject_if_unauthorized_callback(query, user_id, settings):
+            return
 
-    await query.answer("Cancelled.")
-    await _safe_edit_message(query, "Detail prompt unchanged.", InlineKeyboardMarkup([]))
+        if not pop_pending(context.chat_data, pending_key, query.message):
+            await query.answer("Nothing to cancel.")
+            return
+
+        await query.answer("Cancelled.")
+        await _safe_edit_message(query, cancelled_text, InlineKeyboardMarkup([]))
+
+    return callback
 
 
-async def stream_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the "❌ Cancel" tap on the "What should the stream generate?"
-    follow-up prompt (see `stream_command`'s promptless branch and
-    `_stream_prompt_cancel_keyboard`): clears `awaiting_stream_prompt` so
-    the next text message goes back to being treated as a normal
-    generation prompt, and edits the button away so a stale tap (the
-    prompt was already sent and consumed, or a previous cancel already
-    fired) can't be replayed."""
-    query = update.callback_query
-    settings: Settings = context.bot_data["settings"]
-    user_id = update.effective_user.id if update.effective_user else None
-    if await reject_if_unauthorized_callback(query, user_id, settings):
-        return
-
-    if not pop_pending(context.chat_data, "awaiting_stream_prompt", query.message):
-        await query.answer("Nothing to cancel.")
-        return
-
-    await query.answer("Cancelled.")
-    await _safe_edit_message(query, "Cancelled — no stream started.", InlineKeyboardMarkup([]))
+#: "❌ Cancel" on the "send the detail prompt" follow-up — see
+#: `_detail_prompt_keyboard`.
+detail_prompt_cancel_callback = _make_cancel_callback(
+    "awaiting_detail_prompt", "Detail prompt unchanged."
+)
+#: "❌ Cancel" on the "What should the stream generate?" follow-up — see
+#: `stream_command`'s promptless branch and `_stream_prompt_cancel_keyboard`.
+stream_cancel_callback = _make_cancel_callback(
+    "awaiting_stream_prompt", "Cancelled — no stream started."
+)
 
 
 async def _run_stream(
@@ -3253,17 +3282,8 @@ async def _run_stream(
         if checkpoint is None:
             return
 
-        profile = resolve_profile(checkpoint, profiles)
-        profile = apply_profile_override(
-            profile, checkpoint, storage.get_override(chat_id, checkpoint)
-        )
-
-        active_character_name = storage.get_active_character_name(chat_id)
-        character = (
-            storage.get_character(chat_id, active_character_name) if active_character_name else None
-        )
-        effective_prompt, extra_negative, raw_positive, raw_negative = _resolve_effective_prompt(
-            prompt_text, character
+        profile, effective_prompt, extra_negative, raw_positive, raw_negative = (
+            _resolve_profile_and_prompt(chat_id, checkpoint, prompt_text, storage, profiles)
         )
 
         status_message = await message.reply_text(
@@ -3404,6 +3424,39 @@ def _no_tag_data_message() -> str:
     return "No tag data imported yet — run scripts/update_tag_db.py first (see README)."
 
 
+async def _resolve_tag_query(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, usage_text: str
+) -> tuple[TagDatabase, Settings, list[TagSource], str] | None:
+    """Shared `/tags`/`/tagcheck` setup: auth, the "no tag data imported"
+    guard, argument parsing, and `_resolve_tag_sources` resolution — bailing
+    out with `usage_text` if the query/prompt ends up empty. Returns None
+    after already replying, the same "stop here" convention
+    `_run_reporting_errors`/`_resolve_checkpoint_or_default` use elsewhere
+    in this file. Returns `(tags_db, settings, sources, query)` on success."""
+    settings: Settings = context.bot_data["settings"]
+    if await reject_if_unauthorized(update, settings):
+        return None
+
+    message = update.effective_message
+    tags_db: TagDatabase = context.bot_data["tags_db"]
+    if not any(tags_db.stats().values()):
+        await message.reply_text(_no_tag_data_message())
+        return None
+
+    raw = (message.text or "").split(maxsplit=1)
+    args_text = raw[1].strip() if len(raw) > 1 else ""
+
+    storage: Storage = context.bot_data["storage"]
+    profiles: list[ModelProfile] = context.bot_data["profiles"]
+    checkpoint = storage.get_checkpoint(update.effective_chat.id)
+    sources, query = _resolve_tag_sources(args_text, checkpoint, profiles)
+    query = query.strip()
+    if not query:
+        await message.reply_text(usage_text)
+        return None
+    return tags_db, settings, sources, query
+
+
 async def tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/tags <query>` — search the local danbooru/e621 tag database to
     help build a prompt. Scoped to whichever dictionary the current chat's
@@ -3417,30 +3470,16 @@ async def tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     straight into the next prompt message. Doesn't require ComfyUI to be
     reachable — this is pure local sqlite lookup, so it works even before a
     model is selected."""
-    settings: Settings = context.bot_data["settings"]
-    if await reject_if_unauthorized(update, settings):
+    resolved = await _resolve_tag_query(
+        update,
+        context,
+        'Usage: /tags <query> — optionally prefixed with "danbooru:" or "e621:" '
+        'to search a specific dictionary, e.g. "/tags e621:fox"',
+    )
+    if resolved is None:
         return
-
+    tags_db, settings, sources, query = resolved
     message = update.effective_message
-    tags_db: TagDatabase = context.bot_data["tags_db"]
-    if not any(tags_db.stats().values()):
-        await message.reply_text(_no_tag_data_message())
-        return
-
-    raw = (message.text or "").split(maxsplit=1)
-    args_text = raw[1].strip() if len(raw) > 1 else ""
-
-    storage: Storage = context.bot_data["storage"]
-    profiles: list[ModelProfile] = context.bot_data["profiles"]
-    checkpoint = storage.get_checkpoint(update.effective_chat.id)
-    sources, query = _resolve_tag_sources(args_text, checkpoint, profiles)
-    query = query.strip()
-    if not query:
-        await message.reply_text(
-            'Usage: /tags <query> — optionally prefixed with "danbooru:" or "e621:" '
-            'to search a specific dictionary, e.g. "/tags e621:fox"'
-        )
-        return
 
     results = tags_db.search(query, sources, limit=settings.tag_search_results, by_frequency=True)
     if not results:
@@ -3511,30 +3550,16 @@ async def tagcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """`/tagcheck <prompt>` — check each comma-separated tag in `prompt`
     against the tag database (see `_tagcheck_lines`). Same source
     resolution/override as `tags_command`."""
-    settings: Settings = context.bot_data["settings"]
-    if await reject_if_unauthorized(update, settings):
+    resolved = await _resolve_tag_query(
+        update,
+        context,
+        "Usage: /tagcheck <prompt> — checks each comma-separated tag against the "
+        'tag database. Same "danbooru:"/"e621:" prefix override as /tags.',
+    )
+    if resolved is None:
         return
-
+    tags_db, settings, sources, prompt_text = resolved
     message = update.effective_message
-    tags_db: TagDatabase = context.bot_data["tags_db"]
-    if not any(tags_db.stats().values()):
-        await message.reply_text(_no_tag_data_message())
-        return
-
-    raw = (message.text or "").split(maxsplit=1)
-    args_text = raw[1].strip() if len(raw) > 1 else ""
-
-    storage: Storage = context.bot_data["storage"]
-    profiles: list[ModelProfile] = context.bot_data["profiles"]
-    checkpoint = storage.get_checkpoint(update.effective_chat.id)
-    sources, prompt_text = _resolve_tag_sources(args_text, checkpoint, profiles)
-    prompt_text = prompt_text.strip()
-    if not prompt_text:
-        await message.reply_text(
-            "Usage: /tagcheck <prompt> — checks each comma-separated tag against the "
-            'tag database. Same "danbooru:"/"e621:" prefix override as /tags.'
-        )
-        return
 
     lines = _tagcheck_lines(prompt_text, sources, tags_db, settings)
     await message.reply_text("\n".join(lines))

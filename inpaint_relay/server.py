@@ -124,6 +124,15 @@ def require_shared_secret(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing bearer token")
 
 
+def _get_job_or_404(token: str) -> Job:
+    """The job for `token`, or a 404 — shared by every route below that
+    needs an existing job rather than just checking one exists."""
+    job = _jobs.get(token)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown or expired job")
+    return job
+
+
 def _prune_expired_jobs() -> None:
     """Drop jobs older than `JOB_TTL_SECONDS`. Called at the top of every
     request rather than on a separate background timer — this dict is
@@ -161,8 +170,7 @@ async def mask_editor_page(token: str) -> FileResponse:
     than silently serving the editor) once the job has expired or been
     consumed, since there'd be nothing left for it to load."""
     _prune_expired_jobs()
-    if token not in _jobs:
-        raise HTTPException(status_code=404, detail="Unknown or expired job")
+    _get_job_or_404(token)
     return FileResponse(STATIC_DIR / "index.html")
 
 
@@ -170,9 +178,7 @@ async def mask_editor_page(token: str) -> FileResponse:
 async def job_image(token: str) -> Response:
     """The source image for the mask editor's `<canvas>` to draw over."""
     _prune_expired_jobs()
-    job = _jobs.get(token)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Unknown or expired job")
+    job = _get_job_or_404(token)
     return Response(content=job.image, media_type=job.image_content_type)
 
 
@@ -183,9 +189,7 @@ async def submit_mask(token: str, request: Request) -> dict[str, bool]:
     text field (`Telegram.WebApp.initData`, opaque to this relay — see
     module docstring for why it's forwarded rather than checked here)."""
     _prune_expired_jobs()
-    job = _jobs.get(token)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Unknown or expired job")
+    job = _get_job_or_404(token)
     form = await request.form()
     mask_file = form.get("mask")
     init_data = form.get("init_data")
@@ -204,9 +208,7 @@ async def job_result(token: str) -> JSONResponse:
     JSON body alongside `init_data`, rather than needing a second endpoint
     or a multipart response just for the bytes."""
     _prune_expired_jobs()
-    job = _jobs.get(token)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Unknown or expired job")
+    job = _get_job_or_404(token)
     if job.status != "submitted":
         return JSONResponse({"status": "pending"})
     return JSONResponse(

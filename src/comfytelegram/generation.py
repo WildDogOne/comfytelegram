@@ -587,6 +587,108 @@ async def generate(
     return [GeneratedImage(data=data, filename=name, full_params=params) for data, name in raw]
 
 
+def _build_fix_drawn_post_process(
+    base_params: PostProcessBaseParams,
+    uploaded_name: str,
+    mask_upload_name: str,
+    source_image: bytes,
+    mask_bytes: bytes,
+    profiles: list[ModelProfile] | None,
+    detail_prompt: str | None,
+    detail_negative_prompt: str | None,
+) -> tuple[dict, str]:
+    """`post_process`'s `kind="fix_drawn"` graph-building branch, pulled out
+    on its own since — unlike every other `kind`, which just delegates
+    straight to a `build_*` function — this one has real work to do first:
+    pick an override checkpoint (or fall back to the image's own), work out
+    the positive-prompt fallback, and compute the Anima mask-grow/blur/blend
+    geometry. Keeps `post_process` itself down to the same one-branch-per-kind
+    shape every other `kind` uses. Returns `(prompt_graph, save_node_id)`."""
+    # Removal, not refinement: the original positive prompt describes the
+    # whole scene, including whatever the user just marked for deletion,
+    # so conditioning the inpaint on it steers the model toward a nicer
+    # version of the exact thing being removed instead of erasing it.
+    # When there's no fix_artifact_checkpoint override, drop it entirely
+    # and let the fill be driven by `build_fix_drawn_mask`'s
+    # content-aware fill pass and the surrounding image context instead.
+    # The override path composes its own prompt in
+    # `_fix_artifact_override_base` instead — "<profile prefix>,
+    # background scenery", matched against a real krita-ai-diffusion job
+    # (a genuinely blank prompt was this bot's own choice, not krita's).
+    override_base = _fix_artifact_override_base(profiles) if profiles else None
+    if override_base is not None:
+        fix_base_params = override_base
+        checkpoint_source = "fix_artifact_checkpoint override"
+    elif base_params.uses_anima_inpaint_pipeline:
+        # No fix_artifact_checkpoint override matched, but this image's
+        # own checkpoint already has the Anima lllite patch configured
+        # — build_fix_drawn_mask's own routing check (loader=="split"
+        # and anima_lllite_inpaint_patch set) will still send this to
+        # _build_anima_fix_drawn_mask, which documents that it expects a
+        # non-blank positive prompt. A blank one here would silently
+        # reproduce the "masked region came back almost untouched"
+        # regression that whole prompt exists to avoid.
+        fix_base_params = replace(base_params, positive_prompt="background scenery")
+        checkpoint_source = "image's own checkpoint"
+    else:
+        fix_base_params = replace(base_params, positive_prompt="")
+        checkpoint_source = "image's own checkpoint"
+    fix_base_params = _apply_detail_prompt(fix_base_params, detail_prompt, detail_negative_prompt)
+    fix_params = DrawnMaskFixParams()
+    if fix_base_params.uses_anima_inpaint_pipeline:
+        engaged_reason = (
+            f"patch={fix_base_params.anima_lllite_inpaint_patch!r} "
+            f"strength={fix_base_params.anima_lllite_inpaint_patch_strength}"
+        )
+    elif fix_base_params.loader != "split":
+        engaged_reason = f"skipped (loader={fix_base_params.loader!r}, not 'split')"
+    else:
+        engaged_reason = "skipped (anima_lllite_inpaint_patch not set on this profile)"
+    image_size = Image.open(io.BytesIO(source_image)).size
+    geometry = _fix_drawn_geometry(mask_bytes, image_size, fix_params)
+    if fix_base_params.uses_anima_inpaint_pipeline:
+        fix_params = replace(
+            fix_params,
+            mask_grow=geometry.mask_grow,
+            mask_blur=geometry.mask_blur,
+            blend=geometry.blend,
+        )
+    region_longest = max(geometry.context_crop[2], geometry.context_crop[3])
+    logger.info(
+        "Fix Artifact: checkpoint=%s (%s) loader=%s fill_model=%s anima_lllite_patch: %s "
+        "positive_prompt=%r context=%s -> work_size=%s (image_size=%s) "
+        "mask_grow=%s mask_blur=%s blend=%s refine=%s",
+        fix_base_params.checkpoint,
+        checkpoint_source,
+        fix_base_params.loader,
+        fix_params.fill_model,
+        engaged_reason,
+        fix_base_params.positive_prompt,
+        geometry.context_crop,
+        geometry.work_size,
+        image_size,
+        fix_params.mask_grow,
+        fix_params.mask_blur,
+        fix_params.blend,
+        (
+            f"crop={geometry.refine_region[0]} at {geometry.refine_region[1]} "
+            f"strength={fix_params.refine_denoise}"
+            if geometry.refine_region
+            else f"skipped (pass 1 already resolves it at ~{region_longest}px)"
+        ),
+    )
+    return build_fix_drawn_mask(
+        uploaded_name,
+        mask_upload_name,
+        fix_base_params,
+        fix_params,
+        image_size=image_size,
+        work_size=geometry.work_size,
+        context_crop=geometry.context_crop,
+        refine_region=geometry.refine_region,
+    )
+
+
 async def post_process(
     client: ComfyClient,
     kind: Literal[
@@ -694,91 +796,21 @@ async def post_process(
     elif kind == "fix_drawn":
         assert mask_bytes is not None, "fix_drawn requires mask_bytes"
         mask_upload = await client.upload_image(mask_bytes, filename=f"mask_{source_filename}")
-        # Removal, not refinement: the original positive prompt describes the
-        # whole scene, including whatever the user just marked for deletion,
-        # so conditioning the inpaint on it steers the model toward a nicer
-        # version of the exact thing being removed instead of erasing it.
-        # When there's no fix_artifact_checkpoint override, drop it entirely
-        # and let the fill be driven by `build_fix_drawn_mask`'s
-        # content-aware fill pass and the surrounding image context instead.
-        # The override path composes its own prompt in
-        # `_fix_artifact_override_base` instead — "<profile prefix>,
-        # background scenery", matched against a real krita-ai-diffusion job
-        # (a genuinely blank prompt was this bot's own choice, not krita's).
-        override_base = _fix_artifact_override_base(profiles) if profiles else None
-        if override_base is not None:
-            fix_base_params = override_base
-            checkpoint_source = "fix_artifact_checkpoint override"
-        elif base_params.loader == "split" and base_params.anima_lllite_inpaint_patch:
-            # No fix_artifact_checkpoint override matched, but this image's
-            # own checkpoint already has the Anima lllite patch configured
-            # — build_fix_drawn_mask's own routing check (loader=="split"
-            # and anima_lllite_inpaint_patch set) will still send this to
-            # _build_anima_fix_drawn_mask, which documents that it expects a
-            # non-blank positive prompt. A blank one here would silently
-            # reproduce the "masked region came back almost untouched"
-            # regression that whole prompt exists to avoid.
-            fix_base_params = replace(base_params, positive_prompt="background scenery")
-            checkpoint_source = "image's own checkpoint"
-        else:
-            fix_base_params = replace(base_params, positive_prompt="")
-            checkpoint_source = "image's own checkpoint"
-        fix_base_params = _apply_detail_prompt(
-            fix_base_params, detail_prompt, detail_negative_prompt
-        )
-        fix_params = DrawnMaskFixParams()
-        if fix_base_params.loader == "split" and fix_base_params.anima_lllite_inpaint_patch:
-            engaged_reason = (
-                f"patch={fix_base_params.anima_lllite_inpaint_patch!r} "
-                f"strength={fix_base_params.anima_lllite_inpaint_patch_strength}"
-            )
-        elif fix_base_params.loader != "split":
-            engaged_reason = f"skipped (loader={fix_base_params.loader!r}, not 'split')"
-        else:
-            engaged_reason = "skipped (anima_lllite_inpaint_patch not set on this profile)"
-        image_size = Image.open(io.BytesIO(source_image)).size
-        geometry = _fix_drawn_geometry(mask_bytes, image_size, fix_params)
-        is_anima = fix_base_params.loader == "split" and fix_base_params.anima_lllite_inpaint_patch
-        if is_anima:
-            fix_params = replace(
-                fix_params,
-                mask_grow=geometry.mask_grow,
-                mask_blur=geometry.mask_blur,
-                blend=geometry.blend,
-            )
-        region_longest = max(geometry.context_crop[2], geometry.context_crop[3])
-        logger.info(
-            "Fix Artifact: checkpoint=%s (%s) loader=%s fill_model=%s anima_lllite_patch: %s "
-            "positive_prompt=%r context=%s -> work_size=%s (image_size=%s) "
-            "mask_grow=%s mask_blur=%s blend=%s refine=%s",
-            fix_base_params.checkpoint,
-            checkpoint_source,
-            fix_base_params.loader,
-            fix_params.fill_model,
-            engaged_reason,
-            fix_base_params.positive_prompt,
-            geometry.context_crop,
-            geometry.work_size,
-            image_size,
-            fix_params.mask_grow,
-            fix_params.mask_blur,
-            fix_params.blend,
-            (
-                f"crop={geometry.refine_region[0]} at {geometry.refine_region[1]} "
-                f"strength={fix_params.refine_denoise}"
-                if geometry.refine_region
-                else f"skipped (pass 1 already resolves it at ~{region_longest}px)"
-            ),
-        )
-        prompt_graph, save_node_id = build_fix_drawn_mask(
+        # Off the event loop: this decodes the source image and the mask
+        # (both up to the original's full resolution) to work out the
+        # inpaint geometry, real CPU work that would otherwise block every
+        # other concurrently-scheduled update (see `concurrent_updates(True)`
+        # in main.py) for its duration.
+        prompt_graph, save_node_id = await asyncio.to_thread(
+            _build_fix_drawn_post_process,
+            base_params,
             uploaded_name,
             mask_upload["name"],
-            fix_base_params,
-            fix_params,
-            image_size=image_size,
-            work_size=geometry.work_size,
-            context_crop=geometry.context_crop,
-            refine_region=geometry.refine_region,
+            source_image,
+            mask_bytes,
+            profiles,
+            detail_prompt,
+            detail_negative_prompt,
         )
     else:
         raise ValueError(f"Unknown post-processing kind: {kind}")

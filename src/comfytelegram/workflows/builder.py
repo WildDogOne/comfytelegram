@@ -246,6 +246,15 @@ class PostProcessBaseParams:
     anima_lllite_inpaint_patch_strength: float = 1.0
     upscale_denoise: float | None = None
 
+    @property
+    def uses_anima_inpaint_pipeline(self) -> bool:
+        """True when `build_fix_drawn_mask` routes to the hand-built
+        `_build_anima_fix_drawn_mask` pipeline instead of the generic
+        `_build_drawn_mask_detailer` fallback — the one condition that
+        decides it, named here so `generation.py`'s `post_process` can
+        branch on the same thing without re-deriving it inline."""
+        return self.loader == "split" and bool(self.anima_lllite_inpaint_patch)
+
 
 def _build_model_clip_vae(
     g: PromptGraph, base: GenerationParams | PostProcessBaseParams
@@ -669,6 +678,77 @@ class ManualHandDetailerParams:
     crop_factor: float = 3.0
 
 
+def _add_segs_detailer(
+    g: PromptGraph,
+    *,
+    image_ref: NodeRef,
+    mask_ref: NodeRef,
+    model_ref: NodeRef,
+    clip_ref: NodeRef,
+    vae_ref: NodeRef,
+    positive: str,
+    negative: str,
+    params: Any,
+    seed: int,
+    crop_factor: float,
+    denoise: float,
+    segs_title: str,
+    detailer_title: str,
+) -> str:
+    """`MaskToSEGS` -> `DetailerForEach` — the region-inpaint pair shared by
+    `build_hand_detailer_manual` and `_build_drawn_mask_detailer`: turn a
+    ready-made mask into a `SEGS` region (Impact Pack's `MaskToSEGS`) and
+    hand it to `DetailerForEach`, the modular sibling of `FaceDetailer`/
+    `_build_detailer` that inpaints a given `SEGS` directly instead of
+    running its own bbox detection. No detection-check `PreviewImage` node
+    is added here, unlike `_build_detailer` — a manually placed or
+    hand-drawn mask is never empty. `seed`/`crop_factor`/`denoise` are taken
+    explicitly rather than read off `params` since the drawn-mask
+    content-aware-fill path needs that same seed on an earlier node too.
+    Returns the `DetailerForEach` node id."""
+    segs = g.add(
+        "MaskToSEGS",
+        {
+            "mask": list(mask_ref),
+            "combined": False,
+            "crop_factor": crop_factor,
+            "bbox_fill": False,
+            "drop_size": 10,
+            "contour_fill": False,
+        },
+        title=segs_title,
+    )
+    return g.add(
+        "DetailerForEach",
+        {
+            "image": list(image_ref),
+            "segs": [segs, 0],
+            "model": list(model_ref),
+            "clip": list(clip_ref),
+            "vae": list(vae_ref),
+            "positive": [positive, 0],
+            "negative": [negative, 0],
+            "guide_size": params.guide_size,
+            "guide_size_for": True,
+            "max_size": params.max_size,
+            "seed": seed,
+            "steps": params.steps,
+            "cfg": params.cfg,
+            "sampler_name": params.sampler_name,
+            "scheduler": params.scheduler,
+            "denoise": denoise,
+            "feather": params.feather,
+            "noise_mask": True,
+            "force_inpaint": True,
+            "wildcard": "",
+            "cycle": 1,
+            "inpaint_model": False,
+            "noise_mask_feather": 20,
+        },
+        title=detailer_title,
+    )
+
+
 def build_hand_detailer_manual(
     source_filename: str,
     base: PostProcessBaseParams,
@@ -726,47 +806,21 @@ def build_hand_detailer_manual(
         },
         title="Marked Region",
     )
-    segs = g.add(
-        "MaskToSEGS",
-        {
-            "mask": [marked_mask, 0],
-            "combined": False,
-            "crop_factor": params.crop_factor,
-            "bbox_fill": False,
-            "drop_size": 10,
-            "contour_fill": False,
-        },
-        title="Marked Region SEGS",
-    )
-
-    detailer = g.add(
-        "DetailerForEach",
-        {
-            "image": [load, 0],
-            "segs": [segs, 0],
-            "model": list(model_ref),
-            "clip": list(clip_ref),
-            "vae": list(vae_ref),
-            "positive": [positive, 0],
-            "negative": [negative, 0],
-            "guide_size": params.guide_size,
-            "guide_size_for": True,
-            "max_size": params.max_size,
-            "seed": _resolve_seed(params.seed),
-            "steps": params.steps,
-            "cfg": params.cfg,
-            "sampler_name": params.sampler_name,
-            "scheduler": params.scheduler,
-            "denoise": params.denoise,
-            "feather": params.feather,
-            "noise_mask": True,
-            "force_inpaint": True,
-            "wildcard": "",
-            "cycle": 1,
-            "inpaint_model": False,
-            "noise_mask_feather": 20,
-        },
-        title="Hand Detailer (manual)",
+    detailer = _add_segs_detailer(
+        g,
+        image_ref=(load, 0),
+        mask_ref=(marked_mask, 0),
+        model_ref=model_ref,
+        clip_ref=clip_ref,
+        vae_ref=vae_ref,
+        positive=positive,
+        negative=negative,
+        params=params,
+        seed=_resolve_seed(params.seed),
+        crop_factor=params.crop_factor,
+        denoise=params.denoise,
+        segs_title="Marked Region SEGS",
+        detailer_title="Hand Detailer (manual)",
     )
 
     save = g.add(
@@ -1023,7 +1077,7 @@ def build_fix_drawn_mask(
     back to the same graph shape as `build_hand_detailer_drawn_mask` plus a
     `DrawnMaskFixParams.fill_model` content-aware fill pass — see
     `_build_drawn_mask_detailer`'s `content_aware_fill`."""
-    if base.loader == "split" and base.anima_lllite_inpaint_patch:
+    if base.uses_anima_inpaint_pipeline:
         return _build_anima_fix_drawn_mask(
             source_filename,
             mask_filename,
@@ -1792,9 +1846,9 @@ def _build_drawn_mask_detailer(
 
     This function is only actually reached with `content_aware_fill=True`
     when `build_fix_drawn_mask` did *not* route to `_build_anima_fix_drawn_mask`
-    instead — i.e. `base.loader == "split" and base.anima_lllite_inpaint_patch`
-    is guaranteed false here, since that exact condition is what sends the
-    call there first. No Anima-specific ControlNet patching happens in this
+    instead — i.e. `base.uses_anima_inpaint_pipeline` is guaranteed false
+    here, since that exact condition is what sends the call there first.
+    No Anima-specific ControlNet patching happens in this
     function for that reason; see `_build_anima_fix_drawn_mask` for that
     entire pipeline instead. No SDXL/SD1.5 equivalent is wired in at all yet
     for this fallback — that would need either a custom Impact Pack
@@ -1832,47 +1886,21 @@ def _build_drawn_mask_detailer(
         )
         detailer_image = (prefilled, 0)
 
-    segs = g.add(
-        "MaskToSEGS",
-        {
-            "mask": [mask, 0],
-            "combined": False,
-            "crop_factor": params.crop_factor,
-            "bbox_fill": False,
-            "drop_size": 10,
-            "contour_fill": False,
-        },
-        title="Drawn Region SEGS",
-    )
-
-    detailer = g.add(
-        "DetailerForEach",
-        {
-            "image": list(detailer_image),
-            "segs": [segs, 0],
-            "model": list(model_ref),
-            "clip": list(clip_ref),
-            "vae": list(vae_ref),
-            "positive": [positive, 0],
-            "negative": [negative, 0],
-            "guide_size": params.guide_size,
-            "guide_size_for": True,
-            "max_size": params.max_size,
-            "seed": seed,
-            "steps": params.steps,
-            "cfg": params.cfg,
-            "sampler_name": params.sampler_name,
-            "scheduler": params.scheduler,
-            "denoise": denoise,
-            "feather": params.feather,
-            "noise_mask": True,
-            "force_inpaint": True,
-            "wildcard": "",
-            "cycle": 1,
-            "inpaint_model": False,
-            "noise_mask_feather": 20,
-        },
-        title=f"{label} Detailer (drawn mask)",
+    detailer = _add_segs_detailer(
+        g,
+        image_ref=detailer_image,
+        mask_ref=(mask, 0),
+        model_ref=model_ref,
+        clip_ref=clip_ref,
+        vae_ref=vae_ref,
+        positive=positive,
+        negative=negative,
+        params=params,
+        seed=seed,
+        crop_factor=params.crop_factor,
+        denoise=denoise,
+        segs_title="Drawn Region SEGS",
+        detailer_title=f"{label} Detailer (drawn mask)",
     )
 
     save = g.add(

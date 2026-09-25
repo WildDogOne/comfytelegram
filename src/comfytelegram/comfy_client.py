@@ -7,6 +7,7 @@ since the bot needs to handle many concurrent users itself.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -94,8 +95,9 @@ class ComfyClient:
         architecture models like Anima ship as; see `ModelProfile.loader`).
         Both are offered from the same `/model` list; which loader a given
         entry actually needs is decided later by profile resolution."""
-        ckpt_info = await self.get_node_info("CheckpointLoaderSimple")
-        unet_info = await self.get_node_info("UNETLoader")
+        ckpt_info, unet_info = await asyncio.gather(
+            self.get_node_info("CheckpointLoaderSimple"), self.get_node_info("UNETLoader")
+        )
         return _enum_choices(ckpt_info, "ckpt_name") + _enum_choices(unet_info, "unet_name")
 
     async def list_loras(self) -> list[str]:
