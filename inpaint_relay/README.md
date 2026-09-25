@@ -1,11 +1,11 @@
 # inpaint_relay
 
-Small public-host relay backing comfytelegram's "🖌️ Draw Mask" hand-detail
-option. It's what makes a [Telegram Web App](https://core.telegram.org/bots/webapps)
-mask editor possible even though comfytelegram itself runs on a box with no
-public/inbound network exposure — see `server.py`'s module docstring for the
-full trust model and the main repo's `CLAUDE.md`/plan for the end-to-end
-architecture.
+Small public-host relay backing comfytelegram's "🖌️ Draw Mask"/"🩹 Fix
+Artifact" and "✏️ Detail Prompt" options. It's what makes a
+[Telegram Web App](https://core.telegram.org/bots/webapps) editor possible
+even though comfytelegram itself runs on a box with no public/inbound
+network exposure — see `server.py`'s module docstring for the full trust
+model and the main repo's `CLAUDE.md`/plan for the end-to-end architecture.
 
 This is a separate, independently-deployed service: its own `pyproject.toml`,
 its own `Dockerfile`, meant to run on your public Traefik host, not alongside
@@ -13,12 +13,20 @@ the bot itself.
 
 ## What it does (and doesn't)
 
-- Holds two blobs per in-flight job, in memory only: the source image
-  (pushed by comfytelegram) and the drawn mask (pushed by the browser).
-- Serves the mask-editor page (`static/index.html`) and the source image to
-  whatever opens the per-job URL — no ComfyUI or Telegram bot-token access
-  needed or wanted here.
-- Does **not** validate that a submitted mask genuinely came from Telegram
+- Holds one job per in-flight editor session, in memory only. Every job
+  draws a mask; `Job.mode` just decides whether the editor page also shows
+  editable positive/negative/denoise fields next to the canvas ("mask" for
+  "🖌️ Draw Mask"/"🩹 Fix Artifact" — canvas only — vs. "mask_prompt" for
+  "✏️ Detail Prompt" — canvas plus those fields, submitted together in one
+  "Done" tap). One blob comes in from comfytelegram (the source image);
+  one comes back from the browser (the mask, plus the prompt fields when
+  present).
+- Serves the editor page (`static/index.html` — its own JS reads
+  `GET /jobs/{token}/meta`'s `mode` to decide whether to show the prompt
+  fields, that's the only branch) and the source image to whatever opens
+  the per-job URL — no ComfyUI or Telegram bot-token access needed or
+  wanted here.
+- Does **not** validate that a submission genuinely came from Telegram
   (`Telegram.WebApp.initData`) — it has no way to, since it never holds the
   bot token. comfytelegram validates that itself after pulling a job back
   (see `auth.validate_webapp_init_data` in the main package). Don't skip

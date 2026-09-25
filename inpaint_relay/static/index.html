@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-<title>Draw mask</title>
+<title id="page-title">Draw mask</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   :root {
@@ -114,14 +114,110 @@
   #button-row button {
     flex: 1;
   }
+  /* "✏️ Detail Prompt" only (`Job.mode == "mask_prompt"`) — a compact strip
+     below the canvas (which keeps its own `flex: 1` regardless of DOM
+     order, so this doesn't shrink it below what's left after this panel's
+     own capped height), capped so the canvas still gets most of the
+     screen; scrolls internally if a long prompt plus the keyboard leaves
+     it no other room. Hidden by default (`display: none` inline in the
+     markup); shown by `applyMeta` once `GET /jobs/{token}/meta` says so. */
+  #prompt-fields {
+    max-height: 34vh;
+    overflow-y: auto;
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    box-sizing: border-box;
+    border-top: 1px solid #222;
+  }
+  #readonly-info {
+    font-size: 12px;
+    line-height: 1.4;
+    color: #9a9a9a;
+  }
+  .field-label {
+    font-size: 13px;
+    font-weight: 600;
+  }
+  textarea {
+    width: 100%;
+    box-sizing: border-box;
+    font-size: 15px;
+    font-family: inherit;
+    padding: 8px 10px;
+    border: 1px solid #333;
+    border-radius: 8px;
+    background: #1c1c1c;
+    color: var(--fg);
+    resize: vertical;
+  }
+  #denoise-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  #denoise-row label {
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+  #denoise-input {
+    flex: 1;
+    min-width: 100px;
+  }
+  #denoise-value {
+    font-size: 13px;
+    color: #9a9a9a;
+    min-width: 3.5em;
+    text-align: right;
+  }
 </style>
 </head>
 <body>
   <div id="status">Loading image…</div>
+
+  <!-- The image/canvas comes first — everything else (prompt fields,
+       brush controls, action buttons) sits below it, so there's always
+       something to look at immediately instead of scrolling past a panel
+       of fields first. -->
   <div id="canvas-wrap">
     <canvas id="display-canvas"></canvas>
   </div>
   <div id="brush-cursor"></div>
+
+  <!-- "✏️ Detail Prompt" only (`Job.mode == "mask_prompt"`) — hidden by
+       default; shown by `applyMeta` once `GET /jobs/{token}/meta` says so.
+       Submitted together with the mask in one `POST /jobs/{token}/mask`
+       from the same "Done" tap below — there's no separate save step. -->
+  <div id="prompt-fields" style="display: none;">
+    <div id="readonly-info"></div>
+    <div>
+      <div class="field-label">Positive</div>
+      <textarea
+        id="positive-input"
+        rows="2"
+        placeholder="Leave blank to use this image's own positive prompt"
+      ></textarea>
+    </div>
+    <div>
+      <div class="field-label">Negative</div>
+      <textarea
+        id="negative-input"
+        rows="2"
+        placeholder="Leave blank to use this image's own negative prompt"
+      ></textarea>
+    </div>
+    <div id="denoise-row">
+      <label><input type="checkbox" id="denoise-override" /> Override denoise</label>
+      <input type="range" id="denoise-input" min="0" max="1" step="0.01" value="0.5" disabled />
+      <span id="denoise-value">detailer default</span>
+    </div>
+  </div>
+
   <div id="controls">
     <label for="brush-size">Brush</label>
     <input type="range" id="brush-size" min="8" max="120" value="36" />
@@ -158,6 +254,17 @@
   var eraseBtn = document.getElementById("erase-btn");
   var autofillBtn = document.getElementById("autofill-btn");
   var brushCursor = document.getElementById("brush-cursor");
+  // "✏️ Detail Prompt" only (`#prompt-fields`, hidden unless `applyMeta`
+  // turns `promptFieldsEnabled` on) — grabbed unconditionally either way,
+  // same as every other element here, since the elements always exist in
+  // the markup regardless of which mode a given job turns out to be.
+  var promptFieldsEl = document.getElementById("prompt-fields");
+  var readonlyEl = document.getElementById("readonly-info");
+  var positiveInput = document.getElementById("positive-input");
+  var negativeInput = document.getElementById("negative-input");
+  var denoiseOverride = document.getElementById("denoise-override");
+  var denoiseInput = document.getElementById("denoise-input");
+  var denoiseValueEl = document.getElementById("denoise-value");
 
   // On by default (matches the button's own initial "active" class in the
   // markup) — `detectAndFillEnclosedAreas` checks this before doing any
@@ -883,6 +990,12 @@
     brushCursor.classList.toggle("erasing", erasing);
   });
 
+  // `promptFieldsEnabled` is set once, from `GET /jobs/{token}/meta`
+  // (`applyMeta`, below) before the image even starts loading — it decides
+  // both whether `#prompt-fields` is shown at all and whether "Done"
+  // includes them in its submission.
+  var promptFieldsEnabled = false;
+
   doneBtn.addEventListener("click", function () {
     doneBtn.disabled = true;
     doneBtn.textContent = "Sending…";
@@ -890,6 +1003,11 @@
       var form = new FormData();
       form.append("mask", blob, "mask.png");
       form.append("init_data", tg ? tg.initData : "");
+      if (promptFieldsEnabled) {
+        form.append("positive", positiveInput.value);
+        form.append("negative", negativeInput.value);
+        form.append("denoise", denoiseOverride.checked ? denoiseInput.value : "");
+      }
       fetch("/jobs/" + encodeURIComponent(token) + "/mask", {
         method: "POST",
         body: form,
@@ -909,47 +1027,109 @@
     }, "image/png");
   });
 
-  image.onload = function () {
-    // The display canvas's own pixel buffer is capped so the mask editor
-    // stays responsive on a large source image — it's just for drawing,
-    // not the final output, and `scale` maps every stroke back up to
-    // maskCanvas's full source-image resolution regardless of this cap.
-    // The cap used to be a flat 900px, which meant a 4k source image sat
-    // roughly 4.5x downscaled even at rest — and since pinch/wheel zoom
-    // (`view.zoom`, up to MAX_ZOOM) is a CSS `transform: scale()` applied
-    // on top of that same fixed raster rather than a redraw at higher
-    // detail, zooming in just stretched those same soft pixels further and
-    // went blocky fast. Sizing the cap off the actual viewport instead
-    // (times device pixel ratio, times MAX_ZOOM) gives the raster enough
-    // real detail to stay crisp all the way to full pinch zoom on whatever
-    // screen this happens to be open on, while still bounding memory/redraw
-    // cost on a small phone screen the same way the old flat cap did.
-    var viewportPxAtMaxZoom =
-      Math.max(canvasWrap.clientWidth, canvasWrap.clientHeight) *
-      (window.devicePixelRatio || 1) *
-      MAX_ZOOM;
-    var maxDisplayDim = Math.min(4096, Math.max(900, viewportPxAtMaxZoom));
-    var displayScale = Math.min(
-      1,
-      maxDisplayDim / Math.max(image.naturalWidth, image.naturalHeight)
+  // `meta.readonly` (see handlers.py's `_detail_prompt_readonly_info`) is
+  // a single flat dict — unlike the old per-image override this replaced,
+  // the run that follows is always the one detailer "✏️ Detail Prompt"
+  // uses, not a later choice, so there's nothing to key it by.
+  function formatReadonlyInfo(info) {
+    if (!info || typeof info.steps === "undefined") return "";
+    return (
+      "Detailing settings: steps " + info.steps +
+      ", cfg " + info.cfg +
+      ", " + info.sampler_name + "/" + info.scheduler +
+      " (default denoise " + info.denoise + ")"
     );
-    displayCanvas.width = Math.round(image.naturalWidth * displayScale);
-    displayCanvas.height = Math.round(image.naturalHeight * displayScale);
-    overlayCanvas.width = displayCanvas.width;
-    overlayCanvas.height = displayCanvas.height;
-    maskCanvas.width = image.naturalWidth;
-    maskCanvas.height = image.naturalHeight;
-    scale = image.naturalWidth / displayCanvas.width;
+  }
 
-    resetMask();
-    setStatus("Draw over the area to fix, then tap Done.");
-  };
-  image.onerror = function () {
-    setStatus("Couldn't load the image — this link may have expired.");
-    doneBtn.disabled = true;
-    clearBtn.disabled = true;
-  };
-  image.src = "/jobs/" + encodeURIComponent(token) + "/image";
+  function updateDenoiseReadout() {
+    denoiseValueEl.textContent = denoiseOverride.checked
+      ? Number(denoiseInput.value).toFixed(2)
+      : "detailer default";
+  }
+
+  // Whether to show `#prompt-fields` at all is decided server-side, at job
+  // creation (`Job.mode` — see inpaint_relay/server.py), not guessed from
+  // anything client-side.
+  function applyMeta(meta) {
+    if (meta.mode !== "mask_prompt") return;
+    promptFieldsEnabled = true;
+    document.title = "Detail prompt";
+    promptFieldsEl.style.display = "flex";
+    readonlyEl.textContent = formatReadonlyInfo(meta.readonly);
+    // Pre-filled with this image's own current prompt — the usual reason
+    // to open this is to cut a scene-wide prompt down to what the marked
+    // region needs, not type one from scratch. Denoise has no equivalent
+    // "current" value to start from (each detailer has its own fixed
+    // default), so its override checkbox starts unchecked regardless.
+    positiveInput.value = meta.positive || "";
+    negativeInput.value = meta.negative || "";
+    denoiseOverride.addEventListener("change", function () {
+      denoiseInput.disabled = !denoiseOverride.checked;
+      updateDenoiseReadout();
+    });
+    denoiseInput.addEventListener("input", updateDenoiseReadout);
+  }
+
+  function loadImage() {
+    image.onload = function () {
+      // The display canvas's own pixel buffer is capped so the mask editor
+      // stays responsive on a large source image — it's just for drawing,
+      // not the final output, and `scale` maps every stroke back up to
+      // maskCanvas's full source-image resolution regardless of this cap.
+      // The cap used to be a flat 900px, which meant a 4k source image sat
+      // roughly 4.5x downscaled even at rest — and since pinch/wheel zoom
+      // (`view.zoom`, up to MAX_ZOOM) is a CSS `transform: scale()` applied
+      // on top of that same fixed raster rather than a redraw at higher
+      // detail, zooming in just stretched those same soft pixels further and
+      // went blocky fast. Sizing the cap off the actual viewport instead
+      // (times device pixel ratio, times MAX_ZOOM) gives the raster enough
+      // real detail to stay crisp all the way to full pinch zoom on whatever
+      // screen this happens to be open on, while still bounding memory/redraw
+      // cost on a small phone screen the same way the old flat cap did.
+      var viewportPxAtMaxZoom =
+        Math.max(canvasWrap.clientWidth, canvasWrap.clientHeight) *
+        (window.devicePixelRatio || 1) *
+        MAX_ZOOM;
+      var maxDisplayDim = Math.min(4096, Math.max(900, viewportPxAtMaxZoom));
+      var displayScale = Math.min(
+        1,
+        maxDisplayDim / Math.max(image.naturalWidth, image.naturalHeight)
+      );
+      displayCanvas.width = Math.round(image.naturalWidth * displayScale);
+      displayCanvas.height = Math.round(image.naturalHeight * displayScale);
+      overlayCanvas.width = displayCanvas.width;
+      overlayCanvas.height = displayCanvas.height;
+      maskCanvas.width = image.naturalWidth;
+      maskCanvas.height = image.naturalHeight;
+      scale = image.naturalWidth / displayCanvas.width;
+
+      resetMask();
+      setStatus(
+        promptFieldsEnabled
+          ? "Draw over the region to detail, describe it above, then tap Done."
+          : "Draw over the area to fix, then tap Done."
+      );
+    };
+    image.onerror = function () {
+      setStatus("Couldn't load the image — this link may have expired.");
+      doneBtn.disabled = true;
+      clearBtn.disabled = true;
+    };
+    image.src = "/jobs/" + encodeURIComponent(token) + "/image";
+  }
+
+  fetch("/jobs/" + encodeURIComponent(token) + "/meta")
+    .then(function (resp) {
+      if (!resp.ok) throw new Error("meta fetch failed: " + resp.status);
+      return resp.json();
+    })
+    .then(function (meta) {
+      applyMeta(meta);
+      loadImage();
+    })
+    .catch(function () {
+      setStatus("Couldn't load this job — the link may have expired.");
+    });
 })();
 </script>
 </body>

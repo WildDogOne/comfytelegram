@@ -6,7 +6,9 @@ and, at ~19MB after an upscale, routinely didn't finish inside the upload
 timeout. See `handlers._to_display_jpeg`.
 """
 
+import base64
 import io
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -98,6 +100,37 @@ async def test_relay_upload_sends_the_compressed_copy_and_says_what_it_is():
     assert captured["headers"]["Content-Type"] == "image/jpeg"
     assert captured["data"].startswith(b"\xff\xd8\xff")
     assert len(captured["data"]) < len(source)
+
+
+@pytest.mark.asyncio
+async def test_relay_upload_omits_the_meta_header_for_a_plain_mask_job():
+    """The common case ("🖌️ Draw Mask"/"🩹 Fix Artifact") doesn't pass
+    `meta` at all — the relay defaults an unset header to `mode="mask"`."""
+    settings = MagicMock(inpaint_relay_url="https://relay.example", inpaint_relay_shared_secret="s")
+    source = _noisy_png()
+    captured: dict = {}
+
+    with patch("comfytelegram.handlers.aiohttp.ClientSession", _session_patch(captured)):
+        await _relay_create_job(settings, source)
+
+    assert "X-Job-Meta" not in captured["headers"]
+
+
+@pytest.mark.asyncio
+async def test_relay_upload_sends_meta_as_base64_json_header():
+    """ "✏️ Detail Prompt" passes `meta` — base64'd JSON rather than a raw
+    header value, since a prompt can contain non-ASCII text that HTTP
+    headers aren't guaranteed to carry."""
+    settings = MagicMock(inpaint_relay_url="https://relay.example", inpaint_relay_shared_secret="s")
+    source = _noisy_png()
+    captured: dict = {}
+    meta = {"mode": "prompt", "positive": "五本指", "negative": None, "denoise": 0.42}
+
+    with patch("comfytelegram.handlers.aiohttp.ClientSession", _session_patch(captured)):
+        await _relay_create_job(settings, source, meta=meta)
+
+    decoded = json.loads(base64.b64decode(captured["headers"]["X-Job-Meta"]))
+    assert decoded == meta
 
 
 @pytest.mark.asyncio

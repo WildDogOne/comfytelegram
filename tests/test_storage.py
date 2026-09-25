@@ -248,6 +248,32 @@ def test_inpaint_redo_roundtrip(storage: Storage):
         "source_file_id": "file123",
         "source_filename": "source.png",
         "mask_png": b"\x89PNGmaskbytes",
+        "detail_prompt": None,
+        "detail_negative_prompt": None,
+        "detail_denoise": None,
+    }
+
+
+def test_inpaint_redo_carries_the_one_shot_detail_prompt_override(storage: Storage):
+    """ "✏️ Detail Prompt"'s mask+prompt is one-shot — the only place it's
+    kept for a "🔁 Redo (same mask)" is right here, alongside the mask it
+    was submitted with."""
+    storage.store_inpaint_redo(
+        "result1",
+        "file123",
+        "source.png",
+        b"mask-bytes",
+        detail_prompt="two hands",
+        detail_negative_prompt="jewellery",
+        detail_denoise=0.42,
+    )
+    assert storage.get_inpaint_redo("result1") == {
+        "source_file_id": "file123",
+        "source_filename": "source.png",
+        "mask_png": b"mask-bytes",
+        "detail_prompt": "two hands",
+        "detail_negative_prompt": "jewellery",
+        "detail_denoise": 0.42,
     }
 
 
@@ -267,5 +293,8 @@ def test_inpaint_redo_survives_reopen(tmp_path: Path):
         "source_file_id": "file123",
         "source_filename": "source.png",
         "mask_png": b"mask-bytes",
+        "detail_prompt": None,
+        "detail_negative_prompt": None,
+        "detail_denoise": None,
     }
     s2.close()

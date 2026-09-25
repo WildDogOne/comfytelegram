@@ -133,12 +133,18 @@ def _to_post_process_base(params: GenerationParams) -> PostProcessBaseParams:
     )
 
 
-#: The `post_process` kinds a user-supplied detail prompt applies to — the
-#: region detailers only. `"upscale"`/`"homogenize"` deliberately ignore it:
-#: those condition the *whole* image on the prompt, where something written
-#: for one masked region ("two hands, five fingers each") would be actively
-#: wrong everywhere else. See handlers.py's `DETAIL_PROMPT_CALLBACK_KIND`.
-DETAIL_PROMPT_KINDS = ("face", "hand", "hand_manual", "hand_drawn", "fix_drawn")
+#: The `post_process` kinds a caller-supplied detail prompt/denoise
+#: override applies to — just `"hand_drawn"`, which is what
+#: `DETAIL_PROMPT_CALLBACK_KIND` ("✏️ Detail Prompt") actually submits: a
+#: freehand-drawn mask plus a one-shot prompt/denoise describing that one
+#: region, run immediately rather than saved anywhere. Every other kind
+#: never receives an override at all — `"face"`/`"hand"`/`"hand_manual"`
+#: (auto-detect/tap) always condition on the image's own whole-scene
+#: prompt, and `"upscale"`/`"homogenize"` condition the *whole* image (each
+#: already has its own whole-image denoise —
+#: `PostProcessBaseParams.upscale_denoise` for the former; the latter is a
+#: fixed low-denoise seam-blend pass by design).
+DETAIL_PROMPT_KINDS = ("hand_drawn",)
 
 
 def _apply_detail_prompt(
@@ -594,8 +600,6 @@ def _build_fix_drawn_post_process(
     source_image: bytes,
     mask_bytes: bytes,
     profiles: list[ModelProfile] | None,
-    detail_prompt: str | None,
-    detail_negative_prompt: str | None,
 ) -> tuple[dict, str]:
     """`post_process`'s `kind="fix_drawn"` graph-building branch, pulled out
     on its own since — unlike every other `kind`, which just delegates
@@ -633,7 +637,6 @@ def _build_fix_drawn_post_process(
     else:
         fix_base_params = replace(base_params, positive_prompt="")
         checkpoint_source = "image's own checkpoint"
-    fix_base_params = _apply_detail_prompt(fix_base_params, detail_prompt, detail_negative_prompt)
     fix_params = DrawnMaskFixParams()
     if fix_base_params.uses_anima_inpaint_pipeline:
         engaged_reason = (
@@ -703,6 +706,7 @@ async def post_process(
     mask_bytes: bytes | None = None,
     detail_prompt: str | None = None,
     detail_negative_prompt: str | None = None,
+    denoise: float | None = None,
     on_progress: ProgressCallback | None = None,
     profiles: list[ModelProfile] | None = None,
 ) -> GeneratedImage:
@@ -743,15 +747,17 @@ async def post_process(
     pass against a fixed, known-inpainting-aware checkpoint regardless of
     which one the image was originally generated with; every other `kind`
     ignores it entirely and keeps using the image's own checkpoint.
-    `detail_prompt`/`detail_negative_prompt` replace the prompt the *region*
-    detailers condition on (`DETAIL_PROMPT_KINDS` — never the whole-image
-    tiled passes), for steering or narrowing a refinement without
-    regenerating the image; each side is independent, and `None` keeps the
-    image's own. For `kind="fix_drawn"` an explicit one also overrides the
-    prompt that branch would otherwise pick for itself (blank, or the
-    `fix_artifact_checkpoint` profile's "background scenery") — the user
-    asked for this region specifically, which is better information than
-    either default."""
+    `detail_prompt`/`detail_negative_prompt`/`denoise` are a one-shot
+    override for `kind="hand_drawn"` only (`DETAIL_PROMPT_KINDS` —
+    handlers.py's "✏️ Detail Prompt" flow: a freehand mask plus a prompt
+    describing that region, collected together in one webapp visit and run
+    immediately, never saved for a later tap) — each independent, `None`
+    keeping the image's own prompt / `DrawnMaskHandDetailerParams`' own
+    default denoise (0.5). Every other kind ignores all three; in
+    particular `kind="fix_drawn"` always uses its own fixed prompt choice
+    (blank, or the `fix_artifact_checkpoint` profile's "background
+    scenery") and `DrawnMaskFixParams`' own denoise (0.75) — "🩹 Fix
+    Artifact" has no prompt field of its own to pass one from."""
     base_params = _to_post_process_base(full_params)
     if kind in DETAIL_PROMPT_KINDS:
         base_params = _apply_detail_prompt(base_params, detail_prompt, detail_negative_prompt)
@@ -790,8 +796,11 @@ async def post_process(
     elif kind == "hand_drawn":
         assert mask_bytes is not None, "hand_drawn requires mask_bytes"
         mask_upload = await client.upload_image(mask_bytes, filename=f"mask_{source_filename}")
+        drawn_hand_params = DrawnMaskHandDetailerParams()
+        if denoise is not None:
+            drawn_hand_params = replace(drawn_hand_params, denoise=denoise)
         prompt_graph, save_node_id = build_hand_detailer_drawn_mask(
-            uploaded_name, mask_upload["name"], base_params, DrawnMaskHandDetailerParams()
+            uploaded_name, mask_upload["name"], base_params, drawn_hand_params
         )
     elif kind == "fix_drawn":
         assert mask_bytes is not None, "fix_drawn requires mask_bytes"
@@ -809,8 +818,6 @@ async def post_process(
             source_image,
             mask_bytes,
             profiles,
-            detail_prompt,
-            detail_negative_prompt,
         )
     else:
         raise ValueError(f"Unknown post-processing kind: {kind}")

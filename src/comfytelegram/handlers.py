@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import logging
 import re
 import time
@@ -73,7 +74,11 @@ from comfytelegram.settings_menu import _safe_edit_message, handle_custom_value_
 from comfytelegram.storage import IMAGE_FORMAT_PNG, Storage
 from comfytelegram.tags import TagDatabase, TagResult, TagSource, category_label
 from comfytelegram.topics import pop_pending, set_pending
-from comfytelegram.workflows import GenerationParams, ManualHandDetailerParams
+from comfytelegram.workflows import (
+    DrawnMaskHandDetailerParams,
+    GenerationParams,
+    ManualHandDetailerParams,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -140,44 +145,49 @@ HAND_REDO4_CALLBACK_KIND = "hand_redo4"
 #: "hand_drawn") and `DrawnMaskFixParams`/`DrawnMaskHandDetailerParams`
 #: end up used, via `storage.py`'s `inpaint_job.kind` column.
 FIX_DRAW_CALLBACK_KIND = "fix_draw"
-#: "✏️ Detail Prompt" — set the prompt the *region* detailers (face, hand in
-#: all three of its modes, fix-artifact) condition on for one specific
-#: image, without regenerating it. The detailers otherwise inherit the whole
-#: image's prompt, which describes the entire scene: refining a hand with it
-#: re-asserts everything else in the frame over a crop that contains none of
-#: it, and there's no way to say "fewer fingers, no jewellery" about the one
-#: region being worked on. Stored per `result_id` (see `storage.py`'s
-#: `pending_result.detail_prompt`) rather than consumed by a single pass, so
-#: it's set once and then applies to every detailer tap on that image — and
-#: it has to be, for the drawn-mask flows, where the run happens later in
-#: `poll_inpaint_jobs` with no chat entry point left to ask at. Whole-image
-#: passes (upscale/homogenize) deliberately ignore it — see
-#: `generation.DETAIL_PROMPT_KINDS`.
 FIX_REDO_CALLBACK_KIND = "fix_redo"
 FIX_REDO4_CALLBACK_KIND = "fix_redo4"
+#: "✏️ Detail Prompt" — a third relay-backed drawn-mask flow, alongside
+#: "🖌️ Draw Mask"/"🩹 Fix Artifact": the WebApp editor it opens shows the
+#: *same* canvas plus, on top of it, editable positive/negative/denoise
+#: fields (`Job.mode="mask_prompt"` in inpaint_relay/server.py, vs. the
+#: other two's plain `mode="mask"`) — draw the region, describe what should
+#: happen there, tap Done once for both. What comes back
+#: (`_process_one_inpaint_job`) runs immediately, exactly like the other
+#: two — there's no save-for-later step. The prompt is deliberately
+#: one-shot: it's specific to *that* mask (there's no way to say "five
+#: fingers, no jewellery" about a region that hasn't been marked yet), so
+#: unlike the scene-wide `GenerationParams.positive_prompt` nothing here
+#: gets remembered on the image for a future, unrelated detailer tap — only
+#: "🔁 Redo (same mask)" (`DETAIL_REDO_CALLBACK_KIND`) replays it, since a
+#: redo is explicitly "run this exact mask+prompt again", and
+#: `storage.py`'s `inpaint_redo` is where it's kept for that (see
+#: `store_inpaint_redo`'s `detail_prompt`/`detail_negative_prompt`/
+#: `detail_denoise`). Runs through Impact Pack's generic
+#: `MaskToSEGS -> DetailerForEach` shape via `post_process(kind=
+#: "hand_drawn")` — the same graph/params `DrawnMaskHandDetailerParams`
+#: "🖌️ Draw Mask" already uses, reused here for an arbitrary region rather
+#: than specifically a hand, since it's already generic (no bbox detector,
+#: no hand-specific tuning beyond its default denoise/crop_factor) and its
+#: moderate default denoise fits "refine per this description" better than
+#: `DrawnMaskFixParams`' removal-oriented one. See
+#: `generation.DETAIL_PROMPT_KINDS`.
 DETAIL_PROMPT_CALLBACK_KIND = "detail_prompt"
-#: "♻️ Reset" on the "✏️ Detail Prompt" entry message — clears the override
-#: in one tap. Lives in the `pp:` namespace (rather than beside
-#: `DETAIL_PROMPT_CANCEL_CALLBACK_DATA`) because it needs the `result_id`
-#: to know which image to clear, and gets `postprocess_callback`'s expiry
-#: and auth checks for free that way. Shown only when there's actually an
-#: override to clear.
-DETAIL_RESET_CALLBACK_KIND = "detail_reset"
-#: What `_consume_awaiting_detail_prompt` accepts as "drop the override and
-#: go back to the image's own prompt" — a word rather than a bare "-",
-#: which `_split_negative_prompt` would read as the start of a negative tag.
-DETAIL_PROMPT_RESET_WORD = "reset"
+DETAIL_REDO_CALLBACK_KIND = "detail_redo"
+DETAIL_REDO4_CALLBACK_KIND = "detail_redo4"
 
 #: What `storage.py`'s `inpaint_job.kind`/a drawn-mask redo tap actually
 #: means in terms of `generation.post_process`'s API — looked up by
 #: `_process_one_inpaint_job` (from the stored job row) and
-#: `postprocess_callback`'s `HAND_REDO_CALLBACK_KIND`/`FIX_REDO_CALLBACK_KIND`/
-#: `HAND_REDO4_CALLBACK_KIND`/`FIX_REDO4_CALLBACK_KIND` branches (from which
-#: callback fired) so all four ends of the drawn-mask flow share one place
-#: that knows "hand" means `post_process(kind="hand_drawn")` plus a
-#: "Refining hand" label and `HAND_REDO_CALLBACK_KIND`/`HAND_REDO4_CALLBACK_KIND`'s
-#: redo buttons, while "fix" means `"fix_drawn")`/"Fixing artifact"/
-#: `FIX_REDO_CALLBACK_KIND`/`FIX_REDO4_CALLBACK_KIND`.
+#: `postprocess_callback`'s `*_REDO_CALLBACK_KIND`/`*_REDO4_CALLBACK_KIND`
+#: branches (from which callback fired) so every end of the drawn-mask flow
+#: shares one place that knows "hand" means `post_process(kind=
+#: "hand_drawn")` plus a "Refining hand" label and
+#: `HAND_REDO_CALLBACK_KIND`/`HAND_REDO4_CALLBACK_KIND`'s redo buttons,
+#: "fix" means `"fix_drawn")`/"Fixing artifact"/`FIX_REDO_CALLBACK_KIND`/
+#: `FIX_REDO4_CALLBACK_KIND`, and "detail" means `"hand_drawn")` again (see
+#: `DETAIL_PROMPT_CALLBACK_KIND`) but labeled "Detailing" with its own
+#: `DETAIL_REDO_CALLBACK_KIND`/`DETAIL_REDO4_CALLBACK_KIND` redo buttons.
 _DRAWN_MASK_KINDS: dict[str, dict[str, str]] = {
     "hand": {
         "post_process_kind": "hand_drawn",
@@ -190,6 +200,12 @@ _DRAWN_MASK_KINDS: dict[str, dict[str, str]] = {
         "label": "Fixing artifact",
         "redo_callback_kind": FIX_REDO_CALLBACK_KIND,
         "redo4_callback_kind": FIX_REDO4_CALLBACK_KIND,
+    },
+    "detail": {
+        "post_process_kind": "hand_drawn",
+        "label": "Detailing",
+        "redo_callback_kind": DETAIL_REDO_CALLBACK_KIND,
+        "redo4_callback_kind": DETAIL_REDO4_CALLBACK_KIND,
     },
 }
 #: How many revisions "🔁 x4" produces in one tap.
@@ -245,7 +261,6 @@ HAND_POINT_DENSITY_CALLBACK_PREFIX = "hpz:"
 AGAIN_CALLBACK_PREFIX = "again:"
 GENERATE_FROM_PROMPT_CALLBACK_PREFIX = "genp:"
 STREAM_CANCEL_CALLBACK_DATA = "stream:cancel"
-DETAIL_PROMPT_CANCEL_CALLBACK_DATA = "detail:cancel"
 CHARACTER_EDIT_CANCEL_CALLBACK_DATA = "char:edit_cancel"
 CHARACTER_RENAME_CANCEL_CALLBACK_DATA = "char:rename_cancel"
 
@@ -328,9 +343,10 @@ _STREAMING_KEYBOARD = ReplyKeyboardMarkup([["/stop"]], resize_keyboard=True)
 #: scales everything, and "🩹 Fix Artifact" is the general-purpose repair,
 #: tied to no particular subject), then the region detailers, then the two
 #: buttons that hand something back. The detailer row is the one that runs
-#: three wide, because "✏️ Detail Prompt" belongs beside the two buttons it
-#: retargets and nowhere else; the rest stay at two per row, since a full
-#: row of `POSTPROCESS_KEYBOARD_LABELS`-length labels is cramped on a phone
+#: three wide, because "✏️ Detail Prompt" is closely related to them (all
+#: three end up refining one region of the image) and nowhere else fits
+#: better; the rest stay at two per row, since a full row of
+#: `POSTPROCESS_KEYBOARD_LABELS`-length labels is cramped on a phone
 #: screen.
 _DETAILER_KINDS = ("face", "hand")
 
@@ -352,6 +368,8 @@ _REDO_CALLBACK_KINDS = frozenset(
         HAND_REDO4_CALLBACK_KIND,
         FIX_REDO_CALLBACK_KIND,
         FIX_REDO4_CALLBACK_KIND,
+        DETAIL_REDO_CALLBACK_KIND,
+        DETAIL_REDO4_CALLBACK_KIND,
     }
 )
 
@@ -364,11 +382,11 @@ def _post_process_keyboard(result_id: str, page: int = 1) -> InlineKeyboardMarku
 
     Page 1 is what gets tapped while actually working an image: 🔍 Upscale
     4x and 🩹 Fix Artifact, then the ✨ Face / 🖐️ Hand detailers with
-    ✏️ Detail Prompt beside them (it steers those two and 🩹 Fix Artifact,
-    so burying it a page away from them would be the one arrangement that
-    hides a setting from the buttons it applies to), then 📥 Download file
-    and 🐛 Show Prompt. Page 2 holds the rest — 🧵 Homogenize and the three
-    analyzers. The split is one tap deep and reversible, which is the
+    ✏️ Detail Prompt beside them (a third, general-purpose region-detail
+    action — draw a mask, describe it, run immediately — that belongs with
+    the other two more than anywhere else on the keyboard), then
+    📥 Download file and 🐛 Show Prompt. Page 2 holds the rest — 🧵 Homogenize
+    and the three analyzers. The split is one tap deep and reversible, which is the
     point: ten buttons under every image (and every image *derived* from
     it, stacking down the scrollback) had turned a working keyboard into a
     wall.
@@ -635,44 +653,6 @@ def _stream_prompt_cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("❌ Cancel", callback_data=STREAM_CANCEL_CALLBACK_DATA)]]
     )
-
-
-def _detail_prompt_keyboard(
-    copy_text: str, result_id: str, has_override: bool
-) -> InlineKeyboardMarkup:
-    """Attached to the "send the detail prompt" follow-up (see
-    `postprocess_callback`'s `DETAIL_PROMPT_CALLBACK_KIND` branch).
-
-    "📋 Copy current" puts the prompt in effect right now on the clipboard,
-    to paste back into the input box and edit down rather than retype — the
-    usual reason to open this at all is to *remove* most of a scene-wide
-    prompt. `copy_text` is `_raw_prompt_copy_text`-shaped, so what it copies
-    pastes straight back in and round-trips through `_split_negative_prompt`.
-    Same `MAX_COPY_TEXT` gating as `_generate_from_prompt_keyboard`: past
-    Telegram's cap the button is omitted entirely rather than silently
-    copying a truncated prompt, and the text is still in the message above
-    to select by hand.
-
-    "♻️ Reset" (`DETAIL_RESET_CALLBACK_KIND`, only when `has_override`)
-    clears the override in one tap. It exists because the typed
-    `DETAIL_PROMPT_RESET_WORD` alone was a trap: the entry is one-shot, so
-    once a prompt has been sent, typing "reset" lands in `generate_message`
-    as an ordinary prompt and starts a full generation of the word "reset".
-    A button can't be mistimed that way. "❌ Cancel" only abandons the
-    entry, which is a different thing and why both are here."""
-    rows = []
-    if copy_text and len(copy_text) <= InlineKeyboardButtonLimit.MAX_COPY_TEXT:
-        rows.append([InlineKeyboardButton("📋 Copy current", copy_text=CopyTextButton(copy_text))])
-    last_row = [InlineKeyboardButton("❌ Cancel", callback_data=DETAIL_PROMPT_CANCEL_CALLBACK_DATA)]
-    if has_override:
-        last_row.insert(
-            0,
-            InlineKeyboardButton(
-                "♻️ Reset", callback_data=f"pp:{DETAIL_RESET_CALLBACK_KIND}:{result_id}"
-            ),
-        )
-    rows.append(last_row)
-    return InlineKeyboardMarkup(rows)
 
 
 def _character_edit_cancel_keyboard() -> InlineKeyboardMarkup:
@@ -1023,8 +1003,6 @@ async def _send_and_store_result(
     *,
     result_id: str | None = None,
     extra_keyboard_rows: list[list[InlineKeyboardButton]] | None = None,
-    detail_prompt: str | None = None,
-    detail_negative_prompt: str | None = None,
 ) -> str:
     """Send a generated image with its post-processing keyboard, then persist
     what those buttons need (a re-downloadable file_id + the params to build
@@ -1033,11 +1011,7 @@ async def _send_and_store_result(
     caller that needs to know it ahead of time to embed in its own extra
     button (`extra_keyboard_rows`, appended below the standard ones — see
     `postprocess_callback`'s `HAND_REDO_CALLBACK_KIND` branch) can pass one
-    in instead. `detail_prompt`/`detail_negative_prompt` carry the source
-    image's detailer prompt override onto this result (see
-    `DETAIL_PROMPT_CALLBACK_KIND`), so an override set once survives a chain
-    of passes instead of having to be re-entered after each one. Returns
-    whichever id was actually used."""
+    in instead. Returns whichever id was actually used."""
     result_id = result_id or uuid.uuid4().hex[:12]
     reply_markup = _post_process_keyboard_with_extra_rows(result_id, extra_keyboard_rows)
     use_jpeg = storage.get_image_format(chat_id) != IMAGE_FORMAT_PNG
@@ -1050,23 +1024,8 @@ async def _send_and_store_result(
         _extract_file_id(sent),
         img.filename,
         _serialize_generation_params(img.full_params),
-        detail_prompt=detail_prompt,
-        detail_negative_prompt=detail_negative_prompt,
     )
     return result_id
-
-
-def _detail_prompt_of(pending: dict[str, Any]) -> tuple[str | None, str | None]:
-    """The `(positive, negative)` detailer prompt override stored on a
-    `pending_result` row, `(None, None)` when it has none — see
-    `DETAIL_PROMPT_CALLBACK_KIND`. A tuple rather than two lookups because
-    every caller needs both, to pass straight into `post_process` and on to
-    whatever result it stores next. Read with `.get` so a row dict assembled
-    anywhere but `Storage.get_pending_result` (or one read back mid-upgrade,
-    before its `ALTER TABLE` ran) reads as "no override" instead of raising
-    — every caller's next move is a ComfyUI run that shouldn't die over a
-    missing optional field."""
-    return pending.get("detail_prompt"), pending.get("detail_negative_prompt")
 
 
 async def _send_and_store_bot_result(
@@ -1078,8 +1037,6 @@ async def _send_and_store_bot_result(
     message_thread_id: int | None = None,
     result_id: str | None = None,
     extra_keyboard_rows: list[list[InlineKeyboardButton]] | None = None,
-    detail_prompt: str | None = None,
-    detail_negative_prompt: str | None = None,
 ) -> str:
     """`_send_and_store_result`'s counterpart for code with no `Message` to
     reply into — `poll_inpaint_jobs` runs as a background task, not in
@@ -1089,9 +1046,8 @@ async def _send_and_store_bot_result(
     for the same reason: unlike `message.reply_*` (which Telegram routes
     into the replied-to message's own forum topic automatically), a bare
     `chat_id` send has no topic context of its own and defaults to the
-    chat's General topic otherwise. `result_id`/`extra_keyboard_rows`/
-    `detail_prompt`/`detail_negative_prompt` mirror `_send_and_store_result`'s
-    — see there."""
+    chat's General topic otherwise. `result_id`/`extra_keyboard_rows` mirror
+    `_send_and_store_result`'s — see there."""
     result_id = result_id or uuid.uuid4().hex[:12]
     reply_markup = _post_process_keyboard_with_extra_rows(result_id, extra_keyboard_rows)
     use_jpeg = storage.get_image_format(chat_id) != IMAGE_FORMAT_PNG
@@ -1109,8 +1065,6 @@ async def _send_and_store_bot_result(
         _extract_file_id(sent),
         img.filename,
         _serialize_generation_params(img.full_params),
-        detail_prompt=detail_prompt,
-        detail_negative_prompt=detail_negative_prompt,
     )
     return result_id
 
@@ -1160,11 +1114,25 @@ def _to_display_jpeg(source: bytes, quality: int = _RELAY_DISPLAY_JPEG_QUALITY) 
     return buf.getvalue()
 
 
-async def _relay_create_job(settings: Settings, image_bytes: bytes) -> str:
+async def _relay_create_job(
+    settings: Settings, image_bytes: bytes, *, meta: dict[str, Any] | None = None
+) -> str:
     """POST the source image to inpaint_relay's `POST /jobs`, returning the
     job token it assigns. Raises on any HTTP/network failure — the caller
-    (`postprocess_callback`'s `HAND_DRAW_CALLBACK_KIND` branch) reports that
-    back to the chat like any other post-processing error.
+    (`postprocess_callback`'s `HAND_DRAW_CALLBACK_KIND`/`FIX_DRAW_CALLBACK_KIND`/
+    `DETAIL_PROMPT_CALLBACK_KIND` branches) reports that back to the chat
+    like any other post-processing error.
+
+    `meta`, when given, becomes the relay's `X-Job-Meta` header — base64'd
+    JSON rather than raw text, so it can't run into HTTP header encoding
+    rules (headers are meant to stay ASCII/latin-1). Omitted entirely for
+    "🖌️ Draw Mask"/"🩹 Fix Artifact" (the relay defaults an unset header to
+    `mode="mask"`, a canvas with no prompt fields);
+    `DETAIL_PROMPT_CALLBACK_KIND` is the one caller that passes one,
+    carrying `mode="mask_prompt"` (the same canvas plus editable
+    positive/negative/denoise fields, submitted together with the mask —
+    see `_relay_poll_result`) and read-only reference settings to display
+    (`_detail_prompt_readonly_info`).
 
     The image is compressed here (`_to_display_jpeg`) rather than on the
     relay, which is where this used to happen: the relay re-encoded on
@@ -1178,15 +1146,18 @@ async def _relay_create_job(settings: Settings, image_bytes: bytes) -> str:
     running concurrently if nothing blocks the one event loop thread."""
     payload = await asyncio.to_thread(_to_display_jpeg, image_bytes)
     content_type = "image/jpeg" if payload is not image_bytes else "image/png"
+    headers = {
+        "Authorization": f"Bearer {settings.inpaint_relay_shared_secret}",
+        "Content-Type": content_type,
+    }
+    if meta is not None:
+        headers["X-Job-Meta"] = base64.b64encode(json.dumps(meta).encode()).decode("ascii")
     async with (
         aiohttp.ClientSession(timeout=_INPAINT_RELAY_UPLOAD_TIMEOUT) as session,
         session.post(
             f"{settings.inpaint_relay_url}/jobs",
             data=payload,
-            headers={
-                "Authorization": f"Bearer {settings.inpaint_relay_shared_secret}",
-                "Content-Type": content_type,
-            },
+            headers=headers,
         ) as resp,
     ):
         resp.raise_for_status()
@@ -1196,11 +1167,17 @@ async def _relay_create_job(settings: Settings, image_bytes: bytes) -> str:
 
 async def _relay_poll_result(settings: Settings, token: str) -> dict[str, Any] | None:
     """GET a job's status from inpaint_relay's `GET /jobs/{token}/result`.
-    Returns None if it's still waiting on a drawing (`status="pending"`) or
-    the relay no longer knows about it at all (404 — e.g. a relay restart
-    lost its in-memory job store, see inpaint_relay's own docs), or
-    `{"mask": <bytes>, "init_data": <str>}` once the WebApp page has POSTed
-    a finished mask (`status="submitted"`)."""
+    Returns None if it's still waiting on a submission (`status="pending"`)
+    or the relay no longer knows about it at all (404 — e.g. a relay
+    restart lost its in-memory job store, see inpaint_relay's own docs), or
+    `{"mask": <bytes>, "positive": <str|None>, "negative": <str|None>,
+    "denoise": <float|None>, "init_data": <str>}` once submitted — every
+    job submits a mask (both "mask" and "mask_prompt" jobs draw one);
+    `positive`/`negative`/`denoise` are only ever non-None for a
+    `DETAIL_PROMPT_CALLBACK_KIND` job's `mode="mask_prompt"` submission, so
+    `_process_one_inpaint_job` can pass all three straight into
+    `post_process` unconditionally — they're simply always `None` for
+    "🖌️ Draw Mask"/"🩹 Fix Artifact"."""
     async with (
         aiohttp.ClientSession(timeout=_INPAINT_RELAY_TIMEOUT) as session,
         session.get(
@@ -1216,6 +1193,9 @@ async def _relay_poll_result(settings: Settings, token: str) -> dict[str, Any] |
         return None
     return {
         "mask": base64.b64decode(payload["mask_base64"]),
+        "positive": payload.get("positive"),
+        "negative": payload.get("negative"),
+        "denoise": payload.get("denoise"),
         "init_data": payload["init_data"],
     }
 
@@ -1247,25 +1227,25 @@ async def _run_drawn_mask_post_process(
     profiles: list[ModelProfile],
     detail_prompt: str | None = None,
     detail_negative_prompt: str | None = None,
+    detail_denoise: float | None = None,
 ) -> GeneratedImage | None:
     """Shared by `_process_one_inpaint_job` (a freshly submitted mask) and
-    `postprocess_callback`'s `HAND_REDO_CALLBACK_KIND`/`FIX_REDO_CALLBACK_KIND`
-    branch (re-running a previously drawn one against a fresh seed — see
-    storage.py's `inpaint_redo` — for when a detailer result comes out badly
-    and redrawing the whole mask from scratch would be overkill) — both need
+    `postprocess_callback`'s `*_REDO_CALLBACK_KIND` branch (re-running a
+    previously drawn one against a fresh seed — see storage.py's
+    `inpaint_redo` — for when a detailer result comes out badly and
+    redrawing the whole mask from scratch would be overkill) — both need
     the exact same `post_process` call, status-message error reporting, and
     status-message cleanup around it. `post_process_kind`/`label` come from
-    `_DRAWN_MASK_KINDS` ("hand" vs "fix"). `profiles` only matters for
+    `_DRAWN_MASK_KINDS` ("hand"/"fix"/"detail"). `profiles` only matters for
     `post_process_kind="fix_drawn"` — see `generation.
     _fix_artifact_override_base` — passed through unconditionally since
-    "hand_drawn" ignores it. `detail_prompt`/`detail_negative_prompt` are
-    the source image's detailer prompt override (see
-    `DETAIL_PROMPT_CALLBACK_KIND`) — this flow is the reason that override
-    is stored per image rather than asked for per run: by the time a drawn
-    mask comes back through `poll_inpaint_jobs` there's no conversation
-    turn left to ask in. Returns None on failure (already reported into
-    `status_message` by `_run_reporting_errors`); callers should treat that
-    as "stop here", same as `_run_reporting_errors` itself."""
+    "hand_drawn" ignores it. `detail_prompt`/`detail_negative_prompt`/
+    `detail_denoise` are "✏️ Detail Prompt"'s one-shot mask+prompt override
+    (see `DETAIL_PROMPT_CALLBACK_KIND`) — `None`/`None`/`None` for
+    "🖌️ Draw Mask"/"🩹 Fix Artifact", which never collect a prompt at all.
+    Returns None on failure (already reported into `status_message` by
+    `_run_reporting_errors`); callers should treat that as "stop here",
+    same as `_run_reporting_errors` itself."""
     generated = await _run_reporting_errors(
         status_message,
         label,
@@ -1279,6 +1259,7 @@ async def _run_drawn_mask_post_process(
             mask_bytes=mask_bytes,
             detail_prompt=detail_prompt,
             detail_negative_prompt=detail_negative_prompt,
+            denoise=detail_denoise,
             profiles=profiles,
         ),
     )
@@ -1297,20 +1278,29 @@ async def _send_drawn_mask_result_with_redo(
     *,
     redo_callback_kind: str,
     redo4_callback_kind: str,
+    detail_prompt: str | None = None,
+    detail_negative_prompt: str | None = None,
+    detail_denoise: float | None = None,
 ) -> None:
     """Send a `post_process(kind="hand_drawn"/"fix_drawn")` result with
     "🔁 Redo (same mask)"/"🔁 x4" buttons attached (one row), and persist what
     they need to run again (`storage.py`'s `inpaint_redo`) — shared by
     `_process_one_inpaint_job` and `postprocess_callback`'s
-    `HAND_REDO_CALLBACK_KIND`/`FIX_REDO_CALLBACK_KIND`/
-    `HAND_REDO4_CALLBACK_KIND`/`FIX_REDO4_CALLBACK_KIND` branches, which
-    differ only in *how* they send (`send` is `_send_and_store_bot_result`
-    or `_send_and_store_result`, already bound to everything but `img`,
+    `*_REDO_CALLBACK_KIND`/`*_REDO4_CALLBACK_KIND` branches, which differ
+    only in *how* they send (`send` is `_send_and_store_bot_result` or
+    `_send_and_store_result`, already bound to everything but `img`,
     `result_id` and `extra_keyboard_rows`) and which redo buttons
     (`redo_callback_kind`/`redo4_callback_kind`, from `_DRAWN_MASK_KINDS`)
     the result should carry. Every result carries both, including each of
     the `DRAWN_MASK_REDO4_COUNT` results a "🔁 x4" tap itself produces — the
-    chain never drops back to single-redo-only."""
+    chain never drops back to single-redo-only. `detail_prompt`/
+    `detail_negative_prompt`/`detail_denoise` are "✏️ Detail Prompt"'s
+    one-shot override (`None` for "🖌️ Draw Mask"/"🩹 Fix Artifact") —
+    stored alongside the mask in `inpaint_redo` rather than passed to
+    `send`, since it's tied to *this specific mask*, not to the image in
+    general (a redo replays both together; a fresh detail/draw-mask/
+    fix-artifact tap always starts from nothing, whatever prompt a sibling
+    result's redo happens to carry)."""
     new_result_id = uuid.uuid4().hex[:12]
     await send(
         generated,
@@ -1322,7 +1312,15 @@ async def _send_drawn_mask_result_with_redo(
             ]
         ],
     )
-    storage.store_inpaint_redo(new_result_id, source_file_id, source_filename, mask_bytes)
+    storage.store_inpaint_redo(
+        new_result_id,
+        source_file_id,
+        source_filename,
+        mask_bytes,
+        detail_prompt=detail_prompt,
+        detail_negative_prompt=detail_negative_prompt,
+        detail_denoise=detail_denoise,
+    )
 
 
 async def _run_one_drawn_mask_redo(
@@ -1335,21 +1333,27 @@ async def _run_one_drawn_mask_redo(
     drawn_mask_kind: dict[str, str],
     profiles: list[ModelProfile],
     source_bytes: bytes,
-    detail_prompt: str | None = None,
-    detail_negative_prompt: str | None = None,
 ) -> bool:
     """One "🔁 Redo (same mask)"/"🔁 x4" iteration: its own status message,
     `post_process` call, and result send (with fresh redo buttons of its
     own, so the chain keeps going indefinitely either way) — shared by
-    `postprocess_callback`'s `HAND_REDO_CALLBACK_KIND`/`FIX_REDO_CALLBACK_KIND`/
-    `HAND_REDO4_CALLBACK_KIND`/`FIX_REDO4_CALLBACK_KIND` branch, which calls
-    this once or `DRAWN_MASK_REDO4_COUNT` times depending on which button
-    was tapped. `source_bytes` is downloaded once by the caller and reused
-    across every iteration, rather than re-fetched per call. Returns True on
-    success, False on failure (already reported into that iteration's own
-    status message by `_run_reporting_errors`) — the caller stops the loop
-    on the first False rather than continuing to burn ComfyUI time on
-    a source/mask combination that just failed."""
+    `postprocess_callback`'s `*_REDO_CALLBACK_KIND`/`*_REDO4_CALLBACK_KIND`
+    branch, which calls this once or `DRAWN_MASK_REDO4_COUNT` times
+    depending on which button was tapped. `source_bytes` is downloaded once
+    by the caller and reused across every iteration, rather than re-fetched
+    per call. The one-shot `detail_prompt`/`detail_negative_prompt`/
+    `detail_denoise` a "✏️ Detail Prompt" redo replays come from `redo`
+    itself (`storage.py`'s `inpaint_redo`, stored alongside the mask at
+    submission time — see `_send_drawn_mask_result_with_redo`), not a
+    caller-supplied override; they're simply absent for a "🖌️ Draw Mask"/
+    "🩹 Fix Artifact" redo. Returns True on success, False on failure
+    (already reported into that iteration's own status message by
+    `_run_reporting_errors`) — the caller stops the loop on the first False
+    rather than continuing to burn ComfyUI time on a source/mask
+    combination that just failed."""
+    detail_prompt = redo.get("detail_prompt")
+    detail_negative_prompt = redo.get("detail_negative_prompt")
+    detail_denoise = redo.get("detail_denoise")
     status_message = await reply_message.reply_text(
         f"{drawn_mask_kind['label']} (drawn mask)…", disable_notification=True
     )
@@ -1365,19 +1369,12 @@ async def _run_one_drawn_mask_redo(
         profiles=profiles,
         detail_prompt=detail_prompt,
         detail_negative_prompt=detail_negative_prompt,
+        detail_denoise=detail_denoise,
     )
     if generated is None:
         return False
     await _send_drawn_mask_result_with_redo(
-        lambda img, **kw: _send_and_store_result(
-            reply_message,
-            chat_id,
-            storage,
-            img,
-            detail_prompt=detail_prompt,
-            detail_negative_prompt=detail_negative_prompt,
-            **kw,
-        ),
+        lambda img, **kw: _send_and_store_result(reply_message, chat_id, storage, img, **kw),
         storage,
         redo["source_file_id"],
         redo["source_filename"],
@@ -1385,6 +1382,9 @@ async def _run_one_drawn_mask_redo(
         generated,
         redo_callback_kind=drawn_mask_kind["redo_callback_kind"],
         redo4_callback_kind=drawn_mask_kind["redo4_callback_kind"],
+        detail_prompt=detail_prompt,
+        detail_negative_prompt=detail_negative_prompt,
+        detail_denoise=detail_denoise,
     )
     return True
 
@@ -1401,12 +1401,16 @@ async def _process_one_inpaint_job(
     validate it actually came from Telegram (see `auth.
     validate_webapp_init_data` — the relay itself can't check this, since
     it never holds the bot token) before running it through `post_process`
-    and posting the result — `job["kind"]` ("hand" or "fix", see
+    and posting the result — `job["kind"]` ("hand"/"fix"/"detail", see
     `storage.py`'s `inpaint_job.kind`) resolves via `_DRAWN_MASK_KINDS` to
-    which `post_process` kind, status label, and redo button apply. Every
-    path past that validation step (including failure) sends *something*
-    into the chat — this runs unattended, so silently dropping a job on
-    error would leave someone staring at the "Draw over the area..."
+    which `post_process` kind, status label, and redo button apply; one
+    unified path handles all three, since a "detail" job is just a mask
+    job whose result also carries a one-shot `positive`/`negative`/
+    `denoise` (`None` for the other two — see `_relay_poll_result`), passed
+    straight into `post_process` alongside it. Every path past that
+    validation step (including failure) sends *something* into the chat —
+    this runs unattended, so silently dropping a job on error would leave
+    someone staring at the "Draw over the area..."/"Uploading image..."
     message forever with no idea whether it worked."""
     token = job["token"]
     chat_id = job["chat_id"]
@@ -1426,7 +1430,7 @@ async def _process_one_inpaint_job(
         logger.warning("Dropping inpaint_relay job %s: invalid initData signature", token)
         await application.bot.send_message(
             chat_id,
-            "⚠️ Couldn't verify the mask editor submission — please try again.",
+            "⚠️ Couldn't verify the editor submission — please try again.",
             message_thread_id=message_thread_id,
         )
         return
@@ -1450,7 +1454,9 @@ async def _process_one_inpaint_job(
         message_thread_id=message_thread_id,
     )
     full_params = _deserialize_generation_params(pending["base_params"])
-    detail_prompt, detail_negative_prompt = _detail_prompt_of(pending)
+    detail_prompt = result.get("positive")
+    detail_negative_prompt = result.get("negative")
+    detail_denoise = result.get("denoise")
     source_bytes = await _fetch_source_image(
         client,
         application.bot,
@@ -1471,6 +1477,7 @@ async def _process_one_inpaint_job(
         profiles=application.bot_data["profiles"],
         detail_prompt=detail_prompt,
         detail_negative_prompt=detail_negative_prompt,
+        detail_denoise=detail_denoise,
     )
     if generated is None:
         return
@@ -1481,8 +1488,6 @@ async def _process_one_inpaint_job(
             storage,
             img,
             message_thread_id=message_thread_id,
-            detail_prompt=detail_prompt,
-            detail_negative_prompt=detail_negative_prompt,
             **kw,
         ),
         storage,
@@ -1492,6 +1497,9 @@ async def _process_one_inpaint_job(
         generated,
         redo_callback_kind=drawn_mask_kind["redo_callback_kind"],
         redo4_callback_kind=drawn_mask_kind["redo4_callback_kind"],
+        detail_prompt=detail_prompt,
+        detail_negative_prompt=detail_negative_prompt,
+        detail_denoise=detail_denoise,
     )
 
 
@@ -2098,9 +2106,11 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     with live progress, then deliver the result. Defaults to ComfyUI's
     first available checkpoint (and remembers it) if none is selected yet.
     A pending "custom value" `/settings` entry (see
-    `handle_custom_value_message`) or an in-progress `/stream` prompt,
-    character-edit/-rename entry or "✏️ Detail Prompt" entry takes priority
-    over treating the text as a prompt."""
+    `handle_custom_value_message`) or an in-progress `/stream` prompt or
+    character-edit/-rename entry takes priority over treating the text as a
+    prompt. "✏️ Detail Prompt" has no entry here to take priority over —
+    it's a webapp editor now, not a chat follow-up (see
+    `DETAIL_PROMPT_CALLBACK_KIND`)."""
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
         return
@@ -2115,9 +2125,6 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if await _consume_awaiting_character_rename(update, context):
-        return
-
-    if await _consume_awaiting_detail_prompt(update, context):
         return
 
     message = update.effective_message
@@ -2510,6 +2517,26 @@ async def _send_archive_copy(
     await status_message.delete()
 
 
+def _detail_prompt_readonly_info() -> dict[str, Any]:
+    """Read-only reference info sent to the "✏️ Detail Prompt" webapp
+    alongside the editable positive/negative/denoise fields — a single flat
+    dict, since unlike the old per-image override this replaced, the run
+    that follows is always `post_process(kind="hand_drawn")`'s
+    `DrawnMaskHandDetailerParams` (see `DETAIL_PROMPT_CALLBACK_KIND`), not
+    a choice made later. Built from that dataclass's own class-level
+    defaults: static, no image/profile dependency, so this needs no
+    arguments and could be computed once, but stays a function since it's
+    only ever called from one place."""
+    params = DrawnMaskHandDetailerParams()
+    return {
+        "steps": params.steps,
+        "cfg": params.cfg,
+        "sampler_name": params.sampler_name,
+        "scheduler": params.scheduler,
+        "denoise": params.denoise,
+    }
+
+
 async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle a `pp:<kind>:<result_id>` tap from `_post_process_keyboard`:
     `kind` is `"analyze_only"` (run *both* analyzers — WD14 tags and
@@ -2586,49 +2613,8 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await _show_keyboard_page(query, result_id, 2 if kind == MORE_CALLBACK_KIND else 1)
         return
 
-    detail_prompt, detail_negative_prompt = _detail_prompt_of(pending)
-
     if kind == ARCHIVE_CALLBACK_KIND:
         await _send_archive_copy(query.message, client, pending, full_params)
-        return
-
-    if kind == DETAIL_PROMPT_CALLBACK_KIND:
-        effective_positive = full_params.positive_prompt if detail_prompt is None else detail_prompt
-        effective_negative = (
-            full_params.negative_prompt
-            if detail_negative_prompt is None
-            else detail_negative_prompt
-        )
-        header = (
-            "Detailers currently use this image's own prompt:"
-            if detail_prompt is None and detail_negative_prompt is None
-            else "Current detail prompt for this image:"
-        )
-        copy_text = _raw_prompt_copy_text(effective_positive, effective_negative)
-        has_override = detail_prompt is not None or detail_negative_prompt is not None
-        set_pending(context.chat_data, "awaiting_detail_prompt", query.message, result_id)
-        await query.message.reply_text(
-            f"{header}\n\n{copy_text or '(none)'}\n\n"
-            "Reply with the prompt to use for ✨ Face Detail / 🖐️ Hand Detail / "
-            "🩹 Fix Artifact on this image — a line of --- separates negatives, and "
-            f'-token works inline. Reply "{DETAIL_PROMPT_RESET_WORD}" (or tap ♻️ Reset) '
-            "to go back to the image's own prompt. Upscale and Homogenize aren't "
-            "affected.",
-            reply_markup=_detail_prompt_keyboard(copy_text, result_id, has_override),
-        )
-        return
-
-    if kind == DETAIL_RESET_CALLBACK_KIND:
-        # The entry this button sits under is moot now, so close it —
-        # otherwise the next ordinary prompt in this topic would be
-        # swallowed as a detail prompt instead of generating.
-        pop_pending(context.chat_data, "awaiting_detail_prompt", query.message)
-        storage.set_detail_prompt(result_id, None, None)
-        await _safe_edit_message(
-            query,
-            "Detail prompt cleared — detailers will use this image's own prompt again.",
-            InlineKeyboardMarkup([]),
-        )
         return
 
     if kind == SHOW_PROMPT_CALLBACK_KIND:
@@ -2768,11 +2754,35 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    if kind in (HAND_DRAW_CALLBACK_KIND, FIX_DRAW_CALLBACK_KIND):
+    if kind in (HAND_DRAW_CALLBACK_KIND, FIX_DRAW_CALLBACK_KIND, DETAIL_PROMPT_CALLBACK_KIND):
         if not settings.inpaint_relay_url:
             await query.message.reply_text("Mask drawing isn't configured on this bot.")
             return
-        job_kind = "hand" if kind == HAND_DRAW_CALLBACK_KIND else "fix"
+        if kind == HAND_DRAW_CALLBACK_KIND:
+            job_kind = "hand"
+        elif kind == FIX_DRAW_CALLBACK_KIND:
+            job_kind = "fix"
+        else:
+            job_kind = "detail"
+        # DETAIL_PROMPT_CALLBACK_KIND is the one caller that wants the
+        # editor's prompt fields too (`Job.mode="mask_prompt"` — see
+        # `_relay_create_job`); the other two just draw a plain mask
+        # (`meta=None`, which the relay defaults to `mode="mask"`). The
+        # fields pre-fill with this image's own current prompt — the usual
+        # reason to open this is to cut most of a scene-wide prompt down to
+        # what the marked region actually needs, not type one from scratch
+        # — but nothing about them is saved anywhere once the editor closes
+        # (see `DETAIL_PROMPT_CALLBACK_KIND`'s docstring).
+        meta = (
+            {
+                "mode": "mask_prompt",
+                "positive": full_params.positive_prompt,
+                "negative": full_params.negative_prompt,
+                "readonly": _detail_prompt_readonly_info(),
+            }
+            if job_kind == "detail"
+            else None
+        )
         # Uploading a large source image to a remote relay host can take a
         # few seconds, with nothing on screen to show for it in the
         # meantime — long enough that a user unsure whether their tap
@@ -2803,7 +2813,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 on_fallback=_source_fallback_notifier(query.message),
             )
             try:
-                token = await _relay_create_job(settings, source_bytes)
+                token = await _relay_create_job(settings, source_bytes, meta=meta)
             except Exception:
                 logger.exception("Failed to create inpaint_relay job")
                 await status_message.edit_text(
@@ -2817,8 +2827,14 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 query.message.message_thread_id,
                 kind=job_kind,
             )
+            editor_prompt = (
+                "Draw over the region to detail, describe what should be there, then "
+                "tap Done in the editor:"
+                if job_kind == "detail"
+                else "Draw over the area to fix, then tap Done in the editor:"
+            )
             await status_message.edit_text(
-                "Draw over the area to fix, then tap Done in the editor:",
+                editor_prompt,
                 reply_markup=InlineKeyboardMarkup(
                     [
                         [
@@ -2839,17 +2855,27 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if kind in (
         HAND_REDO_CALLBACK_KIND,
         FIX_REDO_CALLBACK_KIND,
+        DETAIL_REDO_CALLBACK_KIND,
         HAND_REDO4_CALLBACK_KIND,
         FIX_REDO4_CALLBACK_KIND,
+        DETAIL_REDO4_CALLBACK_KIND,
     ):
-        is_hand = kind in (HAND_REDO_CALLBACK_KIND, HAND_REDO4_CALLBACK_KIND)
-        is_redo4 = kind in (HAND_REDO4_CALLBACK_KIND, FIX_REDO4_CALLBACK_KIND)
-        drawn_mask_kind = _DRAWN_MASK_KINDS["hand" if is_hand else "fix"]
+        is_redo4 = kind in (
+            HAND_REDO4_CALLBACK_KIND,
+            FIX_REDO4_CALLBACK_KIND,
+            DETAIL_REDO4_CALLBACK_KIND,
+        )
+        if kind in (HAND_REDO_CALLBACK_KIND, HAND_REDO4_CALLBACK_KIND):
+            redo_kind, redo_button_label = "hand", "🖌️ Draw Mask"
+        elif kind in (FIX_REDO_CALLBACK_KIND, FIX_REDO4_CALLBACK_KIND):
+            redo_kind, redo_button_label = "fix", "🩹 Fix Artifact"
+        else:
+            redo_kind, redo_button_label = "detail", "✏️ Detail Prompt"
+        drawn_mask_kind = _DRAWN_MASK_KINDS[redo_kind]
         redo = storage.get_inpaint_redo(result_id)
         if redo is None:
-            redo_button = "🖌️ Draw Mask" if is_hand else "🩹 Fix Artifact"
             await query.message.reply_text(
-                f"That mask has expired — draw a new one with {redo_button}."
+                f"That mask has expired — draw a new one with {redo_button_label}."
             )
             return
         source_bytes = await _fetch_source_image(
@@ -2874,8 +2900,6 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 drawn_mask_kind,
                 context.bot_data["profiles"],
                 source_bytes,
-                detail_prompt=detail_prompt,
-                detail_negative_prompt=detail_negative_prompt,
             )
             if not ok:
                 break
@@ -2923,15 +2947,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 pending["file_id"],
                 on_fallback=_source_fallback_notifier(query.message),
             )
-        return await post_process(
-            client,
-            kind,
-            data,
-            pending["filename"],
-            full_params,
-            detail_prompt=detail_prompt,
-            detail_negative_prompt=detail_negative_prompt,
-        )
+        return await post_process(client, kind, data, pending["filename"], full_params)
 
     result = await _run_reporting_errors(
         status_message, label, "post-processing", _download_and_post_process()
@@ -2944,14 +2960,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         subject = "face" if kind == "face" else "hand"
         await query.message.reply_text(f"⚠️ No {subject} detected — image unchanged.")
         return
-    await _send_and_store_result(
-        query.message,
-        pending["chat_id"],
-        storage,
-        result,
-        detail_prompt=detail_prompt,
-        detail_negative_prompt=detail_negative_prompt,
-    )
+    await _send_and_store_result(query.message, pending["chat_id"], storage, result)
 
 
 async def _show_keyboard_page(query, result_id: str, page: int) -> None:
@@ -3005,7 +3014,6 @@ async def hand_point_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     client: ComfyClient = context.bot_data["comfy_client"]
     full_params = _deserialize_generation_params(pending["base_params"])
-    detail_prompt, detail_negative_prompt = _detail_prompt_of(pending)
     point_frac = (
         (col + 0.5) / grid_size,
         (row + 0.5) / grid_size,
@@ -3030,8 +3038,6 @@ async def hand_point_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             full_params,
             point_frac=point_frac,
             box_size_frac=box_size_frac,
-            detail_prompt=detail_prompt,
-            detail_negative_prompt=detail_negative_prompt,
         )
 
     result = await _run_reporting_errors(
@@ -3041,14 +3047,7 @@ async def hand_point_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     await status_message.delete()
-    await _send_and_store_result(
-        query.message,
-        pending["chat_id"],
-        storage,
-        result,
-        detail_prompt=detail_prompt,
-        detail_negative_prompt=detail_negative_prompt,
-    )
+    await _send_and_store_result(query.message, pending["chat_id"], storage, result)
 
 
 async def hand_point_density_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3346,77 +3345,15 @@ async def _consume_awaiting_character_rename(
     return True
 
 
-async def _consume_awaiting_detail_prompt(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> bool:
-    """If this chat is mid-"send the detail prompt" entry (see
-    `postprocess_callback`'s `DETAIL_PROMPT_CALLBACK_KIND` branch), consume
-    the incoming text as the detailer prompt override for that image and
-    save it, returning True. Otherwise return False so the caller
-    (`generate_message`) treats the text as a normal generation prompt
-    instead. Mirrors `_consume_awaiting_stream_prompt`.
-
-    The text is split by `_split_negative_prompt`, exactly as a generation
-    prompt is — the "---" block separator and inline `-token` negatives work
-    here for the same reason they do there, and a prompt copied out of
-    "✏️ Detail Prompt"'s own "📋 Copy current" button round-trips back
-    through it unchanged. An empty side means "leave that one as the image's
-    own", so overriding only the positive doesn't silently wipe a negative
-    prompt the user never mentioned."""
-    message = update.effective_message
-    result_id = pop_pending(context.chat_data, "awaiting_detail_prompt", message)
-    if result_id is None:
-        return False
-
-    body = (message_text(message) or "").strip()
-    if not body:
-        await message.reply_text("Cancelled — no prompt received.")
-        return True
-
-    if body.lower() == DETAIL_PROMPT_RESET_WORD:
-        positive: str | None = None
-        negative: str | None = None
-    else:
-        split_positive, split_negative = _split_negative_prompt(body)
-        positive = split_positive or None
-        negative = split_negative or None
-
-    storage: Storage = context.bot_data["storage"]
-    if not storage.set_detail_prompt(result_id, positive, negative):
-        await message.reply_text("That image has expired — generate a new one.")
-        return True
-
-    if positive is None and negative is None:
-        await message.reply_text(
-            "Detail prompt cleared — detailers will use this image's own prompt again."
-        )
-        return True
-
-    lines = [
-        (
-            "Detail prompt set for this image — tap a detailer to use it. "
-            "Tap ✏️ Detail Prompt again to change or reset it."
-        )
-    ]
-    if positive is not None:
-        lines.append(f"\nPositive:\n{positive}")
-    if negative is not None:
-        lines.append(f"\nNegative:\n{negative}")
-    await message.reply_text("\n".join(lines))
-    return True
-
-
 def _make_cancel_callback(
     pending_key: str, cancelled_text: str
 ) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]:
     """Build a "❌ Cancel" callback for a one-shot `awaiting_*` follow-up
     entry (the same pattern `settings_menu.py`'s custom-value capture and
-    this file's character-edit/-rename/detail-prompt/stream-prompt entries
-    all use): clears `pending_key` so the next text message goes back to
-    being treated as a normal generation prompt, and edits the button away
-    so a stale tap can't be replayed. `detail_prompt_cancel_callback`/
-    `stream_cancel_callback` differ only in which entry they clear and what
-    the edited message says."""
+    this file's character-edit/-rename/stream-prompt entries all use):
+    clears `pending_key` so the next text message goes back to being treated
+    as a normal generation prompt, and edits the button away so a stale tap
+    can't be replayed."""
 
     async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -3435,11 +3372,6 @@ def _make_cancel_callback(
     return callback
 
 
-#: "❌ Cancel" on the "send the detail prompt" follow-up — see
-#: `_detail_prompt_keyboard`.
-detail_prompt_cancel_callback = _make_cancel_callback(
-    "awaiting_detail_prompt", "Detail prompt unchanged."
-)
 #: "❌ Cancel" on the "What should the stream generate?" follow-up — see
 #: `stream_command`'s promptless branch and `_stream_prompt_cancel_keyboard`.
 stream_cancel_callback = _make_cancel_callback(

@@ -8,7 +8,7 @@
     "sampler_name": "euler_ancestral",
     "scheduler": "normal",
     "clip_skip": -2,
-    "upscale_denoise": 0.35
+    "upscale_denoise": 0.3
   },
   "prompt_style": "tags",
   "tag_dictionary": "e621",
@@ -35,5 +35,5 @@
     }
   ],
   "tile_controlnet": "xinsir_tile_sdxl.safetensors",
-  "tile_controlnet_strength": 0.25
+  "tile_controlnet_strength": 0.4
 }

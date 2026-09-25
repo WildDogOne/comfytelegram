@@ -96,9 +96,7 @@ CREATE TABLE IF NOT EXISTS pending_result (
     file_id TEXT NOT NULL,
     filename TEXT NOT NULL,
     base_params_json TEXT NOT NULL,
-    created_at REAL NOT NULL,
-    detail_prompt TEXT,
-    detail_negative_prompt TEXT
+    created_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS character (
@@ -145,7 +143,10 @@ CREATE TABLE IF NOT EXISTS inpaint_redo (
     source_file_id TEXT NOT NULL,
     source_filename TEXT NOT NULL,
     mask_png BLOB NOT NULL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    detail_prompt TEXT,
+    detail_negative_prompt TEXT,
+    detail_denoise REAL
 );
 """
 
@@ -178,8 +179,9 @@ class Storage:
         self._add_column_if_missing("derived_prompt", "negative_prompt", "TEXT NOT NULL DEFAULT ''")
         self._add_column_if_missing("inpaint_job", "message_thread_id", "INTEGER")
         self._add_column_if_missing("inpaint_job", "kind", "TEXT NOT NULL DEFAULT 'hand'")
-        self._add_column_if_missing("pending_result", "detail_prompt", "TEXT")
-        self._add_column_if_missing("pending_result", "detail_negative_prompt", "TEXT")
+        self._add_column_if_missing("inpaint_redo", "detail_prompt", "TEXT")
+        self._add_column_if_missing("inpaint_redo", "detail_negative_prompt", "TEXT")
+        self._add_column_if_missing("inpaint_redo", "detail_denoise", "REAL")
         #: Last `_prune()` sweep time per table — see PRUNE_INTERVAL_SECONDS.
         self._last_prune: dict[str, float] = {}
 
@@ -288,70 +290,38 @@ class Storage:
         file_id: str,
         filename: str,
         base_params: dict[str, Any],
-        detail_prompt: str | None = None,
-        detail_negative_prompt: str | None = None,
     ) -> None:
         """Record what a post-processing/regenerate button (result_id) refers
         to: the Telegram file_id to re-download the source image from, and
         the full resolved generation params (already a plain dict — see
         handlers.py's (de)serialization helpers) needed to build the next
         graph, whether that's an upscale/face-detail pass or a fresh
-        "🔁 Regenerate" run. `detail_prompt`/`detail_negative_prompt` are the
-        optional per-image detailer prompt override (see `set_detail_prompt`);
-        callers pass the source image's own when storing a derived result, so
-        an override set once follows the image down a chain of passes."""
+        "🔁 Regenerate" run."""
         self._prune("pending_result")
         with self._conn:
             self._conn.execute(
                 "INSERT OR REPLACE INTO pending_result "
-                "(result_id, chat_id, file_id, filename, base_params_json, created_at, "
-                "detail_prompt, detail_negative_prompt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    result_id,
-                    chat_id,
-                    file_id,
-                    filename,
-                    json.dumps(base_params),
-                    time.time(),
-                    detail_prompt,
-                    detail_negative_prompt,
-                ),
+                "(result_id, chat_id, file_id, filename, base_params_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (result_id, chat_id, file_id, filename, json.dumps(base_params), time.time()),
             )
-
-    def set_detail_prompt(self, result_id: str, positive: str | None, negative: str | None) -> bool:
-        """Override (or, with `None`/`None`, clear) the prompt the region
-        detailers condition on for `result_id` — see handlers.py's
-        `DETAIL_PROMPT_CALLBACK_KIND`. Kept as its own column rather than
-        rewritten into `base_params_json` because that blob also drives
-        whole-image passes (upscale/homogenize) and "🐛 Show Prompt", none of
-        which should see a prompt written for one small masked region.
-        Returns False if the row has expired out from under the button."""
-        with self._conn:
-            cursor = self._conn.execute(
-                "UPDATE pending_result SET detail_prompt = ?, detail_negative_prompt = ? "
-                "WHERE result_id = ?",
-                (positive, negative, result_id),
-            )
-        return cursor.rowcount > 0
 
     def get_pending_result(self, result_id: str) -> dict[str, Any] | None:
         """The row `store_pending_result` wrote for `result_id`, or None if
         it doesn't exist (never stored, or pruned past its TTL)."""
         row = self._conn.execute(
-            "SELECT chat_id, file_id, filename, base_params_json, detail_prompt, "
-            "detail_negative_prompt FROM pending_result WHERE result_id = ?",
+            "SELECT chat_id, file_id, filename, base_params_json FROM pending_result "
+            "WHERE result_id = ?",
             (result_id,),
         ).fetchone()
         if row is None:
             return None
-        chat_id, file_id, filename, base_params_json, detail_prompt, detail_negative_prompt = row
+        chat_id, file_id, filename, base_params_json = row
         return {
             "chat_id": chat_id,
             "file_id": file_id,
             "filename": filename,
             "base_params": json.loads(base_params_json),
-            "detail_prompt": detail_prompt,
-            "detail_negative_prompt": detail_negative_prompt,
         }
 
     def _prune(self, table: str, ttl_seconds: float = PENDING_RESULT_TTL_SECONDS) -> None:
@@ -598,26 +568,52 @@ class Storage:
             self._conn.execute("DELETE FROM inpaint_job WHERE created_at < ?", (cutoff,))
 
     def store_inpaint_redo(
-        self, result_id: str, source_file_id: str, source_filename: str, mask_png: bytes
+        self,
+        result_id: str,
+        source_file_id: str,
+        source_filename: str,
+        mask_png: bytes,
+        detail_prompt: str | None = None,
+        detail_negative_prompt: str | None = None,
+        detail_denoise: float | None = None,
     ) -> None:
         """Record what "🔁 Redo (same mask)" (`handlers.py`'s
-        `HAND_REDO_CALLBACK_KIND`) needs to re-run a hand-drawn-mask
-        refinement against a fresh seed: the pre-refinement source image's
-        Telegram `file_id` (re-downloadable, same as `pending_result`) and
-        the drawn mask's raw PNG bytes — see this module's docstring for why
-        that specific blob, unlike everything else in here, has no `file_id`
-        of its own to point at instead. Keyed by the *same* `result_id` as
-        the `pending_result` row for the refined image this mask produced —
-        `postprocess_callback` looks both up together, and either expiring
-        invalidates the redo button the same way. `_prune`'s default TTL
-        (`PENDING_RESULT_TTL_SECONDS`) keeps them in sync in practice."""
+        `HAND_REDO_CALLBACK_KIND`/`FIX_REDO_CALLBACK_KIND`/
+        `DETAIL_REDO_CALLBACK_KIND`) needs to re-run a drawn-mask refinement
+        against a fresh seed: the pre-refinement source image's Telegram
+        `file_id` (re-downloadable, same as `pending_result`) and the drawn
+        mask's raw PNG bytes — see this module's docstring for why that
+        specific blob, unlike everything else in here, has no `file_id` of
+        its own to point at instead. `detail_prompt`/`detail_negative_prompt`/
+        `detail_denoise` are "✏️ Detail Prompt"'s one-shot override — unlike
+        the old per-image `pending_result.detail_prompt` this replaced, it's
+        never saved anywhere *except* here, keyed to the exact mask it was
+        submitted alongside, since a redo is the only thing that should ever
+        reuse it (a fresh "✏️ Detail Prompt"/"🖌️ Draw Mask"/"🩹 Fix Artifact"
+        tap always starts from nothing); `None` for the "🖌️ Draw Mask"/
+        "🩹 Fix Artifact" flows, which never collect a prompt at all. Keyed
+        by the *same* `result_id` as the `pending_result` row for the
+        refined image this mask produced — `postprocess_callback` looks
+        both up together, and either expiring invalidates the redo button
+        the same way. `_prune`'s default TTL (`PENDING_RESULT_TTL_SECONDS`)
+        keeps them in sync in practice."""
         self._prune("inpaint_redo")
         with self._conn:
             self._conn.execute(
                 "INSERT OR REPLACE INTO inpaint_redo "
-                "(result_id, source_file_id, source_filename, mask_png, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (result_id, source_file_id, source_filename, mask_png, time.time()),
+                "(result_id, source_file_id, source_filename, mask_png, created_at, "
+                "detail_prompt, detail_negative_prompt, detail_denoise) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    result_id,
+                    source_file_id,
+                    source_filename,
+                    mask_png,
+                    time.time(),
+                    detail_prompt,
+                    detail_negative_prompt,
+                    detail_denoise,
+                ),
             )
 
     def get_inpaint_redo(self, result_id: str) -> dict[str, Any] | None:
@@ -625,17 +621,27 @@ class Storage:
         doesn't exist (never stored — not every result has a redoable
         mask — or pruned past its TTL)."""
         row = self._conn.execute(
-            "SELECT source_file_id, source_filename, mask_png FROM inpaint_redo "
-            "WHERE result_id = ?",
+            "SELECT source_file_id, source_filename, mask_png, detail_prompt, "
+            "detail_negative_prompt, detail_denoise FROM inpaint_redo WHERE result_id = ?",
             (result_id,),
         ).fetchone()
         if row is None:
             return None
-        source_file_id, source_filename, mask_png = row
+        (
+            source_file_id,
+            source_filename,
+            mask_png,
+            detail_prompt,
+            detail_negative_prompt,
+            detail_denoise,
+        ) = row
         return {
             "source_file_id": source_file_id,
             "source_filename": source_filename,
             "mask_png": bytes(mask_png),
+            "detail_prompt": detail_prompt,
+            "detail_negative_prompt": detail_negative_prompt,
+            "detail_denoise": detail_denoise,
         }
 
     def close(self) -> None:
