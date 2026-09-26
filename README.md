@@ -132,7 +132,7 @@ see the Docker section below for the container case specifically.
 
 ## Running with Docker
 
-A `Dockerfile` and `docker-compose.example.yml` are included:
+A `Dockerfile` and `docker-compose.yml` are included:
 
 ```bash
 docker compose up -d --build
@@ -142,7 +142,7 @@ The container uses host networking by default (so `COMFYUI_HOST=127.0.0.1`/
 `OLLAMA_HOST=127.0.0.1` in `.env` reach ComfyUI/Ollama running directly on
 the same host, matching the non-Docker setup above) — Linux-only. On
 macOS/Windows, switch to the `extra_hosts`/`host.docker.internal`
-alternative commented in `docker-compose.example.yml` (set both `COMFYUI_HOST` and
+alternative commented in `docker-compose.yml` (set both `COMFYUI_HOST` and
 `OLLAMA_HOST` to `host.docker.internal` in that case). The `data/` directory
 (sqlite state + tag database), `model_profiles/`, and `models/wd14/` are
 bind-mounted from the repo, so they're the same files a bare `uv run
