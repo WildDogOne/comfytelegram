@@ -421,21 +421,21 @@ def test_lora_field_text_shows_both_strengths():
     assert "0.9" in text
 
 
-def test_lora_field_keyboard_has_steppers_presets_custom_and_nav():
+def test_lora_field_keyboard_has_steppers_custom_and_nav_but_no_presets():
     lora = LoraDefault(name="styleA.safetensors", strength_model=0.8, strength_clip=0.9)
     keyboard = _lora_field_keyboard(0, lora)
     callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
 
     assert "lr:d:m:0:-0.05" in callback_data
     assert "lr:d:m:0:0.05" in callback_data
-    assert any(cd.startswith("lr:v:m:0:") for cd in callback_data)
     assert "lr:c:m:0" in callback_data
     assert "lr:d:c:0:-0.05" in callback_data
     assert "lr:d:c:0:0.05" in callback_data
-    assert any(cd.startswith("lr:v:c:0:") for cd in callback_data)
     assert "lr:c:c:0" in callback_data
     assert "lr:pr:0" in callback_data
     assert "lr:home" in callback_data
+    # no preset-value row — removed for looking too busy/chaotic
+    assert not any(cd.startswith("lr:v:") for cd in callback_data)
 
 
 @pytest.mark.asyncio
@@ -512,10 +512,15 @@ async def test_stepper_action_adjusts_and_persists_strength(storage: Storage):
 
 
 @pytest.mark.asyncio
-async def test_preset_action_sets_strength_directly(storage: Storage):
+async def test_preset_action_no_longer_exists(storage: Storage):
+    """`lr:v:...` used to set a preset value directly; the preset row was
+    removed for looking too busy, and nothing emits this callback_data
+    anymore — it must fall through to the generic "unknown action" reply
+    rather than silently doing something (e.g. matching `action in
+    ("d", "c")` by accident)."""
     storage.set_checkpoint(1, "ckpt.safetensors")
     query = AsyncMock()
-    query.data = "lr:v:c:1:0.5"  # styleB's strength_clip
+    query.data = "lr:v:c:1:0.5"
     update = MagicMock()
     update.callback_query = query
     update.effective_chat.id = 1
@@ -524,9 +529,8 @@ async def test_preset_action_sets_strength_directly(storage: Storage):
 
     await lora_callback(update, context)
 
-    assert storage.get_lora_strength_overrides(1, "ckpt.safetensors") == {
-        "styleB.safetensors": {"strength_clip": 0.5}
-    }
+    query.answer.assert_awaited_once_with("Unknown action.", show_alert=True)
+    assert storage.get_lora_strength_overrides(1, "ckpt.safetensors") == {}
 
 
 @pytest.mark.asyncio

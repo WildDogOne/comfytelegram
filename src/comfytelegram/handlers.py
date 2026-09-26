@@ -1803,6 +1803,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     buttons = [
         [InlineKeyboardButton(label, callback_data=f"model:{i}")] for i, label in enumerate(labels)
     ]
+    buttons.append([InlineKeyboardButton("✖ Close", callback_data="model:close")])
 
     await update.effective_message.reply_text(
         "Choose a model:", reply_markup=InlineKeyboardMarkup(buttons)
@@ -1813,15 +1814,22 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Handle a `model:<index>` tap from `model_command`'s keyboard: persist
     the chosen checkpoint as this chat's selection. The index is stale (and
     rejected) if `context.bot_data["available_checkpoints"]` has since
-    changed — e.g. from a newer `/model` call in another chat."""
+    changed — e.g. from a newer `/model` call in another chat. `model:close`
+    (the keyboard's own "✖ Close" button) just deletes the picker message
+    instead, the same as `/lora`'s and `/settings`' own Close buttons."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
     if await reject_if_unauthorized_callback(query, user_id, settings):
         return
 
-    checkpoints: list[str] = context.bot_data.get("available_checkpoints", [])
     _, index_str = query.data.split(":", 1)
+    if index_str == "close":
+        await query.answer()
+        await query.message.delete()
+        return
+
+    checkpoints: list[str] = context.bot_data.get("available_checkpoints", [])
     index = int(index_str)
     if index >= len(checkpoints):
         await query.answer("That model list is stale — run /model again.", show_alert=True)

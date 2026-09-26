@@ -60,6 +60,7 @@ from comfytelegram.handlers import (
     _upscale_mode_keyboard,
     hand_point_callback,
     hand_point_density_callback,
+    model_callback,
     postprocess_callback,
     start,
 )
@@ -732,6 +733,26 @@ def test_checkpoint_labels_leaves_unique_display_names_alone():
 def test_checkpoint_labels_falls_back_to_filename_without_a_matching_profile():
     labels = _checkpoint_labels(["unmatched.safetensors"], [])
     assert labels == ["unmatched.safetensors"]
+
+
+@pytest.mark.asyncio
+async def test_model_callback_close_action_deletes_the_message_without_touching_checkpoint():
+    """The `/model` picker's own "✖ Close" button (`model:close`) — mirrors
+    `/lora`'s and `/settings`' Close buttons. Must not fall through to the
+    `int(index_str)` checkpoint-selection path."""
+    query = AsyncMock()
+    query.data = "model:close"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+    context = MagicMock()
+    context.bot_data = {"settings": MagicMock(allowed_user_ids=None), "available_checkpoints": []}
+
+    await model_callback(update, context)
+
+    query.answer.assert_awaited_once()
+    query.message.delete.assert_awaited_once()
+    query.edit_message_text.assert_not_awaited()
 
 
 def test_resolve_tag_sources_uses_profile_tag_dictionary_when_no_override():

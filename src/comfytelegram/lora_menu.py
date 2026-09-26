@@ -69,19 +69,17 @@ from comfytelegram.topics import pop_pending, set_pending
 
 logger = logging.getLogger(__name__)
 
-#: `lr:d:<code>:<index>:<delta>`/`lr:v:<code>:<index>:<value>`/
-#: `lr:c:<code>:<index>` callback codes for the two strength fields a
-#: per-LoRA screen edits — short codes rather than the field names
-#: themselves, same reasoning as using a list index instead of a LoRA's own
-#: filename: shorter callback_data.
+#: `lr:d:<code>:<index>:<delta>`/`lr:c:<code>:<index>` callback codes for
+#: the two strength fields a per-LoRA screen edits — short codes rather
+#: than the field names themselves, same reasoning as using a list index
+#: instead of a LoRA's own filename: shorter callback_data.
 _STRENGTH_FIELDS = {"m": "strength_model", "c": "strength_clip"}
 _STRENGTH_FIELD_LABELS = {"m": "Model strength", "c": "Clip strength"}
 
-#: Stepper increment and quick-preset values for a per-LoRA strength field —
-#: mirrors `settings_menu.py`'s numeric field submenu (stepper + presets +
-#: custom value), just for a 0-1-ish range instead of cfg/steps-sized ones.
+#: Stepper increment for a per-LoRA strength field. No preset-value row
+#: (unlike `settings_menu.py`'s numeric field submenus) — see
+#: `_lora_field_keyboard`.
 _STRENGTH_STEP = 0.05
-_STRENGTH_PRESETS = (0.25, 0.5, 0.75, 1.0, 1.25)
 
 #: Shown (with just a Close button) when the resolved checkpoint has no
 #: profile, or a profile with an empty `loras` list — there's nothing to
@@ -115,13 +113,6 @@ def _format_strength(value: float) -> str:
     """Whole floats without a trailing `.0`, same convention as
     `settings_menu._format_value`."""
     return str(int(value)) if value == int(value) else str(value)
-
-
-def _chunk(buttons: list[InlineKeyboardButton], size: int) -> list[list[InlineKeyboardButton]]:
-    """Split a flat button list into fixed-size rows — same helper
-    `settings_menu.py` has, reimplemented here rather than imported since
-    these two modules deliberately don't share private helpers."""
-    return [buttons[i : i + size] for i in range(0, len(buttons), size)]
 
 
 def _resolve_effective_profile(
@@ -194,11 +185,13 @@ def _lora_field_text(lora: LoraDefault) -> str:
 
 
 def _lora_field_keyboard(index: int, lora: LoraDefault) -> InlineKeyboardMarkup:
-    """A single screen editing both of one LoRA's strength fields —
-    stepper + presets + custom-value entry per field, same controls
-    `settings_menu.py`'s numeric field submenu offers for one field at a
-    time, combined here onto one screen since the two are tightly coupled
-    to this one LoRA and always worth seeing together."""
+    """A single screen editing both of one LoRA's strength fields — a
+    stepper plus custom-value entry per field, combined here onto one
+    screen since the two are tightly coupled to this one LoRA and always
+    worth seeing together. No preset-value row (unlike `settings_menu.py`'s
+    numeric field submenus) — a fixed set of quick values made this screen
+    look busier than it needed to be for a field that's really just "nudge
+    up/down or type an exact number"."""
     rows: list[list[InlineKeyboardButton]] = []
     for code, value in (("m", lora.strength_model), ("c", lora.strength_clip)):
         rows.append(
@@ -211,13 +204,6 @@ def _lora_field_keyboard(index: int, lora: LoraDefault) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("➕", callback_data=f"lr:d:{code}:{index}:{_STRENGTH_STEP}"),
             ]
         )
-        preset_buttons = [
-            InlineKeyboardButton(
-                _format_strength(preset), callback_data=f"lr:v:{code}:{index}:{preset}"
-            )
-            for preset in _STRENGTH_PRESETS
-        ]
-        rows.extend(_chunk(preset_buttons, 3))
         rows.append([InlineKeyboardButton("✏️ Custom value", callback_data=f"lr:c:{code}:{index}")])
     rows.append(
         [
@@ -355,9 +341,9 @@ async def lora_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     position in `profile.loras` (`t`), look up or re-look-up its CivitAI
     info (`i`/`ir` — only reachable when `Settings.comfyui_loras_dir` is
     set, since `_home_keyboard` omits the Info button otherwise), open a
-    LoRA's strength-editing screen (`f`) or step/set/start-custom-entry-for
-    one of its two strength fields there (`d`/`v`/`c`, keyed by
-    `_STRENGTH_FIELDS`) or reset just that LoRA's strengths (`pr`), go back
+    LoRA's strength-editing screen (`f`) or step/start-custom-entry-for one
+    of its two strength fields there (`d`/`c`, keyed by `_STRENGTH_FIELDS`)
+    or reset just that LoRA's strengths (`pr`), go back
     to the home screen (`home`), reset every stored toggle/strength
     override for this checkpoint back to the profile's own defaults (`ra`),
     no-op on a disabled label button (`noop`), or close the menu."""
@@ -432,7 +418,7 @@ async def lora_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _show_lora_field(query, context, chat_id, checkpoint, index)
         return
 
-    if action in ("d", "v", "c"):
+    if action in ("d", "c"):
         code = parts[2]
         field = _STRENGTH_FIELDS.get(code)
         if field is None:
@@ -463,10 +449,7 @@ async def lora_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
             return
 
-        if action == "d":
-            new_value = round(getattr(lora, field) + float(parts[4]), 2)
-        else:  # "v"
-            new_value = float(parts[4])
+        new_value = round(getattr(lora, field) + float(parts[4]), 2)
         storage.set_lora_strength_override(chat_id, checkpoint, lora.name, field, new_value)
         await query.answer(f"{_STRENGTH_FIELD_LABELS[code]}: {_format_strength(new_value)}")
         await _show_lora_field(query, context, chat_id, checkpoint, index)
