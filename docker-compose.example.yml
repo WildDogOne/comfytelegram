@@ -1,3 +1,10 @@
+# Copy this file to docker-compose.yml before running it (`cp
+# docker-compose.example.yml docker-compose.yml`) — unlike the rest of this
+# file, the COMFYUI_LORAS_DIR bind mount below has no sane default, since it
+# points at *your* ComfyUI install's models/loras directory, wherever that
+# actually lives on this host. Edit that one line, then `docker compose up
+# -d --build` as usual.
+
 services:
   bot:
     build: .
@@ -8,6 +15,7 @@ services:
     environment:
       STATE_DB_PATH: /app/data/state.sqlite3
       TAGS_DB_PATH: /app/data/tags.sqlite3
+      COMFYUI_LORAS_DIR: /app/comfyui-loras
     volumes:
       # Bind-mounted straight to the repo path on the host, so the sqlite
       # files are the same ones `uv run comfytelegram` would produce outside
@@ -22,9 +30,15 @@ services:
       # host directory is exactly what Docker does create automatically),
       # no manual `touch`/setup step needed before the first `up`.
       - ./data:/app/data
-      # Edit profiles on the host without rebuilding the image. Drop this
-      # if you're fine with whatever was baked in at build time.
-      - ./model_profiles:/app/model_profiles:ro
+      # Edit profiles on the host without rebuilding the image. Read-write,
+      # not `:ro` — LoRA auto-discovery (see COMFYUI_LORAS_DIR below and
+      # lora_discovery.py) writes newly-registered LoRA entries straight
+      # into these files at boot, and silently can't if this is read-only
+      # (no exception surfaces anywhere useful — the write happens inside
+      # an unawaited background task). Drop this mount entirely if you're
+      # fine with whatever was baked in at build time (auto-discovery then
+      # has nothing it can persist to, so it's pointless without it anyway).
+      - ./model_profiles:/app/model_profiles
       # The WD14 tagger's model.onnx + selected_tags.csv (~370MB), used by
       # the "🔬 Analyze & Regenerate" button for checkpoints whose model
       # profile sets "prompt_style": "tags". These are deliberately *not*
@@ -33,6 +47,18 @@ services:
       # them) — just bind-mount the same directory `uv run comfytelegram`
       # would read outside Docker.
       - ./models/wd14:/app/models/wd14:ro
+      # Read-only access to ComfyUI's own models/loras directory, so the
+      # "ℹ️ Info" button on /lora can hash a LoRA file locally and look up
+      # its trigger words/base-model compatibility on CivitAI by that hash
+      # (the same two-step lookup ComfyUI-Custom-Scripts' web/js/modelInfo.js
+      # does, just server-side here instead of via a custom ComfyUI node
+      # route). REPLACE THE LEFT SIDE with the actual path to your ComfyUI
+      # install's models/loras directory on this host — there's no default
+      # that could possibly be right for every install, unlike every other
+      # mount above. Leave this line out entirely (and COMFYUI_LORAS_DIR
+      # above unset) to skip the feature — the "ℹ️ Info" button is simply
+      # omitted from /lora when it's not configured.
+      - /path/to/your/ComfyUI/models/loras:/app/comfyui-loras:ro
     # ComfyUI (and, if you're using the "🔬 Analyze & Regenerate" button's
     # natural-language path, Ollama) are assumed to be running directly on
     # this host (the .env defaults COMFYUI_HOST=127.0.0.1/OLLAMA_HOST=

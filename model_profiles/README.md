@@ -39,6 +39,7 @@ Files starting with `_` are ignored (reserved for docs/schema files).
       "default_enabled": false        // true = always applied for this model; false = documented but off
     }
   ],
+  "civitai_base_models": [],           // opts this profile into boot-time LoRA auto-discovery — see below
   "loader": "checkpoint",              // "checkpoint" (default) or "split" — see below
   "clip_name": "",                     // "split" only: CLIPLoader's text-encoder filename
   "clip_type": "stable_diffusion",     // "split" only: CLIPLoader's `type` input
@@ -70,6 +71,30 @@ ones. Leave it unset for a checkpoint that isn't clearly one or the other
 command's caller can still override it per-call with a `danbooru:`/`e621:`
 prefix. See the main README's "Tag search" section for how the databases
 themselves get populated.
+
+### `civitai_base_models` — auto-registering downloaded LoRAs into `loras`
+
+Hand-typing a `loras` entry for every LoRA you download is exactly the
+tedium `civitai_base_models` exists to cut down on. If `Settings.
+comfyui_loras_dir` is set (a filesystem path to ComfyUI's own
+`models/loras`, readable by the bot — see the main README's
+[LoRA info lookup](../README.md#lora-info-lookup) section), the bot scans
+that directory at startup for files no profile's `loras` list mentions
+yet, hashes each one, and looks it up on CivitAI. A LoRA whose
+CivitAI-reported `baseModel` (e.g. `"SDXL 1.0"`, `"Pony"`,
+`"Illustrious"` — exact strings, case-insensitive) matches an entry in
+this list gets appended to `loras` automatically, `default_enabled: false`
+so it doesn't silently start applying to generations — toggle it on via
+`/lora` once you've confirmed it's the one you want.
+
+Left empty (the default), a profile is untouched by this entirely — set
+it explicitly to opt in, e.g. `["SDXL 1.0"]` for a plain SDXL profile, or
+`["Pony", "SDXL 1.0"]` if a profile is happy to accept LoRAs trained
+against either. This only ever *adds* entries, never removes or edits an
+existing one, and only for a LoRA CivitAI actually has a hash record for —
+anything privately/custom-trained (like `furrytoonmix_illustrious.json`'s
+three character LoRAs above) still needs to be added here by hand, the
+same as before this existed.
 
 ### `loader: "split"` — Anima-style architectures
 

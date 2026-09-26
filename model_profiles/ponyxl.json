@@ -1,5 +1,7 @@
 {
-  "match": ["*pony*"],
+  "match": [
+    "*pony*"
+  ],
   "display_name": "Pony Diffusion XL",
   "description": "Pony-family checkpoints use a distinctive score_9/score_8_up... quality-tag convention and a matching score_4/score_5/score_6 negative convention baked into their training captions. Common community-recommended starting point, not tuned against a specific install.",
   "defaults": {
@@ -15,5 +17,159 @@
   "tag_dictionary": "danbooru",
   "positive_prompt_prefix": "score_9, score_8_up, score_7_up, source_anime",
   "negative_prompt_prefix": "score_6, score_5, score_4, low quality, worst quality, blurry, jpeg artifacts",
-  "loras": []
+  "loras": [
+    {
+      "name": "PDXL_artist_tags_v2.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "SDXL_2.5DCartoonV2.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/Auto_fellatiocunnilingus_for_furrys.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/Boop.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/Chillin_with_the_Fan__Concept.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/Condoms_for_Furrys.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/MegaFluffyPonyV2.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/PixelartXl.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/PonyBackgroundDetailerV2.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/Sword_Swallowing_Position_XL.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/characters/tsunoda.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/darkstyleXL.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/ear_licking.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/kb0g_1.0Pony.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/lickinglollipop.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/style/PixelSketcher.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/style/Scifi_Environment_Concept_Art_PDXL.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/style/SimpleOutlinePony1.0.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/style/ncpy43 style.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/style/p4st3lg0r3XLP.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/style/ponyemotexl.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/style/stickersXL.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/xl_exaggerated surprised expression(pony)-000015.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sdxl/zy_Detailed_Backgrounds_v1.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "telegramstickerxl.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    }
+  ],
+  "civitai_base_models": [
+    "Pony"
+  ]
 }

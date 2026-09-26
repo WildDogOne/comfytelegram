@@ -1,5 +1,8 @@
 {
-  "match": ["sd_xl_base_*", "sdxl_base_*"],
+  "match": [
+    "sd_xl_base_*",
+    "sdxl_base_*"
+  ],
   "display_name": "SDXL Base",
   "description": "Stability AI's stock SDXL 1.0 base checkpoint. No special tag conventions needed; a generic negative prompt is enough. Common community-recommended starting point, not tuned against a specific install.",
   "defaults": {
@@ -13,5 +16,21 @@
   },
   "positive_prompt_prefix": "",
   "negative_prompt_prefix": "low quality, worst quality, blurry, jpeg artifacts, watermark, signature, extra limbs, deformed",
-  "loras": []
+  "loras": [
+    {
+      "name": "hand 4.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "sd_xl_offset_example-lora_1.0.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    }
+  ],
+  "civitai_base_models": [
+    "SDXL 1.0"
+  ]
 }

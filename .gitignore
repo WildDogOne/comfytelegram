@@ -227,3 +227,4 @@ sample.json
 CLAUDE.md
 
 inpaint_relay/docker-compose.yml
+docker-compose.yml

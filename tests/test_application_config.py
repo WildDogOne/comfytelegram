@@ -5,9 +5,12 @@ a large file, which makes them exactly the kind of thing a later refactor
 would silently drop.
 """
 
+from unittest.mock import MagicMock
+
 from comfytelegram.main import (
     MEDIA_WRITE_TIMEOUT_SECONDS,
     READ_TIMEOUT_SECONDS,
+    _start_lora_discovery,
     build_application,
 )
 from comfytelegram.settings import Settings
@@ -58,3 +61,17 @@ def test_relay_upload_gets_its_own_generous_timeout():
     # shared timeout was really protecting
     assert _INPAINT_RELAY_UPLOAD_TIMEOUT.connect is not None
     assert _INPAINT_RELAY_UPLOAD_TIMEOUT.connect <= 30
+
+
+def test_lora_discovery_is_skipped_without_comfyui_loras_dir():
+    """No `COMFYUI_LORAS_DIR` means no filesystem access to hash anything
+    against — the background task must not even be created, not just
+    no-op once running (that'd still cost an event-loop scheduling round
+    trip on every startup for nothing)."""
+    application = MagicMock()
+    application.bot_data = {}
+    settings = MagicMock(comfyui_loras_dir=None)
+
+    _start_lora_discovery(application, settings)
+
+    assert "lora_discovery_task" not in application.bot_data

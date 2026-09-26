@@ -77,6 +77,22 @@ class Settings(BaseSettings):
         default=PROJECT_ROOT / "model_profiles",
         description="Directory of per-checkpoint default-settings JSON files",
     )
+    comfyui_loras_dir: Path | None = Field(
+        None,
+        description=(
+            "Filesystem path to ComfyUI's own models/loras directory, readable by this "
+            "process (bind-mounted read-only in Docker — see docker-compose.example.yml "
+            "— or just the real local path for a bare install on the same host). Backs "
+            '"/lora"\'s "ℹ️ Info" button (comfytelegram.civitai): hashes a LoRA file '
+            "locally and looks its trigger words/base-model compatibility up on CivitAI "
+            "by that hash, the same two-step lookup ComfyUI-Custom-Scripts' "
+            "web/js/modelInfo.js does client-side against its own custom ComfyUI node "
+            "route, done here server-side instead since this bot has no custom node code "
+            "of its own. Unset (the default) simply omits the Info button — ComfyUI's "
+            "own /object_info gives LoraLoader's dropdown as bare filenames with no hash "
+            "or metadata, so there's nothing this feature can work with without it."
+        ),
+    )
     state_db_path: Path = Field(
         default=DATA_DIR / "state.sqlite3",
         description="SQLite file for durable per-chat state (selected model, profile overrides)",

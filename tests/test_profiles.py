@@ -6,6 +6,7 @@ from comfytelegram.profiles import (
     LoraDefault,
     ModelProfile,
     ProfileDefaults,
+    load_profile_files,
     load_profiles,
     resolve_generation_params,
     resolve_profile,
@@ -19,6 +20,28 @@ def profiles():
     loaded = load_profiles(PROFILES_DIR)
     assert loaded, "expected the shipped example profiles to load"
     return loaded
+
+
+def test_load_profile_files_returns_path_and_raw_dict_alongside_the_profile(tmp_path: Path):
+    (tmp_path / "test.json").write_text('{"match": ["*ckpt*"], "display_name": "X", "loras": []}')
+    (tmp_path / "_schema.json").write_text("{}")  # skipped: underscore-prefixed
+    (tmp_path / "broken.json").write_text("{not valid json")  # skipped: invalid
+
+    results = load_profile_files(tmp_path)
+
+    assert len(results) == 1
+    path, data, profile = results[0]
+    assert path == tmp_path / "test.json"
+    assert data == {"match": ["*ckpt*"], "display_name": "X", "loras": []}
+    assert isinstance(profile, ModelProfile)
+    assert profile.display_name == "X"
+
+
+def test_load_profiles_matches_load_profile_files(tmp_path: Path):
+    (tmp_path / "test.json").write_text('{"match": ["*ckpt*"], "display_name": "X"}')
+
+    via_files = [profile for _, _, profile in load_profile_files(tmp_path)]
+    assert load_profiles(tmp_path) == via_files
 
 
 def test_all_shipped_profiles_load(profiles):

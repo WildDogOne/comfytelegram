@@ -47,7 +47,10 @@ import json
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from comfytelegram.civitai import CivitaiLoraInfo
 
 #: How long a post-processing button stays valid before its row is pruned.
 #: Generous on purpose — the whole point is surviving restarts and letting
@@ -88,6 +91,31 @@ CREATE TABLE IF NOT EXISTS profile_override (
     checkpoint TEXT NOT NULL,
     overrides_json TEXT NOT NULL,
     PRIMARY KEY (chat_id, checkpoint)
+);
+
+CREATE TABLE IF NOT EXISTS lora_override (
+    chat_id INTEGER NOT NULL,
+    checkpoint TEXT NOT NULL,
+    overrides_json TEXT NOT NULL,
+    PRIMARY KEY (chat_id, checkpoint)
+);
+
+CREATE TABLE IF NOT EXISTS lora_strength_override (
+    chat_id INTEGER NOT NULL,
+    checkpoint TEXT NOT NULL,
+    overrides_json TEXT NOT NULL,
+    PRIMARY KEY (chat_id, checkpoint)
+);
+
+CREATE TABLE IF NOT EXISTS lora_civitai_cache (
+    lora_name TEXT PRIMARY KEY,
+    sha256 TEXT NOT NULL,
+    found INTEGER NOT NULL,
+    model_name TEXT,
+    base_model TEXT,
+    trained_words_json TEXT,
+    civitai_url TEXT,
+    fetched_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS pending_result (
@@ -282,6 +310,161 @@ class Storage:
         else:
             self.clear_override(chat_id, checkpoint)
         return current
+
+    def get_lora_overrides(self, chat_id: int, checkpoint: str) -> dict[str, bool]:
+        """This chat's `/lora` toggle state for (chat_id, checkpoint): a
+        `{lora_name: enabled}` map covering only the LoRAs the user has
+        explicitly flipped away from the shipped profile's own
+        `default_enabled` — a name absent from this dict should keep
+        whatever the profile says. `{}` if the chat has never touched
+        `/lora` for this checkpoint."""
+        row = self._conn.execute(
+            "SELECT overrides_json FROM lora_override WHERE chat_id = ? AND checkpoint = ?",
+            (chat_id, checkpoint),
+        ).fetchone()
+        return json.loads(row[0]) if row else {}
+
+    def set_lora_override(
+        self, chat_id: int, checkpoint: str, lora_name: str, enabled: bool
+    ) -> None:
+        """Flip one LoRA's enabled state for (chat_id, checkpoint), keeping
+        every other stored toggle as-is."""
+        current = self.get_lora_overrides(chat_id, checkpoint)
+        current[lora_name] = enabled
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO lora_override (chat_id, checkpoint, overrides_json) VALUES (?, ?, ?) "
+                "ON CONFLICT(chat_id, checkpoint) DO UPDATE SET overrides_json = excluded.overrides_json",
+                (chat_id, checkpoint, json.dumps(current)),
+            )
+
+    def clear_lora_overrides(self, chat_id: int, checkpoint: str) -> None:
+        """Remove every stored `/lora` toggle for (chat_id, checkpoint) —
+        "reset all", reverting to each LoRA's own `default_enabled`."""
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM lora_override WHERE chat_id = ? AND checkpoint = ?",
+                (chat_id, checkpoint),
+            )
+
+    def get_lora_strength_overrides(
+        self, chat_id: int, checkpoint: str
+    ) -> dict[str, dict[str, float]]:
+        """This chat's `/lora` strength overrides for (chat_id, checkpoint):
+        `{lora_name: {"strength_model": ..., "strength_clip": ...}}`, only
+        listing whichever of the two fields have actually been overridden
+        for a given LoRA — a LoRA absent here, or a field absent from its
+        entry, keeps the profile's own configured value. Kept in its own
+        table rather than folded into `lora_override`'s enabled-toggle
+        dict, since the two are independent concerns edited from different
+        screens (see `lora_menu.py`'s home list vs. its per-LoRA field
+        screen)."""
+        row = self._conn.execute(
+            "SELECT overrides_json FROM lora_strength_override WHERE chat_id = ? AND checkpoint = ?",
+            (chat_id, checkpoint),
+        ).fetchone()
+        return json.loads(row[0]) if row else {}
+
+    def set_lora_strength_override(
+        self, chat_id: int, checkpoint: str, lora_name: str, field: str, value: float
+    ) -> None:
+        """Set one strength field (`"strength_model"` or `"strength_clip"`)
+        for one LoRA, keeping every other stored override (for this LoRA or
+        any other) as-is."""
+        current = self.get_lora_strength_overrides(chat_id, checkpoint)
+        current.setdefault(lora_name, {})[field] = value
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO lora_strength_override (chat_id, checkpoint, overrides_json) "
+                "VALUES (?, ?, ?) ON CONFLICT(chat_id, checkpoint) DO UPDATE SET "
+                "overrides_json = excluded.overrides_json",
+                (chat_id, checkpoint, json.dumps(current)),
+            )
+
+    def clear_lora_strength_override(self, chat_id: int, checkpoint: str, lora_name: str) -> None:
+        """Reset both strength fields for one LoRA back to the profile's
+        own values, keeping every other LoRA's overrides as-is."""
+        current = self.get_lora_strength_overrides(chat_id, checkpoint)
+        if lora_name not in current:
+            return
+        del current[lora_name]
+        with self._conn:
+            if current:
+                self._conn.execute(
+                    "UPDATE lora_strength_override SET overrides_json = ? "
+                    "WHERE chat_id = ? AND checkpoint = ?",
+                    (json.dumps(current), chat_id, checkpoint),
+                )
+            else:
+                self._conn.execute(
+                    "DELETE FROM lora_strength_override WHERE chat_id = ? AND checkpoint = ?",
+                    (chat_id, checkpoint),
+                )
+
+    def clear_lora_strength_overrides(self, chat_id: int, checkpoint: str) -> None:
+        """Remove every stored `/lora` strength override for (chat_id,
+        checkpoint) — "reset all"."""
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM lora_strength_override WHERE chat_id = ? AND checkpoint = ?",
+                (chat_id, checkpoint),
+            )
+
+    def get_lora_civitai_cache(self, lora_name: str) -> dict[str, Any] | None:
+        """The cached CivitAI lookup result for `lora_name` (see
+        `civitai.py`, `lora_menu.py`'s "ℹ️ Info" button), or None if it's
+        never been looked up. Cached forever, not TTL'd like
+        `pending_result` — a LoRA file basically never changes once placed,
+        and re-hashing a multi-hundred-MB file on every menu tap just to
+        confirm that would defeat the point of caching; `lora_menu.py`'s
+        "🔄 Refresh" action is the deliberate manual escape hatch for the
+        rare case a same-named file actually was swapped out. `found=False`
+        (no CivitAI match for this hash) is cached too, for the same
+        reason — otherwise every tap on a LoRA CivitAI simply doesn't have
+        would re-hash and re-query for an unchanged "not found" answer."""
+        row = self._conn.execute(
+            "SELECT sha256, found, model_name, base_model, trained_words_json, civitai_url "
+            "FROM lora_civitai_cache WHERE lora_name = ?",
+            (lora_name,),
+        ).fetchone()
+        if row is None:
+            return None
+        sha256, found, model_name, base_model, trained_words_json, civitai_url = row
+        return {
+            "sha256": sha256,
+            "found": bool(found),
+            "model_name": model_name,
+            "base_model": base_model,
+            "trained_words": json.loads(trained_words_json) if trained_words_json else [],
+            "civitai_url": civitai_url,
+        }
+
+    def set_lora_civitai_cache(
+        self, lora_name: str, sha256: str, info: CivitaiLoraInfo | None
+    ) -> None:
+        """Cache a CivitAI lookup result for `lora_name` — `info=None`
+        records "hashed, but CivitAI has no match" (see
+        `get_lora_civitai_cache`), not "not looked up yet"."""
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO lora_civitai_cache "
+                "(lora_name, sha256, found, model_name, base_model, trained_words_json, "
+                "civitai_url, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(lora_name) DO UPDATE SET "
+                "sha256=excluded.sha256, found=excluded.found, model_name=excluded.model_name, "
+                "base_model=excluded.base_model, trained_words_json=excluded.trained_words_json, "
+                "civitai_url=excluded.civitai_url, fetched_at=excluded.fetched_at",
+                (
+                    lora_name,
+                    sha256,
+                    info is not None,
+                    info.model_name if info else None,
+                    info.base_model if info else None,
+                    json.dumps(info.trained_words) if info else None,
+                    info.civitai_url if info else None,
+                    time.time(),
+                ),
+            )
 
     def store_pending_result(
         self,

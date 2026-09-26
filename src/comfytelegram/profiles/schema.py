@@ -77,6 +77,24 @@ class ModelProfile(BaseModel):
 
     loras: list[LoraDefault] = Field(default_factory=list)
 
+    civitai_base_models: list[str] = Field(
+        default_factory=list,
+        description=(
+            "CivitAI 'baseModel' strings (exact match, case-insensitive) this profile "
+            "accepts for boot-time LoRA auto-discovery (see lora_discovery.py) — e.g. "
+            "['SDXL 1.0'] for a plain SDXL profile, ['Pony'] for a Pony-derived one, "
+            "['Illustrious'] for an Illustrious-derived one. A LoRA file found under "
+            "Settings.comfyui_loras_dir that no profile's `loras` list already mentions "
+            "gets identified via CivitAI's hash lookup and, if its reported base model "
+            "matches an entry here, appended to this profile's `loras` (disabled by "
+            "default) automatically. Empty (the default) opts this profile out of "
+            "auto-discovery entirely — existing profiles are unaffected until this is "
+            "set. A LoRA CivitAI has no hash record for at all (most commonly a "
+            "privately/custom-trained one) can never be matched this way regardless of "
+            "this setting and still needs to be added to `loras` by hand."
+        ),
+    )
+
     prompt_style: Literal["tags", "natural"] = Field(
         "natural",
         description=(

@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from comfytelegram.civitai import CivitaiLoraInfo
 from comfytelegram.storage import IMAGE_FORMAT_JPEG, IMAGE_FORMAT_PNG, Storage
 
 
@@ -80,6 +81,140 @@ def test_clear_override(storage: Storage):
     storage.set_override_fields(1, "ckpt.safetensors", {"cfg": 6.0})
     storage.clear_override(1, "ckpt.safetensors")
     assert storage.get_override(1, "ckpt.safetensors") == {}
+
+
+def test_lora_override_roundtrip_and_merge(storage: Storage):
+    assert storage.get_lora_overrides(1, "ckpt.safetensors") == {}
+    storage.set_lora_override(1, "ckpt.safetensors", "styleA.safetensors", False)
+    assert storage.get_lora_overrides(1, "ckpt.safetensors") == {"styleA.safetensors": False}
+
+    # a second toggle merges in, doesn't replace the first
+    storage.set_lora_override(1, "ckpt.safetensors", "styleB.safetensors", True)
+    assert storage.get_lora_overrides(1, "ckpt.safetensors") == {
+        "styleA.safetensors": False,
+        "styleB.safetensors": True,
+    }
+
+    # flipping the same lora again overwrites its own entry in place
+    storage.set_lora_override(1, "ckpt.safetensors", "styleA.safetensors", True)
+    assert storage.get_lora_overrides(1, "ckpt.safetensors") == {
+        "styleA.safetensors": True,
+        "styleB.safetensors": True,
+    }
+
+
+def test_lora_override_is_scoped_per_checkpoint(storage: Storage):
+    storage.set_lora_override(1, "a.safetensors", "styleA.safetensors", False)
+    assert storage.get_lora_overrides(1, "b.safetensors") == {}
+
+
+def test_clear_lora_overrides(storage: Storage):
+    storage.set_lora_override(1, "ckpt.safetensors", "styleA.safetensors", False)
+    storage.clear_lora_overrides(1, "ckpt.safetensors")
+    assert storage.get_lora_overrides(1, "ckpt.safetensors") == {}
+
+
+def test_lora_strength_override_roundtrip_and_merge(storage: Storage):
+    assert storage.get_lora_strength_overrides(1, "ckpt.safetensors") == {}
+    storage.set_lora_strength_override(
+        1, "ckpt.safetensors", "styleA.safetensors", "strength_model", 0.6
+    )
+    assert storage.get_lora_strength_overrides(1, "ckpt.safetensors") == {
+        "styleA.safetensors": {"strength_model": 0.6}
+    }
+
+    # a second field for the same lora merges in, doesn't replace it
+    storage.set_lora_strength_override(
+        1, "ckpt.safetensors", "styleA.safetensors", "strength_clip", 0.9
+    )
+    assert storage.get_lora_strength_overrides(1, "ckpt.safetensors") == {
+        "styleA.safetensors": {"strength_model": 0.6, "strength_clip": 0.9}
+    }
+
+    # a different lora gets its own independent entry
+    storage.set_lora_strength_override(
+        1, "ckpt.safetensors", "styleB.safetensors", "strength_model", 1.2
+    )
+    assert storage.get_lora_strength_overrides(1, "ckpt.safetensors") == {
+        "styleA.safetensors": {"strength_model": 0.6, "strength_clip": 0.9},
+        "styleB.safetensors": {"strength_model": 1.2},
+    }
+
+
+def test_lora_strength_override_is_scoped_per_checkpoint(storage: Storage):
+    storage.set_lora_strength_override(
+        1, "a.safetensors", "styleA.safetensors", "strength_model", 0.6
+    )
+    assert storage.get_lora_strength_overrides(1, "b.safetensors") == {}
+
+
+def test_clear_lora_strength_override_removes_just_one_lora(storage: Storage):
+    storage.set_lora_strength_override(
+        1, "ckpt.safetensors", "styleA.safetensors", "strength_model", 0.6
+    )
+    storage.set_lora_strength_override(
+        1, "ckpt.safetensors", "styleB.safetensors", "strength_model", 1.2
+    )
+    storage.clear_lora_strength_override(1, "ckpt.safetensors", "styleA.safetensors")
+    assert storage.get_lora_strength_overrides(1, "ckpt.safetensors") == {
+        "styleB.safetensors": {"strength_model": 1.2}
+    }
+
+
+def test_clear_lora_strength_overrides(storage: Storage):
+    storage.set_lora_strength_override(
+        1, "ckpt.safetensors", "styleA.safetensors", "strength_model", 0.6
+    )
+    storage.clear_lora_strength_overrides(1, "ckpt.safetensors")
+    assert storage.get_lora_strength_overrides(1, "ckpt.safetensors") == {}
+
+
+def test_lora_civitai_cache_defaults_to_none(storage: Storage):
+    assert storage.get_lora_civitai_cache("styleA.safetensors") is None
+
+
+def test_lora_civitai_cache_roundtrip_for_a_match(storage: Storage):
+    info = CivitaiLoraInfo(
+        model_name="Cool Style",
+        base_model="SDXL 1.0",
+        trained_words=["cool style", "trigger2"],
+        civitai_url="https://civitai.com/models/123",
+    )
+    storage.set_lora_civitai_cache("styleA.safetensors", "deadbeef", info)
+    cached = storage.get_lora_civitai_cache("styleA.safetensors")
+
+    assert cached == {
+        "sha256": "deadbeef",
+        "found": True,
+        "model_name": "Cool Style",
+        "base_model": "SDXL 1.0",
+        "trained_words": ["cool style", "trigger2"],
+        "civitai_url": "https://civitai.com/models/123",
+    }
+
+
+def test_lora_civitai_cache_records_a_miss(storage: Storage):
+    storage.set_lora_civitai_cache("styleA.safetensors", "deadbeef", None)
+    cached = storage.get_lora_civitai_cache("styleA.safetensors")
+    assert cached["found"] is False
+    assert cached["sha256"] == "deadbeef"
+    assert cached["trained_words"] == []
+
+
+def test_lora_civitai_cache_overwrites_on_repeat_set(storage: Storage):
+    storage.set_lora_civitai_cache("styleA.safetensors", "oldhash", None)
+    info = CivitaiLoraInfo(
+        model_name="Cool Style",
+        base_model="SDXL 1.0",
+        trained_words=["trigger"],
+        civitai_url="https://civitai.com/models/123",
+    )
+    storage.set_lora_civitai_cache("styleA.safetensors", "newhash", info)
+
+    cached = storage.get_lora_civitai_cache("styleA.safetensors")
+    assert cached["sha256"] == "newhash"
+    assert cached["found"] is True
+    assert cached["model_name"] == "Cool Style"
 
 
 def test_character_save_and_get(storage: Storage):

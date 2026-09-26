@@ -24,8 +24,14 @@ PROMPT_OVERRIDE_FIELDS = {"positive_prompt_prefix", "negative_prompt_prefix"}
 logger = logging.getLogger(__name__)
 
 
-def load_profiles(directory: Path) -> list[ModelProfile]:
-    """Parse every `*.json` file in `directory` as a ModelProfile.
+def load_profile_files(directory: Path) -> list[tuple[Path, dict[str, Any], ModelProfile]]:
+    """Like `load_profiles`, but keeps each file's path and raw parsed JSON
+    dict alongside the validated `ModelProfile` — `load_profiles` itself is
+    built on this and just drops the extra two. `lora_discovery.py` needs
+    both: the raw dict is what it mutates and writes back (so every field
+    it doesn't touch round-trips through `json.dump` exactly as parsed,
+    not re-derived from `ModelProfile.model_dump()`, which would drop
+    unknown fields and re-order things), and the path is where.
 
     Files starting with `_` (e.g. `_schema.json`) are skipped — that prefix
     is reserved for non-profile documentation/schema files living alongside
@@ -36,16 +42,25 @@ def load_profiles(directory: Path) -> list[ModelProfile]:
         logger.warning("Model profiles directory %s does not exist", directory)
         return []
 
-    profiles: list[ModelProfile] = []
+    results: list[tuple[Path, dict[str, Any], ModelProfile]] = []
     for path in sorted(directory.glob("*.json")):
         if path.name.startswith("_"):
             continue
         try:
             data = json.loads(path.read_text())
-            profiles.append(ModelProfile.model_validate(data))
+            profile = ModelProfile.model_validate(data)
         except (json.JSONDecodeError, ValidationError) as exc:
             logger.error("Skipping invalid model profile %s: %s", path, exc)
-    return profiles
+            continue
+        results.append((path, data, profile))
+    return results
+
+
+def load_profiles(directory: Path) -> list[ModelProfile]:
+    """Parse every `*.json` file in `directory` as a ModelProfile. See
+    `load_profile_files` for the version that also keeps each file's path
+    and raw JSON."""
+    return [profile for _, _, profile in load_profile_files(directory)]
 
 
 def resolve_profile(checkpoint_name: str, profiles: list[ModelProfile]) -> ModelProfile | None:
@@ -76,6 +91,49 @@ def apply_profile_override(
     defaults_updates = {k: v for k, v in override_fields.items() if k not in PROMPT_OVERRIDE_FIELDS}
     merged_defaults = base.defaults.model_copy(update=defaults_updates)
     return base.model_copy(update={"defaults": merged_defaults, **prompt_updates})
+
+
+def apply_lora_overrides(
+    profile: ModelProfile | None, overrides: dict[str, bool]
+) -> ModelProfile | None:
+    """Layer a chat's `/lora` toggle state (see `storage.get_lora_overrides`)
+    on top of the profile's own `LoraDefault.default_enabled` flags. A LoRA
+    name with no stored override keeps whatever the profile's JSON says;
+    only `resolve_generation_params`'s `default_enabled` filter reads this,
+    so this has no effect on a checkpoint with no matched profile (nothing
+    to toggle) or on post-processing, which stays locked to whatever LoRAs
+    actually made the original image rather than reacting to a later
+    toggle (see `generation._refresh_tunable_defaults`'s docstring for why
+    that split exists)."""
+    if profile is None or not overrides:
+        return profile
+    updated_loras = [
+        lora.model_copy(update={"default_enabled": overrides[lora.name]})
+        if lora.name in overrides
+        else lora
+        for lora in profile.loras
+    ]
+    return profile.model_copy(update={"loras": updated_loras})
+
+
+def apply_lora_strength_overrides(
+    profile: ModelProfile | None, overrides: dict[str, dict[str, float]]
+) -> ModelProfile | None:
+    """Layer a chat's `/lora` per-LoRA `strength_model`/`strength_clip`
+    overrides (see `storage.get_lora_strength_overrides`) on top of the
+    profile's own configured values — the same override shape as
+    `apply_lora_overrides`, just for strength instead of enabled/disabled,
+    and kept as a separate function/table since the two are edited from
+    different `/lora` screens. A LoRA name absent from `overrides`, or a
+    field absent from its entry, keeps the profile's own value; a partial
+    entry (just one of the two fields) only touches that one."""
+    if profile is None or not overrides:
+        return profile
+    updated_loras = [
+        lora.model_copy(update=overrides[lora.name]) if lora.name in overrides else lora
+        for lora in profile.loras
+    ]
+    return profile.model_copy(update={"loras": updated_loras})
 
 
 def join_nonempty(parts: list[str], sep: str = ", ") -> str:

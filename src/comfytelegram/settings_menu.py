@@ -556,6 +556,8 @@ async def handle_custom_value_message(update: Update, context: ContextTypes.DEFA
     )
     await message.reply_text(
         _home_text(checkpoint, profile),
-        reply_markup=_home_keyboard(checkpoint, profile, override_fields),
+        reply_markup=_home_keyboard(
+            checkpoint, profile, override_fields, storage.get_image_format(chat_id)
+        ),
     )
     return True

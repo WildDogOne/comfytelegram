@@ -55,6 +55,7 @@ from comfytelegram.generation import (
     repeat,
     resolve_live_upscale_defaults,
 )
+from comfytelegram.lora_menu import handle_lora_custom_value_message
 from comfytelegram.message_text import message_text
 from comfytelegram.params_serde import (
     deserialize_generation_params,
@@ -71,6 +72,8 @@ from comfytelegram.png_metadata import (
 )
 from comfytelegram.profiles import (
     ModelProfile,
+    apply_lora_overrides,
+    apply_lora_strength_overrides,
     apply_profile_override,
     join_nonempty,
     resolve_profile,
@@ -1734,6 +1737,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         '-watermark".\n\n'
         "/model — pick a checkpoint\n"
         "/settings — view or change generation defaults for the current model\n"
+        "/lora — toggle which of the current model's LoRAs are applied\n"
         "/character save <name> | <prompt> — save a reusable character design\n"
         "/characters — list saved characters, activate one, or ✏️ edit/🔤 rename it\n"
         f"/stream [prompt] — generate single images back-to-back (up to {STREAM_HARD_LIMIT}) "
@@ -2124,13 +2128,17 @@ def _resolve_profile_and_prompt(
     storage: Storage,
     profiles: list[ModelProfile],
 ) -> tuple[ModelProfile, str, str, str | None, str | None]:
-    """This chat's profile (with its `/settings` override applied) plus the
-    active character folded into `prompt_text` via `_resolve_effective_prompt`
-    — the shared setup `generate_message` and `_run_stream` both need before
-    calling `generate()`. Returns `(profile, effective_prompt, extra_negative,
-    raw_positive, raw_negative)`."""
+    """This chat's profile (with its `/settings` and `/lora` overrides
+    applied) plus the active character folded into `prompt_text` via
+    `_resolve_effective_prompt` — the shared setup `generate_message` and
+    `_run_stream` both need before calling `generate()`. Returns `(profile,
+    effective_prompt, extra_negative, raw_positive, raw_negative)`."""
     profile = resolve_profile(checkpoint, profiles)
     profile = apply_profile_override(profile, checkpoint, storage.get_override(chat_id, checkpoint))
+    profile = apply_lora_overrides(profile, storage.get_lora_overrides(chat_id, checkpoint))
+    profile = apply_lora_strength_overrides(
+        profile, storage.get_lora_strength_overrides(chat_id, checkpoint)
+    )
 
     active_character_name = storage.get_active_character_name(chat_id)
     character = (
@@ -2148,17 +2156,22 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     with live progress, then deliver the result. Defaults to ComfyUI's
     first available checkpoint (and remembers it) if none is selected yet.
     A pending "custom value" `/settings` entry (see
-    `handle_custom_value_message`) or an in-progress `/stream` prompt,
-    character-edit/-rename entry, or "⚙️ Customize" upscale denoise/tile-
-    strength entry (`_consume_awaiting_upscale_custom`) takes priority over
-    treating the text as a prompt. "✏️ Detail Prompt" has no entry here to
-    take priority over — it's a webapp editor now, not a chat follow-up (see
+    `handle_custom_value_message`), a custom LoRA-strength entry from
+    `/lora`'s strength-editing screen (`handle_lora_custom_value_message`),
+    or an in-progress `/stream` prompt, character-edit/-rename entry, or
+    "⚙️ Customize" upscale denoise/tile-strength entry
+    (`_consume_awaiting_upscale_custom`) takes priority over treating the
+    text as a prompt. "✏️ Detail Prompt" has no entry here to take priority
+    over — it's a webapp editor now, not a chat follow-up (see
     `DETAIL_PROMPT_CALLBACK_KIND`)."""
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
         return
 
     if await handle_custom_value_message(update, context):
+        return
+
+    if await handle_lora_custom_value_message(update, context):
         return
 
     if await _consume_awaiting_stream_prompt(update, context):
@@ -3258,9 +3271,9 @@ async def generate_from_prompt_callback(update: Update, context: ContextTypes.DE
     in callback_data (see storage.py's `derived_prompt`), including that
     prompt's stored negative — empty for WD14 tags, a Qwen-VL caption's
     suggested negative otherwise (see `analyze_caption`). Uses the chat's
-    current `/settings` override for the checkpoint the source image was
-    generated with, rather than any stale params from that original
-    generation."""
+    current `/settings`/`/lora` overrides for the checkpoint the source
+    image was generated with, rather than any stale params from that
+    original generation."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
@@ -3281,6 +3294,10 @@ async def generate_from_prompt_callback(update: Update, context: ContextTypes.DE
     profiles: list[ModelProfile] = context.bot_data["profiles"]
     profile = resolve_profile(checkpoint, profiles)
     profile = apply_profile_override(profile, checkpoint, storage.get_override(chat_id, checkpoint))
+    profile = apply_lora_overrides(profile, storage.get_lora_overrides(chat_id, checkpoint))
+    profile = apply_lora_strength_overrides(
+        profile, storage.get_lora_strength_overrides(chat_id, checkpoint)
+    )
 
     status_message = await query.message.reply_text("Generating… 0%", disable_notification=True)
     images = await _run_reporting_errors(

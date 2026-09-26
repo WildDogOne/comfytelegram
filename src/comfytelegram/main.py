@@ -47,6 +47,8 @@ from comfytelegram.handlers import (
     tagcheck_command,
     tags_command,
 )
+from comfytelegram.lora_discovery import discover_new_loras
+from comfytelegram.lora_menu import lora_callback, lora_command
 from comfytelegram.message_text import TEXT_CONTENT, message_text
 from comfytelegram.profiles import load_profiles
 from comfytelegram.settings import Settings, load_settings
@@ -68,6 +70,7 @@ _COMMANDS = (
     ("help", help_command, "Show the command list"),
     ("model", model_command, "Pick a checkpoint"),
     ("settings", settings_command, "View or change generation defaults for this model"),
+    ("lora", lora_command, "Toggle which of this model's LoRAs are applied"),
     ("character", character_command, "Save or delete a reusable character design"),
     ("characters", characters_command, "List, activate, edit, or rename saved characters"),
     ("stream", stream_command, "Generate images back-to-back until /stop"),
@@ -130,9 +133,10 @@ async def _post_init(application: Application) -> None:
     sync with the bot's actual commands on every startup instead of
     needing a manual BotFather edit whenever one is added/removed/
     reworded — and, unless disabled, fire the tag database's staleness
-    check as a background task (see `_start_tag_db_refresh`), plus the
+    check as a background task (see `_start_tag_db_refresh`), the
     inpaint_relay job poller if that feature is configured (see
-    `_start_inpaint_job_poller`)."""
+    `_start_inpaint_job_poller`), and a LoRA auto-discovery pass if that's
+    configured too (see `_start_lora_discovery`)."""
     settings: Settings = application.bot_data["settings"]
     client = ComfyClient(settings.comfyui_http_base, settings.comfyui_ws_base)
     await client.__aenter__()
@@ -149,6 +153,32 @@ async def _post_init(application: Application) -> None:
 
     _start_tag_db_refresh(application, settings)
     _start_inpaint_job_poller(application, settings)
+    _start_lora_discovery(application, settings)
+
+
+def _start_lora_discovery(application: Application, settings: Settings) -> None:
+    """Fire `discover_new_loras` as an unawaited background task, the same
+    pattern as `_start_tag_db_refresh` — only when `comfyui_loras_dir` is
+    configured (nothing to scan otherwise; see `Settings.comfyui_loras_dir`,
+    `lora_discovery.py`). Reloads `bot_data['profiles']` from disk
+    afterward if the scan actually wrote anything, so a freshly-discovered
+    LoRA shows up in `/lora` immediately rather than needing a restart. The
+    task is stashed in `bot_data` purely to keep a strong reference (an
+    unreferenced asyncio task can be garbage-collected mid-flight) and so
+    `_post_shutdown` can cancel it if it's still running."""
+    if not settings.comfyui_loras_dir:
+        return
+
+    async def _run() -> None:
+        storage: Storage = application.bot_data["storage"]
+        changed = await discover_new_loras(
+            settings.comfyui_loras_dir, settings.model_profiles_dir, storage
+        )
+        if changed:
+            application.bot_data["profiles"] = load_profiles(settings.model_profiles_dir)
+            logger.info("LoRA auto-discovery: reloaded model profiles after writing new entries")
+
+    application.bot_data["lora_discovery_task"] = asyncio.create_task(_run())
 
 
 def _start_inpaint_job_poller(application: Application, settings: Settings) -> None:
@@ -202,6 +232,9 @@ async def _post_shutdown(application: Application) -> None:
     inpaint_job_poll_task: asyncio.Task | None = application.bot_data.get("inpaint_job_poll_task")
     if inpaint_job_poll_task is not None:
         inpaint_job_poll_task.cancel()
+    lora_discovery_task: asyncio.Task | None = application.bot_data.get("lora_discovery_task")
+    if lora_discovery_task is not None:
+        lora_discovery_task.cancel()
     client: ComfyClient | None = application.bot_data.get("comfy_client")
     if client is not None:
         await client.__aexit__(None, None, None)
@@ -291,6 +324,7 @@ def build_application(settings: Settings) -> Application:
         )
     )
     application.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^st:"))
+    application.add_handler(CallbackQueryHandler(lora_callback, pattern=r"^lr:"))
     application.add_handler(CallbackQueryHandler(character_callback, pattern=r"^char:"))
     application.add_handler(
         CallbackQueryHandler(stream_cancel_callback, pattern=rf"^{STREAM_CANCEL_CALLBACK_DATA}$")

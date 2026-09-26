@@ -52,6 +52,15 @@ CLI at runtime.
   model's generation defaults per chat (steppers + presets for numeric
   fields, a live-populated grid for sampler/scheduler, free text for prompt
   prefixes), without editing any files.
+- **`/lora`** — an in-place inline-keyboard menu to toggle which of the
+  current model's LoRAs are applied, per chat, without editing
+  `model_profiles/*.json` or restarting the bot. Only shows the LoRAs
+  already configured in that model's profile (there's no way to safely
+  guess which of every installed LoRA file fits a given checkpoint's
+  architecture, so the profile's own curated list is what `/lora` toggles)
+  — plus, if configured, an "ℹ️ Info" button to look up each LoRA's trigger
+  words and base-model compatibility on CivitAI. See
+  [LoRA info lookup](#lora-info-lookup) below.
 - **Saved characters** — `/character save <name> | <prompt>` stores a
   reusable prompt snippet; `/characters` activates one so it's folded into
   every generation until you switch or clear it.
@@ -132,9 +141,14 @@ see the Docker section below for the container case specifically.
 
 ## Running with Docker
 
-A `Dockerfile` and `docker-compose.yml` are included:
+A `Dockerfile` and `docker-compose.example.yml` are included. Copy the
+compose file before running it — unlike everything else in it, the
+`COMFYUI_LORAS_DIR` bind mount (see [LoRA info lookup](#lora-info-lookup)
+below) has no sane default, since it points at wherever *your* ComfyUI
+install's `models/loras` directory actually lives:
 
 ```bash
+cp docker-compose.example.yml docker-compose.yml   # then edit the loras mount path
 docker compose up -d --build
 ```
 
@@ -189,6 +203,7 @@ to mark** as before.
 | *(PNG sent as a file)* | Re-import a previously generated image from the settings embedded in it, restoring its post-processing buttons |
 | `/model` | Pick a checkpoint (inline keyboard, populated live from ComfyUI) |
 | `/settings` | View/change cfg, steps, sampler, scheduler, clip skip, width, height, batch size, and prompt prefixes for the current model, per chat — plus a chat-wide "🖼️ Display" toggle between compressed (JPEG, default) and lossless (PNG) in-chat images |
+| `/lora` | Toggle which of the current model's configured LoRAs apply to your next generation, per chat |
 | `/character save <name> \| <positive> [\| <negative>]` | Save a reusable prompt snippet |
 | `/character delete <name>` | Delete one |
 | `/characters` | List saved characters and activate one |
@@ -320,6 +335,43 @@ filename). Drop in a new file to add support for a model — no code changes
 needed. Full format and worked examples in
 [`model_profiles/README.md`](model_profiles/README.md).
 
+## LoRA info lookup
+
+`/lora`'s "ℹ️ Info" button looks up a configured LoRA's trigger words and
+base-model compatibility on [CivitAI](https://civitai.com) — the two things
+a model profile's curated `loras` list can't tell you by itself. It needs
+`COMFYUI_LORAS_DIR` set to a filesystem path this process can read (see
+`env.example`, and `docker-compose.example.yml`'s bind mount for the Docker
+case) — ComfyUI's own HTTP API only exposes LoRA filenames, with no hash or
+metadata attached, so there's no way to do this lookup without reading the
+actual file. The button is simply omitted when it's unset.
+
+Mechanically, this replicates what
+[ComfyUI-Custom-Scripts](https://github.com/pythongosssss/ComfyUI-Custom-Scripts)'
+"Info" dialog does — hash the file (SHA256) and query
+`https://civitai.com/api/v1/model-versions/by-hash/<hash>`, CivitAI's public,
+no-API-key-required hash-lookup endpoint — just done here server-side in one
+step instead of split across a custom ComfyUI node route and a browser-side
+fetch, since this bot has no custom ComfyUI node code of its own to hang a
+route on. Results (including "no CivitAI match") are cached indefinitely per
+LoRA filename, since hashing a multi-hundred-MB file on every menu tap would
+be wasteful — a "🔄 Refresh" button on the info reply forces a re-check.
+
+### Auto-discovering new LoRAs
+
+With `COMFYUI_LORAS_DIR` set, the bot also scans that directory once at
+startup for LoRA files no `model_profiles/*.json` entry mentions yet,
+identifies each via the same CivitAI hash lookup, and — for a profile
+that's opted in with a `civitai_base_models` list matching the LoRA's
+reported base model — appends it to that profile's `loras` list
+automatically (`default_enabled: false`, so it shows up in `/lora` to
+review and turn on rather than silently affecting generations). See
+[`model_profiles/README.md`](model_profiles/README.md#civitai_base_models--auto-registering-downloaded-loras-into-loras)
+for the field and its trade-offs — in short, it saves hand-typing an entry
+for anything CivitAI already knows about, but a privately/custom-trained
+LoRA (no CivitAI hash record at all) still needs to be added by hand, same
+as before this existed, and each profile has to opt in explicitly.
+
 ## Tag search
 
 `/tags <query>` and `/tagcheck <prompt>` are backed by a local sqlite tag
@@ -437,6 +489,20 @@ shared singletons (`Settings`, `ComfyClient`, loaded `ModelProfile`s,
 - **`settings_menu.py`** — the `/settings` in-place inline-keyboard UI.
   Enum fields build their button grid from ComfyUI's live `/object_info`,
   so the menu can never offer a value the server would reject.
+- **`lora_menu.py`** — the `/lora` in-place inline-keyboard UI, same
+  edit-in-place pattern as `settings_menu.py`. Toggles are scoped to
+  exactly the LoRAs already listed in the checkpoint's `model_profiles/*.json`
+  entry, per chat, without touching that file.
+- **`civitai.py`** — Telegram-independent CivitAI lookup for `lora_menu.py`'s
+  "ℹ️ Info" button: hashes a LoRA file under `Settings.comfyui_loras_dir`
+  and queries CivitAI's public hash-lookup API for trigger words/base-model
+  compatibility. See [LoRA info lookup](#lora-info-lookup) above.
+- **`lora_discovery.py`** — the boot-time scan (`main.py`'s
+  `_start_lora_discovery`) that uses `civitai.py` in bulk: finds LoRA files
+  under `comfyui_loras_dir` no profile's `loras` list mentions yet and
+  registers the CivitAI-identifiable ones into any profile whose
+  `civitai_base_models` accepts their base model. See
+  [Auto-discovering new LoRAs](#auto-discovering-new-loras) above.
 - **`storage.py`** — durable per-chat state in SQLite (stdlib `sqlite3`,
   deliberately no ORM/migrations framework): selected checkpoint, profile
   overrides, saved characters, and a post-processing result registry. That
