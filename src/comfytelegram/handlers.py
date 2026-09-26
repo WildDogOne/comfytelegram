@@ -3870,6 +3870,19 @@ async def tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 _PAREN_WEIGHT_RE = re.compile(r"^\(+(?P<name>.+?)(?::[0-9]*\.?[0-9]+)?\)+$")
 _BRACKET_WEIGHT_RE = re.compile(r"^\[+(?P<name>.+?)(?::[0-9]*\.?[0-9]+)?\]+$")
 
+#: `_tagcheck_lines`'s tokenizer: a comma, or a full stop that's acting as a
+#: sentence/tag separator rather than as part of a tag name. Plenty of real
+#: tags contain literal periods — decimals like "0.05", franchise names like
+#: ".hack//", leading-dot tags like ".flow", and the ellipsis tags "...",
+#: "...!", "...?" are all real Danbooru/e621 entries — so a bare `\.` would
+#: wrongly split every one of those into garbage tokens. What actually marks
+#: a delimiter period, as opposed to one of those, is that it stands alone
+#: (not adjacent to another period, which rules out the ellipsis tags and
+#: mid-run periods like ".hack//g.u.") and is immediately followed by
+#: whitespace or the end of the string (which rules out every tag-internal
+#: period above, none of which are ever followed by a space).
+_TAG_SPLIT_RE = re.compile(r",|(?<!\.)\.(?!\.)(?=\s|$)")
+
 
 def _strip_prompt_weight(token: str) -> str:
     """Unwrap a comma-split prompt token's emphasis syntax, if any, down to
@@ -3884,15 +3897,18 @@ def _strip_prompt_weight(token: str) -> str:
 def _tagcheck_lines(
     prompt_text: str, sources: list[TagSource], tags_db: TagDatabase, settings: Settings
 ) -> list[str]:
-    """Comma-split `prompt_text` (this codebase's usual booru-prompt
-    convention) and check each token against `tags_db`: found & common
-    (✅), found but rare — i.e. little training data behind it (⚠️), or not
-    a known tag at all (❌, with a "did you mean" hint when a close match
+    """Split `prompt_text` on commas and sentence-ending full stops (see
+    `_TAG_SPLIT_RE` — this codebase's usual booru-prompt convention is
+    comma-separated, but a natural-language-style prompt separates tags with
+    periods instead, which used to be looked up as one giant unmatched
+    token) and check each token against `tags_db`: found & common (✅),
+    found but rare — i.e. little training data behind it (⚠️), or not a
+    known tag at all (❌, with a "did you mean" hint when a close match
     turns up). Emphasis syntax (see `_strip_prompt_weight`) is stripped
     before lookup but the token is still displayed as the user wrote it.
     Shared by `tagcheck_command` and `postprocess_callback`'s
     `SHOW_PROMPT_CALLBACK_KIND` branch."""
-    tokens = [token for token in (t.strip() for t in prompt_text.split(",")) if token]
+    tokens = [token for token in (t.strip() for t in _TAG_SPLIT_RE.split(prompt_text)) if token]
     omitted = max(0, len(tokens) - TAGCHECK_TOKEN_LIMIT)
     tokens = tokens[:TAGCHECK_TOKEN_LIMIT]
 

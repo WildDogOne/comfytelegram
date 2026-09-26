@@ -789,6 +789,51 @@ def test_tagcheck_lines_flags_an_unknown_tag_with_a_suggestion():
     assert lines == ['❌ 1gril — not a known tag — did you mean "1girl"?']
 
 
+def test_tagcheck_lines_splits_on_sentence_ending_periods():
+    """A natural-language-style prompt separates tags with periods instead
+    of commas — those used to be swallowed into one giant unmatched token
+    instead of being checked individually."""
+    tags_db = MagicMock()
+    tags_db.lookup_exact.side_effect = lambda name, sources: _tag_result(name, 500_000)
+    settings = MagicMock(tag_rare_threshold=100)
+
+    lines = _tagcheck_lines("1girl. blue eyes. smiling.", [TagSource.DANBOORU], tags_db, settings)
+
+    assert [call.args[0] for call in tags_db.lookup_exact.call_args_list] == [
+        "1girl",
+        "blue eyes",
+        "smiling",
+    ]
+    assert lines == [
+        "✅ 1girl — 500,000 posts (danbooru)",
+        "✅ blue eyes — 500,000 posts (danbooru)",
+        "✅ smiling — 500,000 posts (danbooru)",
+    ]
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        "...",  # ellipsis — a real Danbooru/e621 tag, not three delimiters
+        "0.05",  # a decimal-looking tag
+        ".hack//",  # a franchise tag with a leading period
+        "12.7cm_twin_gun_mount",  # digits either side of a mid-tag period
+    ],
+)
+def test_tagcheck_lines_keeps_tags_containing_literal_periods_intact(tag):
+    """Plenty of real tags contain periods that aren't delimiters at all —
+    splitting on every period would wrongly break these into garbage
+    tokens (see `_TAG_SPLIT_RE`)."""
+    tags_db = MagicMock()
+    tags_db.lookup_exact.return_value = _tag_result(tag, 500_000)
+    settings = MagicMock(tag_rare_threshold=100)
+
+    lines = _tagcheck_lines(f"1girl, {tag}", [TagSource.DANBOORU], tags_db, settings)
+
+    tags_db.lookup_exact.assert_any_call(tag, [TagSource.DANBOORU])
+    assert lines[-1] == f"✅ {tag} — 500,000 posts (danbooru)"
+
+
 def test_strip_prompt_weight_unwraps_an_explicit_weight():
     assert _strip_prompt_weight("(yellow markings:1.2)") == "yellow markings"
 
