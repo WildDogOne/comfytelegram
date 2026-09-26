@@ -203,7 +203,8 @@ to mark** as before.
 | *(PNG sent as a file)* | Re-import a previously generated image from the settings embedded in it, restoring its post-processing buttons |
 | `/model` | Pick a checkpoint (inline keyboard, populated live from ComfyUI) |
 | `/settings` | View/change cfg, steps, sampler, scheduler, clip skip, width, height, batch size, and prompt prefixes for the current model, per chat — plus a chat-wide "🖼️ Display" toggle between compressed (JPEG, default) and lossless (PNG) in-chat images |
-| `/lora` | Toggle which of the current model's configured LoRAs apply to your next generation, per chat |
+| `/lora` | Toggle which of the current model's configured LoRAs apply to your next generation, and adjust their strength, per chat |
+| `/reload` | Reload `model_profiles/*.json` from disk and check for new LoRAs — no restart needed after hand-editing a profile or dropping in a new LoRA file |
 | `/character save <name> \| <positive> [\| <negative>]` | Save a reusable prompt snippet |
 | `/character delete <name>` | Delete one |
 | `/characters` | List saved characters and activate one |
@@ -372,6 +373,13 @@ for anything CivitAI already knows about, but a privately/custom-trained
 LoRA (no CivitAI hash record at all) still needs to be added by hand, same
 as before this existed, and each profile has to opt in explicitly.
 
+That scan otherwise only runs once, at startup — `/reload` (or `/lora`'s
+own "🔁 Reload profiles" button) re-runs it on demand and, either way,
+reloads every `model_profiles/*.json` from disk, so both a newly-dropped-in
+LoRA file and a profile you edited by hand (a manually added `loras` entry,
+a new `civitai_base_models` list, tweaked defaults, a whole new profile
+file) take effect immediately instead of waiting for the bot to restart.
+
 ## Tag search
 
 `/tags <query>` and `/tagcheck <prompt>` are backed by a local sqlite tag
@@ -501,7 +509,9 @@ shared singletons (`Settings`, `ComfyClient`, loaded `ModelProfile`s,
   `_start_lora_discovery`) that uses `civitai.py` in bulk: finds LoRA files
   under `comfyui_loras_dir` no profile's `loras` list mentions yet and
   registers the CivitAI-identifiable ones into any profile whose
-  `civitai_base_models` accepts their base model. See
+  `civitai_base_models` accepts their base model. Its
+  `reload_profiles_and_discover` is the on-demand counterpart backing
+  `/reload` and `/lora`'s "🔁 Reload profiles" button. See
   [Auto-discovering new LoRAs](#auto-discovering-new-loras) above.
 - **`storage.py`** — durable per-chat state in SQLite (stdlib `sqlite3`,
   deliberately no ORM/migrations framework): selected checkpoint, profile

@@ -36,6 +36,18 @@ follow-up chat message, the same one-shot `context.chat_data` flag pattern
 `settings_menu.py`'s "✏️ Custom value" uses (see
 `handle_lora_custom_value_message`, checked from `handlers.generate_message`
 right alongside `settings_menu.handle_custom_value_message`).
+
+"🔁 Reload profiles" (`lora_discovery.reload_profiles_and_discover`) is the
+on-demand counterpart to the boot-time LoRA auto-discovery pass
+(`main.py`'s `_start_lora_discovery`) — re-runs discovery, then
+unconditionally re-reads every `model_profiles/*.json` from disk into
+`bot_data['profiles']`, so a hand-edited profile (a manually added LoRA
+entry, a new `civitai_base_models` list, tweaked defaults, a brand-new
+profile file) or a LoRA file dropped in since the bot last started both
+take effect immediately, with no restart. `handlers.reload_command`
+(`/reload`) is the same action as a standalone command, for when the thing
+that needs picking up isn't tied to whatever checkpoint `/lora` happens to
+have open right now.
 """
 
 from __future__ import annotations
@@ -54,6 +66,7 @@ from comfytelegram.civitai import (
     hash_lora_file,
     resolve_lora_path,
 )
+from comfytelegram.lora_discovery import reload_profiles_and_discover
 from comfytelegram.message_text import message_text
 from comfytelegram.profiles import (
     LoraDefault,
@@ -149,7 +162,8 @@ def _home_keyboard(profile: ModelProfile, show_info: bool) -> InlineKeyboardMark
     own text was, truncating even fairly short filenames to a handful of
     characters (confirmed from an actual screenshot). Splitting the toggle
     onto its own row gives it the full width; doubling the row count per
-    LoRA is the trade-off. Then Reset-all and Close. `profile.loras`'
+    LoRA is the trade-off. Then Reset-all, Reload ("🔁 Reload profiles" —
+    see `reload_profiles_and_discover`), and Close. `profile.loras`'
     order is stable across a render/tap pair — loaded once from disk at
     startup into `bot_data['profiles']`, never reloaded mid-request — so a
     button's list index is a safe, short stand-in for the LoRA's own
@@ -172,6 +186,7 @@ def _home_keyboard(profile: ModelProfile, show_info: bool) -> InlineKeyboardMark
             secondary_row.append(InlineKeyboardButton("ℹ️ Info", callback_data=f"lr:i:{index}"))
         rows.append(secondary_row)
     rows.append([InlineKeyboardButton("🔄 Reset all to model defaults", callback_data="lr:ra")])
+    rows.append([InlineKeyboardButton("🔁 Reload profiles", callback_data="lr:reload")])
     rows.append([InlineKeyboardButton("✖ Close", callback_data="lr:close")])
     return InlineKeyboardMarkup(rows)
 
@@ -221,7 +236,10 @@ def _render(
     initial `/lora` send and every in-place callback edit."""
     if profile is None or not profile.loras:
         return _NO_LORAS_TEXT, InlineKeyboardMarkup(
-            [[InlineKeyboardButton("✖ Close", callback_data="lr:close")]]
+            [
+                [InlineKeyboardButton("🔁 Reload profiles", callback_data="lr:reload")],
+                [InlineKeyboardButton("✖ Close", callback_data="lr:close")],
+            ]
         )
     return _home_text(checkpoint, profile), _home_keyboard(profile, show_info)
 
@@ -346,7 +364,9 @@ async def lora_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     or reset just that LoRA's strengths (`pr`), go back
     to the home screen (`home`), reset every stored toggle/strength
     override for this checkpoint back to the profile's own defaults (`ra`),
-    no-op on a disabled label button (`noop`), or close the menu."""
+    reload every `model_profiles/*.json` from disk and re-run LoRA
+    auto-discovery (`reload` — see `reload_profiles_and_discover`), no-op
+    on a disabled label button (`noop`), or close the menu."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
@@ -381,6 +401,20 @@ async def lora_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         storage.clear_lora_overrides(chat_id, checkpoint)
         storage.clear_lora_strength_overrides(chat_id, checkpoint)
         await query.answer("Reset to model defaults.")
+        await _show_home(query, context, chat_id, checkpoint)
+        return
+
+    if action == "reload":
+        await query.answer()
+        await _safe_edit_message(
+            query,
+            "🔄 Reloading model profiles and checking for new LoRAs…",
+            InlineKeyboardMarkup([]),
+        )
+        profiles, discovered = await reload_profiles_and_discover(settings, storage)
+        context.bot_data["profiles"] = profiles
+        if discovered:
+            await query.message.reply_text("🆕 New LoRA(s) found and registered.")
         await _show_home(query, context, chat_id, checkpoint)
         return
 

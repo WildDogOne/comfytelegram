@@ -82,6 +82,42 @@
       "strength_model": 1.0,
       "strength_clip": 1.0,
       "default_enabled": false
+    },
+    {
+      "name": "illustrious/D3lken_V2.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "illustrious/Husdingo_Artist_Style_Illustrious_illustrious_3266233_epoch_20.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "illustrious/ImpressionismMJ7illustrious.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "illustrious/Pearly_flat_n_cute_style_illustrious.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "illustrious/haiz-illustriousXL_v01_V1-CAME.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
+    },
+    {
+      "name": "illustrious/jikoMaviesOtakuAnime_v40.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false
     }
   ],
   "civitai_base_models": [

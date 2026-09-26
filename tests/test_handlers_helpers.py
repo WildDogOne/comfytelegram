@@ -62,6 +62,7 @@ from comfytelegram.handlers import (
     hand_point_density_callback,
     model_callback,
     postprocess_callback,
+    reload_command,
     start,
 )
 from comfytelegram.profiles import ModelProfile
@@ -753,6 +754,58 @@ async def test_model_callback_close_action_deletes_the_message_without_touching_
     query.answer.assert_awaited_once()
     query.message.delete.assert_awaited_once()
     query.edit_message_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reload_command_reloads_profiles_and_reports_the_count():
+    message = AsyncMock()
+    status = AsyncMock()
+    message.reply_text = AsyncMock(return_value=status)
+    update = MagicMock()
+    update.effective_message = message
+    context = MagicMock()
+    context.bot_data = {
+        "settings": MagicMock(allowed_user_ids=None),
+        "storage": MagicMock(),
+        "profiles": [],
+    }
+
+    profiles = [MagicMock(), MagicMock()]
+    with patch(
+        "comfytelegram.handlers.reload_profiles_and_discover",
+        AsyncMock(return_value=(profiles, False)),
+    ):
+        await reload_command(update, context)
+
+    assert context.bot_data["profiles"] == profiles
+    status.edit_text.assert_awaited_once()
+    text = status.edit_text.await_args.args[0]
+    assert "Reloaded 2 model profile" in text
+    assert "New LoRA" not in text
+
+
+@pytest.mark.asyncio
+async def test_reload_command_mentions_newly_discovered_loras():
+    message = AsyncMock()
+    status = AsyncMock()
+    message.reply_text = AsyncMock(return_value=status)
+    update = MagicMock()
+    update.effective_message = message
+    context = MagicMock()
+    context.bot_data = {
+        "settings": MagicMock(allowed_user_ids=None),
+        "storage": MagicMock(),
+        "profiles": [],
+    }
+
+    with patch(
+        "comfytelegram.handlers.reload_profiles_and_discover",
+        AsyncMock(return_value=([], True)),
+    ):
+        await reload_command(update, context)
+
+    text = status.edit_text.await_args.args[0]
+    assert "New LoRA" in text
 
 
 def test_resolve_tag_sources_uses_profile_tag_dictionary_when_no_override():

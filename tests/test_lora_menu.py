@@ -90,11 +90,11 @@ def test_home_keyboard_shows_only_the_filename_not_the_full_path():
     assert "illustrious/" not in label
 
 
-def test_render_with_no_loras_shows_the_no_loras_message_and_just_close():
+def test_render_with_no_loras_shows_the_no_loras_message_with_reload_and_close():
     text, keyboard = _render("ckpt.safetensors", None, show_info=False)
     assert text == _NO_LORAS_TEXT
     callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
-    assert callback_data == ["lr:close"]
+    assert callback_data == ["lr:reload", "lr:close"]
 
     empty_profile = ModelProfile(match=["*ckpt*"], display_name="X")
     text, _ = _render("ckpt.safetensors", empty_profile, show_info=False)
@@ -113,10 +113,11 @@ def test_home_keyboard_marks_each_lora_enabled_state_and_shows_strength():
     assert "styleB.safetensors" in style_b.text
 
 
-def test_home_keyboard_has_reset_all_and_close():
+def test_home_keyboard_has_reset_all_reload_and_close():
     keyboard = _home_keyboard(_profile_with_loras(), show_info=False)
     callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
     assert "lr:ra" in callback_data
+    assert "lr:reload" in callback_data
     assert "lr:close" in callback_data
 
 
@@ -658,3 +659,55 @@ async def test_custom_value_message_returns_false_when_nothing_pending(storage: 
     handled = await handle_lora_custom_value_message(update, context)
 
     assert handled is False
+
+
+@pytest.mark.asyncio
+async def test_reload_action_updates_profiles_and_shows_the_refreshed_home_screen(
+    storage: Storage,
+):
+    storage.set_checkpoint(1, "ckpt.safetensors")
+    query = AsyncMock()
+    query.data = "lr:reload"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_chat.id = 1
+    update.effective_user.id = 1
+    context = _context(storage, [_profile_with_loras()])
+
+    reloaded_profile = ModelProfile(
+        match=["*ckpt*"],
+        display_name="Reloaded Model",
+        loras=[LoraDefault(name="new_style.safetensors", default_enabled=False)],
+    )
+    with patch(
+        "comfytelegram.lora_menu.reload_profiles_and_discover",
+        AsyncMock(return_value=([reloaded_profile], False)),
+    ) as mock_reload:
+        await lora_callback(update, context)
+
+    mock_reload.assert_awaited_once()
+    assert context.bot_data["profiles"] == [reloaded_profile]
+    final_text = query.edit_message_text.await_args_list[-1].args[0]
+    assert "Reloaded Model" in final_text
+    query.message.reply_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reload_action_announces_newly_discovered_loras(storage: Storage):
+    storage.set_checkpoint(1, "ckpt.safetensors")
+    query = AsyncMock()
+    query.data = "lr:reload"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_chat.id = 1
+    update.effective_user.id = 1
+    context = _context(storage, [_profile_with_loras()])
+
+    with patch(
+        "comfytelegram.lora_menu.reload_profiles_and_discover",
+        AsyncMock(return_value=([_profile_with_loras()], True)),
+    ):
+        await lora_callback(update, context)
+
+    query.message.reply_text.assert_awaited_once()
+    assert "New LoRA" in query.message.reply_text.await_args.args[0]

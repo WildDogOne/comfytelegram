@@ -5,8 +5,17 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from comfytelegram.civitai import CivitaiLookupError, CivitaiLoraInfo
-from comfytelegram.lora_discovery import _scan_lora_files, discover_new_loras
+from comfytelegram.lora_discovery import (
+    _scan_lora_files,
+    discover_new_loras,
+    reload_profiles_and_discover,
+)
+from comfytelegram.settings import Settings
 from comfytelegram.storage import Storage
+
+
+def _settings(**overrides) -> Settings:
+    return Settings(_env_file=None, telegram_bot_token="test-token", **overrides)
 
 
 @pytest.fixture
@@ -287,3 +296,63 @@ async def test_discover_reports_changed_false_when_the_write_fails(
     # the match was still computed and cached — just never persisted
     assert storage.get_lora_civitai_cache("new.safetensors")["found"] is True
     assert json.loads(profile_path.read_text())["loras"] == []
+
+
+@pytest.mark.asyncio
+async def test_reload_profiles_and_discover_skips_scan_without_loras_dir(
+    tmp_path: Path, storage: Storage
+):
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    _write_profile(profiles_dir / "a.json", display_name="A")
+    settings = _settings(model_profiles_dir=profiles_dir, comfyui_loras_dir=None)
+
+    with patch("comfytelegram.lora_discovery.discover_new_loras", AsyncMock()) as discover_mock:
+        profiles, discovered = await reload_profiles_and_discover(settings, storage)
+
+    discover_mock.assert_not_awaited()
+    assert discovered is False
+    assert [p.display_name for p in profiles] == ["A"]
+
+
+@pytest.mark.asyncio
+async def test_reload_profiles_and_discover_runs_discovery_when_loras_dir_set(
+    tmp_path: Path, storage: Storage
+):
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    _write_profile(profiles_dir / "a.json", display_name="A")
+    loras_dir = tmp_path / "loras"
+    loras_dir.mkdir()
+    settings = _settings(model_profiles_dir=profiles_dir, comfyui_loras_dir=loras_dir)
+
+    with patch(
+        "comfytelegram.lora_discovery.discover_new_loras", AsyncMock(return_value=True)
+    ) as discover_mock:
+        profiles, discovered = await reload_profiles_and_discover(settings, storage)
+
+    discover_mock.assert_awaited_once_with(loras_dir, profiles_dir, storage)
+    assert discovered is True
+    assert [p.display_name for p in profiles] == ["A"]
+
+
+@pytest.mark.asyncio
+async def test_reload_profiles_and_discover_always_rereads_profiles_from_disk(
+    tmp_path: Path, storage: Storage
+):
+    """Unlike `_start_lora_discovery`'s boot-time reload (only when
+    discovery itself wrote something), this must re-read every profile
+    file unconditionally — the whole point is picking up a hand-edited
+    profile discovery never touched at all."""
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    profile_path = profiles_dir / "a.json"
+    _write_profile(profile_path, display_name="Before Edit")
+    settings = _settings(model_profiles_dir=profiles_dir, comfyui_loras_dir=None)
+
+    profiles, _ = await reload_profiles_and_discover(settings, storage)
+    assert profiles[0].display_name == "Before Edit"
+
+    _write_profile(profile_path, display_name="After Hand Edit")
+    profiles, _ = await reload_profiles_and_discover(settings, storage)
+    assert profiles[0].display_name == "After Hand Edit"

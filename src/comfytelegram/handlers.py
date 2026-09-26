@@ -55,6 +55,7 @@ from comfytelegram.generation import (
     repeat,
     resolve_live_upscale_defaults,
 )
+from comfytelegram.lora_discovery import reload_profiles_and_discover
 from comfytelegram.lora_menu import handle_lora_custom_value_message
 from comfytelegram.message_text import message_text
 from comfytelegram.params_serde import (
@@ -1738,6 +1739,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/model — pick a checkpoint\n"
         "/settings — view or change generation defaults for the current model\n"
         "/lora — toggle which of the current model's LoRAs are applied\n"
+        "/reload — reload model_profiles/*.json and check for new LoRAs, "
+        "no restart needed\n"
         "/character save <name> | <prompt> — save a reusable character design\n"
         "/characters — list saved characters, activate one, or ✏️ edit/🔤 rename it\n"
         f"/stream [prompt] — generate single images back-to-back (up to {STREAM_HARD_LIMIT}) "
@@ -1844,6 +1847,38 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await query.answer()
     await query.edit_message_text(f"Model set to: {label}")
+
+
+async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/reload` — reload every `model_profiles/*.json` from disk into
+    `bot_data['profiles']`, picking up a hand-edited profile (a manually
+    added LoRA entry, a new `civitai_base_models` list, tweaked defaults, a
+    brand-new profile file) without restarting the bot. If
+    `Settings.comfyui_loras_dir` is configured, runs one LoRA
+    auto-discovery pass first (see `lora_discovery.
+    reload_profiles_and_discover`), so a LoRA file dropped in since the bot
+    last started gets registered too — the standalone-command counterpart
+    to `/lora`'s own "🔁 Reload profiles" button, for when the thing that
+    needs picking up isn't tied to whatever checkpoint `/lora` happens to
+    have open. `/model`'s own checkpoint *list* needs no equivalent —
+    `ComfyClient.list_checkpoints()` is already queried fresh on every
+    `/model` tap — but its *labels* come from `bot_data['profiles']`
+    (`_checkpoint_labels`), so a stale profile list can still show a raw
+    filename there instead of a profile's nice `display_name` until this
+    runs."""
+    settings: Settings = context.bot_data["settings"]
+    if await reject_if_unauthorized(update, settings):
+        return
+
+    message = update.effective_message
+    status = await message.reply_text("🔄 Reloading model profiles…", disable_notification=True)
+
+    storage: Storage = context.bot_data["storage"]
+    profiles, discovered = await reload_profiles_and_discover(settings, storage)
+    context.bot_data["profiles"] = profiles
+
+    note = " New LoRA(s) were found and registered — check /lora." if discovered else ""
+    await status.edit_text(f"✅ Reloaded {len(profiles)} model profile(s).{note}")
 
 
 def _characters_keyboard(

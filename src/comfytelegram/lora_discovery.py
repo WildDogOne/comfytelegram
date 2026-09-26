@@ -41,7 +41,9 @@ from comfytelegram.civitai import (
     hash_lora_file,
     resolve_lora_path,
 )
+from comfytelegram.profiles import ModelProfile, load_profiles
 from comfytelegram.profiles.loader import load_profile_files
+from comfytelegram.settings import Settings
 from comfytelegram.storage import Storage
 
 logger = logging.getLogger(__name__)
@@ -185,3 +187,31 @@ async def discover_new_loras(loras_dir: Path, profiles_dir: Path, storage: Stora
         written.add(path)
 
     return bool(written)
+
+
+async def reload_profiles_and_discover(
+    settings: Settings, storage: Storage
+) -> tuple[list[ModelProfile], bool]:
+    """The on-demand counterpart to `main.py`'s `_start_lora_discovery`,
+    which only ever runs once, at boot. Backs both `/reload` and `/lora`'s
+    "🔁 Reload profiles" button (see `lora_menu.py`): run one LoRA
+    auto-discovery pass first if `Settings.comfyui_loras_dir` is
+    configured (so a LoRA file dropped in since the bot last started gets
+    registered too, not just picked up on the *next* restart), then
+    unconditionally reload every `model_profiles/*.json` from disk —
+    unlike `_start_lora_discovery`'s own reload, which only happens when
+    *discovery itself* wrote something, this always re-reads every file,
+    since the whole point of an on-demand reload is picking up a profile
+    someone hand-edited in between (a manually added LoRA entry, a new
+    `civitai_base_models` list, tweaked defaults, a brand-new profile
+    file) — something discovery's own "did I write anything" tracking
+    can't see at all. Returns the freshly loaded profiles and whether
+    discovery found anything new, so callers can tailor their
+    confirmation message."""
+    discovered = False
+    if settings.comfyui_loras_dir:
+        discovered = await discover_new_loras(
+            settings.comfyui_loras_dir, settings.model_profiles_dir, storage
+        )
+    profiles = load_profiles(settings.model_profiles_dir)
+    return profiles, discovered
