@@ -2618,13 +2618,19 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     "<denoise> <tile strength>" follow-up message
     (`_consume_awaiting_upscale_custom`), which runs the upscale itself with
     those as a one-shot override — never saved, unlike a profile's own
-    defaults. Only *then* does the already-large-image gate apply: a fresh
+    defaults. The already-large-image gate applies either way: a fresh
     `"upscale"` tap (post-choice) on an image already at or beyond
     `UPSCALE_CONFIRM_THRESHOLD_PX` doesn't upscale immediately either — it
     downloads just far enough to measure the image, then replies with a
     "this is already large — continue?" prompt (`_upscale_confirm_keyboard`)
     instead, which comes back as either `UPSCALE_CONFIRM_CALLBACK_KIND`
-    (proceed) or `UPSCALE_CANCEL_CALLBACK_KIND` (abort) — `"homogenize"` has
+    (proceed) or `UPSCALE_CANCEL_CALLBACK_KIND` (abort);
+    `_consume_awaiting_upscale_custom` runs the exact same check on its own
+    typed-override path, stashing the override in `chat_data`'s
+    `awaiting_upscale_custom_confirm` (keyed by result_id, since
+    `UPSCALE_CONFIRM_CALLBACK_KIND`'s callback_data has no room for two
+    floats) so a confirmed "✅ Upscale anyway" still applies it instead of
+    silently falling back to profile defaults — `"homogenize"` has
     no such gate, since it never changes the image's pixel dimensions (see
     `generation.post_process`'s `TiledRefineParams` branch). A `"face"`/`"hand"` result whose
     detector found nothing to refine (`GeneratedImage.unchanged`, see
@@ -2787,6 +2793,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if kind == UPSCALE_CANCEL_CALLBACK_KIND:
+        pop_pending(context.chat_data, "awaiting_upscale_custom_confirm", query.message)
         await _safe_edit_message(query, "Upscale cancelled.", InlineKeyboardMarkup([]))
         return
 
@@ -2799,10 +2806,18 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if kind == "upscale":
         # Clears any stale "⚙️ Customize" text-entry flag — reached either
-        # from a fresh tap (nothing pending, a harmless no-op) or from that
-        # prompt's own "↩ Cancel" button, which re-shows this chooser rather
-        # than routing through `_make_cancel_callback`'s dedicated pattern.
-        pop_pending(context.chat_data, "awaiting_upscale_custom", query.message)
+        # from a fresh tap (nothing pending, a harmless no-op), from that
+        # prompt's own "↩ Cancel" button (re-tapping this same result_id, so
+        # no notice needed), or from an "🔍 Upscale 4x" tap on a *different*
+        # image while another image's customize prompt was still pending —
+        # that last case gets an explicit heads-up, since dropping it with no
+        # notice could leave the user typing override numbers for an image
+        # that already stopped listening for them.
+        stale_result_id = pop_pending(context.chat_data, "awaiting_upscale_custom", query.message)
+        if stale_result_id is not None and stale_result_id != result_id:
+            await query.message.reply_text(
+                "Cancelled the pending “⚙️ Customize” request for the other image."
+            )
         profiles: list[ModelProfile] = context.bot_data["profiles"]
         tile_strength, denoise = resolve_live_upscale_defaults(full_params.checkpoint, profiles)
         await query.message.reply_text(
@@ -2998,8 +3013,21 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         kind = "upscale"
 
     source_bytes: bytes | None = None
+    upscale_denoise_override: float | None = None
+    tile_controlnet_strength_override: float | None = None
     if kind in ("upscale", UPSCALE_CONFIRM_CALLBACK_KIND):
         if kind == UPSCALE_CONFIRM_CALLBACK_KIND:
+            # A confirmed "⚙️ Customize" override (see
+            # `_consume_awaiting_upscale_custom`'s own already-large-image
+            # gate, which stashes it here rather than in callback_data — no
+            # room there for two floats alongside the result_id) rides along
+            # to this confirm tap so the customize path's chosen values
+            # survive the "already large — continue?" round trip too.
+            pending_custom = pop_pending(
+                context.chat_data, "awaiting_upscale_custom_confirm", query.message
+            )
+            if pending_custom is not None and pending_custom[0] == result_id:
+                _, upscale_denoise_override, tile_controlnet_strength_override = pending_custom
             await _safe_edit_message(query, "Upscaling anyway…", InlineKeyboardMarkup([]))
         source_bytes = await _fetch_source_image(
             client,
@@ -3043,6 +3071,8 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             pending["filename"],
             full_params,
             profiles=context.bot_data["profiles"],
+            upscale_denoise_override=upscale_denoise_override,
+            tile_controlnet_strength_override=tile_controlnet_strength_override,
         )
 
     result = await _run_reporting_errors(
@@ -3480,7 +3510,10 @@ async def _consume_awaiting_upscale_custom(
     `_consume_awaiting_stream_prompt`, but runs the post-processing pass
     itself rather than handing off to a shared starter — there's no other
     caller for "upscale with an explicit denoise/tile-strength override" to
-    share it with."""
+    share it with. Applies the same `UPSCALE_CONFIRM_THRESHOLD_PX`
+    already-large-image gate `postprocess_callback`'s bare-tap path does —
+    this used to skip it entirely, since it's a separate hand-rolled
+    pipeline rather than a route through that shared block."""
     message = update.effective_message
     result_id = pop_pending(context.chat_data, "awaiting_upscale_custom", message)
     if result_id is None:
@@ -3507,30 +3540,49 @@ async def _consume_awaiting_upscale_custom(
     denoise, tile_strength = parsed
 
     client: ComfyClient = context.bot_data["comfy_client"]
+    source_bytes = await _fetch_source_image(
+        client,
+        context.bot,
+        pending["filename"],
+        pending["file_id"],
+        on_fallback=_source_fallback_notifier(message),
+    )
+    width, height = Image.open(io.BytesIO(source_bytes)).size
+    if max(width, height) >= UPSCALE_CONFIRM_THRESHOLD_PX:
+        # Stash the typed override so the "✅ Upscale anyway" tap — handled
+        # by `postprocess_callback`'s shared `UPSCALE_CONFIRM_CALLBACK_KIND`
+        # branch, not this function — can still apply it; callback_data has
+        # no room to carry two floats alongside the result_id itself.
+        set_pending(
+            context.chat_data,
+            "awaiting_upscale_custom_confirm",
+            message,
+            (result_id, denoise, tile_strength),
+        )
+        await message.reply_text(
+            f"This image is already {width}×{height} — a 4x upscale would "
+            f"produce a {width * 4}×{height * 4} image. Upscale anyway?",
+            reply_markup=_upscale_confirm_keyboard(result_id),
+        )
+        return True
+
     label = POSTPROCESS_STATUS_LABELS["upscale"]
     status_message = await message.reply_text(f"{label}…", disable_notification=True)
 
-    async def _download_and_post_process() -> GeneratedImage:
-        data = await _fetch_source_image(
-            client,
-            context.bot,
-            pending["filename"],
-            pending["file_id"],
-            on_fallback=_source_fallback_notifier(message),
-        )
-        return await post_process(
+    result = await _run_reporting_errors(
+        status_message,
+        label,
+        "post-processing",
+        post_process(
             client,
             "upscale",
-            data,
+            source_bytes,
             pending["filename"],
             full_params,
             profiles=profiles,
             upscale_denoise_override=denoise,
             tile_controlnet_strength_override=tile_strength,
-        )
-
-    result = await _run_reporting_errors(
-        status_message, label, "post-processing", _download_and_post_process()
+        ),
     )
     if result is None:
         return True

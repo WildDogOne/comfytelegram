@@ -498,8 +498,15 @@ async def test_consume_awaiting_upscale_custom_runs_with_the_parsed_override():
         "comfy_client": _comfy_client_mock(),
         "profiles": [profile],
     }
+    # The customize path measures the source image (already-large-image
+    # gate) before post-processing it too — needs real PNG bytes, not
+    # arbitrary placeholder bytes.
+    source_png = io.BytesIO()
+    Image.new("RGB", (64, 64)).save(source_png, format="PNG")
     context.bot.get_file = AsyncMock(
-        return_value=MagicMock(download_as_bytearray=AsyncMock(return_value=bytearray(b"orig")))
+        return_value=MagicMock(
+            download_as_bytearray=AsyncMock(return_value=bytearray(source_png.getvalue()))
+        )
     )
 
     changed_result = GeneratedImage(
@@ -544,8 +551,12 @@ async def test_consume_awaiting_upscale_custom_dash_keeps_the_live_default():
         "comfy_client": _comfy_client_mock(),
         "profiles": [profile],
     }
+    source_png = io.BytesIO()
+    Image.new("RGB", (64, 64)).save(source_png, format="PNG")
     context.bot.get_file = AsyncMock(
-        return_value=MagicMock(download_as_bytearray=AsyncMock(return_value=bytearray(b"orig")))
+        return_value=MagicMock(
+            download_as_bytearray=AsyncMock(return_value=bytearray(source_png.getvalue()))
+        )
     )
 
     changed_result = GeneratedImage(
@@ -1253,9 +1264,149 @@ async def test_upscale_defaults_choice_runs_like_a_bare_upscale_tap():
 
     post_process_mock.assert_awaited_once()
     assert post_process_mock.await_args.args[1] == "upscale"
-    assert "upscale_denoise_override" not in post_process_mock.await_args.kwargs
-    assert "tile_controlnet_strength_override" not in post_process_mock.await_args.kwargs
+    assert post_process_mock.await_args.kwargs["upscale_denoise_override"] is None
+    assert post_process_mock.await_args.kwargs["tile_controlnet_strength_override"] is None
     query.message.reply_photo.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_custom_gates_on_already_large_image():
+    """The "⚙️ Customize" typed-override path used to skip the
+    already-large-image confirmation gate entirely, since it's a separate
+    hand-rolled pipeline from `postprocess_callback`'s shared "upscale"
+    block. It should apply the exact same gate."""
+    message = AsyncMock()
+    message.text = "0.35 0.3"
+    message.message_thread_id = None
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = MagicMock()
+    context.chat_data = {"awaiting_upscale_custom": {NO_TOPIC: "abc123"}}
+    context.bot_data = {
+        "storage": storage,
+        "comfy_client": _comfy_client_mock(),
+        "profiles": [profile],
+    }
+    source_png = io.BytesIO()
+    Image.new("RGB", (2048, 2048)).save(source_png, format="PNG")
+    context.bot.get_file = AsyncMock(
+        return_value=MagicMock(
+            download_as_bytearray=AsyncMock(return_value=bytearray(source_png.getvalue()))
+        )
+    )
+
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock()) as post_process_mock:
+        assert await _consume_awaiting_upscale_custom(update, context) is True
+
+    post_process_mock.assert_not_called()
+    # `_comfy_client_mock` always raises, so `_fetch_source_image` falls
+    # back to Telegram and sends `_SOURCE_FALLBACK_NOTICE` first — the
+    # "Upscale anyway?" prompt is the last reply, not the only one.
+    last_call = message.reply_text.await_args_list[-1]
+    reply_text = last_call.args[0]
+    assert "already" in reply_text
+    assert "Upscale anyway?" in reply_text
+    keyboard = last_call.kwargs["reply_markup"]
+    callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert "pp:upscale_confirmed:abc123" in callback_data
+    assert context.chat_data["awaiting_upscale_custom_confirm"][NO_TOPIC] == (
+        "abc123",
+        0.35,
+        0.3,
+    )
+    # Consumed off the flag it was read from, same as the plain path.
+    assert "awaiting_upscale_custom" not in context.chat_data
+
+
+@pytest.mark.asyncio
+async def test_upscale_confirm_applies_a_stashed_custom_override():
+    """The "✅ Upscale anyway" tap that follows the gate above should still
+    apply the denoise/tile-strength the user typed, not silently fall back
+    to profile defaults."""
+    query = AsyncMock()
+    query.data = "pp:upscale_confirmed:abc123"
+    query.message.message_thread_id = None
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    context.chat_data = {"awaiting_upscale_custom_confirm": {NO_TOPIC: ("abc123", 0.35, 0.3)}}
+
+    changed_result = GeneratedImage(
+        data=b"upscaled",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch(
+        "comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)
+    ) as post_process_mock:
+        await postprocess_callback(update, context)
+
+    post_process_mock.assert_awaited_once()
+    assert post_process_mock.await_args.kwargs["upscale_denoise_override"] == 0.35
+    assert post_process_mock.await_args.kwargs["tile_controlnet_strength_override"] == 0.3
+    assert "awaiting_upscale_custom_confirm" not in context.chat_data
+
+
+@pytest.mark.asyncio
+async def test_bare_upscale_tap_notifies_about_a_different_pending_customize_request():
+    """Tapping "🔍 Upscale 4x" on a different image while another image's
+    "⚙️ Customize" prompt is still pending clears that stale entry — it
+    should say so rather than silently dropping it."""
+    query = AsyncMock()
+    query.data = "pp:upscale:xyz789"
+    query.message.message_thread_id = None
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    context.chat_data = {"awaiting_upscale_custom": {NO_TOPIC: "abc123"}}
+
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock()) as post_process_mock:
+        await postprocess_callback(update, context)
+
+    post_process_mock.assert_not_called()
+    assert "awaiting_upscale_custom" not in context.chat_data
+    replies = [call.args[0] for call in query.message.reply_text.await_args_list]
+    assert any("other image" in reply for reply in replies)
+
+
+@pytest.mark.asyncio
+async def test_bare_upscale_tap_on_the_same_image_has_no_stray_notice():
+    """The customize prompt's own "↩ Cancel" button re-taps this same
+    result_id — that's an expected, unremarkable cancellation and shouldn't
+    get the "other image" notice."""
+    query = AsyncMock()
+    query.data = "pp:upscale:abc123"
+    query.message.message_thread_id = None
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    context.chat_data = {"awaiting_upscale_custom": {NO_TOPIC: "abc123"}}
+
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock()):
+        await postprocess_callback(update, context)
+
+    assert "awaiting_upscale_custom" not in context.chat_data
+    query.message.reply_text.assert_awaited_once()
+    assert "other image" not in query.message.reply_text.await_args.args[0]
 
 
 @pytest.mark.asyncio
