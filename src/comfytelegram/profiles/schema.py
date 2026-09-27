@@ -26,6 +26,28 @@ class LoraDefault(BaseModel):
     default_enabled: bool = Field(
         True, description="Applied automatically unless the user opts out"
     )
+    trigger_words: str = Field(
+        "",
+        description=(
+            "Free text — the word(s)/phrase this LoRA actually needs in the prompt to "
+            "activate. When this LoRA ends up active for a generation (default_enabled, "
+            "after any /lora override), resolve_generation_params folds this straight into "
+            "positive_prompt automatically — right after positive_prompt_prefix and before "
+            "the user's own text — so a LoRA that needs a specific trigger word doesn't "
+            "silently do nothing (or need that word retyped by hand every single time) just "
+            "because nobody remembered to include it. Deliberately manual-only to fill in, "
+            "though: nothing in this codebase ever *writes* to this field automatically "
+            "(specifically including lora_discovery.py's auto-registration, which only ever "
+            "sets name/strength_model/strength_clip/default_enabled) — auto-filling it from "
+            "CivitAI's own trainedWords would be easy to get wrong silently (a LoRA can be "
+            "re-uploaded/renamed under the same hash, CivitAI's own list is sometimes "
+            "incomplete or stale, and a custom-trained LoRA has no CivitAI entry to pull from "
+            "at all), and a wrong trigger word silently saved as if verified — and then "
+            "silently injected into every prompt — is worse than an empty field that's "
+            "obviously still TODO. Left empty (the default, folds in as nothing) if you "
+            "haven't filled it in yet."
+        ),
+    )
 
     def to_spec(self) -> LoraSpec:
         """Drop `default_enabled` (a profile-resolution-only concern) to get

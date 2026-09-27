@@ -36,7 +36,8 @@ Files starting with `_` are ignored (reserved for docs/schema files).
       "name": "family/style.safetensors",
       "strength_model": 0.8,
       "strength_clip": 1.0,
-      "default_enabled": false        // true = always applied for this model; false = documented but off
+      "default_enabled": false,       // true = always applied for this model; false = documented but off
+      "trigger_words": ""             // auto-added to the prompt when this LoRA is active — fill in by hand only, see below
     }
   ],
   "civitai_base_models": [],           // opts this profile into boot-time LoRA auto-discovery — see below
@@ -95,6 +96,47 @@ existing one, and only for a LoRA CivitAI actually has a hash record for —
 anything privately/custom-trained (like `furrytoonmix_illustrious.json`'s
 three character LoRAs above) still needs to be added here by hand, the
 same as before this existed.
+
+### `loras[].trigger_words` — auto-injected, but manual-only to fill in
+
+Free text for whatever word(s)/phrase a LoRA actually needs in the prompt
+to activate. Whenever this LoRA ends up active for a generation
+(`default_enabled`, after any `/lora` override), `resolve_generation_params`
+folds this straight into the positive prompt automatically — right after
+`positive_prompt_prefix` and before whatever the user typed — so you don't
+have to retype a LoRA's trigger word by hand on every single message just
+to get it to actually do anything. A LoRA that's toggled off (`/lora`, or
+`default_enabled: false` in the JSON) contributes nothing, same as its
+`strength_model`/`strength_clip` not applying either. This only ever
+touches the built prompt — not `LoraDefault.to_spec()`, which still only
+ever carries `name`/`strength_model`/`strength_clip` into the actual
+ComfyUI graph, and not what the user actually typed (`raw_positive_prompt`,
+what "🐛 Show Prompt"'s "As typed" reply shows) — "🐛 Show Prompt"'s main
+reply, which shows the fully-resolved prompt, is where an injected trigger
+word is visible.
+
+Filling the field in, though, is deliberately manual-only: nothing in this
+codebase ever writes an actual *value* into it automatically, even though
+CivitAI's API does return a `trainedWords` list right alongside everything
+auto-discovery already pulls from it. The key itself does get added
+automatically — a newly auto-registered LoRA gets `"trigger_words": ""`
+from the start (`lora_discovery.py`'s auto-registration), and every boot
+plus every `/reload` backfills the same empty key onto any older entry
+that predates this field, or that a human wrote by hand without knowing
+about it (`lora_discovery.backfill_trigger_words` — pure JSON-file
+hygiene, so opening the file shows the field as a visible placeholder
+either way) — but the *value* stays empty until you type one in yourself.
+That's on purpose: a LoRA's hash can get re-uploaded under a different/
+renamed listing, CivitAI's own trigger-word list is sometimes incomplete
+or wrong, and a privately/
+custom-trained LoRA has no CivitAI entry to pull one from at all — silently
+saving a wrong trigger word as if it were verified, and then silently
+injecting it into every prompt, is worse than leaving the field empty and
+obviously still TODO. Fill it in by hand once you've actually confirmed
+the trigger word works (checking `/lora`'s "ℹ️ Info" button's own
+CivitAI-sourced trigger words is a fine starting point, just verify before
+copying it in here). Left empty (the default, folds in as nothing) on
+every profile right now.
 
 ### `loader: "split"` — Anima-style architectures
 

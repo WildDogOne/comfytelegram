@@ -260,6 +260,20 @@ def test_lora_default_to_spec_drops_default_enabled_flag():
     assert spec.strength_clip == 0.9
 
 
+def test_lora_default_trigger_words_defaults_to_empty_and_is_manual_only():
+    """Nothing populates this — see model_profiles/README.md's
+    `loras[].trigger_words` section for why it's deliberately never
+    auto-filled from CivitAI."""
+    lora = LoraDefault(name="a.safetensors")
+    assert lora.trigger_words == ""
+
+    lora = LoraDefault(name="a.safetensors", trigger_words="score_9, my_style")
+    assert lora.trigger_words == "score_9, my_style"
+    # not part of the graph-building spec — purely a reference note
+    spec = lora.to_spec()
+    assert not hasattr(spec, "trigger_words")
+
+
 def test_resolve_generation_params_only_applies_default_enabled_loras():
     profile = ModelProfile(
         match=["*ckpt*"],
@@ -271,6 +285,69 @@ def test_resolve_generation_params_only_applies_default_enabled_loras():
     )
     params = resolve_generation_params("ckpt.safetensors", "a fox", profile)
     assert [lora.name for lora in params.loras] == ["on.safetensors"]
+
+
+def test_resolve_generation_params_folds_in_active_lora_trigger_words():
+    profile = ModelProfile(
+        match=["*ckpt*"],
+        display_name="X",
+        positive_prompt_prefix="masterpiece",
+        loras=[
+            LoraDefault(
+                name="on.safetensors", default_enabled=True, trigger_words="my_style_trigger"
+            ),
+            LoraDefault(
+                name="off.safetensors", default_enabled=False, trigger_words="unused_trigger"
+            ),
+        ],
+    )
+    params = resolve_generation_params("ckpt.safetensors", "a fox", profile)
+    assert params.positive_prompt == "masterpiece, my_style_trigger, a fox"
+    # the disabled LoRA's trigger word must not leak in
+    assert "unused_trigger" not in params.positive_prompt
+    # never touches what the user actually typed
+    assert params.raw_positive_prompt == ""
+
+
+def test_resolve_generation_params_joins_multiple_active_lora_trigger_words():
+    profile = ModelProfile(
+        match=["*ckpt*"],
+        display_name="X",
+        loras=[
+            LoraDefault(name="a.safetensors", default_enabled=True, trigger_words="trigger_a"),
+            LoraDefault(name="b.safetensors", default_enabled=True, trigger_words="trigger_b"),
+        ],
+    )
+    params = resolve_generation_params("ckpt.safetensors", "a fox", profile)
+    assert params.positive_prompt == "trigger_a, trigger_b, a fox"
+
+
+def test_resolve_generation_params_with_no_trigger_words_set_is_unchanged():
+    profile = ModelProfile(
+        match=["*ckpt*"],
+        display_name="X",
+        positive_prompt_prefix="masterpiece",
+        loras=[LoraDefault(name="a.safetensors", default_enabled=True)],
+    )
+    params = resolve_generation_params("ckpt.safetensors", "a fox", profile)
+    assert params.positive_prompt == "masterpiece, a fox"
+
+
+def test_resolve_generation_params_respects_lora_override_for_trigger_words():
+    """A LoRA toggled off via `/lora`'s per-chat override must not
+    contribute its trigger word either — `apply_lora_overrides` runs
+    before this, so `profile.loras[].default_enabled` already reflects
+    the chat's actual current state by the time this reads it."""
+    from comfytelegram.profiles import apply_lora_overrides
+
+    profile = ModelProfile(
+        match=["*ckpt*"],
+        display_name="X",
+        loras=[LoraDefault(name="a.safetensors", default_enabled=True, trigger_words="trigger_a")],
+    )
+    overridden = apply_lora_overrides(profile, {"a.safetensors": False})
+    params = resolve_generation_params("ckpt.safetensors", "a fox", overridden)
+    assert params.positive_prompt == "a fox"
 
 
 def test_anima_aesthetic_profile_overrides_fix_artifact_prompts(profiles):

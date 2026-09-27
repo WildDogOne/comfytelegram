@@ -7,6 +7,7 @@ import pytest
 from comfytelegram.civitai import CivitaiLookupError, CivitaiLoraInfo
 from comfytelegram.lora_discovery import (
     _scan_lora_files,
+    backfill_trigger_words,
     discover_new_loras,
     reload_profiles_and_discover,
 )
@@ -112,6 +113,7 @@ async def test_discover_registers_a_matched_lora_into_the_opted_in_profile(
             "strength_model": 1.0,
             "strength_clip": 1.0,
             "default_enabled": False,
+            "trigger_words": "",
         }
     ]
     # other fields survive the rewrite untouched
@@ -356,3 +358,97 @@ async def test_reload_profiles_and_discover_always_rereads_profiles_from_disk(
     _write_profile(profile_path, display_name="After Hand Edit")
     profiles, _ = await reload_profiles_and_discover(settings, storage)
     assert profiles[0].display_name == "After Hand Edit"
+
+
+def test_backfill_trigger_words_adds_missing_key(tmp_path: Path):
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    path = profiles_dir / "a.json"
+    _write_profile(
+        path,
+        loras=[
+            {"name": "old.safetensors", "strength_model": 1.0, "strength_clip": 1.0},
+            {
+                "name": "already_has_it.safetensors",
+                "strength_model": 1.0,
+                "strength_clip": 1.0,
+                "trigger_words": "some_trigger",
+            },
+        ],
+    )
+
+    changed = backfill_trigger_words(profiles_dir)
+
+    assert changed is True
+    written = json.loads(path.read_text())
+    assert written["loras"][0]["trigger_words"] == ""
+    # an entry that already had a value keeps it untouched
+    assert written["loras"][1]["trigger_words"] == "some_trigger"
+
+
+def test_backfill_trigger_words_is_a_noop_when_nothing_is_missing(tmp_path: Path):
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    path = profiles_dir / "a.json"
+    _write_profile(
+        path,
+        loras=[
+            {
+                "name": "a.safetensors",
+                "strength_model": 1.0,
+                "strength_clip": 1.0,
+                "trigger_words": "",
+            }
+        ],
+    )
+    original_text = path.read_text()
+
+    changed = backfill_trigger_words(profiles_dir)
+
+    assert changed is False
+    assert path.read_text() == original_text
+
+
+def test_backfill_trigger_words_handles_a_profile_with_no_loras_at_all(tmp_path: Path):
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    _write_profile(profiles_dir / "a.json", loras=[])
+
+    changed = backfill_trigger_words(profiles_dir)
+
+    assert changed is False
+
+
+def test_backfill_trigger_words_reports_write_failures_without_raising(tmp_path: Path):
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    path = profiles_dir / "a.json"
+    _write_profile(
+        path, loras=[{"name": "a.safetensors", "strength_model": 1.0, "strength_clip": 1.0}]
+    )
+
+    with patch.object(Path, "write_text", side_effect=OSError("Read-only file system")):
+        changed = backfill_trigger_words(profiles_dir)
+
+    assert changed is False
+
+
+@pytest.mark.asyncio
+async def test_reload_profiles_and_discover_backfills_trigger_words_unconditionally(
+    tmp_path: Path, storage: Storage
+):
+    """No comfyui_loras_dir configured at all — discovery itself never
+    runs — but the backfill must still happen, since it needs no
+    filesystem access to any LoRA file, only to model_profiles/*.json."""
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    path = profiles_dir / "a.json"
+    _write_profile(
+        path, loras=[{"name": "a.safetensors", "strength_model": 1.0, "strength_clip": 1.0}]
+    )
+    settings = _settings(model_profiles_dir=profiles_dir, comfyui_loras_dir=None)
+
+    profiles, _ = await reload_profiles_and_discover(settings, storage)
+
+    assert profiles[0].loras[0].trigger_words == ""
+    assert json.loads(path.read_text())["loras"][0]["trigger_words"] == ""

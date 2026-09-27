@@ -21,13 +21,15 @@
       "name": "hand 4.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     },
     {
       "name": "sd_xl_offset_example-lora_1.0.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     }
   ],
   "civitai_base_models": [

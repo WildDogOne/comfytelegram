@@ -152,6 +152,7 @@ async def discover_new_loras(loras_dir: Path, profiles_dir: Path, storage: Stora
                     "strength_model": _DEFAULT_STRENGTH,
                     "strength_clip": _DEFAULT_STRENGTH,
                     "default_enabled": False,
+                    "trigger_words": "",
                 }
             )
             touched.add(path)
@@ -189,6 +190,50 @@ async def discover_new_loras(loras_dir: Path, profiles_dir: Path, storage: Stora
     return bool(written)
 
 
+def backfill_trigger_words(profiles_dir: Path) -> bool:
+    """Add an explicit `"trigger_words": ""` to every `loras[]` entry
+    across `model_profiles/*.json` that doesn't already have the key —
+    pure JSON-file hygiene, not a discovery step: pydantic already
+    defaults a missing key to `""` in memory (see
+    `LoraDefault.trigger_words`), so this changes nothing about how a
+    profile actually resolves. It exists purely so opening the file to
+    fill one in by hand shows the field as a visible placeholder instead
+    of requiring you to already know the schema has it (freshly
+    auto-registered entries already get the key from `discover_new_loras`
+    itself; this is for everything that predates it, or that a human wrote
+    without knowing about it). Deliberately synchronous and independent of
+    `Settings.comfyui_loras_dir` — unlike `discover_new_loras`, this needs
+    no filesystem access to the actual LoRA files, only to
+    `model_profiles/*.json` itself, so it runs unconditionally at every
+    boot (`main.py`'s `build_application`) and every on-demand reload
+    (`reload_profiles_and_discover` below). Returns True if any file was
+    actually modified."""
+    entries = load_profile_files(profiles_dir)
+    dirty: set[Path] = set()
+    for path, data, _ in entries:
+        for lora in data.get("loras", []):
+            if "trigger_words" not in lora:
+                lora["trigger_words"] = ""
+                dirty.add(path)
+
+    data_by_path = {path: data for path, data, _ in entries}
+    written: set[Path] = set()
+    for path in dirty:
+        try:
+            path.write_text(json.dumps(data_by_path[path], indent=2, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            logger.error(
+                "trigger_words backfill: failed to write %s (%s) — check that "
+                "model_profiles/ is writable",
+                path,
+                exc,
+            )
+            continue
+        written.add(path)
+
+    return bool(written)
+
+
 async def reload_profiles_and_discover(
     settings: Settings, storage: Storage
 ) -> tuple[list[ModelProfile], bool]:
@@ -198,20 +243,22 @@ async def reload_profiles_and_discover(
     auto-discovery pass first if `Settings.comfyui_loras_dir` is
     configured (so a LoRA file dropped in since the bot last started gets
     registered too, not just picked up on the *next* restart), then
-    unconditionally reload every `model_profiles/*.json` from disk —
-    unlike `_start_lora_discovery`'s own reload, which only happens when
-    *discovery itself* wrote something, this always re-reads every file,
-    since the whole point of an on-demand reload is picking up a profile
-    someone hand-edited in between (a manually added LoRA entry, a new
-    `civitai_base_models` list, tweaked defaults, a brand-new profile
-    file) — something discovery's own "did I write anything" tracking
-    can't see at all. Returns the freshly loaded profiles and whether
-    discovery found anything new, so callers can tailor their
-    confirmation message."""
+    backfill any missing `trigger_words` key (see `backfill_trigger_words`
+    — unconditional, unlike discovery), then unconditionally reload every
+    `model_profiles/*.json` from disk — unlike `_start_lora_discovery`'s
+    own reload, which only happens when *discovery itself* wrote
+    something, this always re-reads every file, since the whole point of
+    an on-demand reload is picking up a profile someone hand-edited in
+    between (a manually added LoRA entry, a new `civitai_base_models`
+    list, tweaked defaults, a brand-new profile file) — something
+    discovery's own "did I write anything" tracking can't see at all.
+    Returns the freshly loaded profiles and whether discovery found
+    anything new, so callers can tailor their confirmation message."""
     discovered = False
     if settings.comfyui_loras_dir:
         discovered = await discover_new_loras(
             settings.comfyui_loras_dir, settings.model_profiles_dir, storage
         )
+    backfill_trigger_words(settings.model_profiles_dir)
     profiles = load_profiles(settings.model_profiles_dir)
     return profiles, discovered

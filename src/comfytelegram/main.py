@@ -48,7 +48,7 @@ from comfytelegram.handlers import (
     tagcheck_command,
     tags_command,
 )
-from comfytelegram.lora_discovery import discover_new_loras
+from comfytelegram.lora_discovery import backfill_trigger_words, discover_new_loras
 from comfytelegram.lora_menu import lora_callback, lora_command
 from comfytelegram.message_text import TEXT_CONTENT, message_text
 from comfytelegram.profiles import load_profiles
@@ -134,12 +134,25 @@ async def _post_init(application: Application) -> None:
     registry BotFather's `/setcommands` edits, so this keeps the menu in
     sync with the bot's actual commands on every startup instead of
     needing a manual BotFather edit whenever one is added/removed/
-    reworded — and, unless disabled, fire the tag database's staleness
+    reworded — backfill any `model_profiles/*.json` entry missing an
+    explicit `trigger_words` key (see `lora_discovery.backfill_trigger_words`
+    — unconditional, unlike everything else here, since it needs no
+    ComfyUI/filesystem-loras-dir access, only the profile files themselves)
+    — and, unless disabled, fire the tag database's staleness
     check as a background task (see `_start_tag_db_refresh`), the
     inpaint_relay job poller if that feature is configured (see
     `_start_inpaint_job_poller`), and a LoRA auto-discovery pass if that's
-    configured too (see `_start_lora_discovery`)."""
+    configured too (see `_start_lora_discovery`). Deliberately not done in
+    `build_application` itself — that runs against a real `model_profiles/`
+    directory in this project's own test suite (`test_application_config.py`
+    doesn't override `model_profiles_dir`), and writing there as a side
+    effect of running `pytest` would be exactly the kind of thing that
+    should never happen."""
     settings: Settings = application.bot_data["settings"]
+    if backfill_trigger_words(settings.model_profiles_dir):
+        application.bot_data["profiles"] = load_profiles(settings.model_profiles_dir)
+        logger.info("Backfilled missing trigger_words keys in model_profiles/*.json")
+
     client = ComfyClient(settings.comfyui_http_base, settings.comfyui_ws_base)
     await client.__aenter__()
     application.bot_data["comfy_client"] = client

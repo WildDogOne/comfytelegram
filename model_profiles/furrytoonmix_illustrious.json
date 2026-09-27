@@ -21,103 +21,148 @@
       "name": "illustrious/yakovlev-vad/yakovlev-vad.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     },
     {
       "name": "illustrious/waspsalad/waspsalad.safetensors",
       "strength_model": 0.8,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     },
     {
       "name": "illustrious/Chibi_licking_your_screen-10.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     },
     {
       "name": "illustrious/ych-il.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     },
     {
       "name": "whiteklaw_v3-il.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     },
     {
       "name": "illustrious/medieval.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     },
     {
       "name": "illustrious/RealisticAnimeIXL_v2.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     },
     {
       "name": "illustrious/Niji_oil_animme.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     },
     {
       "name": "illustrious/People'sWorks_v10.5_Illusv1.0.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     },
     {
       "name": "illustrious/retro_neon_cyberpunk_illustriousXL_by_zura_janai-000029.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     },
     {
       "name": "illustrious/retro_scifi_artstyle_illustriousXL-000021.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     },
     {
       "name": "illustrious/D3lken_V2.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     },
     {
       "name": "illustrious/Husdingo_Artist_Style_Illustrious_illustrious_3266233_epoch_20.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     },
     {
       "name": "illustrious/ImpressionismMJ7illustrious.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     },
     {
       "name": "illustrious/Pearly_flat_n_cute_style_illustrious.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     },
     {
       "name": "illustrious/haiz-illustriousXL_v01_V1-CAME.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
     },
     {
       "name": "illustrious/jikoMaviesOtakuAnime_v40.safetensors",
       "strength_model": 1.0,
       "strength_clip": 1.0,
-      "default_enabled": false
+      "default_enabled": false,
+      "trigger_words": ""
+    },
+    {
+      "name": "illustrious/clrfx/clrfx-step00001500.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false,
+      "trigger_words": ""
+    },
+    {
+      "name": "illustrious/jayrnski/jayrnski-step00001500.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false,
+      "trigger_words": ""
+    },
+    {
+      "name": "illustrious/louart/louart-step00000700.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false,
+      "trigger_words": ""
+    },
+    {
+      "name": "illustrious/waspsalad/waspsalad-step00001800.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false,
+      "trigger_words": ""
     }
   ],
   "civitai_base_models": [

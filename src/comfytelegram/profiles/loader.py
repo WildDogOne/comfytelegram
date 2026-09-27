@@ -166,13 +166,32 @@ def resolve_generation_params(
     `positive_prompt`/`negative_prompt` at all, just the caller's own
     record of what the user actually typed before any profile/character
     prompt got mixed in (see `GenerationParams.raw_positive_prompt`).
+
+    Every *active* LoRA's `trigger_words` (default_enabled after `/lora`'s
+    own toggle overrides — see the `active_loras` filter below, shared with
+    `loras`) gets folded into `positive_prompt` too, right after the
+    profile's own `positive_prompt_prefix` and before `user_prompt` — a
+    LoRA that needs a specific word/phrase to actually activate is useless
+    if that word never reaches the prompt, and typing it by hand every time
+    is exactly the tedium `trigger_words` (manual-only — see
+    `LoraDefault.trigger_words`'s docstring for why it's never auto-filled)
+    exists to remove. Purely additive to `positive_prompt`; never touches
+    `raw_positive_prompt` (still exactly what the user typed) or the
+    `LoraSpec`s the graph itself is built from (`LoraDefault.to_spec()`
+    still drops it, same as ever) — "🐛 Show Prompt" on the resulting image
+    shows the folded-in result via `positive_prompt`, so an injected
+    trigger word is never invisible.
     """
     overrides = dict(overrides or {})
 
     if profile is not None:
-        positive_prompt = join_nonempty([profile.positive_prompt_prefix, user_prompt])
+        active_loras = [lora for lora in profile.loras if lora.default_enabled]
+        lora_trigger_words = join_nonempty([lora.trigger_words for lora in active_loras])
+        positive_prompt = join_nonempty(
+            [profile.positive_prompt_prefix, lora_trigger_words, user_prompt]
+        )
         negative_prompt = profile.negative_prompt_prefix
-        loras = [lora.to_spec() for lora in profile.loras if lora.default_enabled]
+        loras = [lora.to_spec() for lora in active_loras]
         field_defaults = profile.defaults.model_dump(exclude_none=True)
         # Architecture facts about the checkpoint, not a tunable generation
         # default — same reasoning as PROMPT_OVERRIDE_FIELDS living outside
