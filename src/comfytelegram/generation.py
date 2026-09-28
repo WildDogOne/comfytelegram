@@ -344,6 +344,38 @@ def _expand_axis(lo: int, hi: int, minimum: int, limit: int) -> tuple[int, int]:
     return max(0, hi - minimum), hi
 
 
+def _snap_span(
+    lo: int, hi: int, limit: int, multiple: int = _DIFFUSION_MULTIPLE
+) -> tuple[int, int]:
+    """`(lo, hi)` shrunk so its length is a multiple of `multiple`, anchored
+    to whichever side already sits flush against the true image boundary
+    (`lo == 0` or `hi == limit`) instead of always keeping `lo` fixed.
+
+    `target`'s span used to be built as `(x0, _snap_down(x1 - x0))` —
+    `_snap_down` floors the *length*, but `x0` never moved to compensate,
+    so a crop that `_expand_axis` had deliberately pushed flush against the
+    canvas edge (`x1 == full_w`, the drawn mask itself touching it) lost up
+    to `multiple - 1` (15) pixels off that same edge the moment its length
+    wasn't already a multiple of 16 — pulling the crop's own far edge back
+    *inside* the true boundary. Confirmed live on a real "🩹 Fix Artifact"
+    job (Anima pipeline — the only caller of this): the compositing mask
+    built from `target`/`refine_region` (see `_build_anima_fix_drawn_mask`'s
+    `full_crop`) came out a few pixels short of the source's own edge, so
+    `ImageCompositeMasked` left that outermost strip as the *original,
+    unfixed* source pixels instead of the refined patch — a mask painted
+    solid to the true edge still showed old content there. Anchoring to
+    `lo` (as before) is still correct whenever `lo == 0` and `hi < limit`
+    (flush against the left/top edge); this only changes behavior when
+    `hi == limit` and `lo` isn't already 0, which is exactly the
+    right/bottom-edge case that lost pixels."""
+    size = _snap_down(hi - lo, multiple)
+    if lo <= 0:
+        return 0, size
+    if hi >= limit:
+        return limit - size, limit
+    return lo, lo + size
+
+
 def _expand_about_centre(
     bounds: tuple[int, int, int, int], scale: float, limits: tuple[int, int]
 ) -> tuple[int, int, int, int]:
@@ -436,7 +468,9 @@ def _fix_drawn_geometry(
     pad = grow_n + feather_n + max(_REFINE_MIN_PAD, round(_REFINE_PAD_FRAC * max(x1 - x0, y1 - y0)))
     x0, x1 = _expand_axis(max(0, x0 - pad), min(full_w, x1 + pad), _REFINE_MIN_SIZE, full_w)
     y0, y1 = _expand_axis(max(0, y0 - pad), min(full_h, y1 + pad), _REFINE_MIN_SIZE, full_h)
-    target = (x0, y0, _snap_down(x1 - x0), _snap_down(y1 - y0))
+    x0, x1 = _snap_span(x0, x1, full_w)
+    y0, y1 = _snap_span(y0, y1, full_h)
+    target = (x0, y0, x1 - x0, y1 - y0)
 
     context_crop = _expand_about_centre(target, params.context_scale, image_size)
     work_size = _scale_to_max((context_crop[2], context_crop[3]), params.work_max_size)

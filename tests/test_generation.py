@@ -137,6 +137,44 @@ def test_fix_drawn_geometry_refine_region_covers_the_feathered_mask():
     assert x >= cx and y >= cy and x + w <= cx + cw and y + h <= cy + ch
 
 
+def test_fix_drawn_geometry_target_stays_flush_against_the_true_image_edge():
+    """A mask touching the true image edge used to leave `target` (and so
+    `refine_region`'s own compositing mask, `_build_anima_fix_drawn_mask`'s
+    `full_crop`) up to 15px short of that edge whenever the padded span
+    wasn't already a multiple of 16 — `ImageCompositeMasked` then left that
+    outermost strip as the original, unrefined source pixels instead of the
+    refined patch. Confirmed live: a mask painted solid to the bottom-right
+    corner of a real 4096x4096 image still showed a sharp seam of original
+    content a few pixels in from the true edge. See `_snap_span`."""
+    size = (4096, 4096)
+    mask = _rect_mask_png(*size, (3500, 3500, 4095, 4095))
+    geo = _fix_drawn_geometry(mask, size, DrawnMaskFixParams())
+    assert geo.refine_region is not None
+    (x, y, w, h), _refine_size = geo.refine_region
+    assert x + w == size[0]
+    assert y + h == size[1]
+
+
+def test_snap_span_anchors_to_whichever_edge_is_already_flush():
+    # Touches the right/bottom true edge (hi == limit): must anchor there,
+    # not to lo, or the shrunk span's far edge pulls back inside the true
+    # boundary.
+    lo, hi = generation._snap_span(3902, 4096, 4096)
+    assert hi == 4096
+    assert (hi - lo) % 16 == 0
+
+    # Touches the left/top true edge (lo == 0): anchor there instead.
+    lo, hi = generation._snap_span(0, 194, 4096)
+    assert lo == 0
+    assert (hi - lo) % 16 == 0
+
+    # Touches neither edge: anchoring doesn't matter, just stay inside the
+    # original span and a multiple of 16.
+    lo, hi = generation._snap_span(1000, 1194, 4096)
+    assert (hi - lo) % 16 == 0
+    assert lo >= 1000 and hi <= 1194
+
+
 class _StubComfyClient:
     """Minimal stand-in for `ComfyClient` — just enough of the queue/watch/
     history/download surface for `generate()`'s `_run_graph` call to run
