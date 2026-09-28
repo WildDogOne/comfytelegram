@@ -106,6 +106,14 @@
     border-color: rgba(255, 255, 255, 0.9);
     background: rgba(255, 255, 255, 0.15);
   }
+  /* Undo/redo share `#controls` with the brush slider and Fill/Erase
+     toggles rather than getting a row of their own — screen space in the
+     WebApp is tight, and unlike those two toggles these have no persistent
+     on/off state worth a text label, so a bare glyph keeps them narrow. */
+  .icon-btn {
+    padding: 10px 12px;
+    flex: none;
+  }
   #button-row {
     display: flex;
     gap: 10px;
@@ -223,6 +231,8 @@
     <input type="range" id="brush-size" min="8" max="120" value="36" />
     <button id="autofill-btn" type="button" class="active">🪣 Fill</button>
     <button id="erase-btn" type="button">🧹 Erase</button>
+    <button id="undo-btn" type="button" class="icon-btn" disabled title="Undo">↩</button>
+    <button id="redo-btn" type="button" class="icon-btn" disabled title="Redo">↪</button>
   </div>
   <div id="button-row">
     <button id="clear-btn">Clear</button>
@@ -253,6 +263,8 @@
   var doneBtn = document.getElementById("done-btn");
   var eraseBtn = document.getElementById("erase-btn");
   var autofillBtn = document.getElementById("autofill-btn");
+  var undoBtn = document.getElementById("undo-btn");
+  var redoBtn = document.getElementById("redo-btn");
   var brushCursor = document.getElementById("brush-cursor");
   // "✏️ Detail Prompt" only (`#prompt-fields`, hidden unless `applyMeta`
   // turns `promptFieldsEnabled` on) — grabbed unconditionally either way,
@@ -267,10 +279,10 @@
   var denoiseValueEl = document.getElementById("denoise-value");
 
   // On by default (matches the button's own initial "active" class in the
-  // markup) — `detectAndFillEnclosedAreas` checks this before doing any
-  // work, so toggling off just stops future strokes from triggering it.
-  // Anything already auto-filled before toggling off is left as-is, same
-  // as toggling erase mode doesn't undo prior painting.
+  // markup) — `finishAction` checks this before running `runEnclosedFill`,
+  // so toggling off just stops future strokes from triggering it. Anything
+  // already auto-filled before toggling off is left as-is, same as
+  // toggling erase mode doesn't undo prior painting.
   var autoFillEnabled = true;
 
   autofillBtn.addEventListener("click", function () {
@@ -299,7 +311,7 @@
   // Auto-fill-enclosed-area scratch canvases. `overlayCanvas` can be up to
   // 4096px on a side (see `image.onload`), and running a flood fill at that
   // resolution after every stroke would be slow enough to feel like lag —
-  // so `detectAndFillEnclosedAreas` instead flood-fills a small fixed-size
+  // so `runEnclosedFill` instead flood-fills a small fixed-size
   // downscaled copy of it (`fillDetectCanvas`) and upscales whatever it
   // finds back onto the real `maskCanvas`/`overlayCanvas`. `fillShapeCanvas`
   // is a reused scratch buffer for that upscale step, sized to match
@@ -334,6 +346,78 @@
   // has no reliable modifier-key signal and its second contact point is
   // already claimed by pinch-zoom.
   var lastPaintPoint = null;
+
+  // Undo/redo, as a log of discrete *actions* (one per completed stroke,
+  // shift-click line, or Clear) rather than pixel snapshots. `maskCanvas`
+  // is sized to the source image's own full resolution — routinely well
+  // past `overlayCanvas`'s already-capped-at-4096 display size (see
+  // `image.onload`) once a prior post-processing pass has upscaled it — so
+  // keeping a raster copy of it per undo step would burn tens of MB every
+  // single stroke. An action is just a handful of numbers (each dab's
+  // point/radius/erase flag) regardless of image size, so undo/redo
+  // instead replays the whole log from a blank canvas — cheap, since a
+  // real editing session is at most a few dozen strokes.
+  //
+  // `actionHistory` holds every action ever committed, in order;
+  // `historyIndex` is how many of them are currently "applied" (0..
+  // length). Undo/redo just move `historyIndex` and replay; committing a
+  // *new* action truncates anything past the current index first, the
+  // standard "a fresh edit erases the redo branch" rule.
+  var actionHistory = [];
+  var historyIndex = 0;
+  // The action currently being accumulated by an in-progress stroke/line —
+  // null the rest of the time. `paintAt` appends to it; `finishAction`
+  // commits and clears it.
+  var currentAction = null;
+
+  function updateUndoRedoButtons() {
+    undoBtn.disabled = historyIndex === 0;
+    redoBtn.disabled = historyIndex >= actionHistory.length;
+  }
+
+  function commitAction(action) {
+    actionHistory.length = historyIndex;
+    actionHistory.push(action);
+    historyIndex = actionHistory.length;
+    updateUndoRedoButtons();
+  }
+
+  // Re-applies one previously-committed action's pixels onto the current
+  // (already-blank, via `replayHistory`) canvases — the replay counterpart
+  // to actually drawing it live.
+  function applyAction(action) {
+    if (action.type === "clear") {
+      resetMask();
+      return;
+    }
+    for (var i = 0; i < action.dabs.length; i++) {
+      var d = action.dabs[i];
+      applyDab(d.x, d.y, d.radius, d.erase);
+    }
+    lastPaintPoint = action.dabs[action.dabs.length - 1];
+    if (action.fill) runEnclosedFill();
+  }
+
+  function replayHistory() {
+    resetMask();
+    for (var i = 0; i < historyIndex; i++) {
+      applyAction(actionHistory[i]);
+    }
+    renderDisplay();
+    updateUndoRedoButtons();
+  }
+
+  function undo() {
+    if (historyIndex === 0) return;
+    historyIndex--;
+    replayHistory();
+  }
+
+  function redo() {
+    if (historyIndex >= actionHistory.length) return;
+    historyIndex++;
+    replayHistory();
+  }
 
   // Zoom/pan of `displayCanvas` itself, via a CSS transform — two-finger
   // pinch on touch (one finger is already spoken for by drawing, so zoom/pan
@@ -588,40 +672,46 @@
     displayCtx.restore();
   }
 
-  function eraseAt(x, y) {
-    var displayRadius = Number(brushSizeInput.value) / 2;
-    overlayCtx.save();
-    overlayCtx.globalCompositeOperation = "destination-out";
-    overlayCtx.beginPath();
-    overlayCtx.arc(x, y, displayRadius, 0, Math.PI * 2);
-    overlayCtx.fill();
-    overlayCtx.restore();
+  // Pure pixel drawing, no recording and no redraw of its own — the one
+  // low-level primitive both live drawing (`paintAt`, which records the dab
+  // and repaints immediately for per-dab feedback) and undo/redo replay
+  // (`applyAction`, which fires many dabs back-to-back and repaints once at
+  // the end) funnel through, so the two can never draw a dab differently.
+  function applyDab(x, y, radius, erase) {
+    if (erase) {
+      overlayCtx.save();
+      overlayCtx.globalCompositeOperation = "destination-out";
+      overlayCtx.beginPath();
+      overlayCtx.arc(x, y, radius, 0, Math.PI * 2);
+      overlayCtx.fill();
+      overlayCtx.restore();
 
-    maskCtx.beginPath();
-    maskCtx.fillStyle = "#000";
-    maskCtx.arc(x * scale, y * scale, displayRadius * scale, 0, Math.PI * 2);
-    maskCtx.fill();
+      maskCtx.beginPath();
+      maskCtx.fillStyle = "#000";
+      maskCtx.arc(x * scale, y * scale, radius * scale, 0, Math.PI * 2);
+      maskCtx.fill();
+    } else {
+      overlayCtx.beginPath();
+      overlayCtx.fillStyle = "#ff2d2d";
+      overlayCtx.arc(x, y, radius, 0, Math.PI * 2);
+      overlayCtx.fill();
 
-    renderDisplay();
+      maskCtx.beginPath();
+      maskCtx.fillStyle = "#fff";
+      maskCtx.arc(x * scale, y * scale, radius * scale, 0, Math.PI * 2);
+      maskCtx.fill();
+    }
   }
 
   function paintAt(x, y) {
     lastPaintPoint = { x: x, y: y };
-    if (erasing) {
-      eraseAt(x, y);
-      return;
-    }
-    var displayRadius = Number(brushSizeInput.value) / 2;
-    overlayCtx.beginPath();
-    overlayCtx.fillStyle = "#ff2d2d";
-    overlayCtx.arc(x, y, displayRadius, 0, Math.PI * 2);
-    overlayCtx.fill();
-
-    maskCtx.beginPath();
-    maskCtx.fillStyle = "#fff";
-    maskCtx.arc(x * scale, y * scale, displayRadius * scale, 0, Math.PI * 2);
-    maskCtx.fill();
-
+    var radius = Number(brushSizeInput.value) / 2;
+    applyDab(x, y, radius, erasing);
+    // `beginStroke`/`paintLineTo` always open `currentAction` before the
+    // first call here, so this is really unconditional in practice — the
+    // guard just keeps `paintAt` safe to call on its own without also
+    // requiring an open action.
+    if (currentAction) currentAction.dabs.push({ x: x, y: y, radius: radius, erase: erasing });
     renderDisplay();
   }
 
@@ -633,8 +723,18 @@
     renderDisplay();
   }
 
+  // The "Clear" button, as opposed to `resetMask` itself — which is also
+  // used internally (initial setup in `loadImage`, and to rebuild from
+  // scratch during undo/redo replay) where wiping the canvas must *not*
+  // itself become another undoable action.
+  function clearMask() {
+    resetMask();
+    commitAction({ type: "clear" });
+  }
+
   function beginStroke(x, y) {
     drawing = true;
+    currentAction = { type: "stroke", dabs: [] };
     paintAt(x, y);
   }
 
@@ -647,10 +747,10 @@
   // `lastPaintPoint` to (x, y), close enough together to look like a single
   // continuous stroke (same spacing idea as a real brush engine) rather
   // than a dashed line of separate circles. Not a "stroke" in the
-  // `drawing`/`beginStroke` sense — it's one discrete click, not a
-  // drag — so it runs `detectAndFillEnclosedAreas` itself afterward
-  // instead of relying on `endStroke`, the same one-shot-then-flood-fill
-  // shape a freehand stroke gets.
+  // `drawing`/`beginStroke` sense — it's one discrete click, not a drag —
+  // so it commits its own action afterward instead of relying on
+  // `endStroke`, the same one-shot-then-flood-fill-then-commit shape a
+  // freehand stroke gets.
   function paintLineTo(x, y) {
     var displayRadius = Number(brushSizeInput.value) / 2;
     var from = lastPaintPoint;
@@ -658,21 +758,40 @@
     var dy = y - from.y;
     var dist = Math.hypot(dx, dy);
     var steps = Math.max(1, Math.ceil(dist / Math.max(1, displayRadius * 0.35)));
+    currentAction = { type: "line", dabs: [] };
     for (var i = 1; i <= steps; i++) {
       var t = i / steps;
       paintAt(from.x + dx * t, from.y + dy * t);
     }
-    detectAndFillEnclosedAreas();
+    finishAction();
+  }
+
+  // Runs the enclosed-area auto-fill (if enabled) and commits whatever
+  // dabs `currentAction` accumulated as one undoable action — shared by
+  // `endStroke` (a freehand drag) and `paintLineTo` (a shift-click line),
+  // the two ways a "stroke" of dabs can complete.
+  function finishAction() {
+    var action = currentAction;
+    currentAction = null;
+    // Can be empty if every dab this action would have recorded was
+    // rolled back by `undoRevocableDab` (a touch that turned out to be the
+    // first finger of a pinch, not a tap) — nothing actually changed, so
+    // there's nothing to fill and no reason to clutter undo history with a
+    // no-op entry.
+    if (!action || !action.dabs.length) return;
+    action.fill = autoFillEnabled;
+    if (action.fill) runEnclosedFill();
+    commitAction(action);
   }
 
   function endStroke() {
     // Guards against the several call sites (`onPointerUp`, `startPan`
     // ending a stroke pre-emptively, ...) that call this even when nothing
     // was actually being drawn — without it, every one of those would
-    // trigger a needless flood-fill pass.
+    // trigger a needless flood-fill pass and a phantom undo entry.
     if (!drawing) return;
     drawing = false;
-    detectAndFillEnclosedAreas();
+    finishAction();
   }
 
   // Flood fill from every edge cell of a `painted` grid (1 = wall,
@@ -689,9 +808,9 @@
   // border-ring cell counts as an open door to the outside — every other
   // wall check, including all interior propagation once the fill is
   // already inside the grid, always uses the real `painted` unchanged. See
-  // `detectAndFillEnclosedAreas`'s call site for why a straight `painted`
-  // check on the border specifically under-detects a stroke drawn right up
-  // against the image edge.
+  // `runEnclosedFill`'s call site for why a straight `painted` check on the
+  // border specifically under-detects a stroke drawn right up against the
+  // image edge.
   function floodFillFromBorder(painted, w, h, borderWall) {
     borderWall = borderWall || painted;
     var reachable = new Uint8Array(w * h);
@@ -736,8 +855,8 @@
   }
 
   // Grows `mask` by one cell in every 4-connected direction (a single
-  // morphological dilation pass). `detectAndFillEnclosedAreas` runs this a
-  // couple of times over the enclosed region it finds before upscaling it,
+  // morphological dilation pass). `runEnclosedFill` runs this a couple of
+  // times over the enclosed region it finds before upscaling it,
   // because that region is defined as everything the flood fill *didn't*
   // reach — which by construction stops one cell short of the stroke
   // itself (the stroke is the wall the fill got blocked by, not part of
@@ -769,16 +888,19 @@
   }
   var FILL_GROW_PASSES = 2;
 
-  // Runs after every completed stroke (paint or erase). Downscales the
-  // current selection highlight into `fillDetectCanvas`, flood-fills it
-  // from the edges, and paints solid fill into any pocket that turned out
-  // enclosed — the "grab a closed circle, its interior fills in too"
-  // feature. Erasing part of an already-filled loop's boundary does *not*
-  // retroactively un-fill its interior (this only ever adds paint, same as
-  // an ordinary brush dab would) — the eraser still works on that interior
-  // directly if that's ever needed.
-  function detectAndFillEnclosedAreas() {
-    if (!autoFillEnabled) return;
+  // Runs after every completed stroke (paint or erase), when auto-fill is
+  // enabled — gated by callers (`finishAction`, and undo/redo's replay of a
+  // past action via `applyAction`), not here, so replay can reproduce
+  // exactly what fired historically even if the button's been toggled
+  // since. Downscales the current selection highlight into
+  // `fillDetectCanvas`, flood-fills it from the edges, and paints solid
+  // fill into any pocket that turned out enclosed — the "grab a closed
+  // circle, its interior fills in too" feature. Erasing part of an
+  // already-filled loop's boundary does *not* retroactively un-fill its
+  // interior (this only ever adds paint, same as an ordinary brush dab
+  // would) — the eraser still works on that interior directly if that's
+  // ever needed.
+  function runEnclosedFill() {
     var detectScale = Math.min(
       1,
       FILL_DETECT_MAX_DIM / Math.max(overlayCanvas.width, overlayCanvas.height)
@@ -966,6 +1088,13 @@
     if (!pendingTouch) return;
     restoreBrushRegion(overlayCtx, pendingTouch.overlaySnap);
     restoreBrushRegion(maskCtx, pendingTouch.maskSnap);
+    // The pixel revert above must be mirrored in the action log, or
+    // `finishAction` would later commit — and undo/redo would later
+    // replay — a dab that was never actually left on the canvas. This is
+    // always exactly the one dab `beginStroke` just recorded a moment ago
+    // (nothing else can have run in between: `handleTouchMove` never calls
+    // `continueStroke` while `pendingTouch` is still set).
+    if (currentAction && currentAction.dabs.length) currentAction.dabs.pop();
     renderDisplay();
     cancelPendingTouch();
   }
@@ -1061,13 +1190,41 @@
   brushSizeInput.addEventListener("input", updateCursorSize);
   window.addEventListener("resize", updateCursorSize);
 
-  clearBtn.addEventListener("click", resetMask);
+  clearBtn.addEventListener("click", clearMask);
 
+  // Same on/off-color pattern as `#autofill-btn` — the label itself never
+  // changes ("🧹 Erase" always names the button, not the current mode), only
+  // `.active` toggles, so the button's width never changes either. It used
+  // to relabel itself to "🖌️ Brush" while erasing, which read fine on its
+  // own but meant the button (and undo/redo after it in this same flex row)
+  // visibly jumped width on every toggle.
   eraseBtn.addEventListener("click", function () {
     erasing = !erasing;
     eraseBtn.classList.toggle("active", erasing);
-    eraseBtn.textContent = erasing ? "🖌️ Brush" : "🧹 Erase";
     brushCursor.classList.toggle("erasing", erasing);
+  });
+
+  undoBtn.addEventListener("click", undo);
+  redoBtn.addEventListener("click", redo);
+
+  // Ctrl/Cmd+Z to undo, Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y to redo — the usual
+  // desktop-app bindings (not Ctrl+V, which is paste everywhere else on the
+  // page, including straight into the "✏️ Detail Prompt" textareas below).
+  // Skipped entirely while a textarea/input has focus so those keep their
+  // own native undo instead of the mask's.
+  window.addEventListener("keydown", function (evt) {
+    var tag = evt.target && evt.target.tagName;
+    if (tag === "TEXTAREA" || tag === "INPUT") return;
+    if (!(evt.ctrlKey || evt.metaKey)) return;
+    var key = evt.key.toLowerCase();
+    if (key === "z") {
+      evt.preventDefault();
+      if (evt.shiftKey) redo();
+      else undo();
+    } else if (key === "y") {
+      evt.preventDefault();
+      redo();
+    }
   });
 
   // `promptFieldsEnabled` is set once, from `GET /jobs/{token}/meta`
