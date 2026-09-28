@@ -325,6 +325,16 @@
   var erasing = false;
   var scale = 1; // maskCanvas pixels per displayCanvas pixel
 
+  // Photoshop-style shift-click straight line: updated by every dab
+  // (freehand or line, paint or erase — set inside `paintAt` itself) so a
+  // shift+click always has an anchor to draw from, chaining point to point
+  // across repeated shift-clicks the same way Photoshop's own does. Reset
+  // to null by `resetMask` — after a clear there's no anchor left that
+  // still means anything. Mouse/pen only (`onPointerDown`, below); touch
+  // has no reliable modifier-key signal and its second contact point is
+  // already claimed by pinch-zoom.
+  var lastPaintPoint = null;
+
   // Zoom/pan of `displayCanvas` itself, via a CSS transform — two-finger
   // pinch on touch (one finger is already spoken for by drawing, so zoom/pan
   // has to live on a second finger, same convention most drawing apps use)
@@ -596,6 +606,7 @@
   }
 
   function paintAt(x, y) {
+    lastPaintPoint = { x: x, y: y };
     if (erasing) {
       eraseAt(x, y);
       return;
@@ -618,6 +629,7 @@
     maskCtx.fillStyle = "#000";
     maskCtx.fillRect(0, 0, maskCanvas.width, maskCanvas.height);
     overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+    lastPaintPoint = null;
     renderDisplay();
   }
 
@@ -629,6 +641,28 @@
   function continueStroke(x, y) {
     if (!drawing) return;
     paintAt(x, y);
+  }
+
+  // Shift-click straight line: dabs stepped along the segment from
+  // `lastPaintPoint` to (x, y), close enough together to look like a single
+  // continuous stroke (same spacing idea as a real brush engine) rather
+  // than a dashed line of separate circles. Not a "stroke" in the
+  // `drawing`/`beginStroke` sense — it's one discrete click, not a
+  // drag — so it runs `detectAndFillEnclosedAreas` itself afterward
+  // instead of relying on `endStroke`, the same one-shot-then-flood-fill
+  // shape a freehand stroke gets.
+  function paintLineTo(x, y) {
+    var displayRadius = Number(brushSizeInput.value) / 2;
+    var from = lastPaintPoint;
+    var dx = x - from.x;
+    var dy = y - from.y;
+    var dist = Math.hypot(dx, dy);
+    var steps = Math.max(1, Math.ceil(dist / Math.max(1, displayRadius * 0.35)));
+    for (var i = 1; i <= steps; i++) {
+      var t = i / steps;
+      paintAt(from.x + dx * t, from.y + dy * t);
+    }
+    detectAndFillEnclosedAreas();
   }
 
   function endStroke() {
@@ -649,10 +683,27 @@
   // fill actually reached from an edge. Any open cell *not* set in the
   // result was walled off from every edge — i.e. enclosed by painted
   // pixels — which is exactly what "closing a loop" means here.
-  function floodFillFromBorder(painted, w, h) {
+  //
+  // `borderWall` (defaults to `painted` itself) is a separate, optionally
+  // more lenient wall check used *only* to decide whether a literal
+  // border-ring cell counts as an open door to the outside — every other
+  // wall check, including all interior propagation once the fill is
+  // already inside the grid, always uses the real `painted` unchanged. See
+  // `detectAndFillEnclosedAreas`'s call site for why a straight `painted`
+  // check on the border specifically under-detects a stroke drawn right up
+  // against the image edge.
+  function floodFillFromBorder(painted, w, h, borderWall) {
+    borderWall = borderWall || painted;
     var reachable = new Uint8Array(w * h);
     var queue = new Int32Array(w * h);
     var qTail = 0;
+
+    function trySeed(idx) {
+      if (!borderWall[idx] && !reachable[idx]) {
+        reachable[idx] = 1;
+        queue[qTail++] = idx;
+      }
+    }
 
     function tryPush(idx) {
       if (!painted[idx] && !reachable[idx]) {
@@ -662,12 +713,12 @@
     }
 
     for (var x = 0; x < w; x++) {
-      tryPush(x);
-      tryPush((h - 1) * w + x);
+      trySeed(x);
+      trySeed((h - 1) * w + x);
     }
     for (var y = 0; y < h; y++) {
-      tryPush(y * w);
-      tryPush(y * w + (w - 1));
+      trySeed(y * w);
+      trySeed(y * w + (w - 1));
     }
 
     var qHead = 0;
@@ -745,7 +796,32 @@
       painted[i] = alpha[i * 4 + 3] > FILL_ALPHA_THRESHOLD ? 1 : 0;
     }
 
-    var reachableFromEdge = floodFillFromBorder(painted, w, h);
+    // floodFillFromBorder seeds *every* unpainted cell on all four edges as
+    // "reachable from outside" — so a pocket the user means to seal against
+    // the image edge only actually gets sealed if every single
+    // detection-grid cell along that edge reads as painted. A stroke drawn
+    // right up to the image boundary routinely falls short of that: a round
+    // brush centered exactly on the edge is geometrically half-clipped by
+    // the canvas bounds, so its actual coverage there is only about half of
+    // what the same stroke gets in the interior — and downscaling that
+    // already-thin coverage into fillDetectCanvas (softening it further,
+    // the same way scaling down any image blurs its edges) can easily pull
+    // it under FILL_ALPHA_THRESHOLD even though the full-resolution stroke
+    // looks solid. One flood fill then leaks in through that gap and the
+    // whole pocket reads as "reachable", not enclosed — this is what
+    // surfaces to the user as "the outermost row of pixels isn't
+    // selectable" via auto-fill.
+    //
+    // The fix is *not* to flood-fill against a globally dilated wall —
+    // that would also wall off, and therefore spuriously enclose, a thin
+    // halo around every ordinary stroke everywhere, not just near the
+    // edge. Only the border-seeding decision needs the leniency: a border
+    // cell counts as walled off (not an open door) if it *or an immediate
+    // neighbor* is painted, while every other wall check — all interior
+    // propagation, including the very next cell in from the border — still
+    // uses the real, undilated `painted`, so open space elsewhere behaves
+    // exactly as before.
+    var reachableFromEdge = floodFillFromBorder(painted, w, h, dilate(painted, w, h));
 
     var enclosed = new Uint8Array(w * h);
     var foundAny = false;
@@ -837,6 +913,10 @@
     moveCursor(evt.clientX, evt.clientY);
     showCursor();
     var p = pointFromEvent(evt);
+    if (evt.shiftKey && lastPaintPoint) {
+      paintLineTo(p.x, p.y);
+      return;
+    }
     beginStroke(p.x, p.y);
   }
 
