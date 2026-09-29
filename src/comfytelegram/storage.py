@@ -174,7 +174,8 @@ CREATE TABLE IF NOT EXISTS inpaint_redo (
     created_at REAL NOT NULL,
     detail_prompt TEXT,
     detail_negative_prompt TEXT,
-    detail_denoise REAL
+    detail_denoise REAL,
+    tile_controlnet INTEGER
 );
 """
 
@@ -210,6 +211,7 @@ class Storage:
         self._add_column_if_missing("inpaint_redo", "detail_prompt", "TEXT")
         self._add_column_if_missing("inpaint_redo", "detail_negative_prompt", "TEXT")
         self._add_column_if_missing("inpaint_redo", "detail_denoise", "REAL")
+        self._add_column_if_missing("inpaint_redo", "tile_controlnet", "INTEGER")
         #: Last `_prune()` sweep time per table — see PRUNE_INTERVAL_SECONDS.
         self._last_prune: dict[str, float] = {}
 
@@ -759,6 +761,7 @@ class Storage:
         detail_prompt: str | None = None,
         detail_negative_prompt: str | None = None,
         detail_denoise: float | None = None,
+        tile_controlnet: bool | None = None,
     ) -> None:
         """Record what "🔁 Redo (same mask)" (`handlers.py`'s
         `HAND_REDO_CALLBACK_KIND`/`FIX_REDO_CALLBACK_KIND`/
@@ -768,25 +771,27 @@ class Storage:
         mask's raw PNG bytes — see this module's docstring for why that
         specific blob, unlike everything else in here, has no `file_id` of
         its own to point at instead. `detail_prompt`/`detail_negative_prompt`/
-        `detail_denoise` are "✏️ Detail Prompt"'s one-shot override — unlike
-        the old per-image `pending_result.detail_prompt` this replaced, it's
-        never saved anywhere *except* here, keyed to the exact mask it was
-        submitted alongside, since a redo is the only thing that should ever
-        reuse it (a fresh "✏️ Detail Prompt"/"🖌️ Draw Mask"/"🩹 Fix Artifact"
-        tap always starts from nothing); `None` for the "🖌️ Draw Mask"/
-        "🩹 Fix Artifact" flows, which never collect a prompt at all. Keyed
-        by the *same* `result_id` as the `pending_result` row for the
-        refined image this mask produced — `postprocess_callback` looks
-        both up together, and either expiring invalidates the redo button
-        the same way. `_prune`'s default TTL (`PENDING_RESULT_TTL_SECONDS`)
-        keeps them in sync in practice."""
+        `detail_denoise`/`tile_controlnet` are "✏️ Detail Prompt"'s one-shot
+        overrides — unlike the old per-image `pending_result.detail_prompt`
+        this replaced, they're never saved anywhere *except* here, keyed to
+        the exact mask they were submitted alongside, since a redo is the
+        only thing that should ever reuse them (a fresh "✏️ Detail Prompt"/
+        "🖌️ Draw Mask"/"🩹 Fix Artifact" tap always starts from nothing);
+        `None` for the "🖌️ Draw Mask"/"🩹 Fix Artifact" flows, which never
+        collect any of the four at all — `tile_controlnet` included, since
+        those two never show the WebApp's checkbox either. Keyed by the
+        *same* `result_id` as the `pending_result` row for the refined image
+        this mask produced — `postprocess_callback` looks both up together,
+        and either expiring invalidates the redo button the same way.
+        `_prune`'s default TTL (`PENDING_RESULT_TTL_SECONDS`) keeps them in
+        sync in practice."""
         self._prune("inpaint_redo")
         with self._conn:
             self._conn.execute(
                 "INSERT OR REPLACE INTO inpaint_redo "
                 "(result_id, source_file_id, source_filename, mask_png, created_at, "
-                "detail_prompt, detail_negative_prompt, detail_denoise) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "detail_prompt, detail_negative_prompt, detail_denoise, tile_controlnet) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     result_id,
                     source_file_id,
@@ -796,6 +801,7 @@ class Storage:
                     detail_prompt,
                     detail_negative_prompt,
                     detail_denoise,
+                    tile_controlnet,
                 ),
             )
 
@@ -805,7 +811,8 @@ class Storage:
         mask — or pruned past its TTL)."""
         row = self._conn.execute(
             "SELECT source_file_id, source_filename, mask_png, detail_prompt, "
-            "detail_negative_prompt, detail_denoise FROM inpaint_redo WHERE result_id = ?",
+            "detail_negative_prompt, detail_denoise, tile_controlnet "
+            "FROM inpaint_redo WHERE result_id = ?",
             (result_id,),
         ).fetchone()
         if row is None:
@@ -817,6 +824,7 @@ class Storage:
             detail_prompt,
             detail_negative_prompt,
             detail_denoise,
+            tile_controlnet,
         ) = row
         return {
             "source_file_id": source_file_id,
@@ -825,6 +833,7 @@ class Storage:
             "detail_prompt": detail_prompt,
             "detail_negative_prompt": detail_negative_prompt,
             "detail_denoise": detail_denoise,
+            "tile_controlnet": None if tile_controlnet is None else bool(tile_controlnet),
         }
 
     def close(self) -> None:

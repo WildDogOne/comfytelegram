@@ -386,6 +386,7 @@ def test_inpaint_redo_roundtrip(storage: Storage):
         "detail_prompt": None,
         "detail_negative_prompt": None,
         "detail_denoise": None,
+        "tile_controlnet": None,
     }
 
 
@@ -401,6 +402,7 @@ def test_inpaint_redo_carries_the_one_shot_detail_prompt_override(storage: Stora
         detail_prompt="two hands",
         detail_negative_prompt="jewellery",
         detail_denoise=0.42,
+        tile_controlnet=True,
     )
     assert storage.get_inpaint_redo("result1") == {
         "source_file_id": "file123",
@@ -409,12 +411,22 @@ def test_inpaint_redo_carries_the_one_shot_detail_prompt_override(storage: Stora
         "detail_prompt": "two hands",
         "detail_negative_prompt": "jewellery",
         "detail_denoise": 0.42,
+        "tile_controlnet": True,
     }
 
 
 def test_inpaint_redo_is_scoped_per_result_id(storage: Storage):
     storage.store_inpaint_redo("result1", "file123", "a.png", b"mask-a")
     assert storage.get_inpaint_redo("result2") is None
+
+
+def test_inpaint_redo_tile_controlnet_false_roundtrips_distinct_from_none(storage: Storage):
+    """`False` (the checkbox was explicitly unchecked) must read back as
+    `False`, not as `None` ("no choice was ever made") — sqlite's INTEGER
+    column stores both as falsy-ish values, so this pins the explicit
+    `None if ... is None else bool(...)` conversion in `get_inpaint_redo`."""
+    storage.store_inpaint_redo("result1", "file123", "a.png", b"mask-a", tile_controlnet=False)
+    assert storage.get_inpaint_redo("result1")["tile_controlnet"] is False
 
 
 def test_inpaint_redo_survives_reopen(tmp_path: Path):
@@ -431,5 +443,6 @@ def test_inpaint_redo_survives_reopen(tmp_path: Path):
         "detail_prompt": None,
         "detail_negative_prompt": None,
         "detail_denoise": None,
+        "tile_controlnet": None,
     }
     s2.close()

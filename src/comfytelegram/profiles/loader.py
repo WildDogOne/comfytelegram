@@ -196,7 +196,14 @@ def resolve_generation_params(
         # Architecture facts about the checkpoint, not a tunable generation
         # default — same reasoning as PROMPT_OVERRIDE_FIELDS living outside
         # `.defaults` — so these come straight off the profile rather than
-        # through `field_defaults`/ProfileDefaults.
+        # through `field_defaults`/ProfileDefaults. `detail_prompt_tile_controlnet`
+        # is the one exception living in this dict despite not being an
+        # architecture fact itself (it's a tunable experiment toggle) — it
+        # rides alongside `tile_controlnet(_strength)` for the same reason
+        # those do: there's nowhere else for a per-checkpoint flag like this
+        # to live, and `generation.post_process` re-resolves all three live
+        # off the current profile anyway (see `_refresh_detail_prompt_tile_controlnet`),
+        # so what's frozen in here at generation time barely matters for it.
         architecture_fields: dict[str, Any] = {
             "loader": profile.loader,
             "clip_name": profile.clip_name,
@@ -205,6 +212,7 @@ def resolve_generation_params(
             "model_sampling_shift": profile.model_sampling_shift,
             "tile_controlnet": profile.tile_controlnet,
             "tile_controlnet_strength": profile.tile_controlnet_strength,
+            "detail_prompt_tile_controlnet": profile.detail_prompt_tile_controlnet,
             "anima_lllite_inpaint_patch": profile.anima_lllite_inpaint_patch,
             "anima_lllite_inpaint_patch_strength": profile.anima_lllite_inpaint_patch_strength,
         }

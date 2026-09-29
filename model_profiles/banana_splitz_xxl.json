@@ -3,7 +3,7 @@
     "*banana*splitz*"
   ],
   "display_name": "Banana Splitz XXL",
-  "description": "Illustrious-based checkpoint by LatteLeopard (civitai.com/models/1261882), trained across a mixed Danbooru/e621/Rule34 tag set with a wide style range (furry/kemono through anime and western toon) rather than furry-only. The creator documents v3.0+ as 'Euler A sampler only' and cfg 4 as the 'go-to' value (4-7 usable range, 20+ steps) — those, plus clip_skip -2 and the quality-tag convention below, mirror furrytoonmix_illustrious.json's own verified NoobAI/Illustrious-family values since this is the same base architecture, but are otherwise a community-recommended starting point, not tuned against a specific install. tag_dictionary is left unset (searches/checks both dictionaries) since the model explicitly blends Danbooru and e621/Rule34 tags rather than favoring one. loras starts empty deliberately — civitai_base_models below opts this profile into lora_discovery.py's propagation pass, which backfills any Illustrious LoRA furrytoonmix_illustrious.json (or any other opted-in profile) already has a cached CivitAI lookup for, disabled by default, on the next boot or /reload; anything never looked up at all (a hand-typed entry that predates any Info tap or discovery run) still needs a manual /lora Info tap or a manual loras entry first.",
+  "description": "Illustrious-based checkpoint by LatteLeopard (civitai.com/models/1261882), trained across a mixed Danbooru/e621/Rule34 tag set with a wide style range (furry/kemono through anime and western toon) rather than furry-only. The creator documents v3.0+ as 'Euler A sampler only' and cfg 4 as the 'go-to' value (4-7 usable range, 20+ steps) — those, plus clip_skip -2 and the quality-tag convention below, mirror furrytoonmix_illustrious.json's own verified NoobAI/Illustrious-family values since this is the same base architecture, but are otherwise a community-recommended starting point, not tuned against a specific install. tag_dictionary is left unset (searches/checks both dictionaries) since the model explicitly blends Danbooru and e621/Rule34 tags rather than favoring one. loras starts empty deliberately — civitai_base_models below opts this profile into lora_discovery.py's propagation pass, which backfills any Illustrious LoRA furrytoonmix_illustrious.json (or any other opted-in profile) already has a cached CivitAI lookup for, disabled by default, on the next boot or /reload; anything never looked up at all (a hand-typed entry that predates any Info tap or discovery run) still needs a manual /lora Info tap or a manual loras entry first. detail_prompt_tile_controlnet was tried as a live experiment for this checkpoint's DetailerForEach pass straying off-structure/artifacting well before a denoise low enough to stop mattering, conditioning it on tile_controlnet (same ControlNetLoader+ControlNetApplyAdvanced wiring the upscale pass already uses) to see whether that steadies it enough to run at a higher, more detail-preserving denoise — confirmed live it makes the artifacting *worse* here, not better, so it's off. detailer_denoise/detailer_cfg/detailer_steps (still being dialed in — 0.3 is still a strong effect at detailer_denoise's own default crop/guide size) instead give the detailer pass its own lower denoise ceiling and match its cfg/steps to this checkpoint's own defaults.cfg/steps above, rather than the DetailerForEach family's hard-coded cfg=5.0/steps=25 (an unrelated mismatch from the sample.json reference workflow, not specific to this checkpoint).",
   "defaults": {
     "cfg": 4.0,
     "steps": 30,
@@ -12,11 +12,15 @@
     "clip_skip": -2,
     "width": 1024,
     "height": 1024,
-    "upscale_denoise": 0.3
+    "upscale_denoise": 0.3,
+    "detailer_denoise": 0.3,
+    "detailer_cfg": 4.0,
+    "detailer_steps": 30
   },
   "prompt_style": "tags",
   "positive_prompt_prefix": "masterpiece, best quality, amazing quality, very aesthetic, newest",
-  "negative_prompt_prefix": "worst quality, low quality, normal quality, jpeg artifacts, blurry, bad anatomy, bad hands, missing fingers, extra digits, fewer digits, watermark, signature, text, error, cropped, lowres",
+  "negative_prompt_prefix_back": "worst quality, low quality, normal quality, jpeg artifacts, blurry, bad anatomy, bad hands, missing fingers, extra digits, fewer digits, watermark, signature, text, error, cropped, lowres",
+  "negative_prompt_prefix": "(worst quality:1.2), (bad quality:1.2), (low quality:1.2), bad anatomy, author signature, text",
   "loras": [{
       "name": "illustrious/yakovlev-vad/yakovlev-vad.safetensors",
       "strength_model": 1.0,
@@ -169,5 +173,6 @@
     "Illustrious"
   ],
   "tile_controlnet": "xinsir_tile_sdxl.safetensors",
-  "tile_controlnet_strength": 0.4
+  "tile_controlnet_strength": 0.4,
+  "detail_prompt_tile_controlnet": false
 }

@@ -45,11 +45,15 @@ def test_generation_params_roundtrip_through_serialization():
     assert restored.model_sampling_shift == params.model_sampling_shift
     assert restored.tile_controlnet == params.tile_controlnet
     assert restored.tile_controlnet_strength == params.tile_controlnet_strength
+    assert restored.detail_prompt_tile_controlnet == params.detail_prompt_tile_controlnet
     assert restored.anima_lllite_inpaint_patch == params.anima_lllite_inpaint_patch
     assert (
         restored.anima_lllite_inpaint_patch_strength == params.anima_lllite_inpaint_patch_strength
     )
     assert restored.upscale_denoise == params.upscale_denoise
+    assert restored.detailer_denoise == params.detailer_denoise
+    assert restored.detailer_cfg == params.detailer_cfg
+    assert restored.detailer_steps == params.detailer_steps
     assert restored.raw_positive_prompt == params.raw_positive_prompt
     assert restored.raw_negative_prompt == params.raw_negative_prompt
 
@@ -65,6 +69,18 @@ def test_tile_controlnet_params_roundtrip_through_serialization():
     restored = _deserialize_generation_params(_serialize_generation_params(params))
     assert restored.tile_controlnet == "xinsir_tile_sdxl.safetensors"
     assert restored.tile_controlnet_strength == 0.55
+
+
+def test_detail_prompt_tile_controlnet_roundtrips_through_serialization():
+    params = GenerationParams(
+        checkpoint="banana.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        detail_prompt_tile_controlnet=True,
+    )
+    restored = _deserialize_generation_params(_serialize_generation_params(params))
+    assert restored.detail_prompt_tile_controlnet is True
 
 
 def test_anima_lllite_inpaint_patch_params_roundtrip_through_serialization():
@@ -90,6 +106,30 @@ def test_upscale_denoise_roundtrips_through_serialization():
     )
     restored = _deserialize_generation_params(_serialize_generation_params(params))
     assert restored.upscale_denoise == 0.5
+
+
+def test_detailer_denoise_roundtrips_through_serialization():
+    params = GenerationParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+        detailer_denoise=0.15,
+    )
+    restored = _deserialize_generation_params(_serialize_generation_params(params))
+    assert restored.detailer_denoise == 0.15
+
+
+def test_detailer_cfg_and_steps_roundtrip_through_serialization():
+    params = GenerationParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+        detailer_cfg=4.0,
+        detailer_steps=30,
+    )
+    restored = _deserialize_generation_params(_serialize_generation_params(params))
+    assert restored.detailer_cfg == 4.0
+    assert restored.detailer_steps == 30
 
 
 def test_split_loader_params_roundtrip_through_serialization():

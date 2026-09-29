@@ -132,9 +132,13 @@ def _to_post_process_base(params: GenerationParams) -> PostProcessBaseParams:
         model_sampling_shift=params.model_sampling_shift,
         tile_controlnet=params.tile_controlnet,
         tile_controlnet_strength=params.tile_controlnet_strength,
+        detail_prompt_tile_controlnet=params.detail_prompt_tile_controlnet,
         anima_lllite_inpaint_patch=params.anima_lllite_inpaint_patch,
         anima_lllite_inpaint_patch_strength=params.anima_lllite_inpaint_patch_strength,
         upscale_denoise=params.upscale_denoise,
+        detailer_denoise=params.detailer_denoise,
+        detailer_cfg=params.detailer_cfg,
+        detailer_steps=params.detailer_steps,
     )
 
 
@@ -142,6 +146,16 @@ def _to_post_process_base(params: GenerationParams) -> PostProcessBaseParams:
 #: `PostProcessBaseParams.tile_controlnet`/`tile_controlnet_strength`/
 #: `upscale_denoise` — see `_refresh_tunable_defaults`.
 _TILED_UPSCALE_KINDS = ("upscale", "homogenize")
+
+#: `post_process` kinds whose detailer pass reads
+#: `PostProcessBaseParams.detailer_denoise`/`detailer_cfg`/`detailer_steps`
+#: — see `_refresh_detailer_tunables`. `"fix_drawn"` is deliberately
+#: excluded: it always runs against `DrawnMaskFixParams`' own fixed
+#: removal-oriented denoise/cfg/steps (and, when `fix_artifact_checkpoint`
+#: is set, a different checkpoint's profile entirely — see
+#: `_fix_artifact_override_base`), so this checkpoint's own detailer
+#: tunables have no business reaching it.
+_DETAILER_TUNABLE_KINDS = ("face", "hand", "hand_manual", "hand_drawn")
 
 
 def _refresh_tunable_defaults(
@@ -170,6 +184,73 @@ def _refresh_tunable_defaults(
         tile_controlnet=live_profile.tile_controlnet,
         tile_controlnet_strength=live_profile.tile_controlnet_strength,
         upscale_denoise=live_profile.defaults.upscale_denoise,
+    )
+
+
+def _refresh_detailer_tunables(
+    base: PostProcessBaseParams, profiles: list[ModelProfile] | None
+) -> PostProcessBaseParams:
+    """Same "edit the profile, see it on the very next tap" reasoning as
+    `_refresh_tunable_defaults`, scoped to `ModelProfile.defaults.
+    detailer_denoise`/`detailer_cfg`/`detailer_steps` — applied for every
+    kind in `_DETAILER_TUNABLE_KINDS` regardless of `is_detail_prompt`,
+    unlike `_refresh_detail_prompt_tile_controlnet`, since a checkpoint that
+    needs a different detailer denoise/cfg/steps needs it whether the tap
+    was "🎯 Face Detail", "🖐️ Hand Detail", "✋ Tap to mark", "🖌️ Draw Mask",
+    or "✏️ Detail Prompt" — there's no reason one of those should get the
+    tuned values and another shouldn't. Falls back to `base` unchanged if
+    the checkpoint no longer matches any shipped profile or `profiles`
+    wasn't supplied."""
+    live_profile = resolve_profile(base.checkpoint, profiles or [])
+    if live_profile is None:
+        return base
+    return replace(
+        base,
+        detailer_denoise=live_profile.defaults.detailer_denoise,
+        detailer_cfg=live_profile.defaults.detailer_cfg,
+        detailer_steps=live_profile.defaults.detailer_steps,
+    )
+
+
+def _detailer_cfg_steps_overrides(base: PostProcessBaseParams) -> dict[str, Any]:
+    """The `replace()` kwargs a detailer-family dataclass (`FaceDetailerParams`/
+    `HandDetailerParams`/`ManualHandDetailerParams`/`DrawnMaskHandDetailerParams`,
+    all sharing the same `cfg`/`steps` field names) should apply from
+    `base`'s live-refreshed `detailer_cfg`/`detailer_steps` — empty (a no-op
+    `replace()`) for any left `None`. `denoise` isn't included here since
+    `"hand_drawn"` has its own one-shot override to fold in first (see
+    `post_process`'s `denoise` parameter); every other kind applies it the
+    same simple way right alongside these two."""
+    overrides: dict[str, Any] = {}
+    if base.detailer_cfg is not None:
+        overrides["cfg"] = base.detailer_cfg
+    if base.detailer_steps is not None:
+        overrides["steps"] = base.detailer_steps
+    return overrides
+
+
+def _refresh_detail_prompt_tile_controlnet(
+    base: PostProcessBaseParams, profiles: list[ModelProfile] | None
+) -> PostProcessBaseParams:
+    """Same "edit the profile, see it on the very next tap" reasoning as
+    `_refresh_tunable_defaults`, scoped to "✏️ Detail Prompt"'s own
+    tile-ControlNet experiment (`ModelProfile.detail_prompt_tile_controlnet`)
+    — plus `tile_controlnet`/`tile_controlnet_strength` themselves, since
+    that's what the experiment actually conditions on. Only ever called for
+    `kind == "hand_drawn"` when `is_detail_prompt` is also True (see
+    `post_process`) — a plain "🖌️ Draw Mask" call never re-resolves any of
+    this, so a profile edit meant only to be tried via "✏️ Detail Prompt"
+    can't accidentally change what "🖌️ Draw Mask" does too. Falls back to
+    `base` unchanged if the checkpoint no longer matches any shipped profile
+    or `profiles` wasn't supplied."""
+    live_profile = resolve_profile(base.checkpoint, profiles or [])
+    if live_profile is None:
+        return base
+    return replace(
+        base,
+        tile_controlnet=live_profile.tile_controlnet,
+        tile_controlnet_strength=live_profile.tile_controlnet_strength,
+        detail_prompt_tile_controlnet=live_profile.detail_prompt_tile_controlnet,
     )
 
 
@@ -277,6 +358,9 @@ def _fix_artifact_override_base(profiles: list[ModelProfile]) -> PostProcessBase
         anima_lllite_inpaint_patch=profile.anima_lllite_inpaint_patch,
         anima_lllite_inpaint_patch_strength=profile.anima_lllite_inpaint_patch_strength,
         upscale_denoise=None,
+        detailer_denoise=None,
+        detailer_cfg=None,
+        detailer_steps=None,
     )
 
 
@@ -805,6 +889,8 @@ async def post_process(
     detail_prompt: str | None = None,
     detail_negative_prompt: str | None = None,
     denoise: float | None = None,
+    is_detail_prompt: bool = False,
+    tile_controlnet_override: bool | None = None,
     upscale_denoise_override: float | None = None,
     tile_controlnet_strength_override: float | None = None,
     on_progress: ProgressCallback | None = None,
@@ -842,7 +928,7 @@ async def post_process(
     since removing an arbitrary artifact needs more creative latitude than
     a hand touch-up) instead of the hand-tuned graph — for painting over any
     unwanted region (a stray object, a background glitch, a watermark)
-    rather than just a hand. `profiles`, if given, is consulted for two
+    rather than just a hand. `profiles`, if given, is consulted for four
     unrelated things depending on `kind`: `"fix_drawn"` — see
     `_fix_artifact_override_base` — runs that pass against a fixed,
     known-inpainting-aware checkpoint regardless of which one the image was
@@ -851,9 +937,22 @@ async def post_process(
     checkpoint's *current* profile (see `_refresh_tunable_defaults`) rather
     than the values frozen into the image at generation time, so editing a
     profile's JSON file is reflected on the very next tap instead of only
-    on the next fresh generation. Every other `kind` ignores `profiles`
-    entirely and keeps using the image's own checkpoint/values as recorded
-    in `full_params`. `upscale_denoise_override`/`tile_controlnet_strength_override`
+    on the next fresh generation; `"face"`/`"hand"`/`"hand_manual"`/
+    `"hand_drawn"` (every `kind` in `_DETAILER_TUNABLE_KINDS`, regardless of
+    `is_detail_prompt`) similarly re-resolve `ModelProfile.defaults.
+    detailer_denoise`/`detailer_cfg`/`detailer_steps` (see
+    `_refresh_detailer_tunables`) — a checkpoint whose detailer pass needs a
+    much lower denoise, or a cfg/steps that actually matches its own tuned
+    generation values, than `FaceDetailerParams`/`HandDetailerParams`/
+    `ManualHandDetailerParams`/`DrawnMaskHandDetailerParams`' own hard-coded
+    defaults (surfaced by Banana Splitz XXL); `"hand_drawn"`
+    *only when `is_detail_prompt` is also True* additionally re-resolves
+    `tile_controlnet`/`tile_controlnet_strength`/`detail_prompt_tile_controlnet`
+    (see `_refresh_detail_prompt_tile_controlnet`) for the same "edit the
+    profile, see it on the next tap" reason. Every refresh above is a no-op
+    whenever `profiles` is `None`/empty or the checkpoint no longer matches
+    any shipped profile, falling back to the image's own checkpoint/values
+    as recorded in `full_params`. `upscale_denoise_override`/`tile_controlnet_strength_override`
     are `kind="upscale"`'s own one-shot override, applied on top of whatever
     `profiles` already resolved — handlers.py's "⚙️ Customize" step on the
     "🔍 Upscale 4x" prompt (see `resolve_live_upscale_defaults`), for a
@@ -870,17 +969,55 @@ async def post_process(
     handlers.py's "✏️ Detail Prompt" flow: a freehand mask plus a prompt
     describing that region, collected together in one webapp visit and run
     immediately, never saved for a later tap) — each independent, `None`
-    keeping the image's own prompt / `DrawnMaskHandDetailerParams`' own
-    default denoise (0.5). Every other kind ignores all three; in
+    keeping the image's own prompt / falling through to
+    `base_params.detailer_denoise` (the checkpoint's own tuned default, if
+    any — see `_refresh_detailer_tunables` above) and only then
+    `DrawnMaskHandDetailerParams`' own hard-coded default denoise (0.5).
+    `detailer_cfg`/`detailer_steps` have no equivalent one-shot field on
+    "✏️ Detail Prompt" at all — they apply straight from the checkpoint's
+    profile whenever set, for every `_DETAILER_TUNABLE_KINDS` kind alike.
+    Every other kind ignores all three; in
     particular `kind="fix_drawn"` always uses its own fixed prompt choice
     (blank, or the `fix_artifact_checkpoint` profile's "background
     scenery") and `DrawnMaskFixParams`' own denoise (0.75) — "🩹 Fix
-    Artifact" has no prompt field of its own to pass one from."""
+    Artifact" has no prompt field of its own to pass one from.
+    `is_detail_prompt` is a separate signal from all three of those — it's
+    perfectly possible for "✏️ Detail Prompt" to be submitted with both
+    fields left blank (falling back to the image's own prompt, same
+    outcome as a plain "🖌️ Draw Mask" tap that never had prompt fields to
+    begin with), so `detail_prompt`/`detail_negative_prompt` being None
+    doesn't mean "this is a Draw Mask call". `handlers.py`'s
+    `_DRAWN_MASK_KINDS` is what actually knows which of the three
+    `storage.py` `inpaint_job.kind`s ("hand"/"fix"/"detail") a given call
+    came from, and passes `is_detail_prompt=True` only for "detail" — the
+    one and only thing it gates is whether `kind="hand_drawn"` even
+    considers conditioning on `tile_controlnet` at all (see `ModelProfile.
+    detail_prompt_tile_controlnet`, `build_hand_detailer_drawn_mask`'s
+    `enable_tile_controlnet`). Ignored entirely for every other `kind`.
+    `tile_controlnet_override` is the WebApp's own checkbox on "✏️ Detail
+    Prompt" (unlike `detail_prompt`/`detail_negative_prompt`/`denoise`,
+    which are free text/blank-means-unset, a checkbox is always
+    definitely checked or unchecked, so this is `True`/`False` for every
+    real submission and `None` only when there was never a checkbox to
+    submit in the first place — a plain "🖌️ Draw Mask"/"🩹 Fix Artifact"
+    job, or a `"detail"` job's stored `inpaint_redo` row from before this
+    existed). When not `None` it wins outright over
+    `base_params.detail_prompt_tile_controlnet`, whatever the checkpoint's
+    *current* profile says — the whole point of a per-submission checkbox
+    is letting one tap try it without needing to flip the profile's JSON
+    field first. `None` falls back to `is_detail_prompt and
+    base_params.detail_prompt_tile_controlnet` exactly as before this
+    parameter existed. Ignored entirely for every `kind` other than
+    `"hand_drawn"`."""
     base_params = _to_post_process_base(full_params)
     if kind in DETAIL_PROMPT_KINDS:
         base_params = _apply_detail_prompt(base_params, detail_prompt, detail_negative_prompt)
     if kind in _TILED_UPSCALE_KINDS:
         base_params = _refresh_tunable_defaults(base_params, profiles)
+    if kind in _DETAILER_TUNABLE_KINDS:
+        base_params = _refresh_detailer_tunables(base_params, profiles)
+    if kind == "hand_drawn" and is_detail_prompt:
+        base_params = _refresh_detail_prompt_tile_controlnet(base_params, profiles)
     if kind == "upscale" and (
         upscale_denoise_override is not None or tile_controlnet_strength_override is not None
     ):
@@ -911,12 +1048,22 @@ async def post_process(
             uploaded_name, base_params, TiledRefineParams()
         )
     elif kind == "face":
+        face_params = FaceDetailerParams()
+        overrides = _detailer_cfg_steps_overrides(base_params)
+        if base_params.detailer_denoise is not None:
+            overrides["denoise"] = base_params.detailer_denoise
+        face_params = replace(face_params, **overrides)
         prompt_graph, save_node_id, detection_node_id = build_face_detailer(
-            uploaded_name, base_params, FaceDetailerParams()
+            uploaded_name, base_params, face_params
         )
     elif kind == "hand":
+        hand_params = HandDetailerParams()
+        overrides = _detailer_cfg_steps_overrides(base_params)
+        if base_params.detailer_denoise is not None:
+            overrides["denoise"] = base_params.detailer_denoise
+        hand_params = replace(hand_params, **overrides)
         prompt_graph, save_node_id, detection_node_id = build_hand_detailer(
-            uploaded_name, base_params, HandDetailerParams()
+            uploaded_name, base_params, hand_params
         )
     elif kind == "hand_manual":
         assert point_frac is not None, "hand_manual requires point_frac"
@@ -926,6 +1073,10 @@ async def post_process(
             if box_size_frac is None
             else ManualHandDetailerParams(box_size_frac=box_size_frac)
         )
+        overrides = _detailer_cfg_steps_overrides(base_params)
+        if base_params.detailer_denoise is not None:
+            overrides["denoise"] = base_params.detailer_denoise
+        manual_params = replace(manual_params, **overrides)
         prompt_graph, save_node_id = build_hand_detailer_manual(
             uploaded_name, base_params, manual_params, point_frac, image_size
         )
@@ -933,10 +1084,23 @@ async def post_process(
         assert mask_bytes is not None, "hand_drawn requires mask_bytes"
         mask_upload = await client.upload_image(mask_bytes, filename=f"mask_{source_filename}")
         drawn_hand_params = DrawnMaskHandDetailerParams()
-        if denoise is not None:
-            drawn_hand_params = replace(drawn_hand_params, denoise=denoise)
+        overrides = _detailer_cfg_steps_overrides(base_params)
+        effective_denoise = denoise if denoise is not None else base_params.detailer_denoise
+        if effective_denoise is not None:
+            overrides["denoise"] = effective_denoise
+        drawn_hand_params = replace(drawn_hand_params, **overrides)
+        if not is_detail_prompt:
+            enable_tile_controlnet = False
+        elif tile_controlnet_override is not None:
+            enable_tile_controlnet = tile_controlnet_override
+        else:
+            enable_tile_controlnet = base_params.detail_prompt_tile_controlnet
         prompt_graph, save_node_id = build_hand_detailer_drawn_mask(
-            uploaded_name, mask_upload["name"], base_params, drawn_hand_params
+            uploaded_name,
+            mask_upload["name"],
+            base_params,
+            drawn_hand_params,
+            enable_tile_controlnet=enable_tile_controlnet,
         )
     elif kind == "fix_drawn":
         assert mask_bytes is not None, "fix_drawn requires mask_bytes"

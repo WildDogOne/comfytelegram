@@ -234,7 +234,7 @@ def _pending() -> dict:
 def test_detail_prompt_readonly_info_is_the_drawn_mask_detailers_own_settings():
     from comfytelegram.workflows import DrawnMaskHandDetailerParams
 
-    info = _detail_prompt_readonly_info()
+    info = _detail_prompt_readonly_info(None)
 
     params = DrawnMaskHandDetailerParams()
     assert info == {
@@ -244,6 +244,55 @@ def test_detail_prompt_readonly_info_is_the_drawn_mask_detailers_own_settings():
         "scheduler": params.scheduler,
         "denoise": params.denoise,
     }
+
+
+def test_detail_prompt_readonly_info_reflects_profile_detailer_denoise():
+    """A blank denoise field on "✏️ Detail Prompt" resolves to the
+    checkpoint's `defaults.detailer_denoise` when set (see
+    `generation.post_process`'s `effective_denoise`) — the readonly
+    reference shown alongside the field must say so instead of always
+    showing `DrawnMaskHandDetailerParams`' own hard-coded 0.5."""
+    from comfytelegram.profiles import ModelProfile, ProfileDefaults
+
+    live_profile = ModelProfile(
+        match=["banana*"],
+        display_name="Banana Splitz Test",
+        defaults=ProfileDefaults(detailer_denoise=0.15),
+    )
+
+    info = _detail_prompt_readonly_info(live_profile)
+
+    assert info["denoise"] == 0.15
+
+
+def test_detail_prompt_readonly_info_reflects_profile_detailer_cfg_and_steps():
+    """`cfg`/`steps` have no one-shot field to override on the WebApp
+    itself, so the readonly reference should show what the run will
+    actually use — the checkpoint's `defaults.detailer_cfg`/`detailer_steps`
+    when set, not `DrawnMaskHandDetailerParams`' own hard-coded 5.0/25."""
+    from comfytelegram.profiles import ModelProfile, ProfileDefaults
+
+    live_profile = ModelProfile(
+        match=["banana*"],
+        display_name="Banana Splitz Test",
+        defaults=ProfileDefaults(detailer_cfg=4.0, detailer_steps=30),
+    )
+
+    info = _detail_prompt_readonly_info(live_profile)
+
+    assert info["cfg"] == 4.0
+    assert info["steps"] == 30
+
+
+def test_detail_prompt_readonly_info_falls_back_without_profile_detailer_denoise():
+    from comfytelegram.profiles import ModelProfile
+    from comfytelegram.workflows import DrawnMaskHandDetailerParams
+
+    live_profile = ModelProfile(match=["furry*"], display_name="No Override")
+
+    info = _detail_prompt_readonly_info(live_profile)
+
+    assert info["denoise"] == DrawnMaskHandDetailerParams().denoise
 
 
 @pytest.mark.asyncio
@@ -274,6 +323,10 @@ async def test_detail_prompt_button_uploads_and_opens_the_mask_editor():
     assert meta["positive"] == "a fox in a forest"
     assert meta["negative"] == "worst quality"
     assert "steps" in meta["readonly"]
+    # No profile matches "ckpt.safetensors" against an empty profiles list
+    # (`_context`'s default) — nothing for the checkbox to turn on.
+    assert meta["tile_controlnet_available"] is False
+    assert meta["tile_controlnet_default"] is False
 
     storage.store_inpaint_job.assert_called_once_with(
         "tok1", "abc123", 1, query.message.message_thread_id, kind="detail"
@@ -281,6 +334,43 @@ async def test_detail_prompt_button_uploads_and_opens_the_mask_editor():
     status_message.edit_text.assert_awaited_once()
     button = status_message.edit_text.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
     assert button.web_app.url == "https://inpaint.example.com/jobs/tok1"
+
+
+@pytest.mark.asyncio
+async def test_detail_prompt_button_reports_tile_controlnet_availability_from_live_profile():
+    """The checkbox's availability/starting state comes off the
+    checkpoint's *current* profile, not anything frozen into the image's
+    own `full_params` — same "live, not frozen" reasoning
+    `generation._refresh_detail_prompt_tile_controlnet` applies on the way
+    back in."""
+    from comfytelegram.profiles import ModelProfile
+
+    update, query = _callback_update(f"pp:{DETAIL_PROMPT_CALLBACK_KIND}:abc123")
+    storage = MagicMock()
+    storage.get_pending_result.return_value = _pending()
+    live_profile = ModelProfile(
+        match=["ckpt*"],
+        display_name="Test",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        detail_prompt_tile_controlnet=True,
+    )
+    context = _context(storage, profiles=[live_profile])
+    context.bot_data["settings"] = MagicMock(
+        allowed_user_ids=None,
+        inpaint_relay_url="https://inpaint.example.com",
+        inpaint_relay_shared_secret="shh",
+    )
+    status_message = AsyncMock()
+    query.message.reply_text.return_value = status_message
+
+    with patch(
+        "comfytelegram.handlers._relay_create_job", new=AsyncMock(return_value="tok1")
+    ) as create_job:
+        await postprocess_callback(update, context)
+
+    meta = create_job.await_args.kwargs["meta"]
+    assert meta["tile_controlnet_available"] is True
+    assert meta["tile_controlnet_default"] is True
 
 
 @pytest.mark.asyncio
@@ -336,6 +426,7 @@ async def test_process_one_inpaint_job_detail_kind_runs_the_one_shot_prompt():
                     "positive": "two hands",
                     "negative": "jewellery",
                     "denoise": 0.42,
+                    "tile_controlnet": True,
                     "init_data": "raw-init-data",
                 }
             ),
@@ -350,6 +441,13 @@ async def test_process_one_inpaint_job_detail_kind_runs_the_one_shot_prompt():
     assert pp.await_args.kwargs["detail_negative_prompt"] == "jewellery"
     assert pp.await_args.kwargs["denoise"] == 0.42
     assert pp.await_args.args[1] == "hand_drawn"
+    # A "detail" job is the one thing that should ever turn on the
+    # tile-ControlNet experiment (`ModelProfile.detail_prompt_tile_controlnet`)
+    # — see `_DRAWN_MASK_KINDS`'s `is_detail_prompt` entry.
+    assert pp.await_args.kwargs["is_detail_prompt"] is True
+    # The WebApp's own checkbox — submitted as an explicit True/False,
+    # forwarded straight into `post_process` as the override.
+    assert pp.await_args.kwargs["tile_controlnet_override"] is True
 
     # One-shot: nothing about the prompt is stored on the image itself.
     assert "detail_prompt" not in storage.store_pending_result.call_args.kwargs
@@ -358,6 +456,7 @@ async def test_process_one_inpaint_job_detail_kind_runs_the_one_shot_prompt():
     storage.store_inpaint_redo.assert_called_once()
     redo_kwargs = storage.store_inpaint_redo.call_args.kwargs
     assert redo_kwargs["detail_prompt"] == "two hands"
+    assert redo_kwargs["tile_controlnet"] is True
     assert redo_kwargs["detail_negative_prompt"] == "jewellery"
     assert redo_kwargs["detail_denoise"] == 0.42
 
@@ -400,6 +499,7 @@ async def test_hand_draw_job_never_carries_a_prompt():
                     "positive": None,
                     "negative": None,
                     "denoise": None,
+                    "tile_controlnet": None,
                     "init_data": "raw-init-data",
                 }
             ),
@@ -413,6 +513,10 @@ async def test_hand_draw_job_never_carries_a_prompt():
     assert pp.await_args.kwargs["detail_prompt"] is None
     assert pp.await_args.kwargs["detail_negative_prompt"] is None
     assert pp.await_args.kwargs["denoise"] is None
+    assert pp.await_args.kwargs["tile_controlnet_override"] is None
+    # "🖌️ Draw Mask" must never turn on the tile-ControlNet experiment,
+    # even if the profile has `detail_prompt_tile_controlnet` set.
+    assert pp.await_args.kwargs["is_detail_prompt"] is False
 
 
 @pytest.mark.asyncio
@@ -427,6 +531,7 @@ async def test_detail_redo_replays_the_stored_mask_and_prompt():
         "detail_prompt": "two hands",
         "detail_negative_prompt": "jewellery",
         "detail_denoise": 0.42,
+        "tile_controlnet": True,
     }
     context = _context(storage)
 
@@ -441,10 +546,13 @@ async def test_detail_redo_replays_the_stored_mask_and_prompt():
     assert pp.await_args.kwargs["detail_prompt"] == "two hands"
     assert pp.await_args.kwargs["detail_negative_prompt"] == "jewellery"
     assert pp.await_args.kwargs["denoise"] == 0.42
+    assert pp.await_args.kwargs["is_detail_prompt"] is True
+    assert pp.await_args.kwargs["tile_controlnet_override"] is True
     # The redo's own result carries the override forward again, so a
     # second redo of *that* result can chain indefinitely.
     storage.store_inpaint_redo.assert_called_once()
     assert storage.store_inpaint_redo.call_args.kwargs["detail_prompt"] == "two hands"
+    assert storage.store_inpaint_redo.call_args.kwargs["tile_controlnet"] is True
 
 
 @pytest.mark.asyncio

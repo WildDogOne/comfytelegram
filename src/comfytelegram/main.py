@@ -90,10 +90,23 @@ _COMMANDS = (
 #: bot simply appearing to ignore you. Pairs with `TEXT_CONTENT` rather
 #: than `filters.TEXT` so it stays the exact complement of the real
 #: handlers' filters, and doesn't claim rich messages back off them.
+#: `filters.StatusUpdate.ALL` is carved out of that "or" separately —
+#: renaming/closing/reopening a forum topic, pinning a message, a member
+#: joining/leaving, etc. all arrive as a service `Message` with no text,
+#: so without this they matched the same "neither text, photo, nor image"
+#: branch above and got the confusing "I didn't understand that" reply for
+#: an action nobody typed at the bot at all. None of this codebase's real
+#: handlers filter on `StatusUpdate` either (the WebApp mask editor's
+#: results come back out-of-band through `inpaint_relay`'s own HTTP poll,
+#: never through Telegram's `WEB_APP_DATA` service message — see
+#: `poll_inpaint_jobs`), so excluding it here just means these updates
+#: match no handler at all and are silently ignored, same as before this
+#: catch-all handler existed — deliberately, since there's nothing for the
+#: bot to usefully say about them.
 _UNHANDLED_FILTER = (
     filters.COMMAND
     & ~filters.Regex(rf"^/({'|'.join(name for name, _, _ in _COMMANDS)})(@\w+)?(\s|$)")
-) | ~(TEXT_CONTENT | filters.PHOTO | filters.Document.IMAGE)
+) | ~(TEXT_CONTENT | filters.PHOTO | filters.Document.IMAGE | filters.StatusUpdate.ALL)
 
 
 async def _log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

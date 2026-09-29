@@ -102,6 +102,26 @@ class Job:
     #: denoise) — set at creation from `meta`, this relay never reads it,
     #: just carries it through.
     readonly_info: dict[str, Any] | None = None
+    #: Whether comfytelegram's tile-ControlNet experiment
+    #: (`ModelProfile.detail_prompt_tile_controlnet`) is even relevant for
+    #: this checkpoint at all (i.e. `tile_controlnet` is also set) — set at
+    #: creation from `meta`, `False` for a plain "mask" job. The editor page
+    #: hides its checkbox entirely when this is `False`, since there'd be
+    #: nothing for it to actually turn on. `tile_controlnet_default` is that
+    #: checkbox's starting checked state, mirroring the profile's own
+    #: default at the moment the job was created — this relay never
+    #: interprets either, just carries them through the same way as
+    #: `readonly_info`.
+    tile_controlnet_available: bool = False
+    tile_controlnet_default: bool = False
+    #: The actual submitted checkbox state, for a `mode == "mask_prompt"`
+    #: job only — `None` until `submit_mask` runs, and always `None` for a
+    #: plain "mask" job (which never shows the checkbox at all, so there's
+    #: nothing to submit). Unlike `denoise`, there's no "blank means no
+    #: override" here — a checkbox is always either checked or unchecked,
+    #: so `submit_mask` always records a definite `True`/`False` for a
+    #: `mask_prompt` job's submission, never leaves this `None`.
+    tile_controlnet: bool | None = None
     init_data: str | None = None
 
 
@@ -204,9 +224,10 @@ async def create_job(request: Request) -> dict[str, str]:
     usual reason to open "✏️ Detail Prompt" is to cut a scene-wide prompt
     down to what the marked region needs, not type one from scratch — but
     these are only ever read back once, off `GET /jobs/{token}/result`;
-    nothing is saved beyond that one submission) and read-only reference
-    info to display — a plain "mask" job (the common case) sends none of
-    this.
+    nothing is saved beyond that one submission), read-only reference info
+    to display, and whether/how to pre-check the tile-ControlNet checkbox
+    (`tile_controlnet_available`/`tile_controlnet_default` — see `Job`) —
+    a plain "mask" job (the common case) sends none of this.
 
     The image is stored and later served verbatim — comfytelegram
     compresses before uploading (`handlers._to_display_jpeg`), so there is
@@ -226,6 +247,8 @@ async def create_job(request: Request) -> dict[str, str]:
         positive_prompt=meta.get("positive"),
         negative_prompt=meta.get("negative"),
         readonly_info=meta.get("readonly"),
+        tile_controlnet_available=bool(meta.get("tile_controlnet_available", False)),
+        tile_controlnet_default=bool(meta.get("tile_controlnet_default", False)),
     )
     return {"token": token}
 
@@ -265,6 +288,8 @@ async def job_meta(token: str) -> JSONResponse:
             "positive": job.positive_prompt,
             "negative": job.negative_prompt,
             "readonly": job.readonly_info or {},
+            "tile_controlnet_available": job.tile_controlnet_available,
+            "tile_controlnet_default": job.tile_controlnet_default,
         }
     )
 
@@ -284,10 +309,12 @@ async def submit_mask(token: str, request: Request) -> dict[str, bool]:
     `mask` file field (grayscale PNG, white = inpaint) and an `init_data`
     text field (`Telegram.WebApp.initData`, opaque to this relay — see
     module docstring for why it's forwarded rather than checked here).
-    `mode="mask_prompt"` jobs also submit `positive`/`negative`/`denoise`
-    text fields alongside the mask, in this same POST — one Done tap, one
-    request, covering both what got drawn and what should happen there
-    (any of the three may be blank, meaning "no override")."""
+    `mode="mask_prompt"` jobs also submit `positive`/`negative`/`denoise`/
+    `tile_controlnet` fields alongside the mask, in this same POST — one
+    Done tap, one request, covering both what got drawn and what should
+    happen there (`positive`/`negative`/`denoise` may be blank, meaning "no
+    override"; `tile_controlnet` is a checkbox, always either "true" or
+    "false", never blank)."""
     _prune_expired_jobs()
     job = _get_job_or_404(token)
     form = await request.form()
@@ -301,6 +328,7 @@ async def submit_mask(token: str, request: Request) -> dict[str, bool]:
         job.negative_prompt = _none_if_blank(form.get("negative"))
         denoise_raw = _none_if_blank(form.get("denoise"))
         job.denoise = float(denoise_raw) if denoise_raw is not None else None
+        job.tile_controlnet = str(form.get("tile_controlnet", "")).strip().lower() == "true"
     job.init_data = str(init_data)
     job.status = "submitted"
     return {"ok": True}
@@ -326,6 +354,7 @@ async def job_result(token: str) -> JSONResponse:
             "positive": job.positive_prompt,
             "negative": job.negative_prompt,
             "denoise": job.denoise,
+            "tile_controlnet": job.tile_controlnet,
             "init_data": job.init_data,
         }
     )

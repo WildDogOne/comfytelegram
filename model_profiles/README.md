@@ -25,7 +25,10 @@ Files starting with `_` are ignored (reserved for docs/schema files).
     "clip_skip": -2,
     "width": 1024,
     "height": 1024,
-    "upscale_denoise": 0.2              // UltimateSDUpscale's denoise for "🔍 Upscale 4x" (omit to use its own default) — see below
+    "upscale_denoise": 0.2,             // UltimateSDUpscale's denoise for "🔍 Upscale 4x" (omit to use its own default) — see below
+    "detailer_denoise": null,           // overrides the face/hand-detailer passes' own denoise for this checkpoint (omit/null to use each graph's own default) — see below
+    "detailer_cfg": null,               // same idea, for cfg (omit/null to use each graph's own default, 5.0) — see below
+    "detailer_steps": null              // same idea, for steps (omit/null to use each graph's own default, 25) — see below
   },
   "positive_prompt_prefix": "quality tags prepended before the user's prompt",
   "negative_prompt_prefix": "used as the negative prompt whenever the user doesn't supply one",
@@ -48,6 +51,7 @@ Files starting with `_` are ignored (reserved for docs/schema files).
   "model_sampling_shift": null,        // "split" only: shift for a ModelSamplingAuraFlow node (omit/null to skip it)
   "tile_controlnet": null,             // ControlNet Tile model filename for the upscale pass (omit/null to skip it) — see below
   "tile_controlnet_strength": 0.4,     // ControlNetApplyAdvanced's strength for tile_controlnet
+  "detail_prompt_tile_controlnet": false, // "✏️ Detail Prompt" only: also condition its detailer on tile_controlnet — see below
   "anima_lllite_inpaint_patch": null,  // "split" (Anima) only: ETN_control_load weights filename for the "🩹 Fix Artifact" pass (omit/null to skip it) — see below
   "anima_lllite_inpaint_patch_strength": 1.0, // ETN_control_apply's strength for anima_lllite_inpaint_patch
   "fix_artifact_checkpoint": null      // exact filename "🩹 Fix Artifact" always uses instead of the image's own checkpoint (omit/null to keep using each image's own) — see below
@@ -217,6 +221,74 @@ The two are meant to be tuned together: `furrytoonmix_illustrious.json`
 sets `upscale_denoise: 0.5` (up from the conservative `0.2` the base
 UpscaleParams default mirrors from `sample.json`) precisely because it
 also has a `tile_controlnet` staged to anchor that extra denoise.
+
+### `defaults.detailer_denoise`/`detailer_cfg`/`detailer_steps` — tuning the whole detailer family
+
+`FaceDetailerParams`/`HandDetailerParams`/`ManualHandDetailerParams`/
+`DrawnMaskHandDetailerParams` each hard-code their own denoise/cfg/steps
+(0.5-0.6 / 5.0 / 25) for their `DetailerForEach`/`FaceDetailer` sampling
+pass — mirroring `sample.json`'s own detailer node, entirely independent of
+whatever `cfg`/`steps` this checkpoint's own `defaults` block actually
+generates at. Most checkpoints tolerate that fine, but one whose detailer
+pass artifacts or strays off-structure even at a much lower denoise than
+that (surfaced by Banana Splitz XXL — `tile_controlnet`-anchoring the
+detailer, see below, actually made this *worse* for it, not better) needs
+its own lower ceiling, and one whose own tuned cfg genuinely differs from
+5.0 (Banana Splitz XXL's own `defaults.cfg` is 4.0) had no way at all to
+carry that into its detailer passes. Setting `defaults.detailer_denoise`/
+`detailer_cfg`/`detailer_steps` overrides each independently for *every*
+detailer-family pass on that checkpoint: "🎯 Face Detail", "🖐️ Hand Detail"
+(auto-detect), "✋ Tap to mark", and "🖌️ Draw Mask"/"✏️ Detail Prompt".
+`detailer_denoise` is the one exception with a one-shot field of its own —
+"✏️ Detail Prompt"'s own denoise field, when actually submitted, still wins
+over it; `detailer_cfg`/`detailer_steps` have no equivalent per-submission
+field, so they apply from the profile unconditionally whenever set.
+Deliberately excluded from all three: "🩹 Fix Artifact" ('fix_drawn'), which
+always uses `DrawnMaskFixParams`' own fixed, higher, removal-oriented
+denoise/cfg/steps (and, if `fix_artifact_checkpoint` is set, a different
+checkpoint's profile entirely) by design. `null`/omitted (the default,
+independently for each) leaves that graph's own hard-coded value in place.
+Like `upscale_denoise`, editing any of these takes effect on the very next
+detailer tap — no regeneration needed.
+
+### `detail_prompt_tile_controlnet` — the same idea, tried on "✏️ Detail Prompt"
+
+Same off-structure-drift problem `tile_controlnet` solves for the upscale
+pass, but for the DetailerForEach pass behind "✏️ Detail Prompt" instead:
+a checkpoint whose detailer strays/artifacts at any denoise high enough to
+still add real detail forces you to choose between consistency (low
+denoise, less detail) and quality (higher denoise, more drift) with no
+middle ground. Setting `detail_prompt_tile_controlnet: true` (needs
+`tile_controlnet` set too — a no-op otherwise, same as leaving
+`tile_controlnet` itself unset) conditions the detailer's positive/
+negative on `tile_controlnet` the exact same `ControlNetLoader`+
+`ControlNetApplyAdvanced` way the upscale pass does, as an experiment to
+see whether anchoring it to the source image lets you raise denoise
+without losing structure. `banana_splitz_xxl.json` turns this on as a live
+test for exactly this symptom — flip it back to `false` if it doesn't
+help, no regeneration needed to see the change (`generation.
+post_process`'s `is_detail_prompt`-gated live refresh picks up a profile
+edit on the very next "✏️ Detail Prompt" tap).
+
+This field is only the *default* the WebApp mask editor pre-checks its own
+"Tile ControlNet" checkbox with, shown right next to the prompt/denoise
+fields (and hidden entirely when `tile_controlnet` isn't set at all, since
+there'd be nothing for it to turn on) — whatever the checkbox is actually
+showing when "Done" is tapped is what gets used for that one submission,
+overriding this field rather than just mirroring it. So you don't have to
+edit this JSON file at all to try it once on a single image; set it here
+once you've decided you want it on (or off) by default going forward.
+
+
+
+Deliberately scoped to *only* "✏️ Detail Prompt" — "🖌️ Draw Mask" and
+"🩹 Fix Artifact" share the exact same underlying graph-building function
+(`_build_drawn_mask_detailer` in `workflows/builder.py`) but never read
+this field at all, even when it's `true`. There's no `kind` value that
+tells them apart at that level (both "🖌️ Draw Mask" and "✏️ Detail
+Prompt" are `post_process(kind="hand_drawn")` — see `generation.
+post_process`'s `is_detail_prompt` parameter, which is what actually makes
+the distinction, from `handlers.py`'s `_DRAWN_MASK_KINDS` table).
 
 ### `anima_lllite_inpaint_patch` — making "🩹 Fix Artifact" actually inpainting-aware
 

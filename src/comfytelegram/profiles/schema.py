@@ -69,6 +69,9 @@ class ProfileDefaults(BaseModel):
     height: int | None = None
     batch_size: int | None = None
     upscale_denoise: float | None = None
+    detailer_denoise: float | None = None
+    detailer_cfg: float | None = None
+    detailer_steps: int | None = None
 
 
 class ModelProfile(BaseModel):
@@ -177,6 +180,23 @@ class ModelProfile(BaseModel):
     )
     tile_controlnet_strength: float = Field(
         0.4, description="tile_controlnet only: ControlNetApplyAdvanced's strength"
+    )
+    detail_prompt_tile_controlnet: bool = Field(
+        False,
+        description=(
+            "Whether '✏️ Detail Prompt' also conditions its DetailerForEach pass on "
+            "tile_controlnet, the same ControlNetLoader+ControlNetApplyAdvanced wiring "
+            "the '🔍 Upscale 4x'/'🧵 Homogenize' passes already use — an experiment for a "
+            "checkpoint whose detailer strays off-structure at any denoise high enough "
+            "to still add real detail, to see whether anchoring it to the source image "
+            "steadies that. False (the default) skips the branch entirely, same as "
+            "tile_controlnet being unset — it's a no-op regardless of this flag if "
+            "tile_controlnet itself isn't also set. '🖌️ Draw Mask'/'🩹 Fix Artifact' never "
+            "read this at all, even though they share the exact same graph-building "
+            "function as '✏️ Detail Prompt' — see generation.post_process's "
+            "is_detail_prompt parameter for how that distinction is actually made, "
+            "since post_process's own kind ('hand_drawn') is identical for both."
+        ),
     )
 
     anima_lllite_inpaint_patch: str | None = Field(

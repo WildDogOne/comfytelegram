@@ -213,24 +213,35 @@ DETAIL_REDO4_CALLBACK_KIND = "detail_redo4"
 #: `FIX_REDO4_CALLBACK_KIND`, and "detail" means `"hand_drawn")` again (see
 #: `DETAIL_PROMPT_CALLBACK_KIND`) but labeled "Detailing" with its own
 #: `DETAIL_REDO_CALLBACK_KIND`/`DETAIL_REDO4_CALLBACK_KIND` redo buttons.
-_DRAWN_MASK_KINDS: dict[str, dict[str, str]] = {
+#: `is_detail_prompt` is this same table's answer to the one thing
+#: `post_process_kind` alone can't say — "hand" and "detail" share the
+#: identical `post_process_kind="hand_drawn")`, but only "detail" is
+#: actually the "✏️ Detail Prompt" flow `generation.post_process`'s own
+#: `is_detail_prompt` parameter gates the tile-ControlNet experiment on
+#: (`ModelProfile.detail_prompt_tile_controlnet`) — see that parameter's
+#: docstring for why `post_process_kind` alone can't already tell them
+#: apart.
+_DRAWN_MASK_KINDS: dict[str, dict[str, Any]] = {
     "hand": {
         "post_process_kind": "hand_drawn",
         "label": "Refining hand",
         "redo_callback_kind": HAND_REDO_CALLBACK_KIND,
         "redo4_callback_kind": HAND_REDO4_CALLBACK_KIND,
+        "is_detail_prompt": False,
     },
     "fix": {
         "post_process_kind": "fix_drawn",
         "label": "Fixing artifact",
         "redo_callback_kind": FIX_REDO_CALLBACK_KIND,
         "redo4_callback_kind": FIX_REDO4_CALLBACK_KIND,
+        "is_detail_prompt": False,
     },
     "detail": {
         "post_process_kind": "hand_drawn",
         "label": "Detailing",
         "redo_callback_kind": DETAIL_REDO_CALLBACK_KIND,
         "redo4_callback_kind": DETAIL_REDO4_CALLBACK_KIND,
+        "is_detail_prompt": True,
     },
 }
 #: How many revisions "🔁 x4" produces in one tap.
@@ -1217,13 +1228,13 @@ async def _relay_poll_result(settings: Settings, token: str) -> dict[str, Any] |
     or the relay no longer knows about it at all (404 — e.g. a relay
     restart lost its in-memory job store, see inpaint_relay's own docs), or
     `{"mask": <bytes>, "positive": <str|None>, "negative": <str|None>,
-    "denoise": <float|None>, "init_data": <str>}` once submitted — every
-    job submits a mask (both "mask" and "mask_prompt" jobs draw one);
-    `positive`/`negative`/`denoise` are only ever non-None for a
-    `DETAIL_PROMPT_CALLBACK_KIND` job's `mode="mask_prompt"` submission, so
-    `_process_one_inpaint_job` can pass all three straight into
-    `post_process` unconditionally — they're simply always `None` for
-    "🖌️ Draw Mask"/"🩹 Fix Artifact"."""
+    "denoise": <float|None>, "tile_controlnet": <bool|None>, "init_data":
+    <str>}` once submitted — every job submits a mask (both "mask" and
+    "mask_prompt" jobs draw one); `positive`/`negative`/`denoise`/
+    `tile_controlnet` are only ever non-None for a `DETAIL_PROMPT_CALLBACK_KIND`
+    job's `mode="mask_prompt"` submission, so `_process_one_inpaint_job` can
+    pass all four straight into `post_process` unconditionally — they're
+    simply always `None` for "🖌️ Draw Mask"/"🩹 Fix Artifact"."""
     async with (
         aiohttp.ClientSession(timeout=_INPAINT_RELAY_TIMEOUT) as session,
         session.get(
@@ -1242,6 +1253,7 @@ async def _relay_poll_result(settings: Settings, token: str) -> dict[str, Any] |
         "positive": payload.get("positive"),
         "negative": payload.get("negative"),
         "denoise": payload.get("denoise"),
+        "tile_controlnet": payload.get("tile_controlnet"),
         "init_data": payload["init_data"],
     }
 
@@ -1274,6 +1286,8 @@ async def _run_drawn_mask_post_process(
     detail_prompt: str | None = None,
     detail_negative_prompt: str | None = None,
     detail_denoise: float | None = None,
+    is_detail_prompt: bool = False,
+    tile_controlnet_override: bool | None = None,
 ) -> GeneratedImage | None:
     """Shared by `_process_one_inpaint_job` (a freshly submitted mask) and
     `postprocess_callback`'s `*_REDO_CALLBACK_KIND` branch (re-running a
@@ -1281,14 +1295,22 @@ async def _run_drawn_mask_post_process(
     `inpaint_redo` — for when a detailer result comes out badly and
     redrawing the whole mask from scratch would be overkill) — both need
     the exact same `post_process` call, status-message error reporting, and
-    status-message cleanup around it. `post_process_kind`/`label` come from
-    `_DRAWN_MASK_KINDS` ("hand"/"fix"/"detail"). `profiles` only matters for
-    `post_process_kind="fix_drawn"` — see `generation.
-    _fix_artifact_override_base` — passed through unconditionally since
-    "hand_drawn" ignores it. `detail_prompt`/`detail_negative_prompt`/
-    `detail_denoise` are "✏️ Detail Prompt"'s one-shot mask+prompt override
-    (see `DETAIL_PROMPT_CALLBACK_KIND`) — `None`/`None`/`None` for
-    "🖌️ Draw Mask"/"🩹 Fix Artifact", which never collect a prompt at all.
+    status-message cleanup around it. `post_process_kind`/`label`/
+    `is_detail_prompt` come from `_DRAWN_MASK_KINDS` ("hand"/"fix"/
+    "detail"). `profiles` matters for `post_process_kind="fix_drawn"` (see
+    `generation._fix_artifact_override_base`) and for `post_process_kind=
+    "hand_drawn"` when `is_detail_prompt` is also True (see
+    `generation._refresh_detail_prompt_tile_controlnet`) — passed through
+    unconditionally either way, since a plain "🖌️ Draw Mask" call
+    (`is_detail_prompt=False`) still ignores it. `detail_prompt`/
+    `detail_negative_prompt`/`detail_denoise` are "✏️ Detail Prompt"'s
+    one-shot mask+prompt override (see `DETAIL_PROMPT_CALLBACK_KIND`) —
+    `None`/`None`/`None` for "🖌️ Draw Mask"/"🩹 Fix Artifact", which never
+    collect a prompt at all. `tile_controlnet_override` is the WebApp's own
+    tile-ControlNet checkbox, submitted alongside the mask for a "detail"
+    job only (see `generation.post_process`'s own docstring for how it
+    overrides the profile's `detail_prompt_tile_controlnet` default) —
+    `None` for "🖌️ Draw Mask"/"🩹 Fix Artifact", same as the prompt fields.
     Returns None on failure (already reported into `status_message` by
     `_run_reporting_errors`); callers should treat that as "stop here",
     same as `_run_reporting_errors` itself."""
@@ -1306,6 +1328,8 @@ async def _run_drawn_mask_post_process(
             detail_prompt=detail_prompt,
             detail_negative_prompt=detail_negative_prompt,
             denoise=detail_denoise,
+            is_detail_prompt=is_detail_prompt,
+            tile_controlnet_override=tile_controlnet_override,
             profiles=profiles,
         ),
     )
@@ -1327,6 +1351,7 @@ async def _send_drawn_mask_result_with_redo(
     detail_prompt: str | None = None,
     detail_negative_prompt: str | None = None,
     detail_denoise: float | None = None,
+    tile_controlnet: bool | None = None,
 ) -> None:
     """Send a `post_process(kind="hand_drawn"/"fix_drawn")` result with
     "🔁 Redo (same mask)"/"🔁 x4" buttons attached (one row), and persist what
@@ -1340,13 +1365,13 @@ async def _send_drawn_mask_result_with_redo(
     the result should carry. Every result carries both, including each of
     the `DRAWN_MASK_REDO4_COUNT` results a "🔁 x4" tap itself produces — the
     chain never drops back to single-redo-only. `detail_prompt`/
-    `detail_negative_prompt`/`detail_denoise` are "✏️ Detail Prompt"'s
-    one-shot override (`None` for "🖌️ Draw Mask"/"🩹 Fix Artifact") —
-    stored alongside the mask in `inpaint_redo` rather than passed to
-    `send`, since it's tied to *this specific mask*, not to the image in
-    general (a redo replays both together; a fresh detail/draw-mask/
-    fix-artifact tap always starts from nothing, whatever prompt a sibling
-    result's redo happens to carry)."""
+    `detail_negative_prompt`/`detail_denoise`/`tile_controlnet` are
+    "✏️ Detail Prompt"'s one-shot overrides (`None` for "🖌️ Draw Mask"/
+    "🩹 Fix Artifact") — stored alongside the mask in `inpaint_redo` rather
+    than passed to `send`, since they're tied to *this specific mask*, not
+    to the image in general (a redo replays all four together; a fresh
+    detail/draw-mask/fix-artifact tap always starts from nothing, whatever
+    a sibling result's redo happens to carry)."""
     new_result_id = uuid.uuid4().hex[:12]
     await send(
         generated,
@@ -1365,6 +1390,7 @@ async def _send_drawn_mask_result_with_redo(
         mask_bytes,
         detail_prompt=detail_prompt,
         detail_negative_prompt=detail_negative_prompt,
+        tile_controlnet=tile_controlnet,
         detail_denoise=detail_denoise,
     )
 
@@ -1376,7 +1402,7 @@ async def _run_one_drawn_mask_redo(
     chat_id: int,
     full_params: GenerationParams,
     redo: dict[str, Any],
-    drawn_mask_kind: dict[str, str],
+    drawn_mask_kind: dict[str, Any],
     profiles: list[ModelProfile],
     source_bytes: bytes,
 ) -> bool:
@@ -1388,18 +1414,19 @@ async def _run_one_drawn_mask_redo(
     depending on which button was tapped. `source_bytes` is downloaded once
     by the caller and reused across every iteration, rather than re-fetched
     per call. The one-shot `detail_prompt`/`detail_negative_prompt`/
-    `detail_denoise` a "✏️ Detail Prompt" redo replays come from `redo`
-    itself (`storage.py`'s `inpaint_redo`, stored alongside the mask at
-    submission time — see `_send_drawn_mask_result_with_redo`), not a
-    caller-supplied override; they're simply absent for a "🖌️ Draw Mask"/
-    "🩹 Fix Artifact" redo. Returns True on success, False on failure
-    (already reported into that iteration's own status message by
-    `_run_reporting_errors`) — the caller stops the loop on the first False
-    rather than continuing to burn ComfyUI time on a source/mask
-    combination that just failed."""
+    `detail_denoise`/`tile_controlnet` a "✏️ Detail Prompt" redo replays
+    come from `redo` itself (`storage.py`'s `inpaint_redo`, stored
+    alongside the mask at submission time — see
+    `_send_drawn_mask_result_with_redo`), not a caller-supplied override;
+    they're simply absent for a "🖌️ Draw Mask"/"🩹 Fix Artifact" redo.
+    Returns True on success, False on failure (already reported into that
+    iteration's own status message by `_run_reporting_errors`) — the
+    caller stops the loop on the first False rather than continuing to
+    burn ComfyUI time on a source/mask combination that just failed."""
     detail_prompt = redo.get("detail_prompt")
     detail_negative_prompt = redo.get("detail_negative_prompt")
     detail_denoise = redo.get("detail_denoise")
+    tile_controlnet_choice = redo.get("tile_controlnet")
     status_message = await reply_message.reply_text(
         f"{drawn_mask_kind['label']} (drawn mask)…", disable_notification=True
     )
@@ -1416,6 +1443,8 @@ async def _run_one_drawn_mask_redo(
         detail_prompt=detail_prompt,
         detail_negative_prompt=detail_negative_prompt,
         detail_denoise=detail_denoise,
+        is_detail_prompt=drawn_mask_kind["is_detail_prompt"],
+        tile_controlnet_override=tile_controlnet_choice,
     )
     if generated is None:
         return False
@@ -1431,6 +1460,7 @@ async def _run_one_drawn_mask_redo(
         detail_prompt=detail_prompt,
         detail_negative_prompt=detail_negative_prompt,
         detail_denoise=detail_denoise,
+        tile_controlnet=tile_controlnet_choice,
     )
     return True
 
@@ -1503,6 +1533,7 @@ async def _process_one_inpaint_job(
     detail_prompt = result.get("positive")
     detail_negative_prompt = result.get("negative")
     detail_denoise = result.get("denoise")
+    tile_controlnet_choice = result.get("tile_controlnet")
     source_bytes = await _fetch_source_image(
         client,
         application.bot,
@@ -1524,6 +1555,8 @@ async def _process_one_inpaint_job(
         detail_prompt=detail_prompt,
         detail_negative_prompt=detail_negative_prompt,
         detail_denoise=detail_denoise,
+        is_detail_prompt=drawn_mask_kind["is_detail_prompt"],
+        tile_controlnet_override=tile_controlnet_choice,
     )
     if generated is None:
         return
@@ -1546,6 +1579,7 @@ async def _process_one_inpaint_job(
         detail_prompt=detail_prompt,
         detail_negative_prompt=detail_negative_prompt,
         detail_denoise=detail_denoise,
+        tile_controlnet=tile_controlnet_choice,
     )
 
 
@@ -2619,23 +2653,46 @@ async def _send_archive_copy(
     await status_message.delete()
 
 
-def _detail_prompt_readonly_info() -> dict[str, Any]:
+def _detail_prompt_readonly_info(live_profile: ModelProfile | None) -> dict[str, Any]:
     """Read-only reference info sent to the "✏️ Detail Prompt" webapp
     alongside the editable positive/negative/denoise fields — a single flat
     dict, since unlike the old per-image override this replaced, the run
     that follows is always `post_process(kind="hand_drawn")`'s
     `DrawnMaskHandDetailerParams` (see `DETAIL_PROMPT_CALLBACK_KIND`), not
-    a choice made later. Built from that dataclass's own class-level
-    defaults: static, no image/profile dependency, so this needs no
-    arguments and could be computed once, but stays a function since it's
-    only ever called from one place."""
+    a choice made later. `sampler_name`/`scheduler` come straight from that
+    dataclass's own class-level defaults — static, no profile override
+    exists for either. `denoise`/`cfg`/`steps` are the exceptions: each is
+    what this exact submission would actually run at (see
+    `generation.post_process`'s `effective_denoise` for `denoise`, folded in
+    ahead of a blank field; `cfg`/`steps` apply from the profile
+    unconditionally, with no one-shot field of their own), which is the
+    checkpoint's live `defaults.detailer_denoise`/`detailer_cfg`/
+    `detailer_steps` when set, not always `DrawnMaskHandDetailerParams`' own
+    hard-coded 0.5/5.0/25 — showing the stale hard-coded values here for a
+    checkpoint like Banana Splitz XXL (cfg 4.0, not 5.0) would silently
+    mislead what "leave it blank" actually produces. `live_profile` is the
+    checkpoint's *current* profile (the same one the caller already resolved
+    for the tile-ControlNet checkbox), not whatever's frozen into the
+    image's own `full_params`."""
     params = DrawnMaskHandDetailerParams()
+    defaults = live_profile.defaults if live_profile is not None else None
+    denoise = (
+        defaults.detailer_denoise
+        if defaults and defaults.detailer_denoise is not None
+        else params.denoise
+    )
+    cfg = defaults.detailer_cfg if defaults and defaults.detailer_cfg is not None else params.cfg
+    steps = (
+        defaults.detailer_steps
+        if defaults and defaults.detailer_steps is not None
+        else params.steps
+    )
     return {
-        "steps": params.steps,
-        "cfg": params.cfg,
+        "steps": steps,
+        "cfg": cfg,
         "sampler_name": params.sampler_name,
         "scheduler": params.scheduler,
-        "denoise": params.denoise,
+        "denoise": denoise,
     }
 
 
@@ -2929,17 +2986,26 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         # reason to open this is to cut most of a scene-wide prompt down to
         # what the marked region actually needs, not type one from scratch
         # — but nothing about them is saved anywhere once the editor closes
-        # (see `DETAIL_PROMPT_CALLBACK_KIND`'s docstring).
-        meta = (
-            {
+        # (see `DETAIL_PROMPT_CALLBACK_KIND`'s docstring). The tile-
+        # ControlNet checkbox's availability/starting state comes off the
+        # checkpoint's *current* profile (not `full_params`' own frozen
+        # `tile_controlnet`/`detail_prompt_tile_controlnet`, which could be
+        # stale for an image generated before a profile edit) — same "live,
+        # not frozen" reasoning `generation._refresh_detail_prompt_tile_controlnet`
+        # applies on the way back in.
+        meta = None
+        if job_kind == "detail":
+            live_profile = resolve_profile(full_params.checkpoint, context.bot_data["profiles"])
+            meta = {
                 "mode": "mask_prompt",
                 "positive": full_params.positive_prompt,
                 "negative": full_params.negative_prompt,
-                "readonly": _detail_prompt_readonly_info(),
+                "readonly": _detail_prompt_readonly_info(live_profile),
+                "tile_controlnet_available": bool(live_profile and live_profile.tile_controlnet),
+                "tile_controlnet_default": bool(
+                    live_profile and live_profile.detail_prompt_tile_controlnet
+                ),
             }
-            if job_kind == "detail"
-            else None
-        )
         # Uploading a large source image to a remote relay host can take a
         # few seconds, with nothing on screen to show for it in the
         # meantime — long enough that a user unsure whether their tap
@@ -3220,6 +3286,7 @@ async def hand_point_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             full_params,
             point_frac=point_frac,
             box_size_frac=box_size_frac,
+            profiles=context.bot_data["profiles"],
         )
 
     result = await _run_reporting_errors(

@@ -177,6 +177,12 @@
     flex: 1;
     min-width: 100px;
   }
+  #tile-controlnet-row label {
+    font-size: 13px;
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+  }
   #denoise-value {
     font-size: 13px;
     color: #9a9a9a;
@@ -223,6 +229,20 @@
       <label><input type="checkbox" id="denoise-override" /> Override denoise</label>
       <input type="range" id="denoise-input" min="0" max="1" step="0.01" value="0.5" disabled />
       <span id="denoise-value">detailer default</span>
+    </div>
+    <!-- Only shown when the checkpoint's profile has both `tile_controlnet`
+         and `detail_prompt_tile_controlnet` available at all (`applyMeta`
+         reads `meta.tile_controlnet_available`) — hidden rather than shown
+         disabled, since there's nothing this checkbox could ever turn on
+         otherwise. Pre-checked from `meta.tile_controlnet_default`, but
+         always submitted as an explicit true/false either way — unlike
+         "Override denoise" above, a checkbox has no third "unset" state to
+         fall back to the profile's own default with. -->
+    <div id="tile-controlnet-row" style="display: none;">
+      <label
+        ><input type="checkbox" id="tile-controlnet-toggle" /> Tile ControlNet (experimental,
+        steadies the detailer against the source image)</label
+      >
     </div>
   </div>
 
@@ -277,6 +297,8 @@
   var denoiseOverride = document.getElementById("denoise-override");
   var denoiseInput = document.getElementById("denoise-input");
   var denoiseValueEl = document.getElementById("denoise-value");
+  var tileControlnetRow = document.getElementById("tile-controlnet-row");
+  var tileControlnetToggle = document.getElementById("tile-controlnet-toggle");
 
   // On by default (matches the button's own initial "active" class in the
   // markup) — `finishAction` checks this before running `runEnclosedFill`,
@@ -1244,6 +1266,11 @@
         form.append("positive", positiveInput.value);
         form.append("negative", negativeInput.value);
         form.append("denoise", denoiseOverride.checked ? denoiseInput.value : "");
+        // Always an explicit "true"/"false", unlike the three above — a
+        // checkbox has no blank "no override" state to fall back to the
+        // profile's own default with, so whatever it's currently showing
+        // is exactly what gets submitted.
+        form.append("tile_controlnet", tileControlnetToggle.checked ? "true" : "false");
       }
       fetch("/jobs/" + encodeURIComponent(token) + "/mask", {
         method: "POST",
@@ -1305,6 +1332,17 @@
       updateDenoiseReadout();
     });
     denoiseInput.addEventListener("input", updateDenoiseReadout);
+    // Hidden entirely (not shown-but-disabled) when this checkpoint's
+    // profile has no tile_controlnet staged at all — there'd be nothing
+    // for the checkbox to actually turn on either way. When it is shown,
+    // it starts checked/unchecked from the profile's own current default
+    // (`ModelProfile.detail_prompt_tile_controlnet`) but is always
+    // submitted as its own explicit value on "Done" regardless of that
+    // starting point.
+    if (meta.tile_controlnet_available) {
+      tileControlnetRow.style.display = "block";
+      tileControlnetToggle.checked = Boolean(meta.tile_controlnet_default);
+    }
   }
 
   function loadImage() {

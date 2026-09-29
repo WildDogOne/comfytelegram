@@ -512,6 +512,107 @@ def test_build_hand_detailer_drawn_mask_has_no_content_aware_fill():
     )
 
 
+def test_build_hand_detailer_drawn_mask_without_enable_flag_skips_tile_controlnet():
+    base = PostProcessBaseParams(
+        checkpoint="banana.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        tile_controlnet_strength=0.55,
+    )
+    prompt, _save_id = build_hand_detailer_drawn_mask(
+        "uploaded.png", "mask_uploaded.png", base, DrawnMaskHandDetailerParams()
+    )
+
+    types = _class_types(prompt)
+    assert "ControlNetLoader" not in types
+    assert "ControlNetApplyAdvanced" not in types
+
+
+def test_build_hand_detailer_drawn_mask_enable_flag_without_tile_controlnet_is_noop():
+    # `enable_tile_controlnet=True` alone isn't enough — same "no-op unless
+    # tile_controlnet is also set" rule the upscale pass follows.
+    base = PostProcessBaseParams(
+        checkpoint="banana.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+    )
+    prompt, _save_id = build_hand_detailer_drawn_mask(
+        "uploaded.png",
+        "mask_uploaded.png",
+        base,
+        DrawnMaskHandDetailerParams(),
+        enable_tile_controlnet=True,
+    )
+
+    types = _class_types(prompt)
+    assert "ControlNetLoader" not in types
+    assert "ControlNetApplyAdvanced" not in types
+
+
+def test_build_hand_detailer_drawn_mask_with_enable_flag_wires_apply_between_prompt_and_detailer():
+    base = PostProcessBaseParams(
+        checkpoint="banana.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        tile_controlnet_strength=0.55,
+    )
+    prompt, save_id = build_hand_detailer_drawn_mask(
+        "uploaded.png",
+        "mask_uploaded.png",
+        base,
+        DrawnMaskHandDetailerParams(seed=888),
+        enable_tile_controlnet=True,
+    )
+
+    types = _class_types(prompt)
+    assert types.count("ControlNetLoader") == 1
+    assert types.count("ControlNetApplyAdvanced") == 1
+
+    loader = next(n for n in prompt.values() if n["class_type"] == "ControlNetLoader")
+    assert loader["inputs"]["control_net_name"] == "xinsir_tile_sdxl.safetensors"
+
+    load_id = next(nid for nid, n in prompt.items() if n["class_type"] == "LoadImage")
+    apply = next(n for n in prompt.values() if n["class_type"] == "ControlNetApplyAdvanced")
+    assert apply["inputs"]["image"] == [load_id, 0]
+    assert apply["inputs"]["strength"] == 0.55
+
+    apply_id = next(
+        nid for nid, n in prompt.items() if n["class_type"] == "ControlNetApplyAdvanced"
+    )
+    detailer = next(n for n in prompt.values() if n["class_type"] == "DetailerForEach")
+    assert detailer["inputs"]["positive"] == [apply_id, 0]
+    assert detailer["inputs"]["negative"] == [apply_id, 1]
+    assert prompt[save_id]["class_type"] == "SaveImage"
+
+
+def test_build_fix_drawn_mask_has_no_enable_tile_controlnet_parameter_at_all():
+    # "🩹 Fix Artifact" never gets this experiment, even when the profile
+    # has tile_controlnet set — build_fix_drawn_mask doesn't expose the
+    # parameter in the first place, so there's no way to accidentally wire
+    # it in from that side.
+    import inspect
+
+    assert "enable_tile_controlnet" not in inspect.signature(build_fix_drawn_mask).parameters
+
+    base = PostProcessBaseParams(
+        checkpoint="banana.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+    )
+    prompt, _save_id = build_fix_drawn_mask(
+        "uploaded.png",
+        "mask_uploaded.png",
+        base,
+        DrawnMaskFixParams(),
+        image_size=(512, 512),
+        work_size=(512, 512),
+    )
+    assert "ControlNetLoader" not in _class_types(prompt)
+
+
 def _anima_fix_base() -> PostProcessBaseParams:
     return PostProcessBaseParams(
         checkpoint="anima_unet.safetensors",

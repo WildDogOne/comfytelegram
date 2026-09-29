@@ -133,8 +133,12 @@ def test_resolve_generation_params_defaults_to_checkpoint_loader_without_profile
     assert params.vae_name == ""
     assert params.model_sampling_shift is None
     assert params.tile_controlnet is None
+    assert params.detail_prompt_tile_controlnet is False
     assert params.anima_lllite_inpaint_patch is None
     assert params.upscale_denoise is None
+    assert params.detailer_denoise is None
+    assert params.detailer_cfg is None
+    assert params.detailer_steps is None
 
 
 def test_resolve_generation_params_carries_upscale_denoise_from_profile_defaults():
@@ -147,6 +151,27 @@ def test_resolve_generation_params_carries_upscale_denoise_from_profile_defaults
     assert params.upscale_denoise == 0.5
 
 
+def test_resolve_generation_params_carries_detailer_denoise_from_profile_defaults():
+    profile = ModelProfile(
+        match=["banana*"],
+        display_name="Banana Splitz Test",
+        defaults=ProfileDefaults(detailer_denoise=0.15),
+    )
+    params = resolve_generation_params("banana_splitz_xxl.safetensors", "a fox", profile)
+    assert params.detailer_denoise == 0.15
+
+
+def test_resolve_generation_params_carries_detailer_cfg_and_steps_from_profile_defaults():
+    profile = ModelProfile(
+        match=["banana*"],
+        display_name="Banana Splitz Test",
+        defaults=ProfileDefaults(detailer_cfg=4.0, detailer_steps=30),
+    )
+    params = resolve_generation_params("banana_splitz_xxl.safetensors", "a fox", profile)
+    assert params.detailer_cfg == 4.0
+    assert params.detailer_steps == 30
+
+
 def test_resolve_generation_params_carries_tile_controlnet_from_profile():
     profile = ModelProfile(
         match=["illustriousxl*"],
@@ -157,6 +182,17 @@ def test_resolve_generation_params_carries_tile_controlnet_from_profile():
     params = resolve_generation_params("illustriousxl_v10.safetensors", "a fox", profile)
     assert params.tile_controlnet == "xinsir_tile_sdxl.safetensors"
     assert params.tile_controlnet_strength == 0.55
+
+
+def test_resolve_generation_params_carries_detail_prompt_tile_controlnet_from_profile():
+    profile = ModelProfile(
+        match=["illustriousxl*"],
+        display_name="Illustrious Test",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        detail_prompt_tile_controlnet=True,
+    )
+    params = resolve_generation_params("illustriousxl_v10.safetensors", "a fox", profile)
+    assert params.detail_prompt_tile_controlnet is True
 
 
 def test_resolve_generation_params_carries_split_loader_fields_from_profile():

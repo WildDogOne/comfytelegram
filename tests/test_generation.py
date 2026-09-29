@@ -376,6 +376,106 @@ async def test_post_process_face_detailer_defaults_to_changed_when_mask_missing(
 
 
 @pytest.mark.asyncio
+async def test_post_process_face_honors_profile_detailer_denoise():
+    """A profile's `defaults.detailer_denoise` (added after Banana Splitz XXL
+    was observed artifacting even at FaceDetailerParams' own 0.6 default)
+    must actually reach the queued FaceDetailer node."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        detailer_denoise=0.15,
+    )
+
+    await post_process(client, "face", source, "source.png", params)
+
+    face_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "FaceDetailer"
+    )
+    assert face_node["inputs"]["denoise"] == 0.15
+
+
+@pytest.mark.asyncio
+async def test_post_process_face_honors_profile_detailer_cfg_and_steps():
+    """A profile's `defaults.detailer_cfg`/`detailer_steps` (added so a
+    checkpoint like Banana Splitz XXL, whose own cfg=4.0/steps=30 differ
+    from FaceDetailerParams' hard-coded cfg=5.0/steps=25, can carry those
+    values into its detailer passes) must reach the queued FaceDetailer
+    node."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        detailer_cfg=4.0,
+        detailer_steps=30,
+    )
+
+    await post_process(client, "face", source, "source.png", params)
+
+    face_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "FaceDetailer"
+    )
+    assert face_node["inputs"]["cfg"] == 4.0
+    assert face_node["inputs"]["steps"] == 30
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_honors_profile_detailer_denoise():
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        detailer_denoise=0.15,
+    )
+
+    await post_process(client, "hand", source, "source.png", params)
+
+    hand_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "FaceDetailer"
+    )
+    assert hand_node["inputs"]["denoise"] == 0.15
+
+
+@pytest.mark.asyncio
+async def test_post_process_detailer_denoise_prefers_live_profile_over_stale_frozen_params():
+    """Same "edit the profile, see it on the next tap" reasoning as
+    `test_post_process_upscale_prefers_live_profile_over_stale_frozen_params`
+    — a same-day profile edit to `detailer_denoise`/`detailer_cfg`/
+    `detailer_steps` should reach the very next "🎯 Face Detail" tap, not
+    just images generated after the edit."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        detailer_denoise=0.3,  # frozen at generation time — since lowered further
+        detailer_cfg=5.0,  # frozen at generation time — since corrected to 4.0
+        detailer_steps=25,  # frozen at generation time — since corrected to 30
+    )
+    live_profile = ModelProfile(
+        match=["banana*"],
+        display_name="Banana",
+        defaults=ProfileDefaults(detailer_denoise=0.15, detailer_cfg=4.0, detailer_steps=30),
+    )
+
+    await post_process(client, "face", source, "source.png", params, profiles=[live_profile])
+
+    face_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "FaceDetailer"
+    )
+    assert face_node["inputs"]["denoise"] == 0.15
+    assert face_node["inputs"]["cfg"] == 4.0
+    assert face_node["inputs"]["steps"] == 30
+
+
+@pytest.mark.asyncio
 async def test_post_process_upscale_never_flags_unchanged():
     """An upscale graph has no detection-check node at all, so there's no
     "detector found nothing" case to flag for it."""
@@ -550,6 +650,46 @@ async def test_post_process_hand_manual_requires_point_frac():
         await post_process(client, "hand_manual", source, "source.png", params)
 
 
+@pytest.mark.asyncio
+async def test_post_process_hand_manual_honors_profile_detailer_denoise():
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        detailer_denoise=0.15,
+    )
+
+    await post_process(client, "hand_manual", source, "source.png", params, point_frac=(0.5, 0.5))
+
+    detailer_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "DetailerForEach"
+    )
+    assert detailer_node["inputs"]["denoise"] == 0.15
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_manual_honors_profile_detailer_cfg_and_steps():
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        detailer_cfg=4.0,
+        detailer_steps=30,
+    )
+
+    await post_process(client, "hand_manual", source, "source.png", params, point_frac=(0.5, 0.5))
+
+    detailer_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "DetailerForEach"
+    )
+    assert detailer_node["inputs"]["cfg"] == 4.0
+    assert detailer_node["inputs"]["steps"] == 30
+
+
 def _pixels(png: bytes) -> bytes:
     """A PNG's decoded pixels. Used instead of comparing raw bytes because
     `generation._tag_images` now stamps every collected image with its own
@@ -687,6 +827,367 @@ async def test_post_process_hand_drawn_requires_mask_bytes():
 
     with pytest.raises(AssertionError):
         await post_process(client, "hand_drawn", source, "source.png", params)
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_drawn_falls_back_to_profile_detailer_denoise():
+    """A plain "🖌️ Draw Mask" tap (no one-shot `denoise` submitted) should
+    still pick up the checkpoint's `detailer_denoise` instead of always
+    landing on `DrawnMaskHandDetailerParams`' own hard-coded 0.5 default."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        detailer_denoise=0.15,
+    )
+
+    await post_process(client, "hand_drawn", source, "source.png", params, mask_bytes=mask)
+
+    detailer_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "DetailerForEach"
+    )
+    assert detailer_node["inputs"]["denoise"] == 0.15
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_drawn_explicit_denoise_overrides_profile_detailer_denoise():
+    """ "✏️ Detail Prompt"'s own one-shot `denoise` field, when actually
+    submitted, still wins over the checkpoint's `detailer_denoise` default —
+    the whole point of a per-submission field is trying a different value
+    without editing the profile's JSON file first."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        detailer_denoise=0.15,
+    )
+
+    await post_process(
+        client, "hand_drawn", source, "source.png", params, mask_bytes=mask, denoise=0.4
+    )
+
+    detailer_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "DetailerForEach"
+    )
+    assert detailer_node["inputs"]["denoise"] == 0.4
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_drawn_honors_profile_detailer_cfg_and_steps():
+    """`detailer_cfg`/`detailer_steps` have no one-shot field on "✏️ Detail
+    Prompt" at all — they apply from the profile unconditionally for
+    "🖌️ Draw Mask"/"✏️ Detail Prompt" alike."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        detailer_cfg=4.0,
+        detailer_steps=30,
+    )
+
+    await post_process(client, "hand_drawn", source, "source.png", params, mask_bytes=mask)
+
+    detailer_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "DetailerForEach"
+    )
+    assert detailer_node["inputs"]["cfg"] == 4.0
+    assert detailer_node["inputs"]["steps"] == 30
+
+
+@pytest.mark.asyncio
+async def test_post_process_fix_drawn_ignores_detailer_denoise():
+    """ "🩹 Fix Artifact" always uses `DrawnMaskFixParams`' own fixed,
+    higher, removal-oriented denoise/cfg/steps by design — the checkpoint's
+    `detailer_denoise`/`detailer_cfg`/`detailer_steps` (tuned for the
+    hand-touch-up/face-detail family) must never reach it. Deliberately uses
+    override values that don't coincidentally match `DrawnMaskFixParams`'
+    own defaults (cfg=4.0/steps=30, captured from a real krita-ai-diffusion
+    job) — otherwise this would pass even if the exclusion were broken."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        detailer_denoise=0.15,
+        detailer_cfg=7.0,
+        detailer_steps=15,
+    )
+
+    await post_process(client, "fix_drawn", source, "source.png", params, mask_bytes=mask)
+
+    detailer_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "DetailerForEach"
+    )
+    fix_defaults = DrawnMaskFixParams()
+    assert detailer_node["inputs"]["denoise"] == fix_defaults.denoise
+    assert detailer_node["inputs"]["cfg"] == fix_defaults.cfg
+    assert detailer_node["inputs"]["steps"] == fix_defaults.steps
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_drawn_ignores_tile_controlnet_without_is_detail_prompt():
+    """A plain "🖌️ Draw Mask" call (`is_detail_prompt` defaults False) must
+    never get the tile-ControlNet branch, even when the profile has both
+    `tile_controlnet` and `detail_prompt_tile_controlnet` set — that
+    combination is meant for "✏️ Detail Prompt" only."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        detail_prompt_tile_controlnet=True,
+    )
+
+    await post_process(client, "hand_drawn", source, "source.png", params, mask_bytes=mask)
+
+    types = {node["class_type"] for node in client.queued_graph.values()}
+    assert "ControlNetLoader" not in types
+    assert "ControlNetApplyAdvanced" not in types
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_drawn_wires_tile_controlnet_for_detail_prompt():
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        tile_controlnet_strength=0.6,
+        detail_prompt_tile_controlnet=True,
+    )
+
+    await post_process(
+        client,
+        "hand_drawn",
+        source,
+        "source.png",
+        params,
+        mask_bytes=mask,
+        is_detail_prompt=True,
+    )
+
+    types = {node["class_type"] for node in client.queued_graph.values()}
+    assert "ControlNetLoader" in types
+    assert "ControlNetApplyAdvanced" in types
+    apply = next(
+        node
+        for node in client.queued_graph.values()
+        if node["class_type"] == "ControlNetApplyAdvanced"
+    )
+    assert apply["inputs"]["strength"] == 0.6
+    detailer = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "DetailerForEach"
+    )
+    apply_id = next(
+        nid
+        for nid, node in client.queued_graph.items()
+        if node["class_type"] == "ControlNetApplyAdvanced"
+    )
+    assert detailer["inputs"]["positive"] == [apply_id, 0]
+    assert detailer["inputs"]["negative"] == [apply_id, 1]
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_drawn_detail_prompt_without_toggle_is_noop():
+    """`is_detail_prompt=True` alone isn't enough — the profile also has to
+    opt in via `detail_prompt_tile_controlnet` (default False)."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+    )
+
+    await post_process(
+        client,
+        "hand_drawn",
+        source,
+        "source.png",
+        params,
+        mask_bytes=mask,
+        is_detail_prompt=True,
+    )
+
+    types = {node["class_type"] for node in client.queued_graph.values()}
+    assert "ControlNetLoader" not in types
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_drawn_detail_prompt_prefers_live_profile_over_frozen_params():
+    """Same "edit the profile, see it on the next tap" reasoning as
+    `test_post_process_upscale_prefers_live_profile_over_stale_frozen_params`
+    — `detail_prompt_tile_controlnet` re-resolves off the checkpoint's
+    *current* profile, not whatever was frozen into `params` at generation
+    time, so toggling it while testing takes effect immediately."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="banana.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        detail_prompt_tile_controlnet=False,  # frozen at generation time — since flipped on
+    )
+    live_profile = ModelProfile(
+        match=["banana*"],
+        display_name="Banana",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        detail_prompt_tile_controlnet=True,
+    )
+
+    await post_process(
+        client,
+        "hand_drawn",
+        source,
+        "source.png",
+        params,
+        mask_bytes=mask,
+        is_detail_prompt=True,
+        profiles=[live_profile],
+    )
+
+    types = {node["class_type"] for node in client.queued_graph.values()}
+    assert "ControlNetLoader" in types
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_drawn_tile_controlnet_override_enables_it_over_profile_default():
+    """The WebApp's own checkbox (`tile_controlnet_override`) wins over the
+    profile's `detail_prompt_tile_controlnet` default, even when the
+    profile itself has the toggle off — the whole point of a per-submission
+    checkbox is trying it without editing the profile's JSON field first."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        detail_prompt_tile_controlnet=False,
+    )
+
+    await post_process(
+        client,
+        "hand_drawn",
+        source,
+        "source.png",
+        params,
+        mask_bytes=mask,
+        is_detail_prompt=True,
+        tile_controlnet_override=True,
+    )
+
+    types = {node["class_type"] for node in client.queued_graph.values()}
+    assert "ControlNetLoader" in types
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_drawn_tile_controlnet_override_disables_it_over_profile_default():
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        detail_prompt_tile_controlnet=True,
+    )
+
+    await post_process(
+        client,
+        "hand_drawn",
+        source,
+        "source.png",
+        params,
+        mask_bytes=mask,
+        is_detail_prompt=True,
+        tile_controlnet_override=False,
+    )
+
+    types = {node["class_type"] for node in client.queued_graph.values()}
+    assert "ControlNetLoader" not in types
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_drawn_tile_controlnet_override_ignored_without_is_detail_prompt():
+    """A plain "🖌️ Draw Mask" call never shows the checkbox at all, so
+    `tile_controlnet_override` should never even arrive as True for one —
+    but defensively, `is_detail_prompt=False` must still win regardless."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+    )
+
+    await post_process(
+        client,
+        "hand_drawn",
+        source,
+        "source.png",
+        params,
+        mask_bytes=mask,
+        tile_controlnet_override=True,
+    )
+
+    types = {node["class_type"] for node in client.queued_graph.values()}
+    assert "ControlNetLoader" not in types
+
+
+@pytest.mark.asyncio
+async def test_post_process_fix_drawn_never_reads_detail_prompt_toggle():
+    """`is_detail_prompt` only ever means anything for `kind="hand_drawn"`
+    — passing it (mistakenly or not) alongside `kind="fix_drawn"` must not
+    wire the tile-ControlNet branch into "🩹 Fix Artifact" at all."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        detail_prompt_tile_controlnet=True,
+    )
+
+    await post_process(
+        client,
+        "fix_drawn",
+        source,
+        "source.png",
+        params,
+        mask_bytes=mask,
+        is_detail_prompt=True,
+    )
+
+    types = {node["class_type"] for node in client.queued_graph.values()}
+    assert "ControlNetLoader" not in types
 
 
 @pytest.mark.asyncio
@@ -1040,6 +1541,34 @@ def test_to_post_process_base_carries_upscale_denoise():
     base = _to_post_process_base(params)
 
     assert base.upscale_denoise == 0.5
+
+
+def test_to_post_process_base_carries_detailer_denoise():
+    params = GenerationParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+        detailer_denoise=0.15,
+    )
+
+    base = _to_post_process_base(params)
+
+    assert base.detailer_denoise == 0.15
+
+
+def test_to_post_process_base_carries_detailer_cfg_and_steps():
+    params = GenerationParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+        detailer_cfg=4.0,
+        detailer_steps=30,
+    )
+
+    base = _to_post_process_base(params)
+
+    assert base.detailer_cfg == 4.0
+    assert base.detailer_steps == 30
 
 
 @pytest.mark.asyncio

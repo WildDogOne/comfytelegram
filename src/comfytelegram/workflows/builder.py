@@ -117,6 +117,19 @@ class GenerationParams:
     tile_controlnet: str | None = None
     #: `ControlNetApplyAdvanced`'s `strength` for `tile_controlnet` above.
     tile_controlnet_strength: float = 0.4
+    #: `build_hand_detailer_drawn_mask` only, and only when
+    #: `generation.post_process`'s `is_detail_prompt` is also True (i.e. an
+    #: actual "✏️ Detail Prompt" call, not "🖌️ Draw Mask" — see that
+    #: parameter's own docstring for why `kind` alone can't tell the two
+    #: apart): whether to condition the detailer's positive/negative on
+    #: `tile_controlnet` above too, the same way the upscale pass already
+    #: does. Not itself an architecture fact like `tile_controlnet` — it's a
+    #: tunable experiment (`ModelProfile.detail_prompt_tile_controlnet`) —
+    #: but it rides the same profile-to-`GenerationParams`-to-
+    #: `PostProcessBaseParams` path since there's nowhere else for a
+    #: per-checkpoint toggle like this to live. `False` (the default) skips
+    #: the branch entirely, same as `tile_controlnet` being unset.
+    detail_prompt_tile_controlnet: bool = False
     #: `build_fix_drawn_mask` only: split-loader (Anima) architecture fact,
     #: same reasoning as `tile_controlnet` above — a `weights` filename for
     #: `ETN_control_load`/`ETN_control_apply` (`comfyui-tooling-nodes`,
@@ -139,6 +152,38 @@ class GenerationParams:
     #: upscale_denoise`) instead of riding straight off the profile. `None`
     #: (the default) leaves `UpscaleParams.denoise`'s own default in place.
     upscale_denoise: float | None = None
+    #: `build_face_detailer`/`build_hand_detailer`/`build_hand_detailer_manual`/
+    #: `build_hand_detailer_drawn_mask` only: overrides `FaceDetailerParams.
+    #: denoise`/`HandDetailerParams.denoise`/`ManualHandDetailerParams.denoise`/
+    #: `DrawnMaskHandDetailerParams.denoise` for this checkpoint's detailer
+    #: passes — the drawn-mask kind only when no explicit one-shot `denoise`
+    #: was supplied for that call (see `generation.post_process`'s `denoise`
+    #: parameter, "✏️ Detail Prompt"'s own override, which still wins). Like
+    #: `upscale_denoise` above this is a tunable generation setting rather
+    #: than an architecture fact, so it comes from a profile's `defaults`
+    #: block (`ProfileDefaults.detailer_denoise`) — added after Banana Splitz
+    #: XXL was observed straying off-structure/artifacting even at a denoise
+    #: low enough that the hard-coded per-graph defaults (0.5-0.6) should
+    #: have barely touched the image at all. `None` (the default) leaves each
+    #: detailer graph's own hard-coded denoise in place. Never applied to
+    #: "🩹 Fix Artifact" (`"fix_drawn"`), which always uses
+    #: `DrawnMaskFixParams`' own fixed denoise by design.
+    detailer_denoise: float | None = None
+    #: Same reasoning/scope as `detailer_denoise` above, for `cfg`/`steps`
+    #: instead: the detailer-family dataclasses' `cfg`/`steps` are fixed
+    #: constants mirroring `sample.json`'s own detailer node
+    #: (cfg=5.0/steps=25), entirely independent of whatever `cfg`/`steps`
+    #: this checkpoint's own profile actually generates at — so a checkpoint
+    #: whose optimal cfg differs meaningfully from 5 (e.g. Banana Splitz
+    #: XXL's own cfg=4.0) had no way to carry that into its detailer passes
+    #: at all. `None` (the default, independently for each) leaves that
+    #: detailer graph's own hard-coded value in place. Same
+    #: `_DETAILER_DENOISE_KINDS`/exclusions as `detailer_denoise` — never
+    #: applied to `"fix_drawn"`, and for `"hand_drawn"` unconditionally
+    #: (there's no per-submission one-shot override for cfg/steps the way
+    #: "✏️ Detail Prompt" has for denoise).
+    detailer_cfg: float | None = None
+    detailer_steps: int | None = None
     #: The exact text the user typed, before `resolve_generation_params`
     #: folded in the profile's `positive_prompt_prefix`/
     #: `negative_prompt_prefix` or an active character's saved prompt.
@@ -242,9 +287,13 @@ class PostProcessBaseParams:
     model_sampling_shift: float | None = None
     tile_controlnet: str | None = None
     tile_controlnet_strength: float = 0.4
+    detail_prompt_tile_controlnet: bool = False
     anima_lllite_inpaint_patch: str | None = None
     anima_lllite_inpaint_patch_strength: float = 1.0
     upscale_denoise: float | None = None
+    detailer_denoise: float | None = None
+    detailer_cfg: float | None = None
+    detailer_steps: int | None = None
 
     @property
     def uses_anima_inpaint_pipeline(self) -> bool:
@@ -686,8 +735,8 @@ def _add_segs_detailer(
     model_ref: NodeRef,
     clip_ref: NodeRef,
     vae_ref: NodeRef,
-    positive: str,
-    negative: str,
+    positive: NodeRef,
+    negative: NodeRef,
     params: Any,
     seed: int,
     crop_factor: float,
@@ -705,7 +754,13 @@ def _add_segs_detailer(
     hand-drawn mask is never empty. `seed`/`crop_factor`/`denoise` are taken
     explicitly rather than read off `params` since the drawn-mask
     content-aware-fill path needs that same seed on an earlier node too.
-    Returns the `DetailerForEach` node id."""
+    `positive`/`negative` are full `NodeRef`s rather than bare node ids —
+    ordinarily both are a `CLIPTextEncode` node's own output 0, but
+    `_build_drawn_mask_detailer`'s tile-ControlNet branch needs to instead
+    point these at a `ControlNetApplyAdvanced` node's two *different*
+    conditioning outputs (0 for positive, 1 for negative), which a bare
+    "always output 0" node id couldn't express. Returns the
+    `DetailerForEach` node id."""
     segs = g.add(
         "MaskToSEGS",
         {
@@ -726,8 +781,8 @@ def _add_segs_detailer(
             "model": list(model_ref),
             "clip": list(clip_ref),
             "vae": list(vae_ref),
-            "positive": [positive, 0],
-            "negative": [negative, 0],
+            "positive": list(positive),
+            "negative": list(negative),
             "guide_size": params.guide_size,
             "guide_size_for": True,
             "max_size": params.max_size,
@@ -813,8 +868,8 @@ def build_hand_detailer_manual(
         model_ref=model_ref,
         clip_ref=clip_ref,
         vae_ref=vae_ref,
-        positive=positive,
-        negative=negative,
+        positive=(positive, 0),
+        negative=(negative, 0),
         params=params,
         seed=_resolve_seed(params.seed),
         crop_factor=params.crop_factor,
@@ -1025,13 +1080,34 @@ def build_hand_detailer_drawn_mask(
     mask_filename: str,
     base: PostProcessBaseParams,
     params: DrawnMaskHandDetailerParams,
+    *,
+    enable_tile_controlnet: bool = False,
 ) -> tuple[dict[str, Any], str]:
     """Build a hand-detail graph from a mask the user drew freehand (the
     Telegram WebApp mask editor), instead of YOLO/SAM detection
     (`build_hand_detailer`) or a fixed box around a tapped point
     (`build_hand_detailer_manual`). See `_build_drawn_mask_detailer` for the
-    shared graph shape behind this and `build_fix_drawn_mask`."""
-    return _build_drawn_mask_detailer(source_filename, mask_filename, base, params, label="Hand")
+    shared graph shape behind this and `build_fix_drawn_mask`.
+
+    `enable_tile_controlnet` is exposed here, and *only* here — not on
+    `build_fix_drawn_mask`, even though both funnel into the same
+    `_build_drawn_mask_detailer` — because it's "✏️ Detail Prompt"'s own
+    experiment (`ModelProfile.detail_prompt_tile_controlnet`), never
+    "🩹 Fix Artifact"'s. This function alone can't tell "✏️ Detail Prompt"
+    apart from a plain "🖌️ Draw Mask" call, though (both are
+    `post_process(kind="hand_drawn")`, differing only in whether a caller
+    happened to also supply a one-shot prompt override, which a blank
+    "✏️ Detail Prompt" submission wouldn't either) — see
+    `generation.post_process`'s `is_detail_prompt` parameter, which is what
+    actually decides the value this gets called with."""
+    return _build_drawn_mask_detailer(
+        source_filename,
+        mask_filename,
+        base,
+        params,
+        label="Hand",
+        enable_tile_controlnet=enable_tile_controlnet,
+    )
 
 
 def build_fix_drawn_mask(
@@ -1826,6 +1902,7 @@ def _build_drawn_mask_detailer(
     *,
     label: str,
     content_aware_fill: bool = False,
+    enable_tile_controlnet: bool = False,
 ) -> tuple[dict[str, Any], str]:
     """Shared graph shape behind `build_hand_detailer_drawn_mask` and
     `build_fix_drawn_mask` — both `source_filename` and `mask_filename` must
@@ -1857,7 +1934,17 @@ def _build_drawn_mask_detailer(
 
     Same downstream shape as `build_hand_detailer_manual` (`MaskToSEGS` ->
     `DetailerForEach`) and the same reasoning for skipping a detection-check
-    `PreviewImage` node — a mask the user drew by hand is never empty."""
+    `PreviewImage` node — a mask the user drew by hand is never empty.
+
+    `enable_tile_controlnet` (only ever True via `build_hand_detailer_drawn_mask`
+    — see its own docstring for why `build_fix_drawn_mask` never sets it)
+    conditions the detailer's positive/negative on `base.tile_controlnet`,
+    the exact `ControlNetLoader`+`ControlNetApplyAdvanced` wiring
+    `_build_tiled_upscale` already uses, conditioned on the same raw source
+    image either way — even when `content_aware_fill` also ran, which only
+    ever applies to the "Fix" label this flag never fires for anyway. A
+    no-op if `base.tile_controlnet` isn't set, same as the upscale pass's
+    own check."""
     g = PromptGraph()
 
     load = g.add("LoadImage", {"image": source_filename}, title="Source Image")
@@ -1886,6 +1973,31 @@ def _build_drawn_mask_detailer(
         )
         detailer_image = (prefilled, 0)
 
+    positive_ref: NodeRef = (positive, 0)
+    negative_ref: NodeRef = (negative, 0)
+    if enable_tile_controlnet and base.tile_controlnet:
+        cn_loader = g.add(
+            "ControlNetLoader",
+            {"control_net_name": base.tile_controlnet},
+            title="ControlNet Tile",
+        )
+        cn_apply = g.add(
+            "ControlNetApplyAdvanced",
+            {
+                "positive": list(positive_ref),
+                "negative": list(negative_ref),
+                "control_net": [cn_loader, 0],
+                "image": [load, 0],
+                "vae": list(vae_ref),
+                "strength": base.tile_controlnet_strength,
+                "start_percent": 0.0,
+                "end_percent": 1.0,
+            },
+            title="Apply ControlNet Tile",
+        )
+        positive_ref = (cn_apply, 0)
+        negative_ref = (cn_apply, 1)
+
     detailer = _add_segs_detailer(
         g,
         image_ref=detailer_image,
@@ -1893,8 +2005,8 @@ def _build_drawn_mask_detailer(
         model_ref=model_ref,
         clip_ref=clip_ref,
         vae_ref=vae_ref,
-        positive=positive,
-        negative=negative,
+        positive=positive_ref,
+        negative=negative_ref,
         params=params,
         seed=seed,
         crop_factor=params.crop_factor,
