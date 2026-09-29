@@ -54,6 +54,7 @@ def test_all_shipped_profiles_load(profiles):
         "Anima Aesthetic",
         "Anima Turbo",
         "AutismMix SDXL",
+        "Banana Splitz XXL",
     }
 
 

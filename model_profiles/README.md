@@ -97,6 +97,24 @@ anything privately/custom-trained (like `furrytoonmix_illustrious.json`'s
 three character LoRAs above) still needs to be added here by hand, the
 same as before this existed.
 
+The `/lora` menu's toggleable set is exactly *this profile's own* `loras`
+list, not "every LoRA this architecture could use" — a LoRA another
+profile already lists never shows up here on its own, even if both
+profiles opt into the same `civitai_base_models` entry, because the
+file-scan above only ever considers a filename *no* profile mentions yet.
+The first profile to claim a name (by this scan or by hand) permanently
+removes it from that scan's consideration. A second, cache-only pass
+(`_propagate_known_loras`) covers exactly this case: for every LoRA name
+some profile already lists with a cached CivitAI lookup — from a past
+discovery run *or* a `/lora` "ℹ️ Info" tap, both land in the same
+`lora_civitai_cache` table — it adds that LoRA to every other opted-in
+profile that accepts its base model and doesn't have it yet, on the next
+boot or `/reload`. It never hashes or queries CivitAI itself, so a LoRA
+nobody has ever actually looked up (no cache entry yet) isn't propagated
+until something populates one — tap "ℹ️ Info" on it once under whichever
+profile already lists it, or just add it to the new profile's `loras` by
+hand, either one seeds the cache (or list) the same way.
+
 ### `loras[].trigger_words` — auto-injected, but manual-only to fill in
 
 Free text for whatever word(s)/phrase a LoRA actually needs in the prompt

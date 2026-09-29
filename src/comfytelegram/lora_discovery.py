@@ -8,6 +8,26 @@ model — replacing the "download a LoRA, hunt down its trigger words, hand-
 type a model_profiles/*.json entry" tedium for the common CivitAI-hosted
 case.
 
+That file-scan only ever considers a name *no* profile currently mentions
+— the first profile to claim a given filename (whether through this scan
+or a hand-written entry) permanently removes it from consideration, even
+for a same-architecture profile added later that would also have accepted
+it. `_propagate_known_loras` is the other half of this: for every LoRA
+name already sitting in *some* profile's `loras` list with a cached
+CivitAI lookup (`lora_civitai_cache` — populated either by a past
+discovery run or by `/lora`'s own "ℹ️ Info" button, both write through the
+same table), it adds that LoRA to every other opted-in profile that
+accepts its base model and doesn't have it yet. This is what makes adding
+a new profile for an architecture this install already has LoRAs staged
+for (e.g. a second Illustrious-based checkpoint alongside
+`furrytoonmix_illustrious.json`) pick those up automatically on the next
+boot or `/reload`, instead of requiring the exact same hand-copy this
+module exists to avoid in the first place. It never hashes or queries
+CivitAI itself, though — a LoRA nobody has ever actually looked up (no
+cache entry yet, most commonly a hand-typed entry that predates any Info
+tap or discovery run) isn't propagated until something populates its
+cache entry first.
+
 This is NOT full automation, by design: a LoRA CivitAI has no hash record
 for at all — most commonly a privately/custom-trained one, exactly the
 case `furrytoonmix_illustrious.json`'s three character LoRAs describe —
@@ -80,6 +100,53 @@ def _scan_lora_files(loras_dir: Path) -> list[str]:
     )
 
 
+def _propagate_known_loras(
+    entries: list[tuple[Path, dict, ModelProfile]],
+    opt_in: list[tuple[Path, dict, ModelProfile]],
+    storage: Storage,
+) -> set[Path]:
+    """For every LoRA name some profile's `loras` list already mentions
+    with a cached CivitAI lookup, add it to every *other* opted-in profile
+    that accepts its base model and doesn't have it yet. See this module's
+    own docstring for why this needs to exist as a step separate from the
+    file-scan below (that scan permanently excludes any name already
+    claimed by a profile, even for a different, later-added profile that
+    would also accept it) and why it's deliberately cache-only (never
+    hashes or queries CivitAI, so a name nobody has looked up yet just
+    isn't propagated until something populates its cache entry)."""
+    touched: set[Path] = set()
+    known_names = sorted({lora.name for _, _, profile in entries for lora in profile.loras})
+    for name in known_names:
+        cached = storage.get_lora_civitai_cache(name)
+        if cached is None or not cached["found"]:
+            continue
+        base_model = cached["base_model"] or ""
+        for path, data, profile in opt_in:
+            if any(lora["name"] == name for lora in data.get("loras", [])):
+                continue  # this profile already has it — nothing to propagate
+            if not any(b.lower() == base_model.lower() for b in profile.civitai_base_models):
+                continue
+            data.setdefault("loras", []).append(
+                {
+                    "name": name,
+                    "strength_model": _DEFAULT_STRENGTH,
+                    "strength_clip": _DEFAULT_STRENGTH,
+                    "default_enabled": False,
+                    "trigger_words": "",
+                }
+            )
+            touched.add(path)
+            logger.info(
+                "LoRA auto-discovery: propagated already-known %s (%s, %s) into %s, "
+                "disabled by default",
+                name,
+                cached["model_name"],
+                base_model,
+                path.name,
+            )
+    return touched
+
+
 async def discover_new_loras(loras_dir: Path, profiles_dir: Path, storage: Storage) -> bool:
     """Run one discovery pass. Returns True if any profile file under
     `profiles_dir` was actually modified, so the caller (`main.py`'s
@@ -93,14 +160,17 @@ async def discover_new_loras(loras_dir: Path, profiles_dir: Path, storage: Stora
         logger.info("LoRA auto-discovery: no profile sets civitai_base_models, nothing to do")
         return False
 
+    touched: set[Path] = _propagate_known_loras(entries, opt_in, storage)
+
     known_names = {lora.name for _, _, profile in entries for lora in profile.loras}
     candidates = [name for name in _scan_lora_files(loras_dir) if name not in known_names]
     if not candidates:
         logger.info("LoRA auto-discovery: no new files under %s", loras_dir)
-        return False
+    else:
+        logger.info(
+            "LoRA auto-discovery: checking %d new file(s) under %s", len(candidates), loras_dir
+        )
 
-    logger.info("LoRA auto-discovery: checking %d new file(s) under %s", len(candidates), loras_dir)
-    touched: set[Path] = set()
     for name in candidates:
         cached = storage.get_lora_civitai_cache(name)
         if cached is None:

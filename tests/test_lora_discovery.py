@@ -160,6 +160,225 @@ async def test_discover_matches_base_model_case_insensitively_across_profiles(
 
 
 @pytest.mark.asyncio
+async def test_discover_propagates_an_already_known_lora_to_a_newly_opted_in_profile(
+    tmp_path: Path, storage: Storage
+):
+    """The gap this whole feature closes: `existing.safetensors` is
+    already claimed by profile A (so it's not a "new file" the plain
+    file-scan below would ever reconsider), and already has a cached
+    CivitAI lookup — from a prior discovery run or a `/lora` Info tap,
+    doesn't matter which. Profile B opts into the same base model but was
+    only just added and has never seen this file. No hashing or CivitAI
+    call should be needed at all."""
+    loras_dir = tmp_path / "loras"
+    loras_dir.mkdir()
+    (loras_dir / "existing.safetensors").write_bytes(b"data")
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    a_path = profiles_dir / "a.json"
+    b_path = profiles_dir / "b.json"
+    _write_profile(
+        a_path,
+        civitai_base_models=["Illustrious"],
+        loras=[
+            {
+                "name": "existing.safetensors",
+                "strength_model": 1.0,
+                "strength_clip": 1.0,
+                "default_enabled": True,
+                "trigger_words": "",
+            }
+        ],
+    )
+    _write_profile(b_path, civitai_base_models=["Illustrious"])
+    storage.set_lora_civitai_cache(
+        "existing.safetensors",
+        "hash1",
+        CivitaiLoraInfo(
+            model_name="Existing Style",
+            base_model="Illustrious",
+            trained_words=[],
+            civitai_url="https://civitai.com/models/2",
+        ),
+    )
+
+    with (
+        patch("comfytelegram.lora_discovery.hash_lora_file", AsyncMock()) as hash_mock,
+        patch("comfytelegram.lora_discovery.fetch_civitai_info", AsyncMock()) as fetch_mock,
+    ):
+        changed = await discover_new_loras(loras_dir, profiles_dir, storage)
+
+    assert changed is True
+    hash_mock.assert_not_awaited()
+    fetch_mock.assert_not_awaited()
+    # profile A is untouched — it already had the entry (with its own
+    # default_enabled=True, which propagation must not clobber)
+    a_loras = json.loads(a_path.read_text())["loras"]
+    assert a_loras == [
+        {
+            "name": "existing.safetensors",
+            "strength_model": 1.0,
+            "strength_clip": 1.0,
+            "default_enabled": True,
+            "trigger_words": "",
+        }
+    ]
+    b_loras = json.loads(b_path.read_text())["loras"]
+    assert b_loras == [
+        {
+            "name": "existing.safetensors",
+            "strength_model": 1.0,
+            "strength_clip": 1.0,
+            "default_enabled": False,
+            "trigger_words": "",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_discover_propagation_skips_a_profile_that_already_has_it(
+    tmp_path: Path, storage: Storage
+):
+    loras_dir = tmp_path / "loras"
+    loras_dir.mkdir()
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    a_path = profiles_dir / "a.json"
+    b_path = profiles_dir / "b.json"
+    known_entry = {
+        "name": "existing.safetensors",
+        "strength_model": 1.0,
+        "strength_clip": 1.0,
+        "default_enabled": False,
+        "trigger_words": "",
+    }
+    _write_profile(a_path, civitai_base_models=["Illustrious"], loras=[known_entry])
+    _write_profile(b_path, civitai_base_models=["Illustrious"], loras=[dict(known_entry)])
+    storage.set_lora_civitai_cache(
+        "existing.safetensors",
+        "hash1",
+        CivitaiLoraInfo(
+            model_name="Existing Style",
+            base_model="Illustrious",
+            trained_words=[],
+            civitai_url="https://civitai.com/models/2",
+        ),
+    )
+
+    changed = await discover_new_loras(loras_dir, profiles_dir, storage)
+
+    assert changed is False
+    assert json.loads(a_path.read_text())["loras"] == [known_entry]
+    assert json.loads(b_path.read_text())["loras"] == [known_entry]
+
+
+@pytest.mark.asyncio
+async def test_discover_propagation_skips_a_lora_never_looked_up(tmp_path: Path, storage: Storage):
+    """`existing.safetensors` predates any Info tap or discovery run (no
+    cache entry at all) — propagation must not silently start hashing it
+    just because a second profile opted in; that stays a manual step (or
+    waits for something else to populate the cache first)."""
+    loras_dir = tmp_path / "loras"
+    loras_dir.mkdir()
+    (loras_dir / "existing.safetensors").write_bytes(b"data")
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    a_path = profiles_dir / "a.json"
+    b_path = profiles_dir / "b.json"
+    _write_profile(
+        a_path,
+        civitai_base_models=["Illustrious"],
+        loras=[
+            {
+                "name": "existing.safetensors",
+                "strength_model": 1.0,
+                "strength_clip": 1.0,
+                "default_enabled": False,
+                "trigger_words": "",
+            }
+        ],
+    )
+    _write_profile(b_path, civitai_base_models=["Illustrious"])
+
+    with (
+        patch("comfytelegram.lora_discovery.hash_lora_file", AsyncMock()) as hash_mock,
+        patch("comfytelegram.lora_discovery.fetch_civitai_info", AsyncMock()) as fetch_mock,
+    ):
+        changed = await discover_new_loras(loras_dir, profiles_dir, storage)
+
+    assert changed is False
+    hash_mock.assert_not_awaited()
+    fetch_mock.assert_not_awaited()
+    assert json.loads(b_path.read_text())["loras"] == []
+
+
+@pytest.mark.asyncio
+async def test_discover_propagation_skips_a_cached_miss(tmp_path: Path, storage: Storage):
+    loras_dir = tmp_path / "loras"
+    loras_dir.mkdir()
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    a_path = profiles_dir / "a.json"
+    b_path = profiles_dir / "b.json"
+    _write_profile(
+        a_path,
+        civitai_base_models=["Illustrious"],
+        loras=[
+            {
+                "name": "custom.safetensors",
+                "strength_model": 1.0,
+                "strength_clip": 1.0,
+                "default_enabled": False,
+                "trigger_words": "",
+            }
+        ],
+    )
+    _write_profile(b_path, civitai_base_models=["Illustrious"])
+    storage.set_lora_civitai_cache("custom.safetensors", "hash1", None)  # cached miss
+
+    changed = await discover_new_loras(loras_dir, profiles_dir, storage)
+
+    assert changed is False
+    assert json.loads(b_path.read_text())["loras"] == []
+
+
+@pytest.mark.asyncio
+async def test_discover_propagation_respects_base_model_mismatch(tmp_path: Path, storage: Storage):
+    loras_dir = tmp_path / "loras"
+    loras_dir.mkdir()
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    a_path = profiles_dir / "a.json"
+    b_path = profiles_dir / "b.json"
+    _write_profile(
+        a_path,
+        civitai_base_models=["Pony"],
+        loras=[
+            {
+                "name": "pony_only.safetensors",
+                "strength_model": 1.0,
+                "strength_clip": 1.0,
+                "default_enabled": False,
+                "trigger_words": "",
+            }
+        ],
+    )
+    _write_profile(b_path, civitai_base_models=["Illustrious"])  # different architecture
+    storage.set_lora_civitai_cache(
+        "pony_only.safetensors",
+        "hash1",
+        CivitaiLoraInfo(
+            model_name="Pony Style", base_model="Pony", trained_words=[], civitai_url="https://x"
+        ),
+    )
+
+    changed = await discover_new_loras(loras_dir, profiles_dir, storage)
+
+    assert changed is False
+    assert json.loads(b_path.read_text())["loras"] == []
+
+
+@pytest.mark.asyncio
 async def test_discover_skips_and_caches_a_civitai_miss(tmp_path: Path, storage: Storage):
     loras_dir = tmp_path / "loras"
     loras_dir.mkdir()
