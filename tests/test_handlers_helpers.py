@@ -27,8 +27,12 @@ from comfytelegram.handlers import (
     HAND_POINT_PREVIEW_MAX_DIM,
     HAND_REDO4_CALLBACK_KIND,
     HAND_REDO_CALLBACK_KIND,
+    LORA_SWITCH_CALLBACK_KIND,
+    LORA_SWITCH_TOGGLE_CALLBACK_PREFIX,
     MORE_CALLBACK_KIND,
     SHOW_PROMPT_CALLBACK_KIND,
+    SWITCH_MODEL_CALLBACK_KIND,
+    SWITCH_MODEL_PICK_CALLBACK_PREFIX,
     TAGCHECK_TOKEN_LIMIT,
     TELEGRAM_PHOTO_SIZE_LIMIT,
     UPSCALE_CUSTOM_CALLBACK_KIND,
@@ -39,6 +43,7 @@ from comfytelegram.handlers import (
     _consume_awaiting_character_edit,
     _consume_awaiting_character_rename,
     _consume_awaiting_upscale_custom,
+    _deserialize_generation_params,
     _draw_hand_point_grid,
     _extract_file_id,
     _generate_from_prompt_keyboard,
@@ -64,13 +69,15 @@ from comfytelegram.handlers import (
     postprocess_callback,
     reload_command,
     start,
+    switch_loras_callback,
+    switch_model_pick_callback,
 )
-from comfytelegram.profiles import ModelProfile
+from comfytelegram.profiles import LoraDefault, ModelProfile, ProfileDefaults
 from comfytelegram.settings import Settings
 from comfytelegram.storage import IMAGE_FORMAT_PNG
 from comfytelegram.tags import TagResult, TagSource
 from comfytelegram.topics import NO_TOPIC
-from comfytelegram.workflows import GenerationParams
+from comfytelegram.workflows import GenerationParams, LoraSpec
 
 
 def _settings(**overrides) -> Settings:
@@ -213,6 +220,7 @@ def test_post_process_keyboard_page_two_holds_the_rest_and_a_way_back():
     assert rows == [
         ["pp:homogenize:abc123", "pp:analyze_only:abc123"],
         ["pp:deep_analyze:abc123", f"pp:{ANALYZE_PROMPT_CALLBACK_KIND}:abc123"],
+        [f"pp:{SWITCH_MODEL_CALLBACK_KIND}:abc123", f"pp:{LORA_SWITCH_CALLBACK_KIND}:abc123"],
         [f"pp:{BACK_CALLBACK_KIND}:abc123"],
     ]
 
@@ -754,6 +762,293 @@ async def test_model_callback_close_action_deletes_the_message_without_touching_
     query.answer.assert_awaited_once()
     query.message.delete.assert_awaited_once()
     query.edit_message_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_switch_model_button_opens_a_checkpoint_picker():
+    query = AsyncMock()
+    query.data = f"pp:{SWITCH_MODEL_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["fluffyfurry*"], display_name="FluffyFurry")
+    other_profile = ModelProfile(match=["furrytoonmix_*"], display_name="FurryToonMix")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    context.bot_data["profiles"] = [profile, other_profile]
+    context.bot_data["comfy_client"].list_checkpoints = AsyncMock(
+        return_value=["fluffyfurry.safetensors", "furrytoonmix_v2.safetensors"]
+    )
+
+    await postprocess_callback(update, context)
+
+    assert context.bot_data["available_checkpoints"] == [
+        "fluffyfurry.safetensors",
+        "furrytoonmix_v2.safetensors",
+    ]
+    query.message.reply_text.assert_awaited_once()
+    markup = query.message.reply_text.await_args.kwargs["reply_markup"]
+    buttons = [b for row in markup.inline_keyboard for b in row]
+    labels = [b.text for b in buttons]
+    assert "FluffyFurry" in labels
+    assert "FurryToonMix" in labels
+    assert "✖ Cancel" in labels
+    pick = next(b for b in buttons if b.text == "FurryToonMix")
+    assert pick.callback_data == f"{SWITCH_MODEL_PICK_CALLBACK_PREFIX}abc123:1"
+
+
+@pytest.mark.asyncio
+async def test_switch_model_pick_callback_close_deletes_the_picker_without_switching():
+    query = AsyncMock()
+    query.data = f"{SWITCH_MODEL_PICK_CALLBACK_PREFIX}abc123:close"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+    context = MagicMock()
+    context.bot_data = {"settings": MagicMock(allowed_user_ids=None)}
+
+    await switch_model_pick_callback(update, context)
+
+    query.answer.assert_awaited_once()
+    query.message.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_switch_model_pick_callback_rejects_a_stale_index():
+    query = AsyncMock()
+    query.data = f"{SWITCH_MODEL_PICK_CALLBACK_PREFIX}abc123:5"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+    context = MagicMock()
+    context.bot_data = {
+        "settings": MagicMock(allowed_user_ids=None),
+        "available_checkpoints": ["a.safetensors"],
+    }
+
+    await switch_model_pick_callback(update, context)
+
+    query.answer.assert_awaited_once()
+    assert "stale" in query.answer.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_switch_model_pick_callback_alerts_on_an_expired_result():
+    query = AsyncMock()
+    query.data = f"{SWITCH_MODEL_PICK_CALLBACK_PREFIX}abc123:0"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+    storage = MagicMock()
+    storage.get_pending_result.return_value = None
+    context = MagicMock()
+    context.bot_data = {
+        "settings": MagicMock(allowed_user_ids=None),
+        "available_checkpoints": ["a.safetensors"],
+        "storage": storage,
+    }
+
+    await switch_model_pick_callback(update, context)
+
+    query.answer.assert_awaited_once_with(
+        "That result has expired — generate a new image.", show_alert=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_switch_model_pick_callback_switches_checkpoint_keeps_prompt_resets_loras():
+    """The image's own resolved prompt/seed survive; checkpoint, tunables,
+    and LoRAs all come from the *new* checkpoint's own profile (see
+    `profiles.apply_checkpoint_switch`) — verified here through the actual
+    `storage.store_pending_result` call, the mechanism every subsequent tap
+    on this image relies on to see the switch."""
+    query = AsyncMock()
+    query.data = f"{SWITCH_MODEL_PICK_CALLBACK_PREFIX}abc123:1"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    old_profile = ModelProfile(match=["fluffyfurry*"], display_name="FluffyFurry")
+    new_profile = ModelProfile(
+        match=["furrytoonmix_*"],
+        display_name="FurryToonMix",
+        defaults=ProfileDefaults(cfg=5.0, clip_skip=-2),
+        loras=[
+            LoraDefault(name="ftm_on.safetensors", default_enabled=True),
+            LoraDefault(name="ftm_off.safetensors", default_enabled=False),
+        ],
+    )
+    storage = _pending_result_mock(old_profile, "masterpiece, a fox")
+    context = MagicMock()
+    context.bot_data = {
+        "settings": MagicMock(allowed_user_ids=None),
+        "storage": storage,
+        "profiles": [old_profile, new_profile],
+        "available_checkpoints": ["fluffyfurry.safetensors", "furrytoonmix_v2.safetensors"],
+    }
+
+    await switch_model_pick_callback(update, context)
+
+    storage.store_pending_result.assert_called_once()
+    call_args = storage.store_pending_result.call_args.args
+    assert call_args[0] == "abc123"
+    assert call_args[1] == 1
+    assert call_args[2] == "file123"
+    assert call_args[3] == "source.png"
+    switched = _deserialize_generation_params(call_args[4])
+    assert switched.checkpoint == "furrytoonmix_v2.safetensors"
+    assert switched.positive_prompt == "masterpiece, a fox"
+    assert switched.cfg == 5.0
+    assert switched.clip_skip == -2
+    assert [lora.name for lora in switched.loras] == ["ftm_on.safetensors"]
+    query.edit_message_text.assert_awaited_once()
+    assert "FurryToonMix" in query.edit_message_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_lora_switch_button_shows_currently_active_loras_checked():
+    query = AsyncMock()
+    query.data = f"pp:{LORA_SWITCH_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(
+        match=["fluffyfurry*"],
+        display_name="FluffyFurry",
+        loras=[
+            LoraDefault(name="a.safetensors", default_enabled=False),
+            LoraDefault(name="b.safetensors", default_enabled=True),
+        ],
+    )
+    # The image's own params already carry "a" active (e.g. from a previous
+    # switch), not just the profile's own default_enabled set — the
+    # keyboard must reflect the image's actual current state.
+    params = GenerationParams(
+        checkpoint="fluffyfurry.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        loras=[LoraSpec(name="a.safetensors")],
+    )
+    storage = MagicMock()
+    storage.get_pending_result.return_value = {
+        "base_params": _serialize_generation_params(params),
+        "chat_id": 1,
+        "file_id": "file123",
+        "filename": "source.png",
+    }
+    context = _postprocess_context(storage, profile)
+
+    await postprocess_callback(update, context)
+
+    query.message.reply_text.assert_awaited_once()
+    markup = query.message.reply_text.await_args.kwargs["reply_markup"]
+    toggle_labels = [b.text for row in markup.inline_keyboard[:-1] for b in row]
+    assert toggle_labels == ["✅ a.safetensors", "◻️ b.safetensors"]
+
+
+@pytest.mark.asyncio
+async def test_lora_switch_button_reports_when_checkpoint_has_no_loras():
+    query = AsyncMock()
+    query.data = f"pp:{LORA_SWITCH_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["fluffyfurry*"], display_name="FluffyFurry")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+
+    await postprocess_callback(update, context)
+
+    query.message.reply_text.assert_awaited_once()
+    assert "no LoRAs configured" in query.message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_switch_loras_callback_toggle_flips_the_bit_and_rerenders():
+    query = AsyncMock()
+    query.data = f"{LORA_SWITCH_TOGGLE_CALLBACK_PREFIX}t:abc123:0:1"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(
+        match=["fluffyfurry*"],
+        display_name="FluffyFurry",
+        loras=[
+            LoraDefault(name="a.safetensors", default_enabled=False),
+            LoraDefault(name="b.safetensors", default_enabled=False),
+        ],
+    )
+    storage = _pending_result_mock(profile, "a fox")
+    context = MagicMock()
+    context.bot_data = {
+        "settings": MagicMock(allowed_user_ids=None),
+        "storage": storage,
+        "profiles": [profile],
+    }
+
+    await switch_loras_callback(update, context)
+
+    query.edit_message_reply_markup.assert_awaited_once()
+    markup = query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+    toggle_labels = [b.text for row in markup.inline_keyboard[:-1] for b in row]
+    assert toggle_labels == ["◻️ a.safetensors", "✅ b.safetensors"]
+    storage.store_pending_result.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_switch_loras_callback_apply_persists_the_selected_loras():
+    query = AsyncMock()
+    # mask 0b10 -> only index 1 ("b.safetensors") selected
+    query.data = f"{LORA_SWITCH_TOGGLE_CALLBACK_PREFIX}a:abc123:2"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(
+        match=["fluffyfurry*"],
+        display_name="FluffyFurry",
+        loras=[
+            LoraDefault(name="a.safetensors", default_enabled=True),
+            LoraDefault(name="b.safetensors", default_enabled=False),
+        ],
+    )
+    storage = _pending_result_mock(profile, "a fox")
+    context = MagicMock()
+    context.bot_data = {
+        "settings": MagicMock(allowed_user_ids=None),
+        "storage": storage,
+        "profiles": [profile],
+    }
+
+    await switch_loras_callback(update, context)
+
+    storage.store_pending_result.assert_called_once()
+    call_args = storage.store_pending_result.call_args.args
+    switched = _deserialize_generation_params(call_args[4])
+    assert [lora.name for lora in switched.loras] == ["b.safetensors"]
+    assert switched.positive_prompt == "a fox"
+    query.edit_message_text.assert_awaited_once()
+    assert "b.safetensors" in query.edit_message_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_switch_loras_callback_cancel_deletes_the_screen_without_changes():
+    query = AsyncMock()
+    query.data = f"{LORA_SWITCH_TOGGLE_CALLBACK_PREFIX}c:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+    context = MagicMock()
+    context.bot_data = {"settings": MagicMock(allowed_user_ids=None)}
+
+    await switch_loras_callback(update, context)
+
+    query.answer.assert_awaited_once()
+    query.message.delete.assert_awaited_once()
 
 
 @pytest.mark.asyncio

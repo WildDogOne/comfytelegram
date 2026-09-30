@@ -60,6 +60,7 @@ def serialize_generation_params(params: GenerationParams) -> dict[str, Any]:
         "detailer_denoise": params.detailer_denoise,
         "detailer_cfg": params.detailer_cfg,
         "detailer_steps": params.detailer_steps,
+        "detailer_disable_lora": params.detailer_disable_lora,
         "raw_positive_prompt": params.raw_positive_prompt,
         "raw_negative_prompt": params.raw_negative_prompt,
     }
@@ -98,6 +99,7 @@ def deserialize_generation_params(data: dict[str, Any]) -> GenerationParams:
         detailer_denoise=data.get("detailer_denoise"),
         detailer_cfg=data.get("detailer_cfg"),
         detailer_steps=data.get("detailer_steps"),
+        detailer_disable_lora=data.get("detailer_disable_lora"),
         raw_positive_prompt=data.get("raw_positive_prompt", ""),
         raw_negative_prompt=data.get("raw_negative_prompt", ""),
     )

@@ -24,7 +24,9 @@ from comfytelegram.handlers import (
     GENERATE_FROM_PROMPT_CALLBACK_PREFIX,
     HAND_POINT_CALLBACK_PREFIX,
     HAND_POINT_DENSITY_CALLBACK_PREFIX,
+    LORA_SWITCH_TOGGLE_CALLBACK_PREFIX,
     STREAM_CANCEL_CALLBACK_DATA,
+    SWITCH_MODEL_PICK_CALLBACK_PREFIX,
     again_callback,
     character_callback,
     character_command,
@@ -45,6 +47,8 @@ from comfytelegram.handlers import (
     stop_command,
     stream_cancel_callback,
     stream_command,
+    switch_loras_callback,
+    switch_model_pick_callback,
     tagcheck_command,
     tags_command,
 )
@@ -342,6 +346,16 @@ def build_application(settings: Settings) -> Application:
     )
     application.add_handler(
         CallbackQueryHandler(hand_point_callback, pattern=rf"^{HAND_POINT_CALLBACK_PREFIX}")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            switch_model_pick_callback, pattern=rf"^{SWITCH_MODEL_PICK_CALLBACK_PREFIX}"
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            switch_loras_callback, pattern=rf"^{LORA_SWITCH_TOGGLE_CALLBACK_PREFIX}"
+        )
     )
     application.add_handler(
         CallbackQueryHandler(again_callback, pattern=rf"^{AGAIN_CALLBACK_PREFIX}")

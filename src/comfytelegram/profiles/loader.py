@@ -5,6 +5,8 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
+from dataclasses import fields as dataclass_fields
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,24 @@ from comfytelegram.workflows.builder import GenerationParams
 #: be routed differently in `apply_profile_override` rather than merged
 #: straight into `.defaults`.
 PROMPT_OVERRIDE_FIELDS = {"positive_prompt_prefix", "negative_prompt_prefix"}
+
+#: `apply_checkpoint_switch`'s `new_profile=None` branch resets every other
+#: `GenerationParams` field to its generic default — these are the ones a
+#: checkpoint switch must never touch: the image's own identity (`seed`,
+#: `filename_prefix`), its scene content (prompt/raw-prompt pairs), and
+#: `loras` (reset separately, to `[]`, rather than `GenerationParams`' own
+#: default_factory — spelled out here for clarity even though the two are
+#: actually the same value).
+_CHECKPOINT_SWITCH_PRESERVED_FIELDS = {
+    "checkpoint",
+    "positive_prompt",
+    "negative_prompt",
+    "raw_positive_prompt",
+    "raw_negative_prompt",
+    "seed",
+    "filename_prefix",
+    "loras",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +111,82 @@ def apply_profile_override(
     defaults_updates = {k: v for k, v in override_fields.items() if k not in PROMPT_OVERRIDE_FIELDS}
     merged_defaults = base.defaults.model_copy(update=defaults_updates)
     return base.model_copy(update={"defaults": merged_defaults, **prompt_updates})
+
+
+def _architecture_fields(profile: ModelProfile) -> dict[str, Any]:
+    """The `GenerationParams` fields that describe *how to load* `profile`'s
+    checkpoint (loader/clip/vae/model-sampling-shift/tile-ControlNet/Anima
+    inpaint patch), as opposed to a tunable generation default — shared by
+    `resolve_generation_params` (fresh generation) and
+    `apply_checkpoint_switch` (switching an existing image's post-processing
+    pipeline to a different checkpoint) so a new architecture-fact field
+    only needs adding here once. `detail_prompt_tile_controlnet` is the one
+    exception living in this dict despite not being an architecture fact
+    itself (it's a tunable experiment toggle) — it rides alongside
+    `tile_controlnet(_strength)` for the same reason those do: there's
+    nowhere else for a per-checkpoint flag like this to live, and
+    `generation.post_process` re-resolves all three live off the current
+    profile anyway (see `_refresh_detail_prompt_tile_controlnet`), so what's
+    frozen in here at resolution time barely matters for it."""
+    return {
+        "loader": profile.loader,
+        "clip_name": profile.clip_name,
+        "clip_type": profile.clip_type,
+        "vae_name": profile.vae_name,
+        "model_sampling_shift": profile.model_sampling_shift,
+        "tile_controlnet": profile.tile_controlnet,
+        "tile_controlnet_strength": profile.tile_controlnet_strength,
+        "detail_prompt_tile_controlnet": profile.detail_prompt_tile_controlnet,
+        "anima_lllite_inpaint_patch": profile.anima_lllite_inpaint_patch,
+        "anima_lllite_inpaint_patch_strength": profile.anima_lllite_inpaint_patch_strength,
+    }
+
+
+def apply_checkpoint_switch(
+    params: GenerationParams, new_checkpoint: str, new_profile: ModelProfile | None
+) -> GenerationParams:
+    """`handlers.py`'s "🔀 Switch Model" button: rebuild `params` for
+    `new_checkpoint`, keeping the image's own scene content (positive/
+    negative prompt, both raw and resolved) exactly as it is — the picture
+    being detailed/upscaled hasn't changed just because a different
+    checkpoint is now doing the technical work — while replacing every
+    architecture fact (`_architecture_fields`) and tunable generation
+    default (`ProfileDefaults`, via the same `model_dump(exclude_none=True)`
+    merge `resolve_generation_params` uses) with `new_profile`'s own, same
+    as a fresh generation against that checkpoint would get. `loras` resets
+    to `new_profile`'s own `default_enabled` set — the original image's
+    LoRAs were validated for the *old* checkpoint, not this one, so
+    silently carrying them over risks an incompatible or simply wrong
+    result; `handlers.py`'s "🎛 LoRAs" button is the follow-up for picking
+    exactly which of the new checkpoint's LoRAs should actually be active.
+    `new_profile=None` (no shipped profile matches `new_checkpoint`) falls
+    back to `GenerationParams`' own generic defaults for everything —
+    mirrors `resolve_generation_params`'s own `profile is None` branch.
+    Derives the reset field set from `dataclass_fields(GenerationParams)`
+    itself, minus `_CHECKPOINT_SWITCH_PRESERVED_FIELDS`, rather than listing
+    every field by hand — so a field added to `GenerationParams` later (the
+    next `detailer_*`-style tunable, say) is reset to its generic default
+    here automatically instead of silently keeping the old checkpoint's
+    stale value."""
+    if new_profile is None:
+        defaults = GenerationParams(
+            checkpoint=new_checkpoint, positive_prompt="", negative_prompt=""
+        )
+        reset_fields = {
+            f.name: getattr(defaults, f.name)
+            for f in dataclass_fields(GenerationParams)
+            if f.name not in _CHECKPOINT_SWITCH_PRESERVED_FIELDS
+        }
+        return replace(params, checkpoint=new_checkpoint, loras=[], **reset_fields)
+    active_loras = [lora.to_spec() for lora in new_profile.loras if lora.default_enabled]
+    field_defaults = new_profile.defaults.model_dump(exclude_none=True)
+    return replace(
+        params,
+        checkpoint=new_checkpoint,
+        loras=active_loras,
+        **_architecture_fields(new_profile),
+        **field_defaults,
+    )
 
 
 def apply_lora_overrides(
@@ -195,27 +291,10 @@ def resolve_generation_params(
         field_defaults = profile.defaults.model_dump(exclude_none=True)
         # Architecture facts about the checkpoint, not a tunable generation
         # default — same reasoning as PROMPT_OVERRIDE_FIELDS living outside
-        # `.defaults` — so these come straight off the profile rather than
-        # through `field_defaults`/ProfileDefaults. `detail_prompt_tile_controlnet`
-        # is the one exception living in this dict despite not being an
-        # architecture fact itself (it's a tunable experiment toggle) — it
-        # rides alongside `tile_controlnet(_strength)` for the same reason
-        # those do: there's nowhere else for a per-checkpoint flag like this
-        # to live, and `generation.post_process` re-resolves all three live
-        # off the current profile anyway (see `_refresh_detail_prompt_tile_controlnet`),
-        # so what's frozen in here at generation time barely matters for it.
-        architecture_fields: dict[str, Any] = {
-            "loader": profile.loader,
-            "clip_name": profile.clip_name,
-            "clip_type": profile.clip_type,
-            "vae_name": profile.vae_name,
-            "model_sampling_shift": profile.model_sampling_shift,
-            "tile_controlnet": profile.tile_controlnet,
-            "tile_controlnet_strength": profile.tile_controlnet_strength,
-            "detail_prompt_tile_controlnet": profile.detail_prompt_tile_controlnet,
-            "anima_lllite_inpaint_patch": profile.anima_lllite_inpaint_patch,
-            "anima_lllite_inpaint_patch_strength": profile.anima_lllite_inpaint_patch_strength,
-        }
+        # `.defaults` — so these come straight off the profile (via
+        # `_architecture_fields`) rather than through `field_defaults`/
+        # ProfileDefaults.
+        architecture_fields = _architecture_fields(profile)
     else:
         positive_prompt = user_prompt
         negative_prompt = ""

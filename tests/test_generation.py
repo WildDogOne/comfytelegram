@@ -424,6 +424,29 @@ async def test_post_process_face_honors_profile_detailer_cfg_and_steps():
 
 
 @pytest.mark.asyncio
+async def test_post_process_face_honors_checkpoint_loader_vae_override():
+    """`vae_name` set on an otherwise-default `loader="checkpoint"` profile
+    (see `ModelProfile.vae_name`) should reach every post-processing graph
+    too, not just the initial txt2img build — `_build_model_clip_vae` is
+    shared by all of them."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        vae_name="sdxl_vae.safetensors",
+    )
+
+    await post_process(client, "face", source, "source.png", params)
+
+    vae_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "VAELoader"
+    )
+    assert vae_node["inputs"]["vae_name"] == "sdxl_vae.safetensors"
+
+
+@pytest.mark.asyncio
 async def test_post_process_hand_honors_profile_detailer_denoise():
     source = _solid_png(10, 10, (255, 0, 0))
     client = _StubUploadingComfyClient(source)
@@ -473,6 +496,54 @@ async def test_post_process_detailer_denoise_prefers_live_profile_over_stale_fro
     assert face_node["inputs"]["denoise"] == 0.15
     assert face_node["inputs"]["cfg"] == 4.0
     assert face_node["inputs"]["steps"] == 30
+
+
+@pytest.mark.asyncio
+async def test_post_process_face_honors_profile_detailer_disable_lora():
+    """A profile's `defaults.detailer_disable_lora` (added after Banana
+    Splitz XXL's detailer pass came out visibly worse with any LoRA
+    attached, regardless of which one) should keep LoRAs out of the
+    detailer graph's model/clip pipeline entirely."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        loras=[LoraSpec(name="a.safetensors")],
+        detailer_disable_lora=True,
+    )
+
+    await post_process(client, "face", source, "source.png", params)
+
+    assert "LoraLoader" not in [n["class_type"] for n in client.queued_graph.values()]
+
+
+@pytest.mark.asyncio
+async def test_post_process_detailer_disable_lora_prefers_live_profile_over_stale_frozen_params():
+    """Same "edit the profile, see it on the next tap" reasoning as
+    `test_post_process_detailer_denoise_prefers_live_profile_over_stale_frozen_params`
+    — a same-day profile edit turning `detailer_disable_lora` on should
+    reach the very next "🎯 Face Detail" tap, not just images generated
+    after the edit."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        loras=[LoraSpec(name="a.safetensors")],
+        detailer_disable_lora=False,  # frozen at generation time — since turned on
+    )
+    live_profile = ModelProfile(
+        match=["banana*"],
+        display_name="Banana",
+        defaults=ProfileDefaults(detailer_disable_lora=True),
+    )
+
+    await post_process(client, "face", source, "source.png", params, profiles=[live_profile])
+
+    assert "LoraLoader" not in [n["class_type"] for n in client.queued_graph.values()]
 
 
 @pytest.mark.asyncio
@@ -1161,6 +1232,89 @@ async def test_post_process_hand_drawn_tile_controlnet_override_ignored_without_
 
 
 @pytest.mark.asyncio
+async def test_post_process_hand_drawn_detailer_disable_lora_override_wins_over_profile():
+    """The WebApp's own "Disable LoRAs" checkbox wins over whatever the
+    image's own frozen `detailer_disable_lora` says — unlike
+    `tile_controlnet_override`, this one isn't scoped to
+    `is_detail_prompt`, since it's relevant to a plain "🖌️ Draw Mask" call
+    too."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        loras=[LoraSpec(name="a.safetensors")],
+        detailer_disable_lora=False,
+    )
+
+    await post_process(
+        client,
+        "hand_drawn",
+        source,
+        "source.png",
+        params,
+        mask_bytes=mask,
+        detailer_disable_lora_override=True,
+    )
+
+    assert "LoraLoader" not in [n["class_type"] for n in client.queued_graph.values()]
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_drawn_detailer_disable_lora_override_can_reenable_it():
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        loras=[LoraSpec(name="a.safetensors")],
+        detailer_disable_lora=True,
+    )
+
+    await post_process(
+        client,
+        "hand_drawn",
+        source,
+        "source.png",
+        params,
+        mask_bytes=mask,
+        detailer_disable_lora_override=False,
+    )
+
+    assert "LoraLoader" in [n["class_type"] for n in client.queued_graph.values()]
+
+
+@pytest.mark.asyncio
+async def test_post_process_hand_drawn_detailer_disable_lora_override_none_keeps_profile_value():
+    source = _solid_png(10, 10, (255, 0, 0))
+    mask = _solid_mask_png(10, 10, 255)
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        loras=[LoraSpec(name="a.safetensors")],
+        detailer_disable_lora=True,
+    )
+
+    await post_process(
+        client,
+        "hand_drawn",
+        source,
+        "source.png",
+        params,
+        mask_bytes=mask,
+        detailer_disable_lora_override=None,
+    )
+
+    assert "LoraLoader" not in [n["class_type"] for n in client.queued_graph.values()]
+
+
+@pytest.mark.asyncio
 async def test_post_process_fix_drawn_never_reads_detail_prompt_toggle():
     """`is_detail_prompt` only ever means anything for `kind="hand_drawn"`
     — passing it (mistakenly or not) alongside `kind="fix_drawn"` must not
@@ -1569,6 +1723,19 @@ def test_to_post_process_base_carries_detailer_cfg_and_steps():
 
     assert base.detailer_cfg == 4.0
     assert base.detailer_steps == 30
+
+
+def test_to_post_process_base_carries_detailer_disable_lora():
+    params = GenerationParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+        detailer_disable_lora=True,
+    )
+
+    base = _to_post_process_base(params)
+
+    assert base.detailer_disable_lora is True
 
 
 @pytest.mark.asyncio

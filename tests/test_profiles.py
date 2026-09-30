@@ -6,11 +6,13 @@ from comfytelegram.profiles import (
     LoraDefault,
     ModelProfile,
     ProfileDefaults,
+    apply_checkpoint_switch,
     load_profile_files,
     load_profiles,
     resolve_generation_params,
     resolve_profile,
 )
+from comfytelegram.workflows import GenerationParams, LoraSpec
 
 PROFILES_DIR = Path(__file__).resolve().parent.parent / "model_profiles"
 
@@ -139,6 +141,7 @@ def test_resolve_generation_params_defaults_to_checkpoint_loader_without_profile
     assert params.detailer_denoise is None
     assert params.detailer_cfg is None
     assert params.detailer_steps is None
+    assert params.detailer_disable_lora is None
 
 
 def test_resolve_generation_params_carries_upscale_denoise_from_profile_defaults():
@@ -170,6 +173,30 @@ def test_resolve_generation_params_carries_detailer_cfg_and_steps_from_profile_d
     params = resolve_generation_params("banana_splitz_xxl.safetensors", "a fox", profile)
     assert params.detailer_cfg == 4.0
     assert params.detailer_steps == 30
+
+
+def test_resolve_generation_params_carries_detailer_disable_lora_from_profile_defaults():
+    profile = ModelProfile(
+        match=["banana*"],
+        display_name="Banana Splitz Test",
+        defaults=ProfileDefaults(detailer_disable_lora=True),
+    )
+    params = resolve_generation_params("banana_splitz_xxl.safetensors", "a fox", profile)
+    assert params.detailer_disable_lora is True
+
+
+def test_resolve_generation_params_carries_checkpoint_loader_vae_override_from_profile():
+    """`vae_name` is optional for `loader="checkpoint"` profiles (the
+    default loader) — a profile can set it to override a suspect baked-in
+    VAE without switching to the split-loader architecture."""
+    profile = ModelProfile(
+        match=["banana*"],
+        display_name="Banana Splitz Test",
+        vae_name="sdxl_vae.safetensors",
+    )
+    params = resolve_generation_params("banana_splitz_xxl.safetensors", "a fox", profile)
+    assert params.loader == "checkpoint"
+    assert params.vae_name == "sdxl_vae.safetensors"
 
 
 def test_resolve_generation_params_carries_tile_controlnet_from_profile():
@@ -405,3 +432,92 @@ def test_fix_artifact_prompt_overrides_default_to_none():
     profile = ModelProfile(match=["*ckpt*"], display_name="X")
     assert profile.fix_artifact_positive_prefix is None
     assert profile.fix_artifact_negative_prefix is None
+
+
+def test_apply_checkpoint_switch_keeps_scene_content_swaps_architecture_and_tunables():
+    """ "🔀 Switch Model": the image's own resolved/raw prompt and seed must
+    survive untouched — the picture hasn't changed — while every
+    architecture fact and tunable generation default comes from the *new*
+    checkpoint's own profile, same as a fresh generation against it would
+    get."""
+    params = GenerationParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="masterpiece, a fox, forest",
+        negative_prompt="worst quality",
+        raw_positive_prompt="a fox, forest",
+        raw_negative_prompt="",
+        seed=12345,
+        cfg=4.0,
+        steps=30,
+        clip_skip=-2,
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        detailer_denoise=0.3,
+        detailer_cfg=4.0,
+        detailer_steps=30,
+        detailer_disable_lora=True,
+        loras=[LoraSpec(name="banana_only_lora.safetensors")],
+    )
+    new_profile = ModelProfile(
+        match=["furrytoonmix_*"],
+        display_name="FurryToonMix Test",
+        defaults=ProfileDefaults(
+            cfg=5.0, steps=40, clip_skip=-3, detailer_denoise=0.5, detailer_disable_lora=False
+        ),
+        tile_controlnet="different_tile.safetensors",
+        loras=[
+            LoraDefault(name="ftm_default_on.safetensors", default_enabled=True),
+            LoraDefault(name="ftm_default_off.safetensors", default_enabled=False),
+        ],
+    )
+
+    switched = apply_checkpoint_switch(
+        params, "furrytoonmix_xlIllustriousV2.safetensors", new_profile
+    )
+
+    # scene content untouched
+    assert switched.positive_prompt == "masterpiece, a fox, forest"
+    assert switched.negative_prompt == "worst quality"
+    assert switched.raw_positive_prompt == "a fox, forest"
+    assert switched.seed == 12345
+    # checkpoint + tunables + architecture come from the new profile
+    assert switched.checkpoint == "furrytoonmix_xlIllustriousV2.safetensors"
+    assert switched.cfg == 5.0
+    assert switched.steps == 40
+    assert switched.clip_skip == -3
+    assert switched.tile_controlnet == "different_tile.safetensors"
+    assert switched.detailer_denoise == 0.5
+    # new profile explicitly sets detailer_disable_lora=False, overriding
+    # the old checkpoint's True
+    assert switched.detailer_disable_lora is False
+    # loras reset to the new profile's own default_enabled set
+    assert [lora.name for lora in switched.loras] == ["ftm_default_on.safetensors"]
+
+
+def test_apply_checkpoint_switch_without_matching_profile_resets_to_generic_defaults():
+    """No shipped profile matches the target checkpoint — fall back to
+    `GenerationParams`' own generic defaults for everything except scene
+    content, rather than silently keeping the old checkpoint's tuned
+    values."""
+    params = GenerationParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="worst quality",
+        cfg=4.0,
+        clip_skip=-2,
+        tile_controlnet="xinsir_tile_sdxl.safetensors",
+        detailer_denoise=0.3,
+        detailer_disable_lora=True,
+        loras=[LoraSpec(name="banana_only_lora.safetensors")],
+    )
+
+    switched = apply_checkpoint_switch(params, "some_unmatched_checkpoint.safetensors", None)
+
+    assert switched.checkpoint == "some_unmatched_checkpoint.safetensors"
+    assert switched.positive_prompt == "a fox"
+    generic = GenerationParams(checkpoint="x", positive_prompt="", negative_prompt="")
+    assert switched.cfg == generic.cfg
+    assert switched.clip_skip == generic.clip_skip
+    assert switched.tile_controlnet is None
+    assert switched.detailer_denoise is None
+    assert switched.detailer_disable_lora is None
+    assert switched.loras == []

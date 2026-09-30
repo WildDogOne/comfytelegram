@@ -139,6 +139,7 @@ def _to_post_process_base(params: GenerationParams) -> PostProcessBaseParams:
         detailer_denoise=params.detailer_denoise,
         detailer_cfg=params.detailer_cfg,
         detailer_steps=params.detailer_steps,
+        detailer_disable_lora=params.detailer_disable_lora,
     )
 
 
@@ -148,8 +149,8 @@ def _to_post_process_base(params: GenerationParams) -> PostProcessBaseParams:
 _TILED_UPSCALE_KINDS = ("upscale", "homogenize")
 
 #: `post_process` kinds whose detailer pass reads
-#: `PostProcessBaseParams.detailer_denoise`/`detailer_cfg`/`detailer_steps`
-#: — see `_refresh_detailer_tunables`. `"fix_drawn"` is deliberately
+#: `PostProcessBaseParams.detailer_denoise`/`detailer_cfg`/`detailer_steps`/
+#: `detailer_disable_lora` — see `_refresh_detailer_tunables`. `"fix_drawn"` is deliberately
 #: excluded: it always runs against `DrawnMaskFixParams`' own fixed
 #: removal-oriented denoise/cfg/steps (and, when `fix_artifact_checkpoint`
 #: is set, a different checkpoint's profile entirely — see
@@ -192,15 +193,17 @@ def _refresh_detailer_tunables(
 ) -> PostProcessBaseParams:
     """Same "edit the profile, see it on the very next tap" reasoning as
     `_refresh_tunable_defaults`, scoped to `ModelProfile.defaults.
-    detailer_denoise`/`detailer_cfg`/`detailer_steps` — applied for every
-    kind in `_DETAILER_TUNABLE_KINDS` regardless of `is_detail_prompt`,
-    unlike `_refresh_detail_prompt_tile_controlnet`, since a checkpoint that
-    needs a different detailer denoise/cfg/steps needs it whether the tap
-    was "🎯 Face Detail", "🖐️ Hand Detail", "✋ Tap to mark", "🖌️ Draw Mask",
-    or "✏️ Detail Prompt" — there's no reason one of those should get the
-    tuned values and another shouldn't. Falls back to `base` unchanged if
-    the checkpoint no longer matches any shipped profile or `profiles`
-    wasn't supplied."""
+    detailer_denoise`/`detailer_cfg`/`detailer_steps`/`detailer_disable_lora`
+    — applied for every kind in `_DETAILER_TUNABLE_KINDS` regardless of
+    `is_detail_prompt`, unlike `_refresh_detail_prompt_tile_controlnet`,
+    since a checkpoint that needs a different detailer denoise/cfg/steps (or
+    needs its LoRAs left out of the detailer pass entirely — surfaced by
+    Banana Splitz XXL, whose detailer pass got visibly worse with any LoRA
+    attached) needs it whether the tap was "🎯 Face Detail", "🖐️ Hand
+    Detail", "✋ Tap to mark", "🖌️ Draw Mask", or "✏️ Detail Prompt" —
+    there's no reason one of those should get the tuned values and another
+    shouldn't. Falls back to `base` unchanged if the checkpoint no longer
+    matches any shipped profile or `profiles` wasn't supplied."""
     live_profile = resolve_profile(base.checkpoint, profiles or [])
     if live_profile is None:
         return base
@@ -209,6 +212,7 @@ def _refresh_detailer_tunables(
         detailer_denoise=live_profile.defaults.detailer_denoise,
         detailer_cfg=live_profile.defaults.detailer_cfg,
         detailer_steps=live_profile.defaults.detailer_steps,
+        detailer_disable_lora=live_profile.defaults.detailer_disable_lora,
     )
 
 
@@ -891,6 +895,7 @@ async def post_process(
     denoise: float | None = None,
     is_detail_prompt: bool = False,
     tile_controlnet_override: bool | None = None,
+    detailer_disable_lora_override: bool | None = None,
     upscale_denoise_override: float | None = None,
     tile_controlnet_strength_override: float | None = None,
     on_progress: ProgressCallback | None = None,
@@ -940,11 +945,14 @@ async def post_process(
     on the next fresh generation; `"face"`/`"hand"`/`"hand_manual"`/
     `"hand_drawn"` (every `kind` in `_DETAILER_TUNABLE_KINDS`, regardless of
     `is_detail_prompt`) similarly re-resolve `ModelProfile.defaults.
-    detailer_denoise`/`detailer_cfg`/`detailer_steps` (see
-    `_refresh_detailer_tunables`) — a checkpoint whose detailer pass needs a
-    much lower denoise, or a cfg/steps that actually matches its own tuned
-    generation values, than `FaceDetailerParams`/`HandDetailerParams`/
-    `ManualHandDetailerParams`/`DrawnMaskHandDetailerParams`' own hard-coded
+    detailer_denoise`/`detailer_cfg`/`detailer_steps`/`detailer_disable_lora`
+    (see `_refresh_detailer_tunables`) — a checkpoint whose detailer pass
+    needs a much lower denoise, a cfg/steps that actually matches its own
+    tuned generation values, or its LoRAs left out of the detailer pass
+    entirely (`detailer_disable_lora`, since attaching any LoRA at all
+    visibly degraded the detailer pass for it), than `FaceDetailerParams`/
+    `HandDetailerParams`/`ManualHandDetailerParams`/
+    `DrawnMaskHandDetailerParams`' own hard-coded
     defaults (surfaced by Banana Splitz XXL); `"hand_drawn"`
     *only when `is_detail_prompt` is also True* additionally re-resolves
     `tile_controlnet`/`tile_controlnet_strength`/`detail_prompt_tile_controlnet`
@@ -1008,7 +1016,24 @@ async def post_process(
     field first. `None` falls back to `is_detail_prompt and
     base_params.detail_prompt_tile_controlnet` exactly as before this
     parameter existed. Ignored entirely for every `kind` other than
-    `"hand_drawn"`."""
+    `"hand_drawn"`.
+    `detailer_disable_lora_override` is the WebApp's own "Disable LoRAs for
+    this detailer pass" checkbox — same always-`True`/`False`-or-`None`
+    shape as `tile_controlnet_override`, but *not* scoped to
+    `is_detail_prompt`: the editor shows it for a plain "🖌️ Draw Mask" job
+    too (see `handlers.py`'s `postprocess_callback`), since
+    `detailer_disable_lora` matters for any detailer pass, not just the
+    tile-ControlNet experiment "✏️ Detail Prompt" owns. When not `None` it
+    wins outright over `base_params.detailer_disable_lora` — whatever the
+    checkpoint's current profile says (`_refresh_detailer_tunables`) or
+    whatever was frozen into the image at generation time — the same
+    "one tap tries it without touching the profile's JSON file" reasoning
+    as the tile-ControlNet checkbox. Reaches `_build_drawn_mask_detailer`/
+    `_build_anima_fix_drawn_mask` via `_detailer_base` regardless of `kind`,
+    but today only `"hand_drawn"` callers (`handlers.py`) ever supply a
+    non-`None` value — "🩹 Fix Artifact" (`"fix_drawn"`) has no WebApp
+    checkbox for it (see `handlers.py`'s `postprocess_callback`, which never
+    builds one for that job kind)."""
     base_params = _to_post_process_base(full_params)
     if kind in DETAIL_PROMPT_KINDS:
         base_params = _apply_detail_prompt(base_params, detail_prompt, detail_negative_prompt)
@@ -1018,6 +1043,8 @@ async def post_process(
         base_params = _refresh_detailer_tunables(base_params, profiles)
     if kind == "hand_drawn" and is_detail_prompt:
         base_params = _refresh_detail_prompt_tile_controlnet(base_params, profiles)
+    if detailer_disable_lora_override is not None:
+        base_params = replace(base_params, detailer_disable_lora=detailer_disable_lora_override)
     if kind == "upscale" and (
         upscale_denoise_override is not None or tile_controlnet_strength_override is not None
     ):

@@ -175,7 +175,8 @@ CREATE TABLE IF NOT EXISTS inpaint_redo (
     detail_prompt TEXT,
     detail_negative_prompt TEXT,
     detail_denoise REAL,
-    tile_controlnet INTEGER
+    tile_controlnet INTEGER,
+    detailer_disable_lora INTEGER
 );
 """
 
@@ -212,6 +213,7 @@ class Storage:
         self._add_column_if_missing("inpaint_redo", "detail_negative_prompt", "TEXT")
         self._add_column_if_missing("inpaint_redo", "detail_denoise", "REAL")
         self._add_column_if_missing("inpaint_redo", "tile_controlnet", "INTEGER")
+        self._add_column_if_missing("inpaint_redo", "detailer_disable_lora", "INTEGER")
         #: Last `_prune()` sweep time per table — see PRUNE_INTERVAL_SECONDS.
         self._last_prune: dict[str, float] = {}
 
@@ -762,6 +764,7 @@ class Storage:
         detail_negative_prompt: str | None = None,
         detail_denoise: float | None = None,
         tile_controlnet: bool | None = None,
+        detailer_disable_lora: bool | None = None,
     ) -> None:
         """Record what "🔁 Redo (same mask)" (`handlers.py`'s
         `HAND_REDO_CALLBACK_KIND`/`FIX_REDO_CALLBACK_KIND`/
@@ -779,7 +782,13 @@ class Storage:
         "🖌️ Draw Mask"/"🩹 Fix Artifact" tap always starts from nothing);
         `None` for the "🖌️ Draw Mask"/"🩹 Fix Artifact" flows, which never
         collect any of the four at all — `tile_controlnet` included, since
-        those two never show the WebApp's checkbox either. Keyed by the
+        those two never show the WebApp's checkbox either. `detailer_disable_lora`
+        is the WebApp's "Disable LoRAs for this detailer pass" checkbox —
+        unlike `tile_controlnet`, this one can be non-`None` for "🖌️ Draw
+        Mask" too (it isn't scoped to "✏️ Detail Prompt" the way tile
+        ControlNet is — see `generation.post_process`'s
+        `detailer_disable_lora_override`), still always `None` for "🩹 Fix
+        Artifact" (no checkbox there either). Keyed by the
         *same* `result_id` as the `pending_result` row for the refined image
         this mask produced — `postprocess_callback` looks both up together,
         and either expiring invalidates the redo button the same way.
@@ -790,8 +799,9 @@ class Storage:
             self._conn.execute(
                 "INSERT OR REPLACE INTO inpaint_redo "
                 "(result_id, source_file_id, source_filename, mask_png, created_at, "
-                "detail_prompt, detail_negative_prompt, detail_denoise, tile_controlnet) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "detail_prompt, detail_negative_prompt, detail_denoise, tile_controlnet, "
+                "detailer_disable_lora) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     result_id,
                     source_file_id,
@@ -802,6 +812,7 @@ class Storage:
                     detail_negative_prompt,
                     detail_denoise,
                     tile_controlnet,
+                    detailer_disable_lora,
                 ),
             )
 
@@ -811,7 +822,7 @@ class Storage:
         mask — or pruned past its TTL)."""
         row = self._conn.execute(
             "SELECT source_file_id, source_filename, mask_png, detail_prompt, "
-            "detail_negative_prompt, detail_denoise, tile_controlnet "
+            "detail_negative_prompt, detail_denoise, tile_controlnet, detailer_disable_lora "
             "FROM inpaint_redo WHERE result_id = ?",
             (result_id,),
         ).fetchone()
@@ -825,6 +836,7 @@ class Storage:
             detail_negative_prompt,
             detail_denoise,
             tile_controlnet,
+            detailer_disable_lora,
         ) = row
         return {
             "source_file_id": source_file_id,
@@ -834,6 +846,9 @@ class Storage:
             "detail_negative_prompt": detail_negative_prompt,
             "detail_denoise": detail_denoise,
             "tile_controlnet": None if tile_controlnet is None else bool(tile_controlnet),
+            "detailer_disable_lora": (
+                None if detailer_disable_lora is None else bool(detailer_disable_lora)
+            ),
         }
 
     def close(self) -> None:

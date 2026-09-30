@@ -177,17 +177,31 @@
     flex: 1;
     min-width: 100px;
   }
-  #tile-controlnet-row label {
-    font-size: 13px;
-    display: flex;
-    align-items: flex-start;
-    gap: 6px;
-  }
   #denoise-value {
     font-size: 13px;
     color: #9a9a9a;
     min-width: 3.5em;
     text-align: right;
+  }
+  /* Both checkboxes share one row so a job with only one of them available
+     (the common case) doesn't spend a whole row's height on it — outside
+     #prompt-fields, unlike tile-controlnet-row used to be, since the LoRA
+     checkbox also has to show for a plain "mask" job ("🖌️ Draw Mask"), not
+     just "mask_prompt" ("✏️ Detail Prompt"). Hidden by default; applyMeta
+     shows this container whenever either child checkbox is shown, and
+     wraps to two lines if a narrow screen can't fit both on one. */
+  #toggle-row {
+    display: none;
+    flex-wrap: wrap;
+    gap: 4px 18px;
+    padding: 8px 14px;
+    border-top: 1px solid #222;
+  }
+  #toggle-row label {
+    font-size: 13px;
+    display: none;
+    align-items: flex-start;
+    gap: 6px;
   }
 </style>
 </head>
@@ -230,20 +244,26 @@
       <input type="range" id="denoise-input" min="0" max="1" step="0.01" value="0.5" disabled />
       <span id="denoise-value">detailer default</span>
     </div>
-    <!-- Only shown when the checkpoint's profile has both `tile_controlnet`
-         and `detail_prompt_tile_controlnet` available at all (`applyMeta`
-         reads `meta.tile_controlnet_available`) — hidden rather than shown
-         disabled, since there's nothing this checkbox could ever turn on
-         otherwise. Pre-checked from `meta.tile_controlnet_default`, but
-         always submitted as an explicit true/false either way — unlike
-         "Override denoise" above, a checkbox has no third "unset" state to
-         fall back to the profile's own default with. -->
-    <div id="tile-controlnet-row" style="display: none;">
-      <label
-        ><input type="checkbox" id="tile-controlnet-toggle" /> Tile ControlNet (experimental,
-        steadies the detailer against the source image)</label
-      >
-    </div>
+  </div>
+
+  <!-- Both checkboxes live here, outside #prompt-fields — tile-ControlNet
+       is still only ever available for a "mask_prompt" job ("✏️ Detail
+       Prompt"), but the LoRA checkbox also has to show for a plain "mask"
+       job ("🖌️ Draw Mask"), so the shared row can't live inside that panel.
+       Each <label> is hidden by default (#toggle-row label CSS) and shown
+       individually by applyMeta when its own `meta.*_available` flag says
+       so — hidden rather than shown-disabled, since there'd be nothing for
+       either checkbox to turn on/off otherwise. Both are pre-checked from
+       their own `meta.*_default` but always submitted as an explicit
+       true/false, same as "Override denoise" is not. -->
+  <div id="toggle-row">
+    <label id="tile-controlnet-row"
+      ><input type="checkbox" id="tile-controlnet-toggle" /> Tile ControlNet (experimental,
+      steadies the detailer against the source image)</label
+    >
+    <label id="lora-row"
+      ><input type="checkbox" id="lora-toggle" /> Disable LoRAs for this detailer pass</label
+    >
   </div>
 
   <div id="controls">
@@ -297,8 +317,14 @@
   var denoiseOverride = document.getElementById("denoise-override");
   var denoiseInput = document.getElementById("denoise-input");
   var denoiseValueEl = document.getElementById("denoise-value");
+  // Shared row for the tile-ControlNet and "Disable LoRAs" checkboxes (see
+  // applyMeta) — outside #prompt-fields since the LoRA one has to show for
+  // a plain "mask" job too, not just "mask_prompt".
+  var toggleRowEl = document.getElementById("toggle-row");
   var tileControlnetRow = document.getElementById("tile-controlnet-row");
   var tileControlnetToggle = document.getElementById("tile-controlnet-toggle");
+  var loraRow = document.getElementById("lora-row");
+  var loraToggle = document.getElementById("lora-toggle");
 
   // On by default (matches the button's own initial "active" class in the
   // markup) — `finishAction` checks this before running `runEnclosedFill`,
@@ -1254,6 +1280,11 @@
   // both whether `#prompt-fields` is shown at all and whether "Done"
   // includes them in its submission.
   var promptFieldsEnabled = false;
+  // Set once, from `GET /jobs/{token}/meta` (`applyMeta`, below) — unlike
+  // `promptFieldsEnabled` this isn't tied to `mode`, since the LoRA toggle
+  // is relevant to a plain "mask" job ("🖌️ Draw Mask") too, not just
+  // "mask_prompt" ("✏️ Detail Prompt").
+  var loraAvailable = false;
 
   doneBtn.addEventListener("click", function () {
     doneBtn.disabled = true;
@@ -1262,6 +1293,9 @@
       var form = new FormData();
       form.append("mask", blob, "mask.png");
       form.append("init_data", tg ? tg.initData : "");
+      if (loraAvailable) {
+        form.append("detailer_disable_lora", loraToggle.checked ? "true" : "false");
+      }
       if (promptFieldsEnabled) {
         form.append("positive", positiveInput.value);
         form.append("negative", negativeInput.value);
@@ -1315,6 +1349,33 @@
   // creation (`Job.mode` — see inpaint_relay/server.py), not guessed from
   // anything client-side.
   function applyMeta(meta) {
+    // Both checked up front, before the mode-gated early return below —
+    // `tile_controlnet_available` is only ever true for a "mask_prompt"
+    // job anyway (the relay only sets it then), but checking it here
+    // rather than after the early return is what lets both checkboxes
+    // share one row regardless of which one(s) end up shown.
+    var toggleShown = false;
+    if (meta.detailer_disable_lora_available) {
+      loraAvailable = true;
+      loraRow.style.display = "flex";
+      loraToggle.checked = Boolean(meta.detailer_disable_lora_default);
+      toggleShown = true;
+    }
+    // Hidden entirely (not shown-but-disabled) when this checkpoint's
+    // profile has no tile_controlnet staged at all — there'd be nothing
+    // for the checkbox to actually turn on either way. When it is shown,
+    // it starts checked/unchecked from the profile's own current default
+    // (`ModelProfile.detail_prompt_tile_controlnet`) but is always
+    // submitted as its own explicit value on "Done" regardless of that
+    // starting point.
+    if (meta.tile_controlnet_available) {
+      tileControlnetRow.style.display = "flex";
+      tileControlnetToggle.checked = Boolean(meta.tile_controlnet_default);
+      toggleShown = true;
+    }
+    if (toggleShown) {
+      toggleRowEl.style.display = "flex";
+    }
     if (meta.mode !== "mask_prompt") return;
     promptFieldsEnabled = true;
     document.title = "Detail prompt";
@@ -1332,17 +1393,6 @@
       updateDenoiseReadout();
     });
     denoiseInput.addEventListener("input", updateDenoiseReadout);
-    // Hidden entirely (not shown-but-disabled) when this checkpoint's
-    // profile has no tile_controlnet staged at all — there'd be nothing
-    // for the checkbox to actually turn on either way. When it is shown,
-    // it starts checked/unchecked from the profile's own current default
-    // (`ModelProfile.detail_prompt_tile_controlnet`) but is always
-    // submitted as its own explicit value on "Done" regardless of that
-    // starting point.
-    if (meta.tile_controlnet_available) {
-      tileControlnetRow.style.display = "block";
-      tileControlnetToggle.checked = Boolean(meta.tile_controlnet_default);
-    }
   }
 
   function loadImage() {

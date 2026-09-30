@@ -18,6 +18,7 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -72,7 +73,9 @@ from comfytelegram.png_metadata import (
     summarize_graph,
 )
 from comfytelegram.profiles import (
+    LoraDefault,
     ModelProfile,
+    apply_checkpoint_switch,
     apply_lora_overrides,
     apply_lora_strength_overrides,
     apply_profile_override,
@@ -294,6 +297,39 @@ HAND_POINT_CALLBACK_PREFIX = "hp:"
 #: main.py). Its own namespace rather than folding into `HAND_POINT_CALLBACK_PREFIX`
 #: since it carries no row/col.
 HAND_POINT_DENSITY_CALLBACK_PREFIX = "hpz:"
+#: `pp:<SWITCH_MODEL_CALLBACK_KIND>:<result_id>` on `_post_process_keyboard`
+#: opens a checkpoint picker for switching *this image's* working checkpoint
+#: from this point onward (see `profiles.apply_checkpoint_switch`) — for a
+#: checkpoint whose own generation/upscale quality is fine but whose
+#: detailer pass isn't (the motivating case: generate/upscale with one
+#: checkpoint, detail with another). Picker taps land on
+#: `SWITCH_MODEL_PICK_CALLBACK_PREFIX`, their own namespace (not `pp:`)
+#: since they carry a checkpoint-list index alongside `result_id` — same
+#: reasoning as `HAND_POINT_CALLBACK_PREFIX`.
+SWITCH_MODEL_CALLBACK_KIND = "switch_model"
+SWITCH_MODEL_PICK_CALLBACK_PREFIX = "swm:"
+#: `pp:<LORA_SWITCH_CALLBACK_KIND>:<result_id>` opens a lightweight on/off
+#: LoRA toggle screen for *this image's own current checkpoint* (whatever
+#: `SWITCH_MODEL_CALLBACK_KIND` last set it to, or the original one if never
+#: switched) — the follow-up to switching models, since the previous
+#: checkpoint's LoRAs get reset to the new checkpoint's own
+#: `default_enabled` set (see `apply_checkpoint_switch`) rather than
+#: carried over unvalidated. Deliberately not the full `/lora` menu
+#: (`lora_menu.py`) reused as-is: that module is hardwired to the chat's
+#: *currently-selected* checkpoint (`storage.get_checkpoint`), not
+#: necessarily this specific image's — generalizing it to target an
+#: arbitrary checkpoint would mean threading one through every one of its
+#: existing `lr:` sub-screens (strength editing, CivitAI info) for a much
+#: simpler need here: no strength editing, no persistence beyond this one
+#: image. Toggle taps land on `LORA_SWITCH_TOGGLE_CALLBACK_PREFIX`, their
+#: own namespace, carrying the in-progress selection as a bitmask
+#: (`profile.loras`' own stable list order — see `lora_menu.py`'s own
+#: docstring for why that ordering is safe to rely on) directly in the
+#: callback data rather than in `chat_data`, the same "state rides in the
+#: callback, not chat_data" convention `_post_process_keyboard`'s own
+#: paging uses.
+LORA_SWITCH_CALLBACK_KIND = "switch_loras"
+LORA_SWITCH_TOGGLE_CALLBACK_PREFIX = "swl:"
 AGAIN_CALLBACK_PREFIX = "again:"
 GENERATE_FROM_PROMPT_CALLBACK_PREFIX = "genp:"
 STREAM_CANCEL_CALLBACK_DATA = "stream:cancel"
@@ -421,8 +457,12 @@ def _post_process_keyboard(result_id: str, page: int = 1) -> InlineKeyboardMarku
     ✏️ Detail Prompt beside them (a third, general-purpose region-detail
     action — draw a mask, describe it, run immediately — that belongs with
     the other two more than anywhere else on the keyboard), then
-    📥 Download file and 🐛 Show Prompt. Page 2 holds the rest — 🧵 Homogenize
-    and the three analyzers. The split is one tap deep and reversible, which is the
+    📥 Download file and 🐛 Show Prompt. Page 2 holds the rest — 🧵 Homogenize,
+    the three analyzers, and 🔀 Switch Model / 🎛 LoRAs (see
+    `SWITCH_MODEL_CALLBACK_KIND`/`LORA_SWITCH_CALLBACK_KIND` — deliberately
+    page 2, not 1: switching a checkpoint mid-pipeline is a rare, deliberate
+    choice, not something tapped while routinely working an image). The
+    split is one tap deep and reversible, which is the
     point: ten buttons under every image (and every image *derived* from
     it, stacking down the scrollback) had turned a working keyboard into a
     wall.
@@ -459,6 +499,16 @@ def _post_process_keyboard(result_id: str, page: int = 1) -> InlineKeyboardMarku
                     InlineKeyboardButton(
                         "🔬 Analyze Prompt",
                         callback_data=f"pp:{ANALYZE_PROMPT_CALLBACK_KIND}:{result_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔀 Switch Model",
+                        callback_data=f"pp:{SWITCH_MODEL_CALLBACK_KIND}:{result_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "🎛 LoRAs",
+                        callback_data=f"pp:{LORA_SWITCH_CALLBACK_KIND}:{result_id}",
                     ),
                 ],
                 [
@@ -502,6 +552,42 @@ def _post_process_keyboard(result_id: str, page: int = 1) -> InlineKeyboardMarku
             [InlineKeyboardButton("⋯ More", callback_data=f"pp:{MORE_CALLBACK_KIND}:{result_id}")],
         ]
     )
+
+
+def _lora_switch_keyboard(
+    result_id: str, loras: list[LoraDefault], mask: int
+) -> InlineKeyboardMarkup:
+    """One row per `loras` entry (a ✅/◻️ toggle, same icon convention as
+    `lora_menu.py`'s own `_home_keyboard`) plus an Apply/Cancel row. `mask`
+    (the in-progress selection, one bit per `loras` index) rides in every
+    button's own callback data rather than `chat_data` — a toggle tap
+    re-renders this exact keyboard with the flipped bit already baked in,
+    so there's no server-side state to go stale or leak between chats.
+    `loras`' index order must match whatever `mask` was built against
+    (`profile.loras`' own stable list order — loaded once at startup, never
+    reordered mid-request, same guarantee `lora_menu.py` relies on for its
+    own index-keyed callbacks)."""
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"{'✅' if mask & (1 << i) else '◻️'} {lora.name.rsplit('/', 1)[-1]}",
+                callback_data=(f"{LORA_SWITCH_TOGGLE_CALLBACK_PREFIX}t:{result_id}:{mask:x}:{i}"),
+            )
+        ]
+        for i, lora in enumerate(loras)
+    ]
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "✅ Apply",
+                callback_data=f"{LORA_SWITCH_TOGGLE_CALLBACK_PREFIX}a:{result_id}:{mask:x}",
+            ),
+            InlineKeyboardButton(
+                "✖ Cancel", callback_data=f"{LORA_SWITCH_TOGGLE_CALLBACK_PREFIX}c:{result_id}"
+            ),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
 def _again_keyboard(snapshot_id: str) -> InlineKeyboardMarkup:
@@ -1183,13 +1269,18 @@ async def _relay_create_job(
     `meta`, when given, becomes the relay's `X-Job-Meta` header — base64'd
     JSON rather than raw text, so it can't run into HTTP header encoding
     rules (headers are meant to stay ASCII/latin-1). Omitted entirely for
-    "🖌️ Draw Mask"/"🩹 Fix Artifact" (the relay defaults an unset header to
-    `mode="mask"`, a canvas with no prompt fields);
-    `DETAIL_PROMPT_CALLBACK_KIND` is the one caller that passes one,
-    carrying `mode="mask_prompt"` (the same canvas plus editable
-    positive/negative/denoise fields, submitted together with the mask —
-    see `_relay_poll_result`) and read-only reference settings to display
-    (`_detail_prompt_readonly_info`).
+    "🩹 Fix Artifact" (the relay defaults an unset header to `mode="mask"`,
+    a canvas with no prompt fields, and there's no per-checkpoint toggle to
+    show for it either); `DETAIL_PROMPT_CALLBACK_KIND` passes one carrying
+    `mode="mask_prompt"` (the same canvas plus editable positive/negative/
+    denoise fields, submitted together with the mask — see
+    `_relay_poll_result`) and read-only reference settings to display
+    (`_detail_prompt_readonly_info`). `HAND_DRAW_CALLBACK_KIND` ("🖌️ Draw
+    Mask") also passes one now, despite staying a plain `mode="mask"`
+    canvas — just for `detailer_disable_lora_available`/`_default` (the
+    "Disable LoRAs for this detailer pass" checkbox, relevant to any
+    detailer pass, not only "✏️ Detail Prompt"'s tile-ControlNet
+    experiment).
 
     The image is compressed here (`_to_display_jpeg`) rather than on the
     relay, which is where this used to happen: the relay re-encoded on
@@ -1228,13 +1319,19 @@ async def _relay_poll_result(settings: Settings, token: str) -> dict[str, Any] |
     or the relay no longer knows about it at all (404 — e.g. a relay
     restart lost its in-memory job store, see inpaint_relay's own docs), or
     `{"mask": <bytes>, "positive": <str|None>, "negative": <str|None>,
-    "denoise": <float|None>, "tile_controlnet": <bool|None>, "init_data":
-    <str>}` once submitted — every job submits a mask (both "mask" and
-    "mask_prompt" jobs draw one); `positive`/`negative`/`denoise`/
-    `tile_controlnet` are only ever non-None for a `DETAIL_PROMPT_CALLBACK_KIND`
-    job's `mode="mask_prompt"` submission, so `_process_one_inpaint_job` can
-    pass all four straight into `post_process` unconditionally — they're
-    simply always `None` for "🖌️ Draw Mask"/"🩹 Fix Artifact"."""
+    "denoise": <float|None>, "tile_controlnet": <bool|None>,
+    "detailer_disable_lora": <bool|None>, "init_data": <str>}` once
+    submitted — every job submits a mask (both "mask" and "mask_prompt"
+    jobs draw one); `positive`/`negative`/`denoise`/`tile_controlnet` are
+    only ever non-None for a `DETAIL_PROMPT_CALLBACK_KIND` job's
+    `mode="mask_prompt"` submission, so `_process_one_inpaint_job` can pass
+    all five straight into `post_process` unconditionally — they're simply
+    always `None` for "🖌️ Draw Mask"/"🩹 Fix Artifact". `detailer_disable_lora`
+    is the one exception: it can be non-None for a "🖌️ Draw Mask" submission
+    too (the editor shows that checkbox whenever the image has any LoRAs
+    attached at all, not just for "✏️ Detail Prompt" — see
+    `postprocess_callback`'s `meta` construction), still always `None` for
+    "🩹 Fix Artifact"."""
     async with (
         aiohttp.ClientSession(timeout=_INPAINT_RELAY_TIMEOUT) as session,
         session.get(
@@ -1254,6 +1351,7 @@ async def _relay_poll_result(settings: Settings, token: str) -> dict[str, Any] |
         "negative": payload.get("negative"),
         "denoise": payload.get("denoise"),
         "tile_controlnet": payload.get("tile_controlnet"),
+        "detailer_disable_lora": payload.get("detailer_disable_lora"),
         "init_data": payload["init_data"],
     }
 
@@ -1288,6 +1386,7 @@ async def _run_drawn_mask_post_process(
     detail_denoise: float | None = None,
     is_detail_prompt: bool = False,
     tile_controlnet_override: bool | None = None,
+    detailer_disable_lora_override: bool | None = None,
 ) -> GeneratedImage | None:
     """Shared by `_process_one_inpaint_job` (a freshly submitted mask) and
     `postprocess_callback`'s `*_REDO_CALLBACK_KIND` branch (re-running a
@@ -1311,7 +1410,12 @@ async def _run_drawn_mask_post_process(
     job only (see `generation.post_process`'s own docstring for how it
     overrides the profile's `detail_prompt_tile_controlnet` default) —
     `None` for "🖌️ Draw Mask"/"🩹 Fix Artifact", same as the prompt fields.
-    Returns None on failure (already reported into `status_message` by
+    `detailer_disable_lora_override` is the WebApp's "Disable LoRAs for this
+    detailer pass" checkbox — unlike `tile_controlnet_override`, it can be
+    non-`None` for "hand" (plain "🖌️ Draw Mask") too, not just "detail" (see
+    `postprocess_callback`'s `meta` construction); still always `None` for
+    "fix" ("🩹 Fix Artifact"), which has no such checkbox. Returns None on
+    failure (already reported into `status_message` by
     `_run_reporting_errors`); callers should treat that as "stop here",
     same as `_run_reporting_errors` itself."""
     generated = await _run_reporting_errors(
@@ -1330,6 +1434,7 @@ async def _run_drawn_mask_post_process(
             denoise=detail_denoise,
             is_detail_prompt=is_detail_prompt,
             tile_controlnet_override=tile_controlnet_override,
+            detailer_disable_lora_override=detailer_disable_lora_override,
             profiles=profiles,
         ),
     )
@@ -1352,6 +1457,7 @@ async def _send_drawn_mask_result_with_redo(
     detail_negative_prompt: str | None = None,
     detail_denoise: float | None = None,
     tile_controlnet: bool | None = None,
+    detailer_disable_lora: bool | None = None,
 ) -> None:
     """Send a `post_process(kind="hand_drawn"/"fix_drawn")` result with
     "🔁 Redo (same mask)"/"🔁 x4" buttons attached (one row), and persist what
@@ -1371,7 +1477,11 @@ async def _send_drawn_mask_result_with_redo(
     than passed to `send`, since they're tied to *this specific mask*, not
     to the image in general (a redo replays all four together; a fresh
     detail/draw-mask/fix-artifact tap always starts from nothing, whatever
-    a sibling result's redo happens to carry)."""
+    a sibling result's redo happens to carry). `detailer_disable_lora` is
+    the WebApp's "Disable LoRAs for this detailer pass" checkbox — unlike
+    the other four, it can be non-`None` for "🖌️ Draw Mask" too, not just
+    "✏️ Detail Prompt" (still always `None` for "🩹 Fix Artifact", which has
+    no such checkbox)."""
     new_result_id = uuid.uuid4().hex[:12]
     await send(
         generated,
@@ -1392,6 +1502,7 @@ async def _send_drawn_mask_result_with_redo(
         detail_negative_prompt=detail_negative_prompt,
         tile_controlnet=tile_controlnet,
         detail_denoise=detail_denoise,
+        detailer_disable_lora=detailer_disable_lora,
     )
 
 
@@ -1427,6 +1538,7 @@ async def _run_one_drawn_mask_redo(
     detail_negative_prompt = redo.get("detail_negative_prompt")
     detail_denoise = redo.get("detail_denoise")
     tile_controlnet_choice = redo.get("tile_controlnet")
+    detailer_disable_lora_choice = redo.get("detailer_disable_lora")
     status_message = await reply_message.reply_text(
         f"{drawn_mask_kind['label']} (drawn mask)…", disable_notification=True
     )
@@ -1445,6 +1557,7 @@ async def _run_one_drawn_mask_redo(
         detail_denoise=detail_denoise,
         is_detail_prompt=drawn_mask_kind["is_detail_prompt"],
         tile_controlnet_override=tile_controlnet_choice,
+        detailer_disable_lora_override=detailer_disable_lora_choice,
     )
     if generated is None:
         return False
@@ -1461,6 +1574,7 @@ async def _run_one_drawn_mask_redo(
         detail_negative_prompt=detail_negative_prompt,
         detail_denoise=detail_denoise,
         tile_controlnet=tile_controlnet_choice,
+        detailer_disable_lora=detailer_disable_lora_choice,
     )
     return True
 
@@ -1534,6 +1648,7 @@ async def _process_one_inpaint_job(
     detail_negative_prompt = result.get("negative")
     detail_denoise = result.get("denoise")
     tile_controlnet_choice = result.get("tile_controlnet")
+    detailer_disable_lora_choice = result.get("detailer_disable_lora")
     source_bytes = await _fetch_source_image(
         client,
         application.bot,
@@ -1557,6 +1672,7 @@ async def _process_one_inpaint_job(
         detail_denoise=detail_denoise,
         is_detail_prompt=drawn_mask_kind["is_detail_prompt"],
         tile_controlnet_override=tile_controlnet_choice,
+        detailer_disable_lora_override=detailer_disable_lora_choice,
     )
     if generated is None:
         return
@@ -1580,6 +1696,7 @@ async def _process_one_inpaint_job(
         detail_negative_prompt=detail_negative_prompt,
         detail_denoise=detail_denoise,
         tile_controlnet=tile_controlnet_choice,
+        detailer_disable_lora=detailer_disable_lora_choice,
     )
 
 
@@ -2769,7 +2886,16 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     `FIX_DRAW_CALLBACK_KIND`/`FIX_REDO_CALLBACK_KIND` ("🩹 Fix Artifact")
     mirror `HAND_DRAW_CALLBACK_KIND`/`HAND_REDO_CALLBACK_KIND` exactly, just
     for `post_process(kind="fix_drawn")` (general-purpose artifact removal)
-    instead of a hand — see `_DRAWN_MASK_KINDS`."""
+    instead of a hand — see `_DRAWN_MASK_KINDS`. `SWITCH_MODEL_CALLBACK_KIND`
+    ("🔀 Switch Model") doesn't post-process either — it replies with a
+    checkpoint picker (same list/labeling `/model` itself uses); picking one
+    is handled by `switch_model_pick_callback`, not this function, for the
+    same "needs its own callback_data shape" reason `HAND_MANUAL_CALLBACK_KIND`'s
+    grid does. `LORA_SWITCH_CALLBACK_KIND` ("🎛 LoRAs") replies with an on/off
+    toggle screen for *this image's own current checkpoint*'s LoRAs (see that
+    constant's own docstring for why it's a lightweight standalone screen
+    rather than the full `/lora` menu); toggle/apply taps are handled by
+    `switch_loras_callback`, its own dedicated callback."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
@@ -2910,6 +3036,65 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await _safe_edit_message(query, "Upscale cancelled.", InlineKeyboardMarkup([]))
         return
 
+    if kind == SWITCH_MODEL_CALLBACK_KIND:
+        try:
+            checkpoints = await client.list_checkpoints()
+        except (ComfyUIError, OSError) as exc:
+            logger.exception("Failed to list checkpoints for Switch Model")
+            await query.message.reply_text(f"Couldn't reach ComfyUI: {exc}")
+            return
+        if not checkpoints:
+            await query.message.reply_text("ComfyUI reports no checkpoints installed.")
+            return
+        # Same shared list `/model` itself uses (`model_command`/
+        # `model_callback`) — a picker index is only ever resolved against
+        # whichever list is freshest, so a concurrent `/model` tap in another
+        # chat can make this one stale; `switch_model_pick_callback` reports
+        # that the same way `model_callback` does rather than resolving
+        # against a possibly-outdated snapshot.
+        context.bot_data["available_checkpoints"] = checkpoints
+        profiles: list[ModelProfile] = context.bot_data["profiles"]
+        labels = _checkpoint_labels(checkpoints, profiles)
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    label, callback_data=f"{SWITCH_MODEL_PICK_CALLBACK_PREFIX}{result_id}:{i}"
+                )
+            ]
+            for i, label in enumerate(labels)
+        ]
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "✖ Cancel",
+                    callback_data=f"{SWITCH_MODEL_PICK_CALLBACK_PREFIX}{result_id}:close",
+                )
+            ]
+        )
+        await query.message.reply_text(
+            "Choose a model — this image's post-processing (and "
+            '"🔁 Generate Again") will use it from here on:',
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if kind == LORA_SWITCH_CALLBACK_KIND:
+        profiles: list[ModelProfile] = context.bot_data["profiles"]
+        profile = resolve_profile(full_params.checkpoint, profiles)
+        if profile is None or not profile.loras:
+            await query.message.reply_text(
+                "This checkpoint has no LoRAs configured — add them to its entry in "
+                "model_profiles/*.json first."
+            )
+            return
+        active_names = {lora.name for lora in full_params.loras}
+        mask = sum(1 << i for i, lora in enumerate(profile.loras) if lora.name in active_names)
+        await query.message.reply_text(
+            f"🎛 LoRAs for {profile.display_name} — tap to toggle, then Apply:",
+            reply_markup=_lora_switch_keyboard(result_id, profile.loras, mask),
+        )
+        return
+
     if kind == "hand":
         await query.message.reply_text(
             "Auto-detect usually finds it, but you can mark the hand yourself if it keeps missing:",
@@ -2980,32 +3165,47 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             job_kind = "detail"
         # DETAIL_PROMPT_CALLBACK_KIND is the one caller that wants the
         # editor's prompt fields too (`Job.mode="mask_prompt"` — see
-        # `_relay_create_job`); the other two just draw a plain mask
-        # (`meta=None`, which the relay defaults to `mode="mask"`). The
-        # fields pre-fill with this image's own current prompt — the usual
-        # reason to open this is to cut most of a scene-wide prompt down to
-        # what the marked region actually needs, not type one from scratch
-        # — but nothing about them is saved anywhere once the editor closes
-        # (see `DETAIL_PROMPT_CALLBACK_KIND`'s docstring). The tile-
-        # ControlNet checkbox's availability/starting state comes off the
-        # checkpoint's *current* profile (not `full_params`' own frozen
-        # `tile_controlnet`/`detail_prompt_tile_controlnet`, which could be
+        # `_relay_create_job`); HAND_DRAW_CALLBACK_KIND draws a plain mask
+        # (`Job.mode` defaults to "mask" whenever `meta` omits it) but still
+        # gets a `meta` dict, for the "Disable LoRAs" checkbox below — only
+        # FIX_DRAW_CALLBACK_KIND stays at `meta=None` outright, since
+        # detailer_disable_lora isn't live-refreshed for "fix_drawn" either
+        # (see generation.py's `_DETAILER_TUNABLE_KINDS`) and there's no
+        # tile-ControlNet checkbox for it. The prompt fields pre-fill with
+        # this image's own current prompt — the usual reason to open this is
+        # to cut most of a scene-wide prompt down to what the marked region
+        # actually needs, not type one from scratch — but nothing about them
+        # is saved anywhere once the editor closes (see
+        # `DETAIL_PROMPT_CALLBACK_KIND`'s docstring). Both checkboxes'
+        # availability/starting state come off the checkpoint's *current*
+        # profile (not `full_params`' own frozen values, which could be
         # stale for an image generated before a profile edit) — same "live,
-        # not frozen" reasoning `generation._refresh_detail_prompt_tile_controlnet`
-        # applies on the way back in.
+        # not frozen" reasoning `generation._refresh_detail_prompt_tile_controlnet`/
+        # `_refresh_detailer_tunables` apply on the way back in.
         meta = None
-        if job_kind == "detail":
+        if job_kind in ("hand", "detail"):
             live_profile = resolve_profile(full_params.checkpoint, context.bot_data["profiles"])
             meta = {
-                "mode": "mask_prompt",
-                "positive": full_params.positive_prompt,
-                "negative": full_params.negative_prompt,
-                "readonly": _detail_prompt_readonly_info(live_profile),
-                "tile_controlnet_available": bool(live_profile and live_profile.tile_controlnet),
-                "tile_controlnet_default": bool(
-                    live_profile and live_profile.detail_prompt_tile_controlnet
+                "detailer_disable_lora_available": bool(full_params.loras),
+                "detailer_disable_lora_default": bool(
+                    live_profile and live_profile.defaults.detailer_disable_lora
                 ),
             }
+            if job_kind == "detail":
+                meta.update(
+                    {
+                        "mode": "mask_prompt",
+                        "positive": full_params.positive_prompt,
+                        "negative": full_params.negative_prompt,
+                        "readonly": _detail_prompt_readonly_info(live_profile),
+                        "tile_controlnet_available": bool(
+                            live_profile and live_profile.tile_controlnet
+                        ),
+                        "tile_controlnet_default": bool(
+                            live_profile and live_profile.detail_prompt_tile_controlnet
+                        ),
+                    }
+                )
         # Uploading a large source image to a remote relay host can take a
         # few seconds, with nothing on screen to show for it in the
         # meantime — long enough that a user unsure whether their tap
@@ -3334,6 +3534,132 @@ async def hand_point_density_callback(update: Update, context: ContextTypes.DEFA
         caption="Tap the cell over the hand:",
         reply_markup=_hand_point_keyboard(result_id, grid_size),
     )
+
+
+async def switch_model_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle a `swm:<result_id>:<index|"close">` tap from
+    `SWITCH_MODEL_CALLBACK_KIND`'s checkpoint picker: `"close"` just deletes
+    the picker message (same as `/model`'s own "✖ Close"); an index resolves
+    against `context.bot_data["available_checkpoints"]` — the same shared
+    list `/model` itself populates, so it's stale (and rejected the same
+    way `model_callback`'s own index is) if a newer `/model` or "🔀 Switch
+    Model" tap anywhere refreshed it since this picker was opened. On a
+    valid pick, rebuilds `result_id`'s stored `pending_result.base_params`
+    via `profiles.apply_checkpoint_switch` and writes it straight back with
+    the same `result_id`/`chat_id`/`file_id`/`filename`
+    (`storage.store_pending_result` is `INSERT OR REPLACE`, so this is an
+    in-place update, not a new row) — every subsequent tap on this image's
+    *existing* keyboard (Face/Hand Detail, Upscale, "🔁 Generate Again", a
+    later "🎛 LoRAs") re-reads that row fresh and picks up the new
+    checkpoint automatically; nothing needs resending."""
+    query = update.callback_query
+    settings: Settings = context.bot_data["settings"]
+    user_id = update.effective_user.id if update.effective_user else None
+    if await reject_if_unauthorized_callback(query, user_id, settings):
+        return
+
+    _, result_id, token = query.data.split(":", 2)
+    if token == "close":
+        await query.answer()
+        await query.message.delete()
+        return
+
+    checkpoints: list[str] = context.bot_data.get("available_checkpoints", [])
+    index = int(token)
+    if index >= len(checkpoints):
+        await query.answer("That model list is stale — tap 🔀 Switch Model again.", show_alert=True)
+        return
+
+    storage: Storage = context.bot_data["storage"]
+    pending = storage.get_pending_result(result_id)
+    if pending is None:
+        await query.answer("That result has expired — generate a new image.", show_alert=True)
+        return
+
+    new_checkpoint = checkpoints[index]
+    profiles: list[ModelProfile] = context.bot_data["profiles"]
+    new_profile = resolve_profile(new_checkpoint, profiles)
+    full_params = _deserialize_generation_params(pending["base_params"])
+    switched = apply_checkpoint_switch(full_params, new_checkpoint, new_profile)
+    storage.store_pending_result(
+        result_id,
+        pending["chat_id"],
+        pending["file_id"],
+        pending["filename"],
+        _serialize_generation_params(switched),
+    )
+
+    label = _checkpoint_labels(checkpoints, profiles)[index]
+    await query.answer()
+    await query.edit_message_text(f"🔀 Switched to {label} for this image.")
+
+
+async def switch_loras_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle a `swl:<action>:<result_id>:...` tap from `_lora_switch_keyboard`
+    (opened by `LORA_SWITCH_CALLBACK_KIND`): `"c"` (Cancel) just deletes the
+    screen with no change; `"t"` (`swl:t:<result_id>:<mask>:<index>`) flips
+    bit `index` in the in-progress selection and re-renders the same
+    keyboard with the flipped mask baked into every button (see
+    `_lora_switch_keyboard`'s own docstring for why the mask lives in
+    callback data rather than `chat_data`); `"a"` (Apply,
+    `swl:a:<result_id>:<mask>`) resolves `mask` against the checkpoint's
+    *current* profile's `loras` (re-resolved fresh, not cached from when the
+    screen opened — negligible risk in practice since a profile reload
+    mid-toggle is rare, but cheap to get right) and writes the selected
+    LoRAs straight into `result_id`'s stored `pending_result.base_params`,
+    same in-place-update mechanism `switch_model_pick_callback` uses.
+    Defensively re-checks the checkpoint still has a matching profile with
+    `loras` at all — it did when the screen was opened, but a `/reload`
+    could have changed that in between."""
+    query = update.callback_query
+    settings: Settings = context.bot_data["settings"]
+    user_id = update.effective_user.id if update.effective_user else None
+    if await reject_if_unauthorized_callback(query, user_id, settings):
+        return
+
+    _, action, result_id, *rest = query.data.split(":")
+    if action == "c":
+        await query.answer()
+        await query.message.delete()
+        return
+
+    storage: Storage = context.bot_data["storage"]
+    pending = storage.get_pending_result(result_id)
+    if pending is None:
+        await query.answer("That result has expired — generate a new image.", show_alert=True)
+        return
+
+    full_params = _deserialize_generation_params(pending["base_params"])
+    profiles: list[ModelProfile] = context.bot_data["profiles"]
+    profile = resolve_profile(full_params.checkpoint, profiles)
+    if profile is None or not profile.loras:
+        await query.answer("This checkpoint no longer has any LoRAs configured.", show_alert=True)
+        return
+
+    if action == "t":
+        mask_hex, index_str = rest
+        mask = int(mask_hex, 16) ^ (1 << int(index_str))
+        await query.answer()
+        await query.edit_message_reply_markup(
+            reply_markup=_lora_switch_keyboard(result_id, profile.loras, mask)
+        )
+        return
+
+    # action == "a"
+    (mask_hex,) = rest
+    mask = int(mask_hex, 16)
+    selected = [lora.to_spec() for i, lora in enumerate(profile.loras) if mask & (1 << i)]
+    switched = replace(full_params, loras=selected)
+    storage.store_pending_result(
+        result_id,
+        pending["chat_id"],
+        pending["file_id"],
+        pending["filename"],
+        _serialize_generation_params(switched),
+    )
+    await query.answer()
+    names = ", ".join(lora.name.rsplit("/", 1)[-1] for lora in selected) or "none"
+    await query.edit_message_text(f"🎛 LoRAs updated for this image: {names}")
 
 
 async def again_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

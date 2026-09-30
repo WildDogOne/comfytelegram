@@ -47,6 +47,38 @@ def test_build_txt2img_basic_structure():
     assert ksampler["inputs"]["cfg"] == params.cfg
     assert ksampler["inputs"]["steps"] == params.steps
 
+    ckpt_id = next(nid for nid, n in prompt.items() if n["class_type"] == "CheckpointLoaderSimple")
+    decode = next(n for n in prompt.values() if n["class_type"] == "VAEDecode")
+    assert decode["inputs"]["vae"] == [ckpt_id, 2]  # checkpoint's own baked-in VAE output
+
+
+def test_build_txt2img_checkpoint_loader_vae_override_swaps_in_external_vae():
+    """`vae_name`, set on an otherwise-default `loader="checkpoint"`
+    profile, should load an external VAELoader instead of using the
+    checkpoint's own baked-in VAE output — see `ModelProfile.vae_name`."""
+    params = GenerationParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        vae_name="sdxl_vae.safetensors",
+    )
+    prompt, _save_id = build_txt2img(params)
+
+    types = _class_types(prompt)
+    assert types.count("CheckpointLoaderSimple") == 1
+    assert types.count("VAELoader") == 1
+
+    vae_node = next(n for n in prompt.values() if n["class_type"] == "VAELoader")
+    assert vae_node["inputs"]["vae_name"] == "sdxl_vae.safetensors"
+
+    ckpt_id = next(nid for nid, n in prompt.items() if n["class_type"] == "CheckpointLoaderSimple")
+    vae_id = next(nid for nid, n in prompt.items() if n["class_type"] == "VAELoader")
+    decode = next(n for n in prompt.values() if n["class_type"] == "VAEDecode")
+    assert decode["inputs"]["vae"] == [vae_id, 0]
+    # model/clip still come from the checkpoint — only the VAE is swapped
+    ksampler = next(n for n in prompt.values() if n["class_type"] == "KSampler")
+    assert ksampler["inputs"]["model"] == [ckpt_id, 0]
+
 
 def test_build_txt2img_with_loras_and_clip_skip_chains_correctly():
     params = GenerationParams(
@@ -310,7 +342,123 @@ def test_build_face_detailer_wires_detector_and_sam():
     assert prompt[detection_id]["class_type"] == "PreviewImage"
     mask_image_id = prompt[detection_id]["inputs"]["images"][0]
     assert prompt[mask_image_id]["class_type"] == "MaskToImage"
-    assert prompt[mask_image_id]["inputs"]["mask"] == [detailer_id, 3]
+
+
+def test_build_face_detailer_applies_loras_by_default():
+    base = PostProcessBaseParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        loras=[LoraSpec(name="a.safetensors")],
+    )
+    prompt, _save_id, _detection_id = build_face_detailer(
+        "uploaded.png", base, FaceDetailerParams()
+    )
+    assert _class_types(prompt).count("LoraLoader") == 1
+
+
+def test_build_face_detailer_disable_lora_skips_lora_loader():
+    """`PostProcessBaseParams.detailer_disable_lora` (surfaced by Banana
+    Splitz XXL — its detailer pass got visibly worse with any LoRA
+    attached) should keep the base generation's own LoRA chain out of the
+    detailer's model/clip pipeline entirely, not just skip a specific
+    incompatible one."""
+    base = PostProcessBaseParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        loras=[LoraSpec(name="a.safetensors"), LoraSpec(name="b.safetensors")],
+        detailer_disable_lora=True,
+    )
+    prompt, _save_id, _detection_id = build_face_detailer(
+        "uploaded.png", base, FaceDetailerParams()
+    )
+
+    assert "LoraLoader" not in _class_types(prompt)
+    ckpt_id = next(nid for nid, n in prompt.items() if n["class_type"] == "CheckpointLoaderSimple")
+    detailer = next(n for n in prompt.values() if n["class_type"] == "FaceDetailer")
+    assert detailer["inputs"]["model"] == [ckpt_id, 0]
+
+
+def test_build_hand_detailer_disable_lora_skips_lora_loader():
+    base = PostProcessBaseParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        loras=[LoraSpec(name="a.safetensors")],
+        detailer_disable_lora=True,
+    )
+    prompt, _save_id, _detection_id = build_hand_detailer(
+        "uploaded.png", base, HandDetailerParams()
+    )
+    assert "LoraLoader" not in _class_types(prompt)
+
+
+def test_build_hand_detailer_manual_disable_lora_skips_lora_loader():
+    base = PostProcessBaseParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        loras=[LoraSpec(name="a.safetensors")],
+        detailer_disable_lora=True,
+    )
+    prompt, _save_id = build_hand_detailer_manual(
+        "uploaded.png", base, ManualHandDetailerParams(), (0.5, 0.5), (1024, 1024)
+    )
+    assert "LoraLoader" not in _class_types(prompt)
+
+
+def test_build_hand_detailer_drawn_mask_disable_lora_skips_lora_loader():
+    base = PostProcessBaseParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        loras=[LoraSpec(name="a.safetensors")],
+        detailer_disable_lora=True,
+    )
+    prompt, _save_id = build_hand_detailer_drawn_mask(
+        "uploaded.png", "mask.png", base, DrawnMaskHandDetailerParams()
+    )
+    assert "LoraLoader" not in _class_types(prompt)
+
+
+def test_build_fix_drawn_mask_disable_lora_skips_lora_loader():
+    """The generic (non-Anima) `_build_drawn_mask_detailer` fallback behind
+    "🩹 Fix Artifact" also runs through `DetailerForEach`, so it honors the
+    same flag — though in practice `_refresh_detailer_tunables` never
+    re-resolves it live for `kind="fix_drawn"` (see `_DETAILER_TUNABLE_KINDS`);
+    this only reaches a non-default value via whatever was frozen into
+    `full_params` at generation time."""
+    base = PostProcessBaseParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        loras=[LoraSpec(name="a.safetensors")],
+        detailer_disable_lora=True,
+    )
+    prompt, _save_id = build_fix_drawn_mask(
+        "uploaded.png",
+        "mask.png",
+        base,
+        DrawnMaskFixParams(),
+        image_size=(1024, 1024),
+        work_size=(1024, 1024),
+    )
+    assert "LoraLoader" not in _class_types(prompt)
+
+
+def test_build_upscale_ignores_detailer_disable_lora():
+    """`detailer_disable_lora` only affects detailer-family builders — the
+    upscale/homogenize pass keeps applying LoRAs regardless."""
+    base = PostProcessBaseParams(
+        checkpoint="banana_splitz_xxl.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="",
+        loras=[LoraSpec(name="a.safetensors")],
+        detailer_disable_lora=True,
+    )
+    prompt, _save_id = build_upscale("uploaded.png", base, UpscaleParams())
+    assert _class_types(prompt).count("LoraLoader") == 1
 
 
 def test_build_hand_detailer_honors_explicit_seed():

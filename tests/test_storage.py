@@ -387,6 +387,7 @@ def test_inpaint_redo_roundtrip(storage: Storage):
         "detail_negative_prompt": None,
         "detail_denoise": None,
         "tile_controlnet": None,
+        "detailer_disable_lora": None,
     }
 
 
@@ -403,6 +404,7 @@ def test_inpaint_redo_carries_the_one_shot_detail_prompt_override(storage: Stora
         detail_negative_prompt="jewellery",
         detail_denoise=0.42,
         tile_controlnet=True,
+        detailer_disable_lora=True,
     )
     assert storage.get_inpaint_redo("result1") == {
         "source_file_id": "file123",
@@ -412,6 +414,7 @@ def test_inpaint_redo_carries_the_one_shot_detail_prompt_override(storage: Stora
         "detail_negative_prompt": "jewellery",
         "detail_denoise": 0.42,
         "tile_controlnet": True,
+        "detailer_disable_lora": True,
     }
 
 
@@ -429,6 +432,17 @@ def test_inpaint_redo_tile_controlnet_false_roundtrips_distinct_from_none(storag
     assert storage.get_inpaint_redo("result1")["tile_controlnet"] is False
 
 
+def test_inpaint_redo_detailer_disable_lora_false_roundtrips_distinct_from_none(
+    storage: Storage,
+):
+    """Same `False`-vs-`None` distinction as `tile_controlnet` above, for the
+    "Disable LoRAs for this detailer pass" checkbox."""
+    storage.store_inpaint_redo(
+        "result1", "file123", "a.png", b"mask-a", detailer_disable_lora=False
+    )
+    assert storage.get_inpaint_redo("result1")["detailer_disable_lora"] is False
+
+
 def test_inpaint_redo_survives_reopen(tmp_path: Path):
     db_path = tmp_path / "state.sqlite3"
     s1 = Storage(db_path)
@@ -444,5 +458,6 @@ def test_inpaint_redo_survives_reopen(tmp_path: Path):
         "detail_negative_prompt": None,
         "detail_denoise": None,
         "tile_controlnet": None,
+        "detailer_disable_lora": None,
     }
     s2.close()

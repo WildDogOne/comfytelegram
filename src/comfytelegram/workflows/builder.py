@@ -99,7 +99,12 @@ class GenerationParams:
     #: split-loader only: `CLIPLoader`'s filename and `type` value.
     clip_name: str = ""
     clip_type: str = "stable_diffusion"
-    #: split-loader only: `VAELoader`'s filename.
+    #: split-loader: `VAELoader`'s filename, required (no baked-in VAE to
+    #: fall back to). checkpoint-loader (the default): optional — when set,
+    #: swaps an external `VAELoader` in for that checkpoint's own baked-in
+    #: VAE output; empty (the default) keeps the baked-in one. See
+    #: `ModelProfile.vae_name` for why a profile would want this (testing a
+    #: checkpoint whose baked VAE is suspected degraded).
     vae_name: str = ""
     #: split-loader only: shift for a `ModelSamplingAuraFlow` node inserted
     #: after the UNET load (Anima's AuraFlow-style sampling); `None` skips
@@ -184,6 +189,25 @@ class GenerationParams:
     #: "✏️ Detail Prompt" has for denoise).
     detailer_cfg: float | None = None
     detailer_steps: int | None = None
+    #: Skips `_apply_loras` entirely for the detailer-family builders
+    #: (`_build_detailer`, `build_hand_detailer_manual`,
+    #: `_build_drawn_mask_detailer`, `_build_anima_fix_drawn_mask` — see
+    #: `_detailer_base`) regardless of `loras` — some checkpoints (surfaced
+    #: by Banana Splitz XXL) produce visibly worse detailer-pass results
+    #: with *any* LoRA attached, for reasons that don't reduce to a single
+    #: incompatible LoRA. `build_txt2img`/`_build_tiled_upscale` never read
+    #: this field, so the base generation and upscale/homogenize passes
+    #: keep applying `loras` regardless. `None`/`False` (`None` is the
+    #: default) both change nothing — `None` rather than a plain `bool`
+    #: default so `ProfileDefaults.model_dump(exclude_none=True)`
+    #: (`resolve_generation_params`/`apply_checkpoint_switch`) leaves it out
+    #: entirely when a profile doesn't set it, same as `detailer_denoise`/
+    #: `detailer_cfg`/`detailer_steps` above — a plain `False` default would
+    #: instead always appear in that merge and unconditionally reset any
+    #: other field's own per-field `/settings` override coercion
+    #: (`settings_menu._coerce_field_value`, which dumps the whole
+    #: `ProfileDefaults` model for every field, not just the one being set).
+    detailer_disable_lora: bool | None = None
     #: The exact text the user typed, before `resolve_generation_params`
     #: folded in the profile's `positive_prompt_prefix`/
     #: `negative_prompt_prefix` or an active character's saved prompt.
@@ -219,6 +243,22 @@ def _apply_loras(
         model_ref = (node_id, 0)
         clip_ref = (node_id, 1)
     return model_ref, clip_ref
+
+
+def _detailer_base(base: PostProcessBaseParams) -> PostProcessBaseParams:
+    """`base` with `loras` stripped when `detailer_disable_lora` is set —
+    called by every detailer-family builder (`_build_detailer`,
+    `build_hand_detailer_manual`, `_build_drawn_mask_detailer`,
+    `_build_anima_fix_drawn_mask`) right before `_build_model_clip_vae`, so
+    a checkpoint whose detailer pass dislikes LoRAs (see
+    `PostProcessBaseParams.detailer_disable_lora`) gets a plain, LoRA-free
+    model/clip pipeline for that pass alone — `build_txt2img`/
+    `_build_tiled_upscale` never call this, so the base generation and
+    upscale/homogenize passes are unaffected. A no-op (`base` unchanged,
+    same object) whenever the flag is unset."""
+    if base.detailer_disable_lora and base.loras:
+        return replace(base, loras=[])
+    return base
 
 
 def build_txt2img(params: GenerationParams) -> tuple[dict[str, Any], str]:
@@ -294,6 +334,7 @@ class PostProcessBaseParams:
     detailer_denoise: float | None = None
     detailer_cfg: float | None = None
     detailer_steps: int | None = None
+    detailer_disable_lora: bool | None = None
 
     @property
     def uses_anima_inpaint_pipeline(self) -> bool:
@@ -313,11 +354,17 @@ def _build_model_clip_vae(
     `PostProcessBaseParams` both carry the fields this needs.
 
     `base.loader == "checkpoint"` (the default) loads everything through one
-    `CheckpointLoaderSimple` node. `"split"` instead loads `base.checkpoint`
-    as a `UNETLoader` filename plus `base.clip_name`/`base.vae_name` through
-    their own loader nodes, then wraps the model in a `ModelSamplingAuraFlow`
-    node if `base.model_sampling_shift` is set — the shape Anima-family
-    models need (see `ModelProfile.loader`'s docstring for why).
+    `CheckpointLoaderSimple` node — `base.vae_name`, if set, swaps in an
+    external `VAELoader` in place of that checkpoint's own baked-in VAE
+    output (model/clip still come from the checkpoint either way); empty
+    (the default) keeps using the baked-in one exactly as before. `"split"`
+    instead loads `base.checkpoint` as a `UNETLoader` filename plus
+    `base.clip_name`/`base.vae_name` through their own loader nodes (here
+    `vae_name` is load-bearing, not optional — a split architecture ships no
+    baked-in VAE to fall back to), then wraps the model in a
+    `ModelSamplingAuraFlow` node if `base.model_sampling_shift` is set — the
+    shape Anima-family models need (see `ModelProfile.loader`'s docstring
+    for why).
 
     Returns (model_ref, clip_ref, vae_ref, positive_node_id, negative_node_id).
     """
@@ -340,7 +387,11 @@ def _build_model_clip_vae(
         ckpt = g.add("CheckpointLoaderSimple", {"ckpt_name": base.checkpoint}, title="Checkpoint")
         model_ref = (ckpt, 0)
         clip_ref = (ckpt, 1)
-        vae_ref = (ckpt, 2)
+        if base.vae_name:
+            vae = g.add("VAELoader", {"vae_name": base.vae_name}, title="VAE Override")
+            vae_ref = (vae, 0)
+        else:
+            vae_ref = (ckpt, 2)
 
     model_ref, clip_ref = _apply_loras(g, model_ref, clip_ref, base.loras)
 
@@ -614,7 +665,9 @@ def _build_detailer(
     g = PromptGraph()
 
     load = g.add("LoadImage", {"image": source_filename}, title="Source Image")
-    model_ref, clip_ref, vae_ref, positive, negative = _build_model_clip_vae(g, base)
+    model_ref, clip_ref, vae_ref, positive, negative = _build_model_clip_vae(
+        g, _detailer_base(base)
+    )
     bbox_detector = g.add(
         "UltralyticsDetectorProvider",
         {"model_name": params.bbox_model},
@@ -835,7 +888,9 @@ def build_hand_detailer_manual(
     g = PromptGraph()
 
     load = g.add("LoadImage", {"image": source_filename}, title="Source Image")
-    model_ref, clip_ref, vae_ref, positive, negative = _build_model_clip_vae(g, base)
+    model_ref, clip_ref, vae_ref, positive, negative = _build_model_clip_vae(
+        g, _detailer_base(base)
+    )
 
     width, height = image_size
     box_size = max(1, int(min(width, height) * params.box_size_frac))
@@ -1350,7 +1405,7 @@ def _build_anima_fix_drawn_mask(
     # unchanged here silently diverged from the graph shape this function
     # exists to match.
     model_ref, _clip_ref, vae_ref, positive, negative = _build_model_clip_vae(
-        g, replace(base, model_sampling_shift=None)
+        g, replace(_detailer_base(base), model_sampling_shift=None)
     )
     diff_diffusion = g.add(
         "DifferentialDiffusion", {"model": list(model_ref)}, title="Differential Diffusion"
@@ -1948,7 +2003,9 @@ def _build_drawn_mask_detailer(
     g = PromptGraph()
 
     load = g.add("LoadImage", {"image": source_filename}, title="Source Image")
-    model_ref, clip_ref, vae_ref, positive, negative = _build_model_clip_vae(g, base)
+    model_ref, clip_ref, vae_ref, positive, negative = _build_model_clip_vae(
+        g, _detailer_base(base)
+    )
 
     mask = g.add(
         "LoadImageMask",

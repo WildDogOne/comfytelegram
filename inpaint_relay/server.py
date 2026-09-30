@@ -122,6 +122,21 @@ class Job:
     #: so `submit_mask` always records a definite `True`/`False` for a
     #: `mask_prompt` job's submission, never leaves this `None`.
     tile_controlnet: bool | None = None
+    #: Same "available"/"default"/submitted-value shape as
+    #: `tile_controlnet_available`/`tile_controlnet_default`/
+    #: `tile_controlnet` above, for comfytelegram's
+    #: `PostProcessBaseParams.detailer_disable_lora` toggle — but *not*
+    #: scoped to `mode == "mask_prompt"` the way the tile-ControlNet
+    #: checkbox is: that one is specific to "✏️ Detail Prompt"'s own
+    #: experiment, while this one is relevant to any detailer pass, so the
+    #: editor page shows it for a plain "mask" job ("🖌️ Draw Mask") too, not
+    #: just "mask_prompt" ("✏️ Detail Prompt"). `_available` is whether this
+    #: image actually has any LoRAs attached at all — comfytelegram computes
+    #: it off the image's own `GenerationParams.loras`, not anything this
+    #: relay knows about — since toggling the checkbox is a no-op otherwise.
+    detailer_disable_lora_available: bool = False
+    detailer_disable_lora_default: bool = False
+    detailer_disable_lora: bool | None = None
     init_data: str | None = None
 
 
@@ -227,7 +242,10 @@ async def create_job(request: Request) -> dict[str, str]:
     nothing is saved beyond that one submission), read-only reference info
     to display, and whether/how to pre-check the tile-ControlNet checkbox
     (`tile_controlnet_available`/`tile_controlnet_default` — see `Job`) —
-    a plain "mask" job (the common case) sends none of this.
+    a plain "mask" job (the common case) sends none of this, though it can
+    still send `detailer_disable_lora_available`/`detailer_disable_lora_default`
+    (see `Job.detailer_disable_lora_available`), which isn't tied to
+    `mode="mask_prompt"` the way the rest of this is.
 
     The image is stored and later served verbatim — comfytelegram
     compresses before uploading (`handlers._to_display_jpeg`), so there is
@@ -249,6 +267,8 @@ async def create_job(request: Request) -> dict[str, str]:
         readonly_info=meta.get("readonly"),
         tile_controlnet_available=bool(meta.get("tile_controlnet_available", False)),
         tile_controlnet_default=bool(meta.get("tile_controlnet_default", False)),
+        detailer_disable_lora_available=bool(meta.get("detailer_disable_lora_available", False)),
+        detailer_disable_lora_default=bool(meta.get("detailer_disable_lora_default", False)),
     )
     return {"token": token}
 
@@ -290,6 +310,8 @@ async def job_meta(token: str) -> JSONResponse:
             "readonly": job.readonly_info or {},
             "tile_controlnet_available": job.tile_controlnet_available,
             "tile_controlnet_default": job.tile_controlnet_default,
+            "detailer_disable_lora_available": job.detailer_disable_lora_available,
+            "detailer_disable_lora_default": job.detailer_disable_lora_default,
         }
     )
 
@@ -314,7 +336,11 @@ async def submit_mask(token: str, request: Request) -> dict[str, bool]:
     Done tap, one request, covering both what got drawn and what should
     happen there (`positive`/`negative`/`denoise` may be blank, meaning "no
     override"; `tile_controlnet` is a checkbox, always either "true" or
-    "false", never blank)."""
+    "false", never blank). `detailer_disable_lora` is a checkbox too,
+    submitted the same explicit-true/false way whenever
+    `job.detailer_disable_lora_available` is set — unlike the three fields
+    above, that isn't scoped to `mode == "mask_prompt"`; see `Job.
+    detailer_disable_lora_available`'s own docstring for why."""
     _prune_expired_jobs()
     job = _get_job_or_404(token)
     form = await request.form()
@@ -323,6 +349,10 @@ async def submit_mask(token: str, request: Request) -> dict[str, bool]:
     if mask_file is None or init_data is None:
         raise HTTPException(status_code=400, detail="Both 'mask' and 'init_data' are required")
     job.mask = await mask_file.read()
+    if job.detailer_disable_lora_available:
+        job.detailer_disable_lora = (
+            str(form.get("detailer_disable_lora", "")).strip().lower() == "true"
+        )
     if job.mode == "mask_prompt":
         job.positive_prompt = _none_if_blank(form.get("positive"))
         job.negative_prompt = _none_if_blank(form.get("negative"))
@@ -355,6 +385,7 @@ async def job_result(token: str) -> JSONResponse:
             "negative": job.negative_prompt,
             "denoise": job.denoise,
             "tile_controlnet": job.tile_controlnet,
+            "detailer_disable_lora": job.detailer_disable_lora,
             "init_data": job.init_data,
         }
     )

@@ -22,13 +22,15 @@ from comfytelegram.generation import GeneratedImage, post_process
 from comfytelegram.handlers import (
     DETAIL_PROMPT_CALLBACK_KIND,
     DETAIL_REDO_CALLBACK_KIND,
+    FIX_DRAW_CALLBACK_KIND,
+    HAND_DRAW_CALLBACK_KIND,
     _detail_prompt_readonly_info,
     _process_one_inpaint_job,
     _serialize_generation_params,
     postprocess_callback,
 )
 from comfytelegram.storage import Storage
-from comfytelegram.workflows import GenerationParams
+from comfytelegram.workflows import GenerationParams, LoraSpec
 
 
 @pytest.fixture
@@ -216,15 +218,18 @@ def _callback_update(data: str):
     return update, query
 
 
-def _params(positive="a fox in a forest", negative="worst quality") -> GenerationParams:
+def _params(positive="a fox in a forest", negative="worst quality", loras=()) -> GenerationParams:
     return GenerationParams(
-        checkpoint="ckpt.safetensors", positive_prompt=positive, negative_prompt=negative
+        checkpoint="ckpt.safetensors",
+        positive_prompt=positive,
+        negative_prompt=negative,
+        loras=list(loras),
     )
 
 
-def _pending() -> dict:
+def _pending(*, loras=()) -> dict:
     return {
-        "base_params": _serialize_generation_params(_params()),
+        "base_params": _serialize_generation_params(_params(loras=loras)),
         "chat_id": 1,
         "file_id": "file123",
         "filename": "source.png",
@@ -327,6 +332,10 @@ async def test_detail_prompt_button_uploads_and_opens_the_mask_editor():
     # (`_context`'s default) — nothing for the checkbox to turn on.
     assert meta["tile_controlnet_available"] is False
     assert meta["tile_controlnet_default"] is False
+    # `_pending()`'s default GenerationParams has no loras — nothing for
+    # the "Disable LoRAs" checkbox to turn off either.
+    assert meta["detailer_disable_lora_available"] is False
+    assert meta["detailer_disable_lora_default"] is False
 
     storage.store_inpaint_job.assert_called_once_with(
         "tok1", "abc123", 1, query.message.message_thread_id, kind="detail"
@@ -371,6 +380,105 @@ async def test_detail_prompt_button_reports_tile_controlnet_availability_from_li
     meta = create_job.await_args.kwargs["meta"]
     assert meta["tile_controlnet_available"] is True
     assert meta["tile_controlnet_default"] is True
+
+
+@pytest.mark.asyncio
+async def test_detail_prompt_button_reports_detailer_disable_lora_availability_from_image_and_profile():
+    """`detailer_disable_lora_available` comes off the image's own attached
+    LoRAs (`GenerationParams.loras`), not the live profile — toggling is a
+    no-op if there's nothing attached, regardless of what the profile says.
+    `detailer_disable_lora_default` comes off the checkpoint's *current*
+    profile, same "live, not frozen" reasoning as tile ControlNet."""
+    from comfytelegram.profiles import ModelProfile, ProfileDefaults
+
+    update, query = _callback_update(f"pp:{DETAIL_PROMPT_CALLBACK_KIND}:abc123")
+    storage = MagicMock()
+    storage.get_pending_result.return_value = _pending(loras=[LoraSpec(name="a.safetensors")])
+    live_profile = ModelProfile(
+        match=["ckpt*"],
+        display_name="Test",
+        defaults=ProfileDefaults(detailer_disable_lora=True),
+    )
+    context = _context(storage, profiles=[live_profile])
+    context.bot_data["settings"] = MagicMock(
+        allowed_user_ids=None,
+        inpaint_relay_url="https://inpaint.example.com",
+        inpaint_relay_shared_secret="shh",
+    )
+    status_message = AsyncMock()
+    query.message.reply_text.return_value = status_message
+
+    with patch(
+        "comfytelegram.handlers._relay_create_job", new=AsyncMock(return_value="tok1")
+    ) as create_job:
+        await postprocess_callback(update, context)
+
+    meta = create_job.await_args.kwargs["meta"]
+    assert meta["detailer_disable_lora_available"] is True
+    assert meta["detailer_disable_lora_default"] is True
+
+
+@pytest.mark.asyncio
+async def test_hand_draw_button_meta_reports_detailer_disable_lora_but_no_prompt_fields():
+    """ "🖌️ Draw Mask" isn't `mode="mask_prompt"` — no `mode`/prompt/
+    tile-ControlNet keys in its `meta` — but it still gets a `meta` dict now,
+    just for the "Disable LoRAs" checkbox, since that one isn't scoped to
+    "✏️ Detail Prompt" the way tile ControlNet is."""
+    from comfytelegram.profiles import ModelProfile, ProfileDefaults
+
+    update, query = _callback_update(f"pp:{HAND_DRAW_CALLBACK_KIND}:abc123")
+    storage = MagicMock()
+    storage.get_pending_result.return_value = _pending(loras=[LoraSpec(name="a.safetensors")])
+    live_profile = ModelProfile(
+        match=["ckpt*"],
+        display_name="Test",
+        defaults=ProfileDefaults(detailer_disable_lora=True),
+    )
+    context = _context(storage, profiles=[live_profile])
+    context.bot_data["settings"] = MagicMock(
+        allowed_user_ids=None,
+        inpaint_relay_url="https://inpaint.example.com",
+        inpaint_relay_shared_secret="shh",
+    )
+    status_message = AsyncMock()
+    query.message.reply_text.return_value = status_message
+
+    with patch(
+        "comfytelegram.handlers._relay_create_job", new=AsyncMock(return_value="tok1")
+    ) as create_job:
+        await postprocess_callback(update, context)
+
+    meta = create_job.await_args.kwargs["meta"]
+    assert meta["detailer_disable_lora_available"] is True
+    assert meta["detailer_disable_lora_default"] is True
+    assert "mode" not in meta
+    assert "tile_controlnet_available" not in meta
+
+
+@pytest.mark.asyncio
+async def test_fix_draw_sends_no_meta_at_all():
+    """ "🩹 Fix Artifact" gets no `meta` dict at all — `detailer_disable_lora`
+    isn't live-refreshed for `kind="fix_drawn"` either (see
+    `generation._DETAILER_TUNABLE_KINDS`), and there's no tile-ControlNet
+    checkbox for it, so there's nothing for a `meta` dict to carry."""
+    update, query = _callback_update(f"pp:{FIX_DRAW_CALLBACK_KIND}:abc123")
+    storage = MagicMock()
+    storage.get_pending_result.return_value = _pending(loras=[LoraSpec(name="a.safetensors")])
+    context = _context(storage)
+    context.bot_data["settings"] = MagicMock(
+        allowed_user_ids=None,
+        inpaint_relay_url="https://inpaint.example.com",
+        inpaint_relay_shared_secret="shh",
+    )
+    status_message = AsyncMock()
+    query.message.reply_text.return_value = status_message
+
+    with patch(
+        "comfytelegram.handlers._relay_create_job", new=AsyncMock(return_value="tok1")
+    ) as create_job:
+        await postprocess_callback(update, context)
+
+    assert create_job.await_args.kwargs["meta"] is None
 
 
 @pytest.mark.asyncio

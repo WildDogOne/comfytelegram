@@ -28,7 +28,8 @@ Files starting with `_` are ignored (reserved for docs/schema files).
     "upscale_denoise": 0.2,             // UltimateSDUpscale's denoise for "🔍 Upscale 4x" (omit to use its own default) — see below
     "detailer_denoise": null,           // overrides the face/hand-detailer passes' own denoise for this checkpoint (omit/null to use each graph's own default) — see below
     "detailer_cfg": null,               // same idea, for cfg (omit/null to use each graph's own default, 5.0) — see below
-    "detailer_steps": null              // same idea, for steps (omit/null to use each graph's own default, 25) — see below
+    "detailer_steps": null,             // same idea, for steps (omit/null to use each graph's own default, 25) — see below
+    "detailer_disable_lora": null       // true = skip applying LoRAs for detailer passes on this checkpoint (omit/null = apply them normally) — see below
   },
   "positive_prompt_prefix": "quality tags prepended before the user's prompt",
   "negative_prompt_prefix": "used as the negative prompt whenever the user doesn't supply one",
@@ -47,7 +48,7 @@ Files starting with `_` are ignored (reserved for docs/schema files).
   "loader": "checkpoint",              // "checkpoint" (default) or "split" — see below
   "clip_name": "",                     // "split" only: CLIPLoader's text-encoder filename
   "clip_type": "stable_diffusion",     // "split" only: CLIPLoader's `type` input
-  "vae_name": "",                      // "split" only: VAELoader's filename
+  "vae_name": "",                      // "split": required VAELoader filename. "checkpoint": optional external-VAE override — see below
   "model_sampling_shift": null,        // "split" only: shift for a ModelSamplingAuraFlow node (omit/null to skip it)
   "tile_controlnet": null,             // ControlNet Tile model filename for the upscale pass (omit/null to skip it) — see below
   "tile_controlnet_strength": 0.4,     // ControlNetApplyAdvanced's strength for tile_controlnet
@@ -197,6 +198,27 @@ very different values for them (the two shipped profiles already reflect
 that). `clip_skip` isn't meaningful for a non-CLIP text encoder like
 Anima's, so leave it unset (`-1`, i.e. "don't add that node").
 
+### `vae_name` on `loader: "checkpoint"` — overriding a checkpoint's baked-in VAE
+
+Every plain single-file checkpoint bakes its own VAE in, loaded via
+`CheckpointLoaderSimple`'s third output — normally that's exactly what you
+want, and `vae_name` stays empty. But if a checkpoint's own baked VAE is
+suspected degraded (a bad merge, a corrupted export, a model page that
+warns its own VAE needs replacing), setting `vae_name` to a `.safetensors`
+file staged under `models/vae/` swaps in an external `VAELoader` for that
+one output instead — the checkpoint itself still supplies model/clip as
+normal, only the VAE changes. This applies everywhere `checkpoint`
+architecture graphs are built: the initial generation and every
+post-processing pass (upscale, face/hand detailers, drawn-mask flows)
+alike, since they all share the same underlying wiring. Unlike
+`detailer_denoise`/`detailer_cfg`/`detailer_steps` above, this is not
+re-resolved live off the current profile — it's an architecture-style fact
+about the checkpoint (same category as `loader`/`clip_name`), so a same-day
+edit only takes effect on a freshly generated image, not on post-processing
+an image generated before the edit. `""`/omitted (the default) keeps using
+the checkpoint's own baked-in VAE exactly as before — this is purely opt-in
+and has no effect until set.
+
 ### `tile_controlnet` — detail across the whole image, not just faces/hands
 
 The face/hand detailers only touch the regions Impact Pack's detector
@@ -250,6 +272,28 @@ checkpoint's profile entirely) by design. `null`/omitted (the default,
 independently for each) leaves that graph's own hard-coded value in place.
 Like `upscale_denoise`, editing any of these takes effect on the very next
 detailer tap — no regeneration needed.
+
+### `defaults.detailer_disable_lora` — skip LoRAs during detailer passes entirely
+
+Some checkpoints (surfaced by Banana Splitz XXL) produce visibly worse
+results in the detailer pass whenever *any* LoRA is attached, regardless of
+which one or how it's dialed in — tuning `detailer_denoise`/`detailer_cfg`/
+`detailer_steps` down didn't fix it either, and there was no single
+incompatible LoRA to just leave disabled, since the checkpoint's detailer
+pass apparently dislikes the `LoraLoader` chain itself. Setting
+`defaults.detailer_disable_lora: true` skips applying `loras` (whichever
+are currently active — see `/lora`) entirely for that checkpoint's
+detailer-family passes: "🎯 Face Detail", "🖐️ Hand Detail" (auto-detect),
+"✋ Tap to mark", and "🖌️ Draw Mask"/"✏️ Detail Prompt". The base
+generation and "🔍 Upscale 4x"/"🧵 Homogenize" passes never read this field
+at all, so LoRAs still apply there exactly as before — only the detailer
+step itself drops them. Like `detailer_denoise`/`detailer_cfg`/
+`detailer_steps`, editing this takes effect on the very next detailer
+tap — except for "🩹 Fix Artifact" ('fix_drawn'), which (like those three)
+isn't re-resolved live off the current profile; it still inherits whatever
+was frozen into the image at generation time (or, if
+`fix_artifact_checkpoint` is set, that override profile's own value).
+`false`/omitted (the default) changes nothing.
 
 ### `detail_prompt_tile_controlnet` — the same idea, tried on "✏️ Detail Prompt"
 

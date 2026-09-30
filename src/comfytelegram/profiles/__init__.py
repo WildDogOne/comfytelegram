@@ -1,5 +1,6 @@
 from comfytelegram.profiles.loader import (
     PROMPT_OVERRIDE_FIELDS,
+    apply_checkpoint_switch,
     apply_lora_overrides,
     apply_lora_strength_overrides,
     apply_profile_override,
@@ -16,6 +17,7 @@ __all__ = [
     "LoraDefault",
     "ModelProfile",
     "ProfileDefaults",
+    "apply_checkpoint_switch",
     "apply_lora_overrides",
     "apply_lora_strength_overrides",
     "apply_profile_override",

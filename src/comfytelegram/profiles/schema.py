@@ -72,6 +72,7 @@ class ProfileDefaults(BaseModel):
     detailer_denoise: float | None = None
     detailer_cfg: float | None = None
     detailer_steps: int | None = None
+    detailer_disable_lora: bool | None = None
 
 
 class ModelProfile(BaseModel):
@@ -157,7 +158,16 @@ class ModelProfile(BaseModel):
     clip_type: str = Field(
         "stable_diffusion", description="loader='split' only: CLIPLoader's `type` input"
     )
-    vae_name: str = Field("", description="loader='split' only: VAELoader's filename")
+    vae_name: str = Field(
+        "",
+        description=(
+            "loader='split': VAELoader's filename, required — a split architecture ships no "
+            "baked-in VAE to fall back to. loader='checkpoint' (the default): optional "
+            "override of the checkpoint's own baked-in VAE with an external VAELoader — "
+            "e.g. for testing whether a checkpoint's baked VAE is degraded. Empty (the "
+            "default) keeps using the checkpoint's own baked-in VAE as before."
+        ),
+    )
     model_sampling_shift: float | None = Field(
         None,
         description=(
