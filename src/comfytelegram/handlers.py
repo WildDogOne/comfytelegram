@@ -54,6 +54,7 @@ from comfytelegram.generation import (
     generate,
     post_process,
     repeat,
+    resolve_drawn_mask_denoise,
     resolve_live_upscale_defaults,
 )
 from comfytelegram.lora_discovery import reload_profiles_and_discover
@@ -226,6 +227,7 @@ DETAIL_REDO4_CALLBACK_KIND = "detail_redo4"
 #: apart.
 _DRAWN_MASK_KINDS: dict[str, dict[str, Any]] = {
     "hand": {
+        "name": "hand",
         "post_process_kind": "hand_drawn",
         "label": "Refining hand",
         "redo_callback_kind": HAND_REDO_CALLBACK_KIND,
@@ -233,6 +235,7 @@ _DRAWN_MASK_KINDS: dict[str, dict[str, Any]] = {
         "is_detail_prompt": False,
     },
     "fix": {
+        "name": "fix",
         "post_process_kind": "fix_drawn",
         "label": "Fixing artifact",
         "redo_callback_kind": FIX_REDO_CALLBACK_KIND,
@@ -240,6 +243,7 @@ _DRAWN_MASK_KINDS: dict[str, dict[str, Any]] = {
         "is_detail_prompt": False,
     },
     "detail": {
+        "name": "detail",
         "post_process_kind": "hand_drawn",
         "label": "Detailing",
         "redo_callback_kind": DETAIL_REDO_CALLBACK_KIND,
@@ -249,6 +253,41 @@ _DRAWN_MASK_KINDS: dict[str, dict[str, Any]] = {
 }
 #: How many revisions "🔁 x4" produces in one tap.
 DRAWN_MASK_REDO4_COUNT = 4
+#: "🎚️ Redo…" — the third button on a drawn-mask result's redo row: the
+#: same "🔁 Redo (same mask)" re-run, but with a denoise picked first
+#: instead of replaying the stored one. Its own namespace rather than `pp:`
+#: because a picked value has to ride in the callback data alongside the
+#: `_DRAWN_MASK_KINDS` name and `result_id`, same reasoning as
+#: `HAND_POINT_CALLBACK_PREFIX`: `rt:<mask kind>:<result_id>` opens the
+#: picker, `rt:<mask kind>:<result_id>:<value>` runs it (`value` a float,
+#: or `REDO_TWEAK_CUSTOM`/`REDO_TWEAK_CLOSE`). The kind has to be carried
+#: explicitly since `inpaint_redo` doesn't record which drawn-mask flow
+#: made a mask (see `_carried_extra_rows`). The picked denoise is stored
+#: with the new result's own `inpaint_redo` row, so a plain "🔁 Redo" of
+#: *that* result replays it — tweaking is sticky down the chain, not
+#: one-shot. See `redo_tweak_callback`.
+REDO_TWEAK_CALLBACK_PREFIX = "rt:"
+REDO_TWEAK_CUSTOM = "custom"
+REDO_TWEAK_CLOSE = "close"
+#: The picker's preset grid — `REDO_TWEAK_PRESETS_PER_ROW` per row.
+REDO_TWEAK_DENOISE_PRESETS = (
+    0.2,
+    0.25,
+    0.3,
+    0.35,
+    0.4,
+    0.45,
+    0.5,
+    0.55,
+    0.6,
+    0.65,
+    0.7,
+    0.75,
+    0.8,
+    0.85,
+    0.9,
+)
+REDO_TWEAK_PRESETS_PER_ROW = 5
 #: Timeout for the *small* outbound calls to inpaint_relay (poll, delete) —
 #: it's a small, same-purpose-built service the bot fully controls the
 #: deployment of, so a slow/unreachable relay should fail fast rather than
@@ -696,6 +735,49 @@ def _drawn_mask_redo4_button(result_id: str, redo4_callback_kind: str) -> Inline
     )
 
 
+def _drawn_mask_tweak_button(result_id: str, mask_kind: str) -> InlineKeyboardButton:
+    """Third button on the redo row — opens the "🎚️ Redo…" denoise picker
+    (`REDO_TWEAK_CALLBACK_PREFIX`). `mask_kind` is a `_DRAWN_MASK_KINDS`
+    key."""
+    return InlineKeyboardButton(
+        "🎚️ Redo…", callback_data=f"{REDO_TWEAK_CALLBACK_PREFIX}{mask_kind}:{result_id}"
+    )
+
+
+def _redo_tweak_keyboard(result_id: str, mask_kind: str, current: float) -> InlineKeyboardMarkup:
+    """The "🎚️ Redo…" picker: `REDO_TWEAK_DENOISE_PRESETS` (the one matching
+    `current` marked), then "✏️ Custom…"/"✖ Close"."""
+    prefix = f"{REDO_TWEAK_CALLBACK_PREFIX}{mask_kind}:{result_id}:"
+    buttons = [
+        InlineKeyboardButton(
+            f"• {value:g}" if abs(value - current) < 1e-6 else f"{value:g}",
+            callback_data=f"{prefix}{value:g}",
+        )
+        for value in REDO_TWEAK_DENOISE_PRESETS
+    ]
+    rows = [
+        buttons[i : i + REDO_TWEAK_PRESETS_PER_ROW]
+        for i in range(0, len(buttons), REDO_TWEAK_PRESETS_PER_ROW)
+    ]
+    rows.append(
+        [
+            InlineKeyboardButton("✏️ Custom…", callback_data=f"{prefix}{REDO_TWEAK_CUSTOM}"),
+            InlineKeyboardButton("✖ Close", callback_data=f"{prefix}{REDO_TWEAK_CLOSE}"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _parse_denoise(raw: str) -> float | None:
+    """A denoise typed or carried in callback data, or None unless it's a
+    number in (0, 1]."""
+    try:
+        value = float(raw.strip().replace(",", "."))
+    except ValueError:
+        return None
+    return value if 0 < value <= 1 else None
+
+
 def _draw_hand_point_grid(image_bytes: bytes, grid_size: int = HAND_POINT_GRID_SIZE) -> bytes:
     """Overlay a `grid_size`x`grid_size` grid onto a copy of `image_bytes`,
     each cell labeled with the same row-letter/column-number text as its
@@ -1129,11 +1211,14 @@ def _carried_extra_rows(
 
 def _is_redo_button(button: InlineKeyboardButton) -> bool:
     """True for a `pp:<redo kind>:<result_id>` button — see
-    `_REDO_CALLBACK_KINDS`. A `CopyTextButton`/`WebAppInfo` button has no
-    `callback_data` at all, hence the None check."""
+    `_REDO_CALLBACK_KINDS` — or a "🎚️ Redo…" (`REDO_TWEAK_CALLBACK_PREFIX`)
+    one. A `CopyTextButton`/`WebAppInfo` button has no `callback_data` at
+    all, hence the None check."""
     data = button.callback_data
     if not data:
         return False
+    if data.startswith(REDO_TWEAK_CALLBACK_PREFIX):
+        return True
     parts = data.split(":")
     return len(parts) > 1 and parts[1] in _REDO_CALLBACK_KINDS
 
@@ -1453,6 +1538,7 @@ async def _send_drawn_mask_result_with_redo(
     *,
     redo_callback_kind: str,
     redo4_callback_kind: str,
+    mask_kind: str,
     detail_prompt: str | None = None,
     detail_negative_prompt: str | None = None,
     detail_denoise: float | None = None,
@@ -1460,7 +1546,8 @@ async def _send_drawn_mask_result_with_redo(
     detailer_disable_lora: bool | None = None,
 ) -> None:
     """Send a `post_process(kind="hand_drawn"/"fix_drawn")` result with
-    "🔁 Redo (same mask)"/"🔁 x4" buttons attached (one row), and persist what
+    "🔁 Redo (same mask)"/"🔁 x4"/"🎚️ Redo…" buttons attached (one row —
+    `mask_kind`, a `_DRAWN_MASK_KINDS` key, is what the last one needs), and persist what
     they need to run again (`storage.py`'s `inpaint_redo`) — shared by
     `_process_one_inpaint_job` and `postprocess_callback`'s
     `*_REDO_CALLBACK_KIND`/`*_REDO4_CALLBACK_KIND` branches, which differ
@@ -1490,6 +1577,7 @@ async def _send_drawn_mask_result_with_redo(
             [
                 _drawn_mask_redo_button(new_result_id, redo_callback_kind),
                 _drawn_mask_redo4_button(new_result_id, redo4_callback_kind),
+                _drawn_mask_tweak_button(new_result_id, mask_kind),
             ]
         ],
     )
@@ -1516,8 +1604,9 @@ async def _run_one_drawn_mask_redo(
     drawn_mask_kind: dict[str, Any],
     profiles: list[ModelProfile],
     source_bytes: bytes,
+    denoise_override: float | None = None,
 ) -> bool:
-    """One "🔁 Redo (same mask)"/"🔁 x4" iteration: its own status message,
+    """One "🔁 Redo (same mask)"/"🔁 x4"/"🎚️ Redo…" iteration: its own status message,
     `post_process` call, and result send (with fresh redo buttons of its
     own, so the chain keeps going indefinitely either way) — shared by
     `postprocess_callback`'s `*_REDO_CALLBACK_KIND`/`*_REDO4_CALLBACK_KIND`
@@ -1530,17 +1619,22 @@ async def _run_one_drawn_mask_redo(
     alongside the mask at submission time — see
     `_send_drawn_mask_result_with_redo`), not a caller-supplied override;
     they're simply absent for a "🖌️ Draw Mask"/"🩹 Fix Artifact" redo.
+    `denoise_override` is a "🎚️ Redo…" pick, replacing the stored
+    `detail_denoise` for this run *and* for the new result's own redo row.
     Returns True on success, False on failure (already reported into that
     iteration's own status message by `_run_reporting_errors`) — the
     caller stops the loop on the first False rather than continuing to
     burn ComfyUI time on a source/mask combination that just failed."""
     detail_prompt = redo.get("detail_prompt")
     detail_negative_prompt = redo.get("detail_negative_prompt")
-    detail_denoise = redo.get("detail_denoise")
+    detail_denoise = (
+        denoise_override if denoise_override is not None else redo.get("detail_denoise")
+    )
     tile_controlnet_choice = redo.get("tile_controlnet")
     detailer_disable_lora_choice = redo.get("detailer_disable_lora")
+    status_suffix = f", denoise {denoise_override:g}" if denoise_override is not None else ""
     status_message = await reply_message.reply_text(
-        f"{drawn_mask_kind['label']} (drawn mask)…", disable_notification=True
+        f"{drawn_mask_kind['label']} (drawn mask{status_suffix})…", disable_notification=True
     )
     generated = await _run_drawn_mask_post_process(
         client,
@@ -1570,6 +1664,7 @@ async def _run_one_drawn_mask_redo(
         generated,
         redo_callback_kind=drawn_mask_kind["redo_callback_kind"],
         redo4_callback_kind=drawn_mask_kind["redo4_callback_kind"],
+        mask_kind=drawn_mask_kind["name"],
         detail_prompt=detail_prompt,
         detail_negative_prompt=detail_negative_prompt,
         detail_denoise=detail_denoise,
@@ -1577,6 +1672,68 @@ async def _run_one_drawn_mask_redo(
         detailer_disable_lora=detailer_disable_lora_choice,
     )
     return True
+
+
+#: What to tell the user to tap instead when a redo's stored mask has
+#: expired, per `_DRAWN_MASK_KINDS` key.
+_DRAWN_MASK_START_BUTTON_LABELS = {
+    "hand": "🖌️ Draw Mask",
+    "fix": "🩹 Fix Artifact",
+    "detail": "✏️ Detail Prompt",
+}
+
+
+async def _run_drawn_mask_redos(
+    reply_message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    pending: dict[str, Any],
+    full_params: GenerationParams,
+    result_id: str,
+    mask_kind: str,
+    count: int,
+    denoise_override: float | None = None,
+) -> None:
+    """Run `count` redos of `result_id`'s stored mask (`storage.py`'s
+    `inpaint_redo`) — shared by `postprocess_callback`'s
+    `*_REDO_CALLBACK_KIND`/`*_REDO4_CALLBACK_KIND` branch and the "🎚️ Redo…"
+    picker (`redo_tweak_callback`, `_consume_awaiting_redo_denoise`), which
+    passes `denoise_override`. `mask_kind` is a `_DRAWN_MASK_KINDS` key.
+    Reports an expired mask instead of running anything."""
+    storage: Storage = context.bot_data["storage"]
+    client: ComfyClient = context.bot_data["comfy_client"]
+    redo = storage.get_inpaint_redo(result_id)
+    if redo is None:
+        await reply_message.reply_text(
+            "That mask has expired — draw a new one with "
+            f"{_DRAWN_MASK_START_BUTTON_LABELS[mask_kind]}."
+        )
+        return
+    source_bytes = await _fetch_source_image(
+        client,
+        context.bot,
+        redo["source_filename"],
+        redo["source_file_id"],
+        on_fallback=_source_fallback_notifier(reply_message),
+    )
+    # "🔁 x4" runs the same iteration DRAWN_MASK_REDO4_COUNT times instead
+    # of once, reusing the one source download above across all of them.
+    # Stops at the first failure rather than continuing to spend ComfyUI
+    # time on a source/mask combination that just failed.
+    for _ in range(count):
+        ok = await _run_one_drawn_mask_redo(
+            reply_message,
+            client,
+            storage,
+            pending["chat_id"],
+            full_params,
+            redo,
+            _DRAWN_MASK_KINDS[mask_kind],
+            context.bot_data["profiles"],
+            source_bytes,
+            denoise_override=denoise_override,
+        )
+        if not ok:
+            break
 
 
 async def _process_one_inpaint_job(
@@ -1692,6 +1849,7 @@ async def _process_one_inpaint_job(
         generated,
         redo_callback_kind=drawn_mask_kind["redo_callback_kind"],
         redo4_callback_kind=drawn_mask_kind["redo4_callback_kind"],
+        mask_kind=drawn_mask_kind["name"],
         detail_prompt=detail_prompt,
         detail_negative_prompt=detail_negative_prompt,
         detail_denoise=detail_denoise,
@@ -2378,6 +2536,9 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if await _consume_awaiting_upscale_custom(update, context):
+        return
+
+    if await _consume_awaiting_redo_denoise(update, context):
         return
 
     message = update.effective_message
@@ -3289,43 +3450,20 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             DETAIL_REDO4_CALLBACK_KIND,
         )
         if kind in (HAND_REDO_CALLBACK_KIND, HAND_REDO4_CALLBACK_KIND):
-            redo_kind, redo_button_label = "hand", "🖌️ Draw Mask"
+            redo_kind = "hand"
         elif kind in (FIX_REDO_CALLBACK_KIND, FIX_REDO4_CALLBACK_KIND):
-            redo_kind, redo_button_label = "fix", "🩹 Fix Artifact"
+            redo_kind = "fix"
         else:
-            redo_kind, redo_button_label = "detail", "✏️ Detail Prompt"
-        drawn_mask_kind = _DRAWN_MASK_KINDS[redo_kind]
-        redo = storage.get_inpaint_redo(result_id)
-        if redo is None:
-            await query.message.reply_text(
-                f"That mask has expired — draw a new one with {redo_button_label}."
-            )
-            return
-        source_bytes = await _fetch_source_image(
-            client,
-            context.bot,
-            redo["source_filename"],
-            redo["source_file_id"],
-            on_fallback=_source_fallback_notifier(query.message),
+            redo_kind = "detail"
+        await _run_drawn_mask_redos(
+            query.message,
+            context,
+            pending,
+            full_params,
+            result_id,
+            redo_kind,
+            DRAWN_MASK_REDO4_COUNT if is_redo4 else 1,
         )
-        # "🔁 x4" runs the same iteration DRAWN_MASK_REDO4_COUNT times instead
-        # of once, reusing the one source download above across all of them.
-        # Stops at the first failure rather than continuing to spend ComfyUI
-        # time on a source/mask combination that just failed.
-        for _ in range(DRAWN_MASK_REDO4_COUNT if is_redo4 else 1):
-            ok = await _run_one_drawn_mask_redo(
-                query.message,
-                client,
-                storage,
-                pending["chat_id"],
-                full_params,
-                redo,
-                drawn_mask_kind,
-                context.bot_data["profiles"],
-                source_bytes,
-            )
-            if not ok:
-                break
         return
 
     if kind == HAND_AUTO_CALLBACK_KIND:
@@ -3431,6 +3569,149 @@ async def _show_keyboard_page(query, result_id: str, page: int) -> None:
     except BadRequest as exc:
         if "message is not modified" not in str(exc).lower():
             raise
+
+
+async def redo_tweak_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle a "🎚️ Redo…" tap (`REDO_TWEAK_CALLBACK_PREFIX`).
+    `rt:<mask kind>:<result_id>` replies with the denoise picker
+    (`_redo_tweak_keyboard`), showing the value a plain "🔁 Redo" would run
+    at; `rt:<mask kind>:<result_id>:<value>` runs one redo at that denoise
+    via `_run_drawn_mask_redos`, deleting the picker first — the result's
+    own "🎚️ Redo…" opens a fresh one. `REDO_TWEAK_CUSTOM` asks for a typed
+    value instead (consumed by `_consume_awaiting_redo_denoise`, which
+    deletes the picker and that prompt the same way); `REDO_TWEAK_CLOSE`
+    just deletes the picker."""
+    query = update.callback_query
+    settings: Settings = context.bot_data["settings"]
+    user_id = update.effective_user.id if update.effective_user else None
+    if await reject_if_unauthorized_callback(query, user_id, settings):
+        return
+
+    parts = query.data[len(REDO_TWEAK_CALLBACK_PREFIX) :].split(":")
+    mask_kind, result_id = parts[0], parts[1]
+    value = parts[2] if len(parts) > 2 else None
+    if mask_kind not in _DRAWN_MASK_KINDS:
+        await query.answer()
+        return
+
+    if value == REDO_TWEAK_CLOSE:
+        await query.answer()
+        await _delete_messages(context.bot, query.message.chat_id, [query.message.message_id])
+        return
+
+    storage: Storage = context.bot_data["storage"]
+    pending = storage.get_pending_result(result_id)
+    if pending is None:
+        await query.answer("That result has expired — generate a new image.", show_alert=True)
+        return
+    full_params = _deserialize_generation_params(pending["base_params"])
+
+    if value is None:
+        redo = storage.get_inpaint_redo(result_id)
+        if redo is None:
+            await query.answer()
+            await query.message.reply_text(
+                "That mask has expired — draw a new one with "
+                f"{_DRAWN_MASK_START_BUTTON_LABELS[mask_kind]}."
+            )
+            return
+        await query.answer()
+        current = resolve_drawn_mask_denoise(
+            _DRAWN_MASK_KINDS[mask_kind]["post_process_kind"],
+            full_params,
+            context.bot_data["profiles"],
+            redo.get("detail_denoise"),
+        )
+        await query.message.reply_text(
+            f"🎚️ Redo with the same mask — pick a denoise (currently {current:g}):",
+            reply_markup=_redo_tweak_keyboard(result_id, mask_kind, current),
+        )
+        return
+
+    if value == REDO_TWEAK_CUSTOM:
+        await query.answer()
+        prompt = await query.message.reply_text("Send the denoise to redo with, e.g. `0.42`.")
+        set_pending(
+            context.chat_data,
+            "awaiting_redo_denoise",
+            query.message,
+            (mask_kind, result_id, [query.message.message_id, prompt.message_id]),
+        )
+        return
+
+    denoise = _parse_denoise(value)
+    if denoise is None:
+        await query.answer()
+        return
+    await query.answer(f"Redoing at denoise {denoise:g}")
+    anchor = _redo_tweak_reply_anchor(query.message)
+    await _delete_messages(context.bot, query.message.chat_id, [query.message.message_id])
+    await _run_drawn_mask_redos(
+        anchor, context, pending, full_params, result_id, mask_kind, 1, denoise
+    )
+
+
+def _redo_tweak_reply_anchor(picker: Message) -> Message:
+    """What to reply the redo's status/result into once the picker is
+    deleted. In a group PTB's `reply_*` quotes the message it's called on,
+    which fails for a deleted one, so use whatever the picker itself was
+    replying to (the result image) when there is one. In a private chat
+    nothing is quoted and the picker has no `reply_to_message`, so the
+    deleted picker still works as an anchor — only its chat/topic are read."""
+    return picker.reply_to_message or picker
+
+
+async def _delete_messages(bot: Any, chat_id: int, message_ids: list[int]) -> None:
+    """Best-effort cleanup of the "🎚️ Redo…" dialog — Telegram refuses to
+    delete a message older than 48h (or one already gone), which shouldn't
+    stop the redo itself."""
+    for message_id in message_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except BadRequest:
+            logger.debug("Couldn't delete redo dialog message %s", message_id, exc_info=True)
+
+
+async def _consume_awaiting_redo_denoise(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """If this chat is mid-"✏️ Custom…" denoise entry from the "🎚️ Redo…"
+    picker (`redo_tweak_callback`), consume the text as that denoise and run
+    the redo, returning True; otherwise False. Same one-field-flag pattern
+    as `_consume_awaiting_upscale_custom`. An unparseable value keeps the
+    flag set and asks again, rather than silently becoming a prompt. Once
+    the redo starts, the picker and every prompt this dialog sent are
+    deleted (`dialog_message_ids`)."""
+    message = update.effective_message
+    pending_entry = pop_pending(context.chat_data, "awaiting_redo_denoise", message)
+    if pending_entry is None:
+        return False
+    mask_kind, result_id, dialog_message_ids = pending_entry
+
+    denoise = _parse_denoise(message_text(message) or "")
+    if denoise is None:
+        retry = await message.reply_text(
+            "Couldn't read that — send a number between 0 and 1, e.g. `0.42`."
+        )
+        set_pending(
+            context.chat_data,
+            "awaiting_redo_denoise",
+            message,
+            (mask_kind, result_id, [*dialog_message_ids, retry.message_id]),
+        )
+        return True
+    await _delete_messages(context.bot, message.chat_id, dialog_message_ids)
+
+    storage: Storage = context.bot_data["storage"]
+    pending = storage.get_pending_result(result_id)
+    if pending is None:
+        await message.reply_text("That image has expired — nothing to redo.")
+        return True
+    full_params = _deserialize_generation_params(pending["base_params"])
+    await _run_drawn_mask_redos(
+        message, context, pending, full_params, result_id, mask_kind, 1, denoise
+    )
+    return True
 
 
 async def hand_point_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

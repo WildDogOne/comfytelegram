@@ -3,5 +3,19 @@
     <option name="myName" value="Project Default" />
     <inspection_tool class="Eslint" enabled="true" level="WARNING" enabled_by_default="true" />
     <inspection_tool class="TsLint" enabled="true" level="WARNING" enabled_by_default="true" />
+    <!-- python-telegram-bot's own type stubs mark Update/CallbackQuery/Message
+         fields Optional even where this codebase's control flow already
+         guarantees them non-None (e.g. a callback handler always has
+         update.callback_query set) — PyCharm's type checker can't see that,
+         so it flags dozens of "Expected type 'X', got 'Y | None' instead"
+         findings across handlers.py that aren't real bugs. Disabled
+         project-wide rather than silenced per-line. Deliberately NOT
+         disabling PyUnresolvedReferencesInspection too, even though it's
+         responsible for the bulk of the *same* PTB-Optional pattern shown a
+         different way ("Member 'None' of 'X | None' does not have attribute
+         ...") — that inspection also catches genuinely unresolved
+         references/typos project-wide, so it stays on and that noise is
+         just accepted as the cost of keeping it. -->
+    <inspection_tool class="PyTypeCheckerInspection" enabled="false" level="WARNING" enabled_by_default="false" />
   </profile>
 </component>

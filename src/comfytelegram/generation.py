@@ -779,6 +779,52 @@ async def generate(
     return [GeneratedImage(data=data, filename=name, full_params=params) for data, name in raw]
 
 
+def _fix_base_params(
+    base_params: PostProcessBaseParams, profiles: list[ModelProfile] | None
+) -> PostProcessBaseParams:
+    """The checkpoint/loader half of `_build_fix_drawn_post_process`'s base
+    choice — `_fix_artifact_override_base`'s profile if one matches, else
+    the image's own — without the prompt rewrite, for callers that only
+    need to know which pipeline "🩹 Fix Artifact" will route to."""
+    override_base = _fix_artifact_override_base(profiles) if profiles else None
+    return override_base if override_base is not None else base_params
+
+
+def _fix_drawn_denoise_field(fix_base_params: PostProcessBaseParams) -> str:
+    """Which `DrawnMaskFixParams` field a "🩹 Fix Artifact" denoise override
+    lands on. The generic detailer path has one plain `denoise`; the Anima
+    pipeline (`_build_anima_fix_drawn_mask`) runs its first pass at a fixed
+    1.0 and has no such knob at all, so the closest equivalent there is the
+    second pass's own `refine_denoise` strength."""
+    return "refine_denoise" if fix_base_params.uses_anima_inpaint_pipeline else "denoise"
+
+
+def resolve_drawn_mask_denoise(
+    kind: Literal["hand_drawn", "fix_drawn"],
+    full_params: GenerationParams,
+    profiles: list[ModelProfile] | None,
+    override: float | None = None,
+) -> float:
+    """The denoise a drawn-mask `post_process(kind=...)` call will actually
+    run at given `override` (a "🎚️ Redo…" pick, or a "✏️ Detail Prompt"
+    submission's own value) — mirrors `post_process`'s own fallback chain
+    so handlers.py's picker can show the real current value rather than
+    "default". `"hand_drawn"`: override, else the live profile's
+    `detailer_denoise`, else `DrawnMaskHandDetailerParams`' own default.
+    `"fix_drawn"`: override, else `DrawnMaskFixParams`' default for
+    whichever field `_fix_drawn_denoise_field` picks."""
+    if override is not None:
+        return override
+    base_params = _to_post_process_base(full_params)
+    if kind == "hand_drawn":
+        detailer_denoise = _refresh_detailer_tunables(base_params, profiles).detailer_denoise
+        if detailer_denoise is not None:
+            return detailer_denoise
+        return DrawnMaskHandDetailerParams().denoise
+    field = _fix_drawn_denoise_field(_fix_base_params(base_params, profiles))
+    return getattr(DrawnMaskFixParams(), field)
+
+
 def _build_fix_drawn_post_process(
     base_params: PostProcessBaseParams,
     uploaded_name: str,
@@ -786,6 +832,7 @@ def _build_fix_drawn_post_process(
     source_image: bytes,
     mask_bytes: bytes,
     profiles: list[ModelProfile] | None,
+    denoise_override: float | None = None,
 ) -> tuple[dict, str]:
     """`post_process`'s `kind="fix_drawn"` graph-building branch, pulled out
     on its own since — unlike every other `kind`, which just delegates
@@ -793,7 +840,9 @@ def _build_fix_drawn_post_process(
     pick an override checkpoint (or fall back to the image's own), work out
     the positive-prompt fallback, and compute the Anima mask-grow/blur/blend
     geometry. Keeps `post_process` itself down to the same one-branch-per-kind
-    shape every other `kind` uses. Returns `(prompt_graph, save_node_id)`."""
+    shape every other `kind` uses. `denoise_override` is the "🎚️ Redo…"
+    picker's value (see `_fix_drawn_denoise_field`). Returns
+    `(prompt_graph, save_node_id)`."""
     # Removal, not refinement: the original positive prompt describes the
     # whole scene, including whatever the user just marked for deletion,
     # so conditioning the inpaint on it steers the model toward a nicer
@@ -824,6 +873,10 @@ def _build_fix_drawn_post_process(
         fix_base_params = replace(base_params, positive_prompt="")
         checkpoint_source = "image's own checkpoint"
     fix_params = DrawnMaskFixParams()
+    if denoise_override is not None:
+        fix_params = replace(
+            fix_params, **{_fix_drawn_denoise_field(fix_base_params): denoise_override}
+        )
     if fix_base_params.uses_anima_inpaint_pipeline:
         engaged_reason = (
             f"patch={fix_base_params.anima_lllite_inpaint_patch!r} "
@@ -984,11 +1037,13 @@ async def post_process(
     `detailer_cfg`/`detailer_steps` have no equivalent one-shot field on
     "✏️ Detail Prompt" at all — they apply straight from the checkpoint's
     profile whenever set, for every `_DETAILER_TUNABLE_KINDS` kind alike.
-    Every other kind ignores all three; in
+    Every other kind ignores all three (save `denoise` for `"fix_drawn"`, below); in
     particular `kind="fix_drawn"` always uses its own fixed prompt choice
     (blank, or the `fix_artifact_checkpoint` profile's "background
-    scenery") and `DrawnMaskFixParams`' own denoise (0.75) — "🩹 Fix
-    Artifact" has no prompt field of its own to pass one from.
+    scenery") — "🩹 Fix Artifact" has no prompt field of its own to pass
+    one from. `denoise` alone *does* reach `"fix_drawn"` too, for the
+    "🎚️ Redo…" picker (see `_fix_drawn_denoise_field` for which field it
+    lands on); `None` keeps `DrawnMaskFixParams`' own defaults.
     `is_detail_prompt` is a separate signal from all three of those — it's
     perfectly possible for "✏️ Detail Prompt" to be submitted with both
     fields left blank (falling back to the image's own prompt, same
@@ -1145,6 +1200,7 @@ async def post_process(
             source_image,
             mask_bytes,
             profiles,
+            denoise,
         )
     else:
         raise ValueError(f"Unknown post-processing kind: {kind}")

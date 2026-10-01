@@ -25,6 +25,7 @@ from comfytelegram.handlers import (
     HAND_POINT_CALLBACK_PREFIX,
     HAND_POINT_DENSITY_CALLBACK_PREFIX,
     LORA_SWITCH_TOGGLE_CALLBACK_PREFIX,
+    REDO_TWEAK_CALLBACK_PREFIX,
     STREAM_CANCEL_CALLBACK_DATA,
     SWITCH_MODEL_PICK_CALLBACK_PREFIX,
     again_callback,
@@ -42,6 +43,7 @@ from comfytelegram.handlers import (
     photo_message,
     poll_inpaint_jobs,
     postprocess_callback,
+    redo_tweak_callback,
     reload_command,
     start,
     stop_command,
@@ -346,6 +348,9 @@ def build_application(settings: Settings) -> Application:
     )
     application.add_handler(
         CallbackQueryHandler(hand_point_callback, pattern=rf"^{HAND_POINT_CALLBACK_PREFIX}")
+    )
+    application.add_handler(
+        CallbackQueryHandler(redo_tweak_callback, pattern=rf"^{REDO_TWEAK_CALLBACK_PREFIX}")
     )
     application.add_handler(
         CallbackQueryHandler(
