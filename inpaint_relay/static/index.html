@@ -137,7 +137,6 @@
     flex-direction: column;
     gap: 8px;
     box-sizing: border-box;
-    border-top: 1px solid #222;
   }
   #readonly-info {
     font-size: 12px;
@@ -203,6 +202,51 @@
     align-items: flex-start;
     gap: 6px;
   }
+  /* Fold-away wrapper around #prompt-fields and #toggle-row — on a phone
+     those two together can eat half the screen, so the header bar below
+     collapses them out of the way and hands that height back to the
+     canvas (`#canvas-wrap`'s `flex: 1` takes it up automatically, and
+     `#display-canvas`'s `max-width`/`max-height` let it grow into it).
+     Hidden until `initOptionsPanel` finds something to put in it. */
+  #options-panel {
+    display: none;
+    border-top: 1px solid #222;
+  }
+  #options-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 8px 14px;
+    border-radius: 0;
+    background: transparent;
+    font-size: 13px;
+    font-weight: 600;
+    text-align: left;
+  }
+  #options-caret {
+    display: inline-block;
+    transition: transform 0.15s;
+  }
+  #options-summary {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 400;
+    color: #9a9a9a;
+    display: none;
+  }
+  #options-panel.collapsed #options-body {
+    display: none;
+  }
+  #options-panel.collapsed #options-caret {
+    transform: rotate(-90deg);
+  }
+  #options-panel.collapsed #options-summary {
+    display: block;
+  }
 </style>
 </head>
 <body>
@@ -221,6 +265,13 @@
        default; shown by `applyMeta` once `GET /jobs/{token}/meta` says so.
        Submitted together with the mask in one `POST /jobs/{token}/mask`
        from the same "Done" tap below — there's no separate save step. -->
+  <div id="options-panel">
+  <button id="options-toggle" type="button" aria-expanded="true" aria-controls="options-body">
+    <span id="options-caret">▾</span>
+    <span id="options-title">Options</span>
+    <span id="options-summary"></span>
+  </button>
+  <div id="options-body">
   <div id="prompt-fields" style="display: none;">
     <div id="readonly-info"></div>
     <div>
@@ -264,6 +315,8 @@
     <label id="lora-row"
       ><input type="checkbox" id="lora-toggle" /> Disable LoRAs for this detailer pass</label
     >
+  </div>
+  </div>
   </div>
 
   <div id="controls">
@@ -325,6 +378,10 @@
   var tileControlnetToggle = document.getElementById("tile-controlnet-toggle");
   var loraRow = document.getElementById("lora-row");
   var loraToggle = document.getElementById("lora-toggle");
+  var optionsPanel = document.getElementById("options-panel");
+  var optionsToggle = document.getElementById("options-toggle");
+  var optionsTitle = document.getElementById("options-title");
+  var optionsSummary = document.getElementById("options-summary");
 
   // On by default (matches the button's own initial "active" class in the
   // markup) — `finishAction` checks this before running `runEnclosedFill`,
@@ -1395,6 +1452,67 @@
     denoiseInput.addEventListener("input", updateDenoiseReadout);
   }
 
+  // Collapsed/expanded is remembered per viewer (it's a layout preference,
+  // not job state). With nothing stored yet, a touch device starts
+  // collapsed — that's where the panel crowds the canvas — and anything
+  // with a mouse starts expanded. Deliberately not a width breakpoint:
+  // Telegram Desktop opens WebApps in a narrow window too.
+  var OPTIONS_COLLAPSED_KEY = "optionsCollapsed";
+
+  function initialOptionsCollapsed() {
+    try {
+      var stored = localStorage.getItem(OPTIONS_COLLAPSED_KEY);
+      if (stored === "1") return true;
+      if (stored === "0") return false;
+    } catch (e) {
+      // Storage blocked — fall through to the device default.
+    }
+    return window.matchMedia("(pointer: coarse)").matches;
+  }
+
+  // One-line recap shown in the header while collapsed, so what "Done"
+  // will submit is still visible without unfolding the panel. Only
+  // recomputed on collapse — nothing in the panel can change while it's
+  // folded away.
+  function updateOptionsSummary() {
+    var parts = [];
+    if (promptFieldsEnabled) {
+      if (positiveInput.value.trim()) parts.push(positiveInput.value.trim());
+      if (denoiseOverride.checked) {
+        parts.push("denoise " + Number(denoiseInput.value).toFixed(2));
+      }
+      if (tileControlnetToggle.checked) parts.push("tile CN");
+    }
+    if (loraAvailable && loraToggle.checked) parts.push("no LoRAs");
+    optionsSummary.textContent = parts.join(" · ");
+  }
+
+  function setOptionsCollapsed(collapsed) {
+    if (collapsed) updateOptionsSummary();
+    optionsPanel.classList.toggle("collapsed", collapsed);
+    optionsToggle.setAttribute("aria-expanded", String(!collapsed));
+  }
+
+  optionsToggle.addEventListener("click", function () {
+    var collapsed = !optionsPanel.classList.contains("collapsed");
+    setOptionsCollapsed(collapsed);
+    try {
+      localStorage.setItem(OPTIONS_COLLAPSED_KEY, collapsed ? "1" : "0");
+    } catch (e) {
+      // Not remembered this time — harmless.
+    }
+  });
+
+  // Runs after `applyMeta`, so it knows whether either child has anything
+  // to show — a plain "mask" job with no LoRA toggle gets no panel at all.
+  function initOptionsPanel() {
+    var hasToggles = toggleRowEl.style.display === "flex";
+    if (!promptFieldsEnabled && !hasToggles) return;
+    optionsTitle.textContent = promptFieldsEnabled ? "Prompt & options" : "Options";
+    optionsPanel.style.display = "block";
+    setOptionsCollapsed(initialOptionsCollapsed());
+  }
+
   function loadImage() {
     image.onload = function () {
       // The display canvas's own pixel buffer is capped so the mask editor
@@ -1431,7 +1549,7 @@
       resetMask();
       setStatus(
         promptFieldsEnabled
-          ? "Draw over the region to detail, describe it above, then tap Done."
+          ? "Draw over the region to detail, describe it below, then tap Done."
           : "Draw over the area to fix, then tap Done."
       );
     };
@@ -1450,6 +1568,7 @@
     })
     .then(function (meta) {
       applyMeta(meta);
+      initOptionsPanel();
       loadImage();
     })
     .catch(function () {
