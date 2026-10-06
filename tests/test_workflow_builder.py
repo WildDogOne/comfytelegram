@@ -1,9 +1,12 @@
 from comfytelegram.workflows.builder import (
+    KONTEXT_RESOLUTIONS,
     DrawnMaskFixParams,
     DrawnMaskHandDetailerParams,
     FaceDetailerParams,
     GenerationParams,
     HandDetailerParams,
+    KontextModelFiles,
+    KontextParams,
     LoraSpec,
     ManualHandDetailerParams,
     PostProcessBaseParams,
@@ -15,9 +18,11 @@ from comfytelegram.workflows.builder import (
     build_hand_detailer,
     build_hand_detailer_drawn_mask,
     build_hand_detailer_manual,
+    build_kontext_edit,
     build_tiled_refine,
     build_txt2img,
     build_upscale,
+    kontext_resolution,
 )
 
 
@@ -1136,3 +1141,46 @@ def test_drawn_mask_fix_params_default_to_more_aggressive_than_hand():
     fix_defaults = DrawnMaskFixParams()
     assert fix_defaults.denoise > hand_defaults.denoise
     assert fix_defaults.crop_factor > hand_defaults.crop_factor
+
+
+def test_kontext_resolution_snaps_to_nearest_aspect_bucket():
+    assert kontext_resolution((4096, 4096)) == (1024, 1024)
+    assert kontext_resolution((832, 1216)) == (832, 1248)
+    assert kontext_resolution((3000, 1000)) == (1568, 672)
+    # Every bucket stays at Kontext's ~1MP operating size.
+    assert all(w * h <= 1_100_000 for w, h in KONTEXT_RESOLUTIONS)
+
+
+def test_build_kontext_edit_wires_reference_latent_and_flux_guidance():
+    graph, save_id = build_kontext_edit(
+        "src.png",
+        "make the sky purple",
+        (1248, 832),
+        KontextModelFiles(unet="kontext.safetensors", clip_l="l.st", t5xxl="t5.st", vae="ae.st"),
+        KontextParams(steps=20, guidance=2.5, seed=7),
+    )
+    by_type = {n["class_type"]: (nid, n) for nid, n in graph.items()}
+
+    assert graph[save_id]["class_type"] == "SaveImage"
+    _, clip = by_type["DualCLIPLoader"]
+    assert clip["inputs"]["type"] == "flux"
+    assert by_type["UNETLoader"][1]["inputs"]["unet_name"] == "kontext.safetensors"
+    encode_id, _ = by_type["VAEEncode"]
+    ref_id, ref = by_type["ReferenceLatent"]
+    assert ref["inputs"]["latent"] == [encode_id, 0]
+    guidance_id, guidance = by_type["FluxGuidance"]
+    assert guidance["inputs"]["conditioning"] == [ref_id, 0]
+    assert guidance["inputs"]["guidance"] == 2.5
+    zero_id, _ = by_type["ConditioningZeroOut"]
+    latent_id, latent = by_type["EmptySD3LatentImage"]
+    assert (latent["inputs"]["width"], latent["inputs"]["height"]) == (1248, 832)
+
+    _, ks = by_type["KSampler"]
+    assert ks["inputs"]["positive"] == [guidance_id, 0]
+    assert ks["inputs"]["negative"] == [zero_id, 0]
+    assert ks["inputs"]["latent_image"] == [latent_id, 0]
+    assert ks["inputs"]["cfg"] == 1.0
+    assert ks["inputs"]["denoise"] == 1.0
+    assert ks["inputs"]["seed"] == 7
+    _, text = by_type["CLIPTextEncode"]
+    assert text["inputs"]["text"] == "make the sky purple"

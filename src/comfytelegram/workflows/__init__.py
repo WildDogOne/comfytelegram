@@ -4,6 +4,8 @@ from comfytelegram.workflows.builder import (
     FaceDetailerParams,
     GenerationParams,
     HandDetailerParams,
+    KontextModelFiles,
+    KontextParams,
     LoraSpec,
     ManualHandDetailerParams,
     PostProcessBaseParams,
@@ -14,9 +16,11 @@ from comfytelegram.workflows.builder import (
     build_hand_detailer,
     build_hand_detailer_drawn_mask,
     build_hand_detailer_manual,
+    build_kontext_edit,
     build_tiled_refine,
     build_txt2img,
     build_upscale,
+    kontext_resolution,
 )
 
 __all__ = [
@@ -25,6 +29,8 @@ __all__ = [
     "FaceDetailerParams",
     "GenerationParams",
     "HandDetailerParams",
+    "KontextModelFiles",
+    "KontextParams",
     "LoraSpec",
     "ManualHandDetailerParams",
     "PostProcessBaseParams",
@@ -35,7 +41,9 @@ __all__ = [
     "build_hand_detailer",
     "build_hand_detailer_drawn_mask",
     "build_hand_detailer_manual",
+    "build_kontext_edit",
     "build_tiled_refine",
     "build_txt2img",
     "build_upscale",
+    "kontext_resolution",
 ]

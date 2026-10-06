@@ -42,6 +42,7 @@ from comfytelegram.handlers import (
     _checkpoint_labels,
     _consume_awaiting_character_edit,
     _consume_awaiting_character_rename,
+    _consume_awaiting_kontext,
     _consume_awaiting_upscale_custom,
     _deserialize_generation_params,
     _draw_hand_point_grid,
@@ -195,7 +196,7 @@ def test_post_process_keyboard_scopes_every_button_to_result_id():
 
 
 def test_post_process_keyboard_page_one_is_the_working_set():
-    """Page 1 pairs like with like: the two whole-frame operations, then
+    """Page 1 pairs like with like: the three whole-frame operations, then
     the two detailers, then the two read/export buttons, then the toggle.
     Everything on it either starts a ComfyUI run or hands back the image —
     see `_post_process_keyboard`."""
@@ -203,7 +204,7 @@ def test_post_process_keyboard_page_one_is_the_working_set():
         [b.callback_data for b in row] for row in _post_process_keyboard("abc123").inline_keyboard
     ]
     assert rows == [
-        ["pp:upscale:abc123", "pp:fix_draw:abc123"],
+        ["pp:upscale:abc123", "pp:fix_draw:abc123", "pp:kontext:abc123"],
         # Three wide, uniquely: "✏️ Detail Prompt" retargets the two
         # detailers next to it, so it belongs on their row.
         ["pp:face:abc123", "pp:hand:abc123", f"pp:{DETAIL_PROMPT_CALLBACK_KIND}:abc123"],
@@ -2826,3 +2827,65 @@ async def test_page_flip_swallows_an_unmodified_double_tap():
     update.effective_user.id = 1
 
     await postprocess_callback(update, _page_toggle_context())  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_kontext_blank_instruction_keeps_waiting():
+    """A whitespace-only reply must not silently drop the pending edit —
+    the next real instruction would otherwise be generated as a prompt."""
+    message = AsyncMock()
+    message.text = "   "
+    message.message_thread_id = None
+    message.chat_id = 1
+    message.reply_text = AsyncMock(return_value=MagicMock(message_id=78))
+    update = MagicMock()
+    update.effective_message = message
+    context = MagicMock()
+    context.bot = AsyncMock()
+    context.chat_data = {"awaiting_kontext": {NO_TOPIC: ("abc123", 77)}}
+    context.bot_data = {"storage": MagicMock()}
+
+    assert await _consume_awaiting_kontext(update, context) is True
+
+    # The re-prompt replaces the original prompt, and is what's tracked now.
+    assert context.chat_data["awaiting_kontext"] == {NO_TOPIC: ("abc123", 78)}
+    context.bot.delete_message.assert_awaited_once_with(1, 77)
+    message.reply_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_kontext_reports_a_failed_source_fetch_on_its_status():
+    message = AsyncMock()
+    message.text = "make the sky purple"
+    message.message_thread_id = None
+    message.chat_id = 1
+    status_message = AsyncMock()
+    message.reply_text = AsyncMock(return_value=status_message)
+    update = MagicMock()
+    update.effective_message = message
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    context = MagicMock()
+    context.bot = AsyncMock()
+    context.chat_data = {"awaiting_kontext": {NO_TOPIC: ("abc123", 77)}}
+    context.bot_data = {
+        "storage": _pending_result_mock(profile, "a fox"),
+        "comfy_client": _comfy_client_mock(),
+        "settings": MagicMock(),
+    }
+
+    with (
+        patch(
+            "comfytelegram.handlers._fetch_source_image",
+            new=AsyncMock(side_effect=RuntimeError("file gone")),
+        ),
+        patch("comfytelegram.handlers.kontext_edit", new=AsyncMock()) as kontext_mock,
+    ):
+        assert await _consume_awaiting_kontext(update, context) is True
+
+    kontext_mock.assert_not_awaited()
+    # The "describe the change" prompt is gone as soon as the job starts,
+    # whether or not the job then succeeds.
+    context.bot.delete_message.assert_awaited_once_with(1, 77)
+    status_message.edit_text.assert_awaited_once()
+    assert "Kontext edit failed" in status_message.edit_text.await_args.args[0]

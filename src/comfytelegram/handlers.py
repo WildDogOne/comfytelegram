@@ -52,6 +52,7 @@ from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
 from comfytelegram.generation import (
     GeneratedImage,
     generate,
+    kontext_edit,
     post_process,
     repeat,
     resolve_drawn_mask_denoise,
@@ -91,6 +92,8 @@ from comfytelegram.topics import pop_pending, set_pending
 from comfytelegram.workflows import (
     DrawnMaskHandDetailerParams,
     GenerationParams,
+    KontextModelFiles,
+    KontextParams,
     ManualHandDetailerParams,
 )
 
@@ -204,6 +207,13 @@ FIX_REDO4_CALLBACK_KIND = "fix_redo4"
 DETAIL_PROMPT_CALLBACK_KIND = "detail_prompt"
 DETAIL_REDO_CALLBACK_KIND = "detail_redo"
 DETAIL_REDO4_CALLBACK_KIND = "detail_redo4"
+
+#: "🪄 Kontext Edit" — an instruction-driven FLUX.1 Kontext edit of the whole
+#: image (`generation.kontext_edit`). The tap only asks for the instruction;
+#: the follow-up text message is consumed by `_consume_awaiting_kontext`,
+#: same one-field-flag pattern as "⚙️ Customize" upscale.
+KONTEXT_CALLBACK_KIND = "kontext"
+KONTEXT_CANCEL_CALLBACK_DATA = "kontext:cancel"
 
 #: What `storage.py`'s `inpaint_job.kind`/a drawn-mask redo tap actually
 #: means in terms of `generation.post_process`'s API — looked up by
@@ -492,7 +502,8 @@ def _post_process_keyboard(result_id: str, page: int = 1) -> InlineKeyboardMarku
     `pending_result`).
 
     Page 1 is what gets tapped while actually working an image: 🔍 Upscale
-    4x and 🩹 Fix Artifact, then the ✨ Face / 🖐️ Hand detailers with
+    4x, 🩹 Fix Artifact and 🪄 Kontext Edit (the three whole-frame
+    operations), then the ✨ Face / 🖐️ Hand detailers with
     ✏️ Detail Prompt beside them (a third, general-purpose region-detail
     action — draw a mask, describe it, run immediately — that belongs with
     the other two more than anywhere else on the keyboard), then
@@ -566,6 +577,9 @@ def _post_process_keyboard(result_id: str, page: int = 1) -> InlineKeyboardMarku
                 ),
                 InlineKeyboardButton(
                     "🩹 Fix Artifact", callback_data=f"pp:{FIX_DRAW_CALLBACK_KIND}:{result_id}"
+                ),
+                InlineKeyboardButton(
+                    "🪄 Kontext Edit", callback_data=f"pp:{KONTEXT_CALLBACK_KIND}:{result_id}"
                 ),
             ],
             [
@@ -2541,6 +2555,9 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if await _consume_awaiting_redo_denoise(update, context):
         return
 
+    if await _consume_awaiting_kontext(update, context):
+        return
+
     message = update.effective_message
     prompt_text = (message_text(message) or "").strip()
     if not prompt_text:
@@ -3295,6 +3312,25 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("↩ Cancel", callback_data=f"pp:upscale:{result_id}")]]
             ),
+        )
+        return
+
+    if kind == KONTEXT_CALLBACK_KIND:
+        prompt_message = await query.message.reply_text(
+            "🪄 Kontext Edit — describe the change in plain English. Be specific "
+            'and say what to keep, e.g. "Change the jacket to red leather while '
+            'keeping the face, pose and background unchanged". The result comes '
+            "back at ~1MP whatever this image's size.",
+            reply_markup=_kontext_cancel_keyboard(),
+        )
+        # The prompt message's id rides along so `_consume_awaiting_kontext`
+        # can delete it once the edit starts — it's served its purpose, and
+        # a stale Cancel button left under it would only confuse.
+        set_pending(
+            context.chat_data,
+            "awaiting_kontext",
+            query.message,
+            (result_id, prompt_message.message_id),
         )
         return
 
@@ -4326,6 +4362,110 @@ async def _consume_awaiting_upscale_custom(
     return True
 
 
+async def _consume_awaiting_kontext(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """If this chat is mid-"describe the edit" entry (see
+    `postprocess_callback`'s `KONTEXT_CALLBACK_KIND` branch), run the incoming
+    text as a FLUX.1 Kontext instruction against that image and return True;
+    otherwise return False so `generate_message` treats it as a prompt."""
+    message = update.effective_message
+    pending_entry = pop_pending(context.chat_data, "awaiting_kontext", message)
+    if pending_entry is None:
+        return False
+    result_id, prompt_message_id = pending_entry
+
+    instruction = (message_text(message) or "").strip()
+    if not instruction:
+        # Keep waiting rather than silently dropping the edit — otherwise
+        # the next real instruction would be generated as a prompt instead.
+        # The re-prompt replaces the original one, so only one is ever left
+        # around to delete.
+        await _delete_message_quietly(context.bot, message.chat_id, prompt_message_id)
+        reprompt = await message.reply_text(
+            "That was empty — describe the edit, or tap ❌ Cancel.",
+            reply_markup=_kontext_cancel_keyboard(),
+        )
+        set_pending(
+            context.chat_data, "awaiting_kontext", message, (result_id, reprompt.message_id)
+        )
+        return True
+
+    await _delete_message_quietly(context.bot, message.chat_id, prompt_message_id)
+
+    storage: Storage = context.bot_data["storage"]
+    pending = storage.get_pending_result(result_id)
+    if pending is None:
+        await message.reply_text("That image has expired — nothing to edit.")
+        return True
+
+    settings: Settings = context.bot_data["settings"]
+    client: ComfyClient = context.bot_data["comfy_client"]
+    full_params = _deserialize_generation_params(pending["base_params"])
+
+    label = "Kontext editing"
+    status_message = await message.reply_text(f"{label}…", disable_notification=True)
+
+    async def fetch_and_edit() -> GeneratedImage:
+        # The source download runs inside `_run_reporting_errors` too, so a
+        # failed fetch is reported on this status message like any other
+        # Kontext failure rather than as the bot-wide generic error.
+        source_bytes = await _fetch_source_image(
+            client,
+            context.bot,
+            pending["filename"],
+            pending["file_id"],
+            on_fallback=_source_fallback_notifier(message),
+        )
+        return await kontext_edit(
+            client,
+            source_bytes,
+            pending["filename"],
+            full_params,
+            instruction,
+            files=_kontext_model_files(settings),
+            params=KontextParams(
+                steps=settings.flux_kontext_steps, guidance=settings.flux_kontext_guidance
+            ),
+            on_progress=_make_progress_callback(status_message, label),
+        )
+
+    result = await _run_reporting_errors(
+        status_message, "Kontext edit", "Kontext edit", fetch_and_edit()
+    )
+    if result is None:
+        return True
+
+    await status_message.delete()
+    await _send_and_store_result(message, pending["chat_id"], storage, result)
+    return True
+
+
+async def _delete_message_quietly(bot: Bot, chat_id: int, message_id: int) -> None:
+    """Delete a bot message, ignoring the failure if it's already gone (or
+    too old for Telegram to allow deleting) — tidying up is best-effort."""
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except BadRequest:
+        logger.debug("Couldn't delete message %s in chat %s", message_id, chat_id)
+
+
+def _kontext_model_files(settings: Settings) -> KontextModelFiles:
+    """The Kontext model files from `Settings` — the one place their
+    defaults live (`KontextModelFiles` has none of its own)."""
+    return KontextModelFiles(
+        unet=settings.flux_kontext_unet,
+        clip_l=settings.flux_kontext_clip_l,
+        t5xxl=settings.flux_kontext_t5xxl,
+        vae=settings.flux_kontext_vae,
+    )
+
+
+def _kontext_cancel_keyboard() -> InlineKeyboardMarkup:
+    """Attached to "🪄 Kontext Edit"'s "describe the change" follow-up."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Cancel", callback_data=KONTEXT_CANCEL_CALLBACK_DATA)]]
+    )
+
+
 def _make_cancel_callback(
     pending_key: str, cancelled_text: str
 ) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]:
@@ -4351,6 +4491,12 @@ def _make_cancel_callback(
         await _safe_edit_message(query, cancelled_text, InlineKeyboardMarkup([]))
 
     return callback
+
+
+#: "❌ Cancel" on "🪄 Kontext Edit"'s "describe the change" follow-up.
+kontext_cancel_callback = _make_cancel_callback(
+    "awaiting_kontext", "Cancelled — no Kontext edit started."
+)
 
 
 #: "❌ Cancel" on the "What should the stream generate?" follow-up — see

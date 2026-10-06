@@ -34,6 +34,8 @@ from comfytelegram.workflows import (
     FaceDetailerParams,
     GenerationParams,
     HandDetailerParams,
+    KontextModelFiles,
+    KontextParams,
     ManualHandDetailerParams,
     PostProcessBaseParams,
     TiledRefineParams,
@@ -43,9 +45,11 @@ from comfytelegram.workflows import (
     build_hand_detailer,
     build_hand_detailer_drawn_mask,
     build_hand_detailer_manual,
+    build_kontext_edit,
     build_tiled_refine,
     build_txt2img,
     build_upscale,
+    kontext_resolution,
 )
 
 logger = logging.getLogger(__name__)
@@ -1214,6 +1218,67 @@ async def post_process(
     return GeneratedImage(
         data=data, filename=filename, full_params=full_params, unchanged=unchanged
     )
+
+
+def _scale_for_kontext(source_image: bytes) -> tuple[bytes, tuple[int, int]]:
+    """Resize `source_image` to its nearest `KONTEXT_RESOLUTIONS` entry
+    (Lanczos, then a centre crop of whatever sliver the aspect-ratio snap
+    leaves over — the same thing `FluxKontextImageScale` does), returned as
+    PNG bytes plus the resulting size.
+
+    Done here rather than with that node in-graph for two reasons: the
+    graph's empty latent needs the dimensions up front, and a 4x-upscaled
+    source is ~16MP — shipping all of it to ComfyUI just to throw 15/16ths
+    away on arrival is pointless upload time."""
+    image = Image.open(io.BytesIO(source_image)).convert("RGB")
+    target_w, target_h = kontext_resolution(image.size)
+    scale = max(target_w / image.width, target_h / image.height)
+    resized = image.resize(
+        (max(target_w, round(image.width * scale)), max(target_h, round(image.height * scale))),
+        Image.Resampling.LANCZOS,
+    )
+    left = (resized.width - target_w) // 2
+    top = (resized.height - target_h) // 2
+    cropped = resized.crop((left, top, left + target_w, top + target_h))
+    buf = io.BytesIO()
+    cropped.save(buf, format="PNG")
+    return buf.getvalue(), (target_w, target_h)
+
+
+async def kontext_edit(
+    client: ComfyClient,
+    source_image: bytes,
+    source_filename: str,
+    full_params: GenerationParams,
+    instruction: str,
+    *,
+    files: KontextModelFiles,
+    params: KontextParams,
+    on_progress: ProgressCallback | None = None,
+) -> GeneratedImage:
+    """Edit a previously generated image with FLUX.1 Kontext, following a
+    natural-language `instruction` ("change the jacket to red leather, keep
+    everything else the same").
+
+    Deliberately not a `post_process` kind: every one of those rebuilds the
+    image's *own* checkpoint/LoRA/prompt graph, and none of that applies
+    here — Kontext is a separate model (`files`) conditioned only on the
+    instruction and the source pixels. The result still carries the
+    source's `full_params` though, so its own post-processing buttons
+    (upscale, detailers) keep working against the original checkpoint.
+
+    The output is always ~1MP (see `KONTEXT_RESOLUTIONS`), however large
+    the source was — a 4x upscale comes back at roughly a quarter of its
+    side length, to be upscaled again afterwards if wanted."""
+    scaled, size = await asyncio.to_thread(_scale_for_kontext, source_image)
+    upload = await client.upload_image(scaled, filename=f"kontext_{source_filename}")
+    prompt_graph, save_node_id = build_kontext_edit(
+        upload["name"], instruction, size, files, params
+    )
+    logger.info("Submitting Kontext edit on %s at %dx%d", upload["name"], *size)
+    raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
+    data, filename = _tag_images(raw, full_params, kind="kontext", graph=prompt_graph)[0]
+    return GeneratedImage(data=data, filename=filename, full_params=full_params)
 
 
 async def repeat(

@@ -1816,3 +1816,41 @@ async def test_post_process_fix_drawn_falls_back_to_generation_prefixes():
     ]
     assert "generation only, background scenery" in texts
     assert "generation negative" in texts
+
+
+@pytest.mark.asyncio
+async def test_kontext_edit_downscales_large_source_to_a_1mp_bucket():
+    """A 4x-upscaled source must reach ComfyUI at ~1MP — past that Kontext
+    tiles the scene into repeated copies instead of editing it."""
+    source = _solid_png(4096, 2731, (255, 0, 0))
+    client = _StubUploadingComfyClient(_solid_png(8, 8, (0, 0, 255)))
+    uploaded: list[bytes] = []
+    original_upload = client.upload_image
+
+    async def capture(data, **kwargs):
+        uploaded.append(data)
+        return await original_upload(data, **kwargs)
+
+    client.upload_image = capture
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    result = await generation.kontext_edit(
+        client,
+        source,
+        "source.png",
+        params,
+        "make it night",
+        files=generation.KontextModelFiles(unet="k.st", clip_l="l.st", t5xxl="t5.st", vae="ae.st"),
+        params=generation.KontextParams(steps=20, guidance=2.5),
+    )
+
+    (sent,) = uploaded
+    assert Image.open(io.BytesIO(sent)).size == (1248, 832)
+    latent = next(
+        n for n in client.queued_graph.values() if n["class_type"] == "EmptySD3LatentImage"
+    )
+    assert (latent["inputs"]["width"], latent["inputs"]["height"]) == (1248, 832)
+    assert result.full_params is params
+    assert extract_metadata(result.data)["kind"] == "kontext"

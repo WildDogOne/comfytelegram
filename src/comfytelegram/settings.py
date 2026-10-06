@@ -130,6 +130,24 @@ class Settings(BaseSettings):
     )
     tag_search_results: int = Field(15, description="Max rows /tags replies with per query")
 
+    flux_kontext_unet: str = Field(
+        "flux1-dev-kontext_fp8_scaled.safetensors",
+        description=(
+            'FLUX.1 Kontext [dev] diffusion model (ComfyUI models/diffusion_models) for "🪄 '
+            "Kontext Edit\". Independent of the image's own checkpoint — Kontext is a "
+            "separate model. Defaults match flux_kontext_sample.json."
+        ),
+    )
+    flux_kontext_clip_l: str = Field("clip_l.safetensors", description="Kontext's CLIP-L encoder")
+    flux_kontext_t5xxl: str = Field(
+        "t5xxl_fp8_e4m3fn_scaled.safetensors", description="Kontext's T5-XXL encoder"
+    )
+    flux_kontext_vae: str = Field("ae.safetensors", description="Kontext's (FLUX) VAE")
+    flux_kontext_steps: int = Field(20, description="Sampler steps per Kontext edit")
+    flux_kontext_guidance: float = Field(
+        2.5, description="FluxGuidance for Kontext edits (BFL's recommended 2.5)"
+    )
+
     inpaint_relay_url: str | None = Field(
         None,
         description=(

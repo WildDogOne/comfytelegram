@@ -2078,3 +2078,137 @@ def _build_drawn_mask_detailer(
         title="Save Image",
     )
     return g.as_prompt(), save
+
+
+#: The resolutions FLUX.1 Kontext was trained at, from ComfyUI's own
+#: `comfy_extras/nodes_flux.py` (`PREFERRED_KONTEXT_RESOLUTIONS`, what its
+#: `FluxKontextImageScale` node snaps an input to). Every entry is ~1MP —
+#: the model's whole operating range. Past that it doesn't degrade
+#: gracefully, it tiles: a 2048x2048 latent comes back as several copies of
+#: the scene side by side, since nothing in it ever saw a canvas that big.
+KONTEXT_RESOLUTIONS: tuple[tuple[int, int], ...] = (
+    (672, 1568),
+    (688, 1504),
+    (720, 1456),
+    (752, 1392),
+    (800, 1328),
+    (832, 1248),
+    (880, 1184),
+    (944, 1104),
+    (1024, 1024),
+    (1104, 944),
+    (1184, 880),
+    (1248, 832),
+    (1328, 800),
+    (1392, 752),
+    (1456, 720),
+    (1504, 688),
+    (1568, 672),
+)
+
+
+def kontext_resolution(size: tuple[int, int]) -> tuple[int, int]:
+    """The `KONTEXT_RESOLUTIONS` entry whose aspect ratio is closest to
+    `size`'s — the same pick `FluxKontextImageScale` makes, done in Python
+    instead so the caller knows the dimensions up front (the latent has to
+    be sized to match) and only ever uploads the ~1MP copy."""
+    width, height = size
+    aspect = width / height
+    return min(KONTEXT_RESOLUTIONS, key=lambda wh: abs(aspect - wh[0] / wh[1]))
+
+
+@dataclass
+class KontextModelFiles:
+    """The FLUX.1 Kontext [dev] model files, by ComfyUI filename. Unrelated
+    to the image's own checkpoint — Kontext is a separate model entirely,
+    so these come from `Settings` (`Settings.flux_kontext_*`, the only
+    place their defaults are spelled out), not a profile."""
+
+    unet: str
+    clip_l: str
+    t5xxl: str
+    vae: str
+
+
+@dataclass
+class KontextParams:
+    """Sampler settings for a Kontext edit, matching
+    `flux_kontext_sample.json`. `steps`/`guidance` have no defaults here —
+    they come from `Settings.flux_kontext_steps`/`flux_kontext_guidance`.
+    `cfg` stays 1.0 — Kontext dev is guidance-distilled, so prompt adherence
+    comes from `guidance` (`FluxGuidance`) and the negative is just a
+    zeroed-out conditioning; a real cfg would double the cost per step for
+    nothing."""
+
+    steps: int
+    guidance: float
+    sampler_name: str = "euler"
+    scheduler: str = "simple"
+    seed: int | None = None
+
+
+def build_kontext_edit(
+    source_image_name: str,
+    instruction: str,
+    size: tuple[int, int],
+    files: KontextModelFiles,
+    params: KontextParams,
+) -> tuple[dict[str, Any], str]:
+    """A FLUX.1 Kontext instruction edit of an uploaded image, wired like
+    `flux_kontext_sample.json` with its `cg-use-everywhere` broadcasts made
+    explicit: the source is VAE-encoded and attached to the prompt via
+    `ReferenceLatent` (that's how Kontext "sees" the image — it's context,
+    not an img2img starting point), then sampled from an empty latent at
+    full denoise.
+
+    `source_image_name` must already be scaled to `size`, a
+    `KONTEXT_RESOLUTIONS` entry (see `kontext_resolution`) — the empty
+    latent is sized from `size` directly, so the output matches the
+    reference's aspect ratio instead of the sample's fixed 1024x1024 square.
+
+    Returns (graph, save_node_id)."""
+    g = PromptGraph()
+    width, height = size
+
+    unet = g.add("UNETLoader", {"unet_name": files.unet, "weight_dtype": "default"}, title="UNET")
+    clip = g.add(
+        "DualCLIPLoader",
+        {
+            "clip_name1": files.clip_l,
+            "clip_name2": files.t5xxl,
+            "type": "flux",
+            "device": "default",
+        },
+        title="Text Encoders",
+    )
+    vae = g.add("VAELoader", {"vae_name": files.vae}, title="VAE")
+
+    load = g.add("LoadImage", {"image": source_image_name}, title="Source Image")
+    encoded = g.add("VAEEncode", {"pixels": [load, 0], "vae": [vae, 0]}, title="Encode Reference")
+
+    prompt = g.add(
+        "CLIPTextEncode", {"clip": [clip, 0], "text": instruction}, title="Edit Instruction"
+    )
+    referenced = g.add("ReferenceLatent", {"conditioning": [prompt, 0], "latent": [encoded, 0]})
+    positive = g.add("FluxGuidance", {"conditioning": [referenced, 0], "guidance": params.guidance})
+    negative = g.add("ConditioningZeroOut", {"conditioning": [prompt, 0]})
+
+    latent = g.add("EmptySD3LatentImage", {"width": width, "height": height, "batch_size": 1})
+    sampler = g.add(
+        "KSampler",
+        {
+            "model": [unet, 0],
+            "positive": [positive, 0],
+            "negative": [negative, 0],
+            "latent_image": [latent, 0],
+            "seed": _resolve_seed(params.seed),
+            "steps": params.steps,
+            "cfg": 1.0,
+            "sampler_name": params.sampler_name,
+            "scheduler": params.scheduler,
+            "denoise": 1.0,
+        },
+    )
+    decoded = g.add("VAEDecode", {"samples": [sampler, 0], "vae": [vae, 0]})
+    save = g.add("SaveImage", {"images": [decoded, 0], "filename_prefix": "comfytelegram_kontext"})
+    return g.as_prompt(), save

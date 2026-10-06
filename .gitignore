@@ -228,3 +228,4 @@ CLAUDE.md
 
 inpaint_relay/docker-compose.yml
 docker-compose.yml
+flux_kontext_sample.json
