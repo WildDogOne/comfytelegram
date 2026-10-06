@@ -1,558 +1,416 @@
 # comfytelegram
 
-A Telegram bot front-end for a local [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
-installation. Send it a prompt, pick a checkpoint, and it drives ComfyUI over
-HTTP + WebSocket to generate images — with per-model default settings,
-one-tap upscale/face-detail/hand-detail post-processing, and an in-chat
-settings menu.
-It talks to ComfyUI's own API directly; it does not shell out to the `comfy`
-CLI at runtime.
+**Generate, fix and refine Stable Diffusion images from Telegram, using your
+own [ComfyUI](https://github.com/comfyanonymous/ComfyUI) install.**
+
+Send the bot a prompt and it runs the generation on your ComfyUI server,
+then replies with the images. Each image has buttons for the usual follow-up
+work: upscale, face/hand detailing, inpainting a region you draw on your
+phone, instruction-based edits with FLUX Kontext, and turning an image back
+into a prompt. Each checkpoint gets its own default settings from a JSON
+profile, so switching models doesn't mean re-tuning cfg/steps/sampler by
+hand.
+
+The bot talks to ComfyUI's HTTP + WebSocket API directly. It doesn't use the
+`comfy` CLI, and it needs no inbound network access: it long-polls Telegram.
+
+- [Features](#features)
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Running with Docker](#running-with-docker)
+- [Using the bot](#using-the-bot)
+- [Optional features](#optional-features)
+- [Development](#development)
+- [Architecture](#architecture)
 
 ## Features
 
-- **Text-to-image generation** — send any plain-text message as a prompt.
-  Prefix any word with `-` to send it as a negative instead (e.g. `1girl,
-  outdoors, -blurry, -watermark`), stacked on top of the checkpoint's own
-  default negative prompt and any active character's.
-- **Switchable models with smart defaults** — `/model` lists checkpoints
-  ComfyUI has installed; each can have a matching *model profile* (cfg,
-  steps, sampler, clip skip, prompt prefixes, default LoRAs) applied
-  automatically. Most checkpoints are a single file loaded the normal way,
-  but split-file architectures (separate UNET/text-encoder/VAE, e.g. Anima)
-  are supported too via a profile's `loader: "split"` — see
-  [`model_profiles/`](model_profiles/).
-- **Post-processing, one tap away** — every generated image gets 🔍 Upscale
-  (UltimateSDUpscale, 4x), ✨ Face Detail, and 🖐️ Hand Detail buttons (the
-  latter two both Impact Pack's `FaceDetailer` node — it's a generic
-  detect/crop/inpaint node despite the name, so hand-detailing is the same
-  graph with a hand-trained bbox detector swapped in), plus 🏷️ Analyze Image (run
-  *both* the WD14 tagger and a Qwen-VL caption, each sent as its own message
-  with its own 🎨 Generate button, for comparing them side by side) and a
-  🔁 Generate Again button on the whole batch. 🖐️ Hand Detail asks 🤖
-  Auto-detect or ✋ Tap to mark first, since the YOLO bbox detector often
-  can't find a hand at all — tapping a cell on a coarse grid overlay
-  inpaints a small mask centered there instead, skipping detection
-  entirely. ✏️ Detail Prompt retargets what the detailers condition on for
-  one image — they otherwise inherit the whole scene's prompt, which is the
-  wrong thing to re-assert over a crop of one hand.
-- **Image-to-prompt analysis** — 🏷️ Analyze Image runs both a WD14 tagger and a
-  Qwen-VL caption via a local Ollama server, regardless of checkpoint, for
-  comparing them side by side. See [Image analysis](#image-analysis) below.
-- **Upload a photo for analysis** — send the bot any photo (not one of its
-  own generated images — those use the 🏷️ Analyze Image button instead) and it
-  runs the same side-by-side WD14/Qwen-VL analysis, each reply with its own
-  🎨 Generate button.
-- **Archive and re-import** — every generated image carries its own full
-  generation settings inside the PNG. Tap **📥 Download file** to get the
-  uncompressed PNG, save it wherever you keep images, and months later send
-  it back to the bot *as a file* — it reads the settings straight out of the
-  image and restores every post-processing button, with no database row
-  needed. See [Archiving and re-importing](#archiving-and-re-importing).
-- **`/settings`** — an in-place inline-keyboard menu to view and override a
-  model's generation defaults per chat (steppers + presets for numeric
-  fields, a live-populated grid for sampler/scheduler, free text for prompt
-  prefixes), without editing any files.
-- **`/lora`** — an in-place inline-keyboard menu to toggle which of the
-  current model's LoRAs are applied, per chat, without editing
-  `model_profiles/*.json` or restarting the bot. Only shows the LoRAs
-  already configured in that model's profile (there's no way to safely
-  guess which of every installed LoRA file fits a given checkpoint's
-  architecture, so the profile's own curated list is what `/lora` toggles)
-  — plus, if configured, an "ℹ️ Info" button to look up each LoRA's trigger
-  words and base-model compatibility on CivitAI. See
-  [LoRA info lookup](#lora-info-lookup) below.
-- **Saved characters** — `/character save <name> | <prompt>` stores a
-  reusable prompt snippet; `/characters` activates one so it's folded into
-  every generation until you switch or clear it.
-- **`/stream [prompt]`** — generate single images back-to-back from the
-  same prompt (batch size forced to 1 regardless of the checkpoint's own
-  default), sending each one immediately, until `/stop` or a 100-image hard
-  limit ends it. Omit the prompt (or just tap the `/stream` button on the
-  command keyboard, which can only ever send fixed text) and the bot asks
-  for it as a follow-up message instead of erroring — with a "❌ Cancel"
-  button to back out if you tapped it by mistake.
-- **Context-aware command keyboard** — `/start` installs a persistent reply
-  keyboard (not a button on one message, so it's still one tap away no
-  matter how many images have since scrolled past) listing every top-level
-  command. While a `/stream` is running it's swapped for a one-button
-  `/stop` keyboard — no point offering `/model`/`/settings`/etc. mid-stream —
-  then swapped back once the stream ends.
-- **Survives restarts** — selected model, settings overrides, saved
-  characters, and every post-processing button all persist in a local
-  SQLite file, not memory. (A running `/stream` doesn't — it's a live
-  background task, so it stops if the bot restarts.)
-- **Tag search** — `/tags <query>` searches a local danbooru/e621 tag
-  database and hands back tap-to-copy buttons for pasting matches straight
-  into a prompt; `/tagcheck <prompt>` checks a whole prompt's tags against
-  it, flagging unknown or rarely-used ones. See [Tag search](#tag-search)
-  below.
+- **Prompt → image.** Any plain-text message is a prompt. You can write
+  negatives inline as `-blurry -watermark`, or put a whole negative block
+  below a `---` line.
+- **Per-model defaults.** `/model` lists the checkpoints ComfyUI has
+  installed. A matching [model profile](model_profiles/README.md) supplies
+  cfg, steps, sampler, clip skip, prompt prefixes and default LoRAs.
+  Split-file architectures (separate UNET / text encoder / VAE, e.g. Anima)
+  are supported.
+- **Post-processing buttons on every image.** 🔍 Upscale 4x, 🧵 Homogenize,
+  ✨ Face Detail, 🖐️ Hand Detail (auto-detect, tap a grid cell, or draw a
+  mask), 🩹 Fix Artifact, ✏️ Detail Prompt and 🪄 Kontext Edit. Each result
+  gets the same buttons, so passes can be chained.
+- **Freehand masks in Telegram.** A small companion web app
+  ([`inpaint_relay/`](inpaint_relay/README.md)) lets you paint the region to
+  inpaint with your finger, with pinch-zoom and an eraser.
+- **Image → prompt.** A WD14 tagger and a Qwen-VL caption (via Ollama) run
+  side by side. Each result has a 🎨 Generate button that starts a new
+  generation from it.
+- **PNG archives you can re-import.** Every image carries its full
+  generation settings in a PNG chunk. Send the file back months later and
+  all of its buttons work again.
+- **Chat-side tuning.** `/settings` overrides a model's defaults and `/lora`
+  toggles its LoRAs, both per chat, without editing files or restarting.
+- **Saved characters, streaming, tag search.** Reusable prompt snippets,
+  `/stream` for back-to-back generation, and `/tags` / `/tagcheck` against a
+  local danbooru/e621 tag database.
+- **State survives restarts.** Chat settings and every image's buttons are
+  stored in SQLite.
 
 ## Requirements
 
 - Python 3.11+ and [`uv`](https://docs.astral.sh/uv/)
-- A running ComfyUI instance reachable over HTTP/WebSocket, with these
-  custom node packs installed (beyond ComfyUI's own core nodes):
-  - [`ComfyUI-Impact-Pack`](https://github.com/ltdrdata/ComfyUI-Impact-Pack)
-    + `ComfyUI-Impact-Subpack` — face/hand detection/detailing
-    (`FaceDetailer`, `UltralyticsDetectorProvider`, `SAMLoader`); hand
-    detailing additionally needs a hand-trained bbox model staged under
-    ComfyUI's `models/ultralytics/bbox/` (e.g. `hand_yolov8s.pt`) — not
-    bundled with Impact Pack itself, same manual-staging caveat as the WD14
-    tagger files (see [Image analysis](#image-analysis))
-  - [`ComfyUI_UltimateSDUpscale`](https://github.com/ssitu/ComfyUI_UltimateSDUpscale) —
-    the 4x upscale pass
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
+- A running ComfyUI instance with these custom node packs:
+  - [ComfyUI-Impact-Pack](https://github.com/ltdrdata/ComfyUI-Impact-Pack)
+    and ComfyUI-Impact-Subpack, used by the face/hand detailers and the
+    drawn-mask flows
+  - [ComfyUI_UltimateSDUpscale](https://github.com/ssitu/ComfyUI_UltimateSDUpscale),
+    used by 🔍 Upscale and 🧵 Homogenize
+- Model files the default graphs reference by name. Stage them in ComfyUI's
+  usual `models/` subfolders:
 
-## Setup
+  | Used by | File (default) | ComfyUI folder |
+  |---|---|---|
+  | Upscale / Homogenize | `RealESRGAN_x4.pth` | `upscale_models/` |
+  | Face Detail | `FacesV1.pt` | `ultralytics/bbox/` |
+  | Hand Detail (auto) | `hand_yolov8s.pt` | `ultralytics/bbox/` |
+  | Face / Hand Detail | `sam_vit_b_01ec64.pth` | `sams/` |
+  | Upscale (optional, per profile) | `tile_controlnet`, e.g. `xinsir_tile_sdxl.safetensors` | `controlnet/` |
+  | 🪄 Kontext Edit (optional) | see `FLUX_KONTEXT_*` [below](#flux-kontext-edit) | `diffusion_models/`, `text_encoders/`, `vae/` |
+
+Optional:
+
+- [Ollama](https://ollama.com) with a vision model, for Qwen-VL captions
+- WD14 tagger files, for tag-style analysis (see [Image analysis](#image-analysis))
+- A public HTTPS host for `inpaint_relay/`, needed for 🖌️ Draw Mask,
+  🩹 Fix Artifact and ✏️ Detail Prompt (see [Drawn masks](#drawn-masks-inpaint_relay))
+
+## Quick start
 
 ```bash
-uv sync                          # install dependencies
-cp env.example .env              # then edit .env — see below
+uv sync
+cp env.example .env          # set TELEGRAM_BOT_TOKEN at minimum
 uv run comfytelegram
 ```
 
-`.env` (copied from `env.example`) needs:
+Open a chat with your bot, send `/start`, pick a checkpoint with `/model`,
+then send a prompt:
 
-| Variable | Required | Default | Meaning |
-|---|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | yes | — | from @BotFather |
-| `COMFYUI_HOST` | no | `127.0.0.1` | host ComfyUI is reachable at |
-| `COMFYUI_PORT` | no | `8188` | ComfyUI's HTTP/WS port |
-| `COMFYUI_USE_TLS` | no | `false` | use `https`/`wss` instead of `http`/`ws` |
-| `OLLAMA_HOST` / `OLLAMA_PORT` | no | `127.0.0.1` / `11434` | Ollama server for 🏷️ Analyze Image's natural-language captioning |
-| `OLLAMA_VISION_MODEL` | no | `qwen3.5:4b` | vision-capable Ollama model tag to caption with (`ollama pull` it first) — kept small by default since it has to coexist in VRAM with whatever checkpoint ComfyUI keeps resident |
-| `WD14_MODEL_REPO` | no | `SmilingWolf/wd-vit-tagger-v3` | Hugging Face repo the WD14 tagger files come from (see [Image analysis](#image-analysis)) |
-| `WD14_MODEL_DIR` | no | `models/wd14` | local directory holding `model.onnx` + `selected_tags.csv` |
-| `WD14_TAG_THRESHOLD` | no | `0.35` | minimum WD14 tag confidence to include in a derived prompt |
-| `ALLOWED_USER_IDS` | no | (empty = anyone) | comma-separated Telegram numeric user IDs allowed to use the bot |
-| `INPAINT_RELAY_URL` | no | (unset = feature disabled) | base URL of a separately-deployed `inpaint_relay/` (see below) — backs **🖌️ Draw Mask** |
-| `INPAINT_RELAY_SHARED_SECRET` | only if `INPAINT_RELAY_URL` is set | — | must match the relay's own `INPAINT_RELAY_SHARED_SECRET` |
-| `INPAINT_POLL_INTERVAL_SECONDS` | no | `3` | how often to poll the relay for a finished mask drawing |
+```
+1girl, standing in a field of sunflowers, golden hour, -blurry, -watermark
+```
 
-(The settings file is named `settings.py` rather than `config.py`, and the
-template is `env.example` rather than `.env.example`, only because of a
-local tooling rule blocking reads/writes of files literally named
-`config.py`/`.env*` — no functional significance.)
+You'll see a "Generating…" message with live progress, then the image(s)
+with post-processing buttons underneath.
 
-If the bot runs on the same machine as ComfyUI, the defaults just work. If
-it runs elsewhere (e.g. in a container without access to the host's
-`localhost`), point `COMFYUI_HOST` at an address that actually reaches it —
-see the Docker section below for the container case specifically.
+If the bot runs on the same machine as ComfyUI, the defaults just work.
+Otherwise set `COMFYUI_HOST` to an address that reaches it.
+
+## Configuration
+
+All settings are environment variables, read from `.env`. The template,
+with comments, is [`env.example`](env.example), and
+`src/comfytelegram/settings.py` is the authoritative list.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | **required** | from @BotFather |
+| `ALLOWED_USER_IDS` | *(empty = anyone)* | comma-separated Telegram user IDs allowed to use the bot |
+| `COMFYUI_HOST` / `COMFYUI_PORT` | `127.0.0.1` / `8188` | where ComfyUI is reachable |
+| `COMFYUI_USE_TLS` | `false` | use `https`/`wss` |
+| `OLLAMA_HOST` / `OLLAMA_PORT` | `127.0.0.1` / `11434` | Ollama server for Qwen-VL captions |
+| `OLLAMA_VISION_MODEL` | `qwen3.5:4b` | quick caption model. Kept small so it fits in VRAM next to the checkpoint |
+| `OLLAMA_DEEP_VISION_MODEL` | `qwen3.8:latest` | larger model for 🔎 Deep Analyze and uploaded photos |
+| `WD14_MODEL_REPO` | `SmilingWolf/wd-vit-tagger-v3` | where the WD14 files come from |
+| `WD14_MODEL_DIR` | `models/wd14` | local dir holding `model.onnx` + `selected_tags.csv` |
+| `WD14_TAG_THRESHOLD` | `0.35` | minimum tag confidence |
+| `COMFYUI_LORAS_DIR` | *(unset)* | readable path to ComfyUI's `models/loras`. Enables [LoRA info and auto-discovery](#lora-info-and-auto-discovery) |
+| `TAG_DB_AUTO_UPDATE` | `true` | refresh the tag database in the background at startup |
+| `TAG_DB_MAX_AGE_DAYS` | `30` | how stale a tag source may get before refreshing |
+| `TAG_RARE_THRESHOLD` | `100` | post count below which `/tagcheck` flags a tag as rare |
+| `INPAINT_RELAY_URL` | *(unset = drawn masks disabled)* | base URL of your `inpaint_relay` deployment |
+| `INPAINT_RELAY_SHARED_SECRET` | — | required if `INPAINT_RELAY_URL` is set. Must match the relay's own value |
+| `INPAINT_POLL_INTERVAL_SECONDS` | `3` | how often to poll the relay for a finished mask |
+| `FLUX_KONTEXT_*` | see [below](#flux-kontext-edit) | model files and sampler settings for 🪄 Kontext Edit |
+
+> The settings module is `settings.py` (not `config.py`) and the template is
+> `env.example` (not `.env.example`) because of a local tooling rule that
+> blocks those file names. The names don't mean anything else.
 
 ## Running with Docker
 
-A `Dockerfile` and `docker-compose.example.yml` are included. Copy the
-compose file before running it — unlike everything else in it, the
-`COMFYUI_LORAS_DIR` bind mount (see [LoRA info lookup](#lora-info-lookup)
-below) has no sane default, since it points at wherever *your* ComfyUI
-install's `models/loras` directory actually lives:
-
 ```bash
-cp docker-compose.example.yml docker-compose.yml   # then edit the loras mount path
+cp docker-compose.example.yml docker-compose.yml   # edit the loras mount path
 docker compose up -d --build
 ```
 
-The container uses host networking by default (so `COMFYUI_HOST=127.0.0.1`/
-`OLLAMA_HOST=127.0.0.1` in `.env` reach ComfyUI/Ollama running directly on
-the same host, matching the non-Docker setup above) — Linux-only. On
-macOS/Windows, switch to the `extra_hosts`/`host.docker.internal`
-alternative commented in `docker-compose.yml` (set both `COMFYUI_HOST` and
-`OLLAMA_HOST` to `host.docker.internal` in that case). The `data/` directory
-(sqlite state + tag database), `model_profiles/`, and `models/wd14/` are
-bind-mounted from the repo, so they're the same files a bare `uv run
-comfytelegram` would use — no Docker volume commands needed to inspect or
-back them up, and no image rebuild needed to pick up a WD14 model you stage
-later (see [Image analysis](#image-analysis)).
-
-## Freehand mask drawing (🖌️ Draw Mask)
-
-**🖐️ Hand Detail**'s **🖌️ Draw Mask** option opens a real freehand mask
-editor inside Telegram, using [Telegram Web Apps](https://core.telegram.org/bots/webapps) —
-a button that opens an HTTPS page in the Telegram client itself. This needs
-a public HTTPS endpoint, which comfytelegram doesn't have on its own: it
-runs on whatever box has ComfyUI, reachable only outbound (to Telegram's own
-servers, via long-polling), never accepting inbound connections.
-
-That's what `inpaint_relay/` (a separate top-level directory in this repo)
-is for — a small, independently-deployed service meant to run on a
-different, *publicly* reachable host (e.g. one already running Traefik for
-other self-hosted services). It serves the mask-editor page and shuttles two
-blobs between comfytelegram and the user's phone: the source image out, the
-drawn mask back. It never talks to ComfyUI and never holds the Telegram bot
-token — comfytelegram itself validates that a submitted mask genuinely came
-from Telegram (via `Telegram.WebApp.initData`'s signature) after pulling it
-back, since the relay has no way to check that itself. See
-`inpaint_relay/README.md` for how to run/deploy it and
-`inpaint_relay/docker-compose.example.yml` for the Traefik label pattern.
-
-Because comfytelegram's own host typically isn't reachable from the public
-internet either, the two sides never talk to each other directly in the
-"public host calls back into comfytelegram" direction — comfytelegram polls
-the relay outbound for a finished drawing (`INPAINT_POLL_INTERVAL_SECONDS`),
-the same posture it already uses to poll Telegram itself. Leaving
-`INPAINT_RELAY_URL` unset skips all of this — the **🖌️ Draw Mask** button is
-simply omitted, and hand detailing falls back to **🤖 Auto-detect**/**✋ Tap
-to mark** as before.
+- The container uses **host networking** by default (Linux only), so
+  `127.0.0.1` in `.env` reaches ComfyUI and Ollama on the host. On
+  macOS/Windows, switch to the commented `extra_hosts` /
+  `host.docker.internal` variant and point `COMFYUI_HOST` / `OLLAMA_HOST` at
+  `host.docker.internal`.
+- `data/` (SQLite state + tag database), `model_profiles/` and
+  `models/wd14/` are bind-mounted from the repo. A bare `uv run` uses the
+  same files, and you don't need to rebuild the image after staging new
+  files there.
+- The `COMFYUI_LORAS_DIR` mount has no sensible default. Point it at your
+  ComfyUI install's `models/loras`, or remove it.
 
 ## Using the bot
 
+### Commands
+
 | Command | Effect |
 |---|---|
-| *(plain text)* | Generate an image with the current model/settings — prefix any word with `-` (e.g. `-blurry`) to send it as a negative instead of a positive |
-| *(photo upload)* | Analyze the photo with both WD14 tags and a Qwen-VL caption, each with its own 🎨 Generate button |
-| *(PNG sent as a file)* | Re-import a previously generated image from the settings embedded in it, restoring its post-processing buttons |
-| `/model` | Pick a checkpoint (inline keyboard, populated live from ComfyUI) |
-| `/settings` | View/change cfg, steps, sampler, scheduler, clip skip, width, height, batch size, and prompt prefixes for the current model, per chat — plus a chat-wide "🖼️ Display" toggle between compressed (JPEG, default) and lossless (PNG) in-chat images |
-| `/lora` | Toggle which of the current model's configured LoRAs apply to your next generation, and adjust their strength, per chat |
-| `/reload` | Reload `model_profiles/*.json` from disk and check for new LoRAs — no restart needed after hand-editing a profile or dropping in a new LoRA file |
+| *(plain text)* | Generate with the current model and settings |
+| *(photo)* | Analyze it with WD14 tags + a deep Qwen-VL caption, each with a 🎨 Generate button |
+| *(PNG sent as a file)* | Re-import an image from its embedded settings (see [Archiving](#archiving-and-re-importing)) |
+| `/model` | Pick a checkpoint (live list from ComfyUI) |
+| `/settings` | Per-chat overrides for cfg, steps, sampler, scheduler, clip skip, size, batch size and prompt prefixes, plus a JPEG/PNG display toggle |
+| `/lora` | Toggle and re-weight the current model's configured LoRAs |
+| `/reload` | Re-read `model_profiles/*.json` and scan for new LoRAs, no restart needed |
 | `/character save <name> \| <positive> [\| <negative>]` | Save a reusable prompt snippet |
 | `/character delete <name>` | Delete one |
-| `/characters` | List saved characters and activate one |
-| `/stream [prompt]` | Generate single images from `<prompt>` back-to-back (up to 100), sending each immediately — asks for the prompt as a follow-up if omitted, and swaps the command keyboard for a one-tap `/stop` button for the duration |
-| `/stop` | Stop a running `/stream` |
-| `/start`, `/help` | Show the command summary |
+| `/characters` | List, activate, edit or rename saved characters. The active one is folded into every prompt |
+| `/stream [prompt]` | Generate single images back-to-back (max 100) until `/stop`. Asks for the prompt if you leave it out |
+| `/stop` | Stop a running stream |
+| `/tags <query>` | Search the tag database. Prefix `danbooru:` / `e621:` to pick a source |
+| `/tagcheck <prompt>` | Flag unknown or rarely-used tags in a prompt |
+| `/start`, `/help` | Show help and install the command keyboard |
 
-Every generated image comes with inline buttons, on two pages toggled in
-place by **⋯ More** / **‹ Back** (the keyboard swaps on the same message —
-nothing new is posted to the chat). Page 1 is the working set: 🔍 Upscale
-4x, 🩹 Fix Artifact, then ✨ Face Detail / 🖐️ Hand Detail / ✏️ Detail Prompt
-on one row, then 📥 Download file and 🐛 Show Prompt — plus 🔁 Redo (same
-mask) / 🔁 x4 on a drawn-mask result. Page 2 holds 🧵 Homogenize and the
-three analyzers.
+### Writing prompts
 
-- **🔍 Upscale 4x** / **✨ Face Detail** / **🖐️ Hand Detail** — run that
-  post-processing stage on this specific image and send the result (itself
-  with its own buttons, so passes can be chained). **🖐️ Hand Detail** asks
-  **🤖 Auto-detect** (the usual YOLO/SAM detector), **✋ Tap to mark** (sends
-  the image back with a grid overlay and one button per cell, inpainting a
-  small mask centered on whichever cell you tap), or — only when
-  `INPAINT_RELAY_URL` is configured — **🖌️ Draw Mask**, which opens a
-  Telegram WebApp for drawing a real freehand mask instead of a fixed box.
-  See "Freehand mask drawing (🖌️ Draw Mask)" below for what that needs.
-- **✏️ Detail Prompt** — change what the detailers condition on for *this*
-  image, without regenerating it. By default ✨ Face Detail, 🖐️ Hand Detail
-  and 🩹 Fix Artifact inherit the image's whole prompt, which describes the
-  entire scene — refining one hand with it re-asserts the castle and the
-  sunset over a crop containing neither, and there's no way to say
-  "no jewellery, five fingers" about just the region being worked on. Tap
-  it, and the bot replies with the prompt currently in effect (with a
-  **📋 Copy current** button, so you can paste it back and cut it down
-  rather than retyping); send the replacement, using the same `---`
-  separator and inline `-token` negatives a normal prompt takes. It sticks
-  to the image and to anything made from it, so it's set once and then
-  every detailer tap uses it. To clear it, tap **♻️ Reset** on the entry
-  message (typing `reset` also works, but only while the entry is open —
-  once you've sent a prompt you have to tap ✏️ Detail Prompt again first,
-  or the word just becomes your next generation prompt).
-  🔍 Upscale and 🧵 Homogenize deliberately ignore it: they
-  condition the *whole* image, where a region-specific prompt would be
-  wrong everywhere else.
-- **🏷️ Analyze Image** — analyze *this image* with **both** the WD14 tagger and a
-  Qwen-VL caption (regardless of the checkpoint's `prompt_style`), replying
-  with two separate messages — one per analyzer — each carrying its own
-  **🎨 Generate** button to start a fresh generation from exactly that
-  prompt, so you can compare them and pick one manually.
-- **📥 Download file** — re-send this image as an uncompressed file rather
-  than a chat photo, with its full generation settings embedded in the PNG.
-  This is the one to save for archiving; see below.
-- **🔁 Generate Again** (on the "Done" status message) — re-run the *whole*
-  last batch with a fresh seed, for quickly building up more variations
-  without retyping the prompt.
+```
+castle on a hill, sunset, dramatic sky, -lowres
+---
+blurry, jpeg artifacts, extra fingers
+```
 
-## Archiving and re-importing
+`-token` pulls a single word into the negative prompt. A mid-word hyphen
+such as `well-lit` is left alone. A line of three or more dashes splits the
+whole message into a positive block above and a negative block below. Both
+are added on top of the profile's default negative and any active
+character's prompt.
 
-Every image the bot produces has its complete resolved settings — model,
-both prompts (including the raw text you typed, before profile and
-character prefixes were folded in), steps, cfg, sampler, scheduler,
-dimensions, clip skip, LoRAs and strengths, the split-loader CLIP/VAE
-fields, and the seed — written into a PNG `tEXt` chunk keyed
-`comfytelegram`. It sits alongside the ComfyUI `prompt` chunk that
-`SaveImage` already writes, and it's spliced in as a chunk rather than
-re-encoded, so the pixels are untouched and it costs a couple of hundred
-bytes.
+### Image buttons
 
-Sending that image back to the bot **as a file** restores it completely:
-the bot reads the chunk, registers the image, and replies with the full
-post-processing keyboard. Upscale, the detailers, 🩹 Fix Artifact and
-🔁 Generate Again all work again, on an image the bot has no stored record
-of — months later, on a fresh database, on a different install of the bot.
+Every image comes with two pages of buttons. **⋯ More** / **‹ Back** switch
+between them on the same message.
 
-**It has to be a file, not a photo, in both directions.** Telegram
-re-encodes every photo-type upload to JPEG, which discards all PNG
-metadata. That's why:
+**Page 1: working the image**
 
-- Saving the image straight out of the chat gives you a stripped JPEG.
-  Use **📥 Download file** to get the real PNG. (It re-fetches the file
-  from ComfyUI's output directory, so it only works while that file is
-  still there.)
-- Re-uploading has to use "send as file" rather than the normal photo
-  path. A photo upload is still analyzed as before, it just can't carry
-  metadata.
+| Button | What it does |
+|---|---|
+| 🔍 Upscale 4x | Tiled 4x UltimateSDUpscale. Asks whether to use the profile's defaults or a custom denoise / tile-ControlNet strength, and asks for confirmation on images that are already large |
+| 🩹 Fix Artifact | Paint over anything unwanted (a stray object, a glitch, a watermark) and it is inpainted away. *Needs the relay* |
+| 🪄 Kontext Edit | Describe a change ("make it night", "remove the hat") and FLUX.1 Kontext edits the whole image. Upscale and detailer buttons on the result still use the original checkpoint |
+| ✨ Face Detail | Detects faces, then re-inpaints them at higher detail |
+| 🖐️ Hand Detail | Gives three options: **🤖 Auto-detect** (YOLO + SAM), **✋ Tap to mark** (a grid overlay; tap the cell with the hand, or 🔍 Finer grid for 8×8), or **🖌️ Draw Mask** (*needs the relay*) |
+| ✏️ Detail Prompt | Draw a region *and* say what should be there, using editable prompt, denoise and tile-ControlNet fields pre-filled from the image's own prompt. The prompt applies to this mask only and isn't saved on the image |
+| 📥 Download file | Re-sends the image as an uncompressed PNG with its settings embedded |
+| 🐛 Show Prompt | Shows the exact positive and negative prompt used |
 
-Telegram's Bot API also refuses to hand a bot any file over 20MB, so a
-heavily upscaled PNG may be too large to re-import. That's a platform
-limit, not a setting.
+**Page 2: everything else**
 
-A PNG from somewhere else entirely — a raw ComfyUI run, a Krita AI
-Diffusion export, another bot — has no `comfytelegram` chunk, but usually
-does have ComfyUI's own `prompt` chunk. Sent as a file, the bot reads what
-it can out of that workflow (model, prompts, steps, cfg, sampler, seed) and
-offers the prompt with a 🎨 Generate button. It deliberately doesn't offer
-post-processing buttons there: an executed graph doesn't contain enough to
-faithfully rebuild the bot's own generation settings. A file with no
-metadata at all falls back to the usual WD14/Qwen-VL analysis.
+| Button | What it does |
+|---|---|
+| 🧵 Homogenize | A low-denoise whole-image pass at 1x that blends the seams left by separate detailer patches |
+| 🏷️ Analyze Image | WD14 tags + a quick Qwen-VL caption, as two messages, each with 🎨 Generate (and 📋 Copy if the prompt is ≤256 chars) |
+| 🔎 Deep Analyze | Same, with the larger `OLLAMA_DEEP_VISION_MODEL` |
+| 🔬 Analyze Prompt | `/tagcheck` on the prompt this image was made from |
+| 🔀 Switch Model | Use a different checkpoint for this image's next passes, e.g. generate with one model and detail with another |
+| 🎛 LoRAs | Toggle LoRAs for this image's current checkpoint |
 
-## Image analysis
+Results from a drawn mask get an extra row: **🔁 Redo (same mask)** and
+**🔁 x4** re-run the same mask with new seeds, and **🎚️ Redo…** lets you
+pick a denoise first. The "Done" message under a fresh batch has
+**🔁 Generate Again**, which reruns the whole batch with a new seed.
 
-🏷️ Analyze Image runs both analyzers unconditionally, for comparing them side by
-side. A checkpoint's model profile `prompt_style` field (see
-[`model_profiles/`](model_profiles/)) doesn't pick which one runs here — it
-only gates whether the "🔬 Analyze Prompt" button (a `/tagcheck`-style
-tag-health check on the prompt this image was built from, separate from
-"🐛 Show Prompt", which just dumps the raw prompt text) has anything to
-check:
+### Archiving and re-importing
 
-- **WD14 tags** — booru-style comma-separated tags, run locally through a
-  WD14 tagger ONNX model via `onnxruntime`. **The model files are not
-  downloaded automatically** — Hugging Face serves them (`model.onnx`,
-  ~370MB) from an LFS/Xet-backed CDN on a different hostname than
-  `huggingface.co` itself, which some restricted-egress hosts allow while
-  blocking. Download both files from a machine with normal internet
-  access and place them in `WD14_MODEL_DIR`:
+Telegram re-encodes photos to JPEG, which strips all PNG metadata. To keep
+an image you can work on later:
+
+1. Tap **📥 Download file** and save the PNG. The bot re-fetches it from
+   ComfyUI's output folder, so the original must still be there.
+2. Later, send that PNG back **as a file** (not as a photo).
+
+The bot reads its `comfytelegram` `tEXt` chunk, which holds the model,
+prompts (including what you originally typed), sampler settings, LoRAs and
+seed. It then re-registers the image with the full button set, even on a
+fresh database or a different install. The chunk is spliced in without
+re-encoding, so pixels are untouched.
+
+A PNG from plain ComfyUI (with only ComfyUI's own `prompt` chunk) gets a
+summary of the workflow and a 🎨 Generate button, but no post-processing
+buttons: an executed graph doesn't contain enough to rebuild the settings
+reliably. A file with no metadata is analyzed like a photo. Telegram won't
+hand bots files over 20 MB, so very large upscales can't be re-imported.
+
+### Image analysis
+
+- **WD14 tags**: booru-style tags from a local ONNX model run with
+  `onnxruntime`. **The model files are not downloaded automatically.**
+  Hugging Face serves them from an LFS CDN host that restricted-egress
+  networks often block. Fetch them yourself into `WD14_MODEL_DIR`:
+
   ```bash
+  mkdir -p models/wd14 && cd models/wd14
   curl -L -o model.onnx https://huggingface.co/SmilingWolf/wd-vit-tagger-v3/resolve/main/model.onnx
   curl -L -o selected_tags.csv https://huggingface.co/SmilingWolf/wd-vit-tagger-v3/resolve/main/selected_tags.csv
   ```
-- **Qwen-VL caption** — a prose-style description plus a suggested negative
-  prompt, via a vision-capable model on a local Ollama server
-  (`OLLAMA_VISION_MODEL`, e.g. Qwen-VL). Needs `ollama pull <model>` done
-  ahead of time and Ollama reachable at `OLLAMA_HOST`/`OLLAMA_PORT`.
 
-## Model profiles
+- **Qwen-VL caption**: a prose description plus a suggested negative
+  prompt, from Ollama. Run `ollama pull <model>` for both
+  `OLLAMA_VISION_MODEL` and `OLLAMA_DEEP_VISION_MODEL` first.
 
-Each `*.json` file in [`model_profiles/`](model_profiles/) tunes generation
-defaults for one checkpoint or a family of them (glob-matched against the
-filename). Drop in a new file to add support for a model — no code changes
-needed. Full format and worked examples in
-[`model_profiles/README.md`](model_profiles/README.md).
+Images you generate with the bot use the quick model by default (🔎 Deep
+Analyze is opt-in). Uploaded photos always use the deep model, since they
+don't hold up a generation. A profile's `prompt_style` doesn't pick an
+analyzer. It only decides whether 🔬 Analyze Prompt has tags to check.
 
-## LoRA info lookup
+## Optional features
 
-`/lora`'s "ℹ️ Info" button looks up a configured LoRA's trigger words and
-base-model compatibility on [CivitAI](https://civitai.com) — the two things
-a model profile's curated `loras` list can't tell you by itself. It needs
-`COMFYUI_LORAS_DIR` set to a filesystem path this process can read (see
-`env.example`, and `docker-compose.example.yml`'s bind mount for the Docker
-case) — ComfyUI's own HTTP API only exposes LoRA filenames, with no hash or
-metadata attached, so there's no way to do this lookup without reading the
-actual file. The button is simply omitted when it's unset.
+### Drawn masks (`inpaint_relay`)
 
-Mechanically, this replicates what
-[ComfyUI-Custom-Scripts](https://github.com/pythongosssss/ComfyUI-Custom-Scripts)'
-"Info" dialog does — hash the file (SHA256) and query
-`https://civitai.com/api/v1/model-versions/by-hash/<hash>`, CivitAI's public,
-no-API-key-required hash-lookup endpoint — just done here server-side in one
-step instead of split across a custom ComfyUI node route and a browser-side
-fetch, since this bot has no custom ComfyUI node code of its own to hang a
-route on. Results (including "no CivitAI match") are cached indefinitely per
-LoRA filename, since hashing a multi-hundred-MB file on every menu tap would
-be wasteful — a "🔄 Refresh" button on the info reply forces a re-check.
+🖌️ Draw Mask, 🩹 Fix Artifact and ✏️ Detail Prompt open a
+[Telegram Web App](https://core.telegram.org/bots/webapps), which needs a
+public HTTPS URL. The bot has none, because it only makes outbound
+connections. [`inpaint_relay/`](inpaint_relay/README.md) is a small FastAPI
+service you deploy on a publicly reachable host (e.g. behind Traefik). It
+serves the editor and passes the source image and drawn mask back and
+forth:
 
-### Auto-discovering new LoRAs
+```
+bot ──POST image──▶ relay ◀──open editor── Telegram client
+bot ◀──poll mask─── relay ◀──submit mask──
+```
 
-With `COMFYUI_LORAS_DIR` set, the bot also scans that directory once at
-startup for LoRA files no `model_profiles/*.json` entry mentions yet,
-identifies each via the same CivitAI hash lookup, and — for a profile
-that's opted in with a `civitai_base_models` list matching the LoRA's
-reported base model — appends it to that profile's `loras` list
-automatically (`default_enabled: false`, so it shows up in `/lora` to
-review and turn on rather than silently affecting generations). See
-[`model_profiles/README.md`](model_profiles/README.md#civitai_base_models--auto-registering-downloaded-loras-into-loras)
-for the field and its trade-offs — in short, it saves hand-typing an entry
-for anything CivitAI already knows about, but a privately/custom-trained
-LoRA (no CivitAI hash record at all) still needs to be added by hand, same
-as before this existed, and each profile has to opt in explicitly.
+The relay never talks to ComfyUI and never holds the bot token. The bot
+checks the WebApp `initData` signature itself after pulling a mask back.
+Set `INPAINT_RELAY_URL` and `INPAINT_RELAY_SHARED_SECRET` to enable it. If
+`INPAINT_RELAY_URL` is unset, 🖌️ Draw Mask is hidden and 🩹 Fix Artifact /
+✏️ Detail Prompt reply that mask drawing isn't configured.
 
-That scan otherwise only runs once, at startup — `/reload` (or `/lora`'s
-own "🔁 Reload profiles" button) re-runs it on demand and, either way,
-reloads every `model_profiles/*.json` from disk, so both a newly-dropped-in
-LoRA file and a profile you edited by hand (a manually added `loras` entry,
-a new `civitai_base_models` list, tweaked defaults, a whole new profile
-file) take effect immediately instead of waiting for the bot to restart.
+### FLUX Kontext edit
 
-## Tag search
+🪄 Kontext Edit runs a separate FLUX.1 Kontext [dev] model. It ignores the
+image's own checkpoint and LoRAs. The source is resized to the nearest
+~1 MP Kontext resolution first, because larger inputs make Kontext tile the
+scene instead of editing it. Defaults (from `settings.py`, matching
+[`flux_kontext_sample.json`](flux_kontext_sample.json)):
 
-`/tags <query>` and `/tagcheck <prompt>` are backed by a local sqlite tag
-database (`Settings.tags_db_path`, default `data/tags.sqlite3`), built from CSVs
-published by [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDragon/dbr-e621-lists-archive)
-— the companion archive of the
-[danbooru-e621-tag-list-processor](https://github.com/DraconicDragon/danbooru-e621-tag-list-processor)
-project.
+| Variable | Default |
+|---|---|
+| `FLUX_KONTEXT_UNET` | `flux1-dev-kontext_fp8_scaled.safetensors` |
+| `FLUX_KONTEXT_CLIP_L` | `clip_l.safetensors` |
+| `FLUX_KONTEXT_T5XXL` | `t5xxl_fp8_e4m3fn_scaled.safetensors` |
+| `FLUX_KONTEXT_VAE` | `ae.safetensors` |
+| `FLUX_KONTEXT_STEPS` | `20` |
+| `FLUX_KONTEXT_GUIDANCE` | `2.5` |
 
-**It populates itself automatically** — at startup the bot checks each
-source (danbooru, e621) and, in the background (doesn't delay startup),
-downloads the newest CSV for any source that's missing or older than
-`Settings.tag_db_max_age_days` (default 30, matching the archive's own
-monthly refresh cadence). A fresh checkout self-populates on first run; an
-existing install just stays current. A failed check (no network, GitHub
-unreachable) logs a warning and leaves whatever was already imported —
-`/tags`/`/tagcheck` just report "no tag data imported yet" until it
-succeeds. Set `TAG_DB_AUTO_UPDATE=false` to disable this (e.g. an
-offline/airgapped install) and manage the database entirely by hand
-instead:
+### Model profiles
+
+Each `*.json` in [`model_profiles/`](model_profiles/) tunes one checkpoint
+or family of checkpoints. A profile is matched against the checkpoint
+filename with a case-insensitive glob, and the first match wins. Add a file
+to support a new model, no code changes needed. See
+[`model_profiles/README.md`](model_profiles/README.md) for the format.
+
+### LoRA info and auto-discovery
+
+With `COMFYUI_LORAS_DIR` set:
+
+- `/lora` shows an **ℹ️ Info** button per LoRA. It SHA256-hashes the file
+  and looks it up on CivitAI's public
+  `/api/v1/model-versions/by-hash/<hash>` endpoint for trigger words and
+  base model, the same lookup ComfyUI-Custom-Scripts' Info dialog does.
+  Results, including "not found", are cached until you tap 🔄 Refresh.
+- At startup, and on `/reload`, LoRA files that no profile mentions are
+  identified on CivitAI. Each one is added, disabled, to every profile whose
+  `civitai_base_models` list matches its base model. Profiles must opt in
+  to this. LoRAs that aren't on CivitAI still have to be added by hand.
+
+ComfyUI's API only exposes LoRA filenames, so neither feature works without
+read access to the files.
+
+### Tag search
+
+`/tags` and `/tagcheck` use a local SQLite database (`data/tags.sqlite3`)
+built from [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDragon/dbr-e621-lists-archive).
+It fills itself in the background at startup and refreshes any source
+older than `TAG_DB_MAX_AGE_DAYS`. A failed refresh keeps the existing data.
+Each search uses the source named by the profile's `tag_dictionary`
+(`danbooru` or `e621`), or both if the profile doesn't set one.
+
+For offline installs, set `TAG_DB_AUTO_UPDATE=false` and manage the
+database by hand:
 
 ```bash
-uv run python scripts/update_tag_db.py                  # both danbooru and e621
-uv run python scripts/update_tag_db.py --source e621     # just one
+uv run python scripts/update_tag_db.py                 # both sources
+uv run python scripts/update_tag_db.py --source e621   # just one
 uv run python scripts/update_tag_db.py --danbooru-csv /path/to/local.csv
 ```
 
-The script (also useful with auto-update left on, e.g. to force a refresh
-right now, or target one source) downloads the newest dated CSV from the
-archive for each source — or imports a local file you built yourself with
-the upstream processor via `--danbooru-csv`/`--e621-csv`, which also work
-as a fully offline path if you'd rather not hit GitHub's API — and swaps it
-in wholesale.
-
-- **`/tags <query>`** searches tag names and aliases, ranked by post count
-  (roughly, how well-represented a tag is in the model's training data), and
-  replies with a tap-to-copy button per match. It's scoped to whichever
-  dictionary the current chat's checkpoint prefers — a model profile's
-  `tag_dictionary` field (`"e621"` for furry-trained checkpoints, `"danbooru"`
-  for anime/manga-trained ones; see [`model_profiles/README.md`](model_profiles/README.md))
-  — or both if that's unset. Override the scope for one query with a
-  `danbooru:`/`e621:` prefix, e.g. `/tags e621:fox ears`.
-- **`/tagcheck <prompt>`** splits a whole prompt on commas and checks each
-  tag: ✅ known and reasonably common, ⚠️ known but rare (below
-  `Settings.tag_rare_threshold` posts — a sign the model saw little of it
-  during training), or ❌ not a recognized tag at all (with a "did you
-  mean" suggestion when a close match exists). Same source scoping/override
-  as `/tags`.
+`/tagcheck` marks each comma-separated tag ✅ common, ⚠️ rare (below
+`TAG_RARE_THRESHOLD` posts) or ❌ unknown. Unknown tags get a "did you
+mean" suggestion when one exists.
 
 ## Development
 
 ```bash
-uv run pytest                # full test suite (pure logic, no network calls)
+uv run pytest                 # full suite: mocked collaborators, no network or ComfyUI needed
 uv run pytest tests/test_workflow_builder.py::test_build_txt2img_basic_structure
-uv run ruff check .           # lint
-uv run ruff format .          # format
+uv run ruff check .
+uv run ruff format .
 ```
 
-`scripts/smoke_test.py` and `scripts/smoke_test_postprocess.py` are manual
-end-to-end checks against a *real* ComfyUI instance (not part of the pytest
-suite, since they need one running):
+To check against a real ComfyUI instance (these scripts are not part of
+pytest):
 
 ```bash
 uv run python scripts/smoke_test.py --checkpoint <ckpt> --prompt "a fox astronaut"
-uv run python scripts/smoke_test_postprocess.py outputs/<generated>.png --checkpoint <ckpt>
+uv run python scripts/smoke_test_postprocess.py outputs/<generated>.png --checkpoint <ckpt> --prompt "a fox astronaut"
 ```
 
 ## Architecture
 
-`main.py` wires everything into a python-telegram-bot `Application`, storing
-shared singletons (`Settings`, `ComfyClient`, loaded `ModelProfile`s,
-`Storage`) in `application.bot_data`.
+`main.py` wires a python-telegram-bot `Application` and stores shared
+singletons (`Settings`, `ComfyClient`, profiles, `Storage`) in `bot_data`.
+[`CLAUDE.md`](CLAUDE.md) has the detailed per-module design notes. In
+short:
 
-- **`comfy_client.py`** — thin async wrapper around ComfyUI's raw HTTP/WS
-  API (`/prompt`, `/history`, `/view`, `/object_info`, `/ws`). No knowledge
-  of Telegram or prompts/profiles.
-- **`workflows/builder.py`** — `PromptGraph`, a small imperative builder for
-  ComfyUI API-format node graphs. Builds `build_txt2img`, `build_upscale`
-  (UltimateSDUpscale), `build_face_detailer` and `build_hand_detailer`
-  (both Impact Pack's `FaceDetailer` node — it's a generic detect/crop/
-  inpaint/composite node regardless of name, so the two share a
-  `_build_detailer` graph builder and differ only in which bbox-detector
-  model gets wired in), and `build_hand_detailer_manual` — a hand-only
-  variant for when that bbox detector can't find one at all: instead of
-  `UltralyticsDetectorProvider`/`SAMLoader`, it builds a small rectangular
-  mask centered on a user-tapped point (`SolidMask`+`MaskComposite`), turns
-  it into a `SEGS` region with Impact Pack's `MaskToSEGS`, and feeds that to
-  `DetailerForEach` — the modular sibling of `FaceDetailer` that inpaints a
-  ready-made `SEGS` instead of running its own detection. Post-processing
-  graphs are freshly submitted (`LoadImage` from an uploaded source) rather
-  than chained onto the original sampler run, so any single image from a
-  batch can be picked for refinement independent of seed/batch state. The
-  checkpoint/clip/vae wiring these all share (`_build_model_clip_vae`)
-  branches on a profile's `loader` field: `"checkpoint"` (the default,
-  single `CheckpointLoaderSimple` node) or `"split"`, for architectures
-  shipped as separate UNET/text-encoder/VAE files (currently Anima) — see
-  [`model_profiles/`](model_profiles/).
-- **`profiles/`** — the `ModelProfile` pydantic schema plus a loader that
-  glob-matches a checkpoint filename against every `*.json` in
-  `model_profiles/` and layers profile defaults → user prompt → any
-  per-chat override into a ready-to-build `GenerationParams`.
-- **`generation.py`** — Telegram-independent glue: `generate()`,
-  `post_process()`, `repeat()` turn (checkpoint, prompt, profile) into a
-  submitted-and-collected result. `handlers.py` calls these directly;
-  `scripts/smoke_test*.py` do the equivalent inline for manual checks.
-- **`analysis.py`** — Telegram-independent image-to-prompt analysis backing
-  🏷️ Analyze Image: `analyze_tags()` (WD14 tagger via `onnxruntime`) and
-  `analyze_caption()` (Qwen-VL via a local Ollama server), always run
-  together. See [Image analysis](#image-analysis) above.
-- **`handlers.py`** — all Telegram-facing commands and callbacks, including
-  the auto/manual choice behind 🖐️ Hand Detail (`_hand_mode_keyboard`) and
-  the tap-a-grid-cell flow it can lead to (`_draw_hand_point_grid`/
-  `_hand_point_keyboard`, handled by its own `hand_point_callback` since a
-  tapped cell's callback_data needs a row/col alongside the result id).
-- **`settings_menu.py`** — the `/settings` in-place inline-keyboard UI.
-  Enum fields build their button grid from ComfyUI's live `/object_info`,
-  so the menu can never offer a value the server would reject.
-- **`lora_menu.py`** — the `/lora` in-place inline-keyboard UI, same
-  edit-in-place pattern as `settings_menu.py`. Toggles are scoped to
-  exactly the LoRAs already listed in the checkpoint's `model_profiles/*.json`
-  entry, per chat, without touching that file.
-- **`civitai.py`** — Telegram-independent CivitAI lookup for `lora_menu.py`'s
-  "ℹ️ Info" button: hashes a LoRA file under `Settings.comfyui_loras_dir`
-  and queries CivitAI's public hash-lookup API for trigger words/base-model
-  compatibility. See [LoRA info lookup](#lora-info-lookup) above.
-- **`lora_discovery.py`** — the boot-time scan (`main.py`'s
-  `_start_lora_discovery`) that uses `civitai.py` in bulk: finds LoRA files
-  under `comfyui_loras_dir` no profile's `loras` list mentions yet and
-  registers the CivitAI-identifiable ones into any profile whose
-  `civitai_base_models` accepts their base model. Its
-  `reload_profiles_and_discover` is the on-demand counterpart backing
-  `/reload` and `/lora`'s "🔁 Reload profiles" button. See
-  [Auto-discovering new LoRAs](#auto-discovering-new-loras) above.
-- **`storage.py`** — durable per-chat state in SQLite (stdlib `sqlite3`,
-  deliberately no ORM/migrations framework): selected checkpoint, profile
-  overrides, saved characters, and a post-processing result registry. That
-  registry stores only a Telegram `file_id`
-  (re-downloadable indefinitely via `bot.get_file()`) plus the resolved
-  generation params — not raw image bytes — which is why buttons keep
-  working after a bot restart.
-- **`auth.py`** — the `ALLOWED_USER_IDS` allowlist check shared by
-  `handlers.py` and `settings_menu.py`.
-- **`tags/`** — the local danbooru/e621 tag database backing `/tags`/
-  `/tagcheck` (`TagDatabase`, its own sqlite file, separate from
-  `storage.py`'s per-chat state since this is bulk reference data
-  wholesale-replaced by `scripts/update_tag_db.py`) plus the CSV importer
-  for the DraconicDragon tag-list archive format. See
-  [Tag search](#tag-search) above.
+| Module | Role |
+|---|---|
+| `comfy_client.py` | Async wrapper for ComfyUI's `/prompt`, `/history`, `/view`, `/object_info`, `/ws`. Knows nothing about Telegram |
+| `workflows/builder.py` | `PromptGraph` plus one builder per graph: txt2img, upscale/homogenize, face/hand detailers, manual and drawn-mask variants, Kontext |
+| `profiles/` | `ModelProfile` schema, glob matching, layering of defaults → prompt → per-chat overrides |
+| `generation.py` | Telegram-independent `generate()`, `post_process()`, `repeat()`, `kontext_edit()` |
+| `analysis.py` | WD14 tagging and Ollama captioning |
+| `png_metadata.py`, `params_serde.py` | Embed/read the PNG settings chunk, and the dict format shared with SQLite |
+| `handlers.py` | All Telegram commands, callbacks, and the drawn-mask job poller |
+| `settings_menu.py`, `lora_menu.py` | Edit-in-place `/settings` and `/lora` menus |
+| `civitai.py`, `lora_discovery.py` | CivitAI hash lookup and LoRA auto-registration |
+| `storage.py` | Per-chat SQLite state. Stores Telegram `file_id`s plus params, not image bytes, so buttons keep working after a restart |
+| `tags/` | Tag database, CSV importer and auto-updater |
+| `auth.py` | `ALLOWED_USER_IDS` check and WebApp `initData` validation |
+| `topics.py`, `message_text.py` | Forum-topic scoping of pending replies, and support for Telegram "rich" multi-paragraph messages |
+
+Post-processing graphs are submitted fresh: the chosen image is uploaded
+and fed in through `LoadImage`. They aren't chained onto the original
+sampler run, so any single image from a batch can be refined on its own.
 
 ### Background: the reference workflow
 
-Node wiring and default parameter values in `workflows/builder.py` mirror a
-hand-built, frontend-format ComfyUI graph (`sample.json` at the repo root)
-that was originally run manually. It's kept as ground truth for what "the
-right settings" look like, and toggles several optional branches via node
-`mode` (0 = enabled, 4 = bypassed):
+The node wiring and default values in `workflows/builder.py` mirror
+`sample.json`, a hand-built ComfyUI graph kept at the repo root as ground
+truth. It contains the base spine (checkpoint → optional LoRAs → clip skip
+→ prompt encode → sampler → VAE decode), an UltimateSDUpscale 4x branch,
+FaceDetailer passes, and disabled IPAdapter/openpose branches that aren't
+implemented here.
 
-- **Base generation spine (always on):** checkpoint → (optional, disabled
-  by default) LoRA stack → clip skip → positive/negative prompt encode →
-  sampler → VAE decode.
-- **Post-processing branches:** an UltimateSDUpscale 4x tiled upscale
-  (enabled), a FaceDetailer pass before and after the upscale (only the
-  post-upscale one enabled), an IPAdapter style-transfer branch and a
-  ControlNet openpose branch (both disabled, and not implemented as their
-  own builder functions here — a possible future addition).
-
-One important gotcha this codebase deliberately works around: many
-downstream nodes in `sample.json` show `link: null` for inputs like
-`model`/`clip`/`vae` in the raw JSON. That's *not* actually disconnected —
-the graph relies on
-[`cg-use-everywhere`](https://github.com/chrisgoringe/cg-use-everywhere)
-("Anything Everywhere") broadcast nodes that inject those values into any
-type-matching open input, resolved client-side at queue time. `builder.py`
-wires all of this **explicitly** instead, so the bot only depends on
-ComfyUI custom node packs that add real generation capability (Impact Pack,
-UltimateSDUpscale), not ones that just add UI convenience.
+One gotcha: many inputs in `sample.json` show `link: null` for
+`model`/`clip`/`vae`. They aren't disconnected. They're filled at queue time
+by [cg-use-everywhere](https://github.com/chrisgoringe/cg-use-everywhere)
+broadcast nodes. `builder.py` wires all of them explicitly, so the bot
+depends only on node packs that add real generation capability, not
+UI-convenience ones.
