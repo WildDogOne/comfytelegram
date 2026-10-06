@@ -2842,13 +2842,13 @@ async def test_consume_awaiting_kontext_blank_instruction_keeps_waiting():
     update.effective_message = message
     context = MagicMock()
     context.bot = AsyncMock()
-    context.chat_data = {"awaiting_kontext": {NO_TOPIC: ("abc123", 77)}}
+    context.chat_data = {"awaiting_kontext": {NO_TOPIC: ("abc123", 77, False)}}
     context.bot_data = {"storage": MagicMock()}
 
     assert await _consume_awaiting_kontext(update, context) is True
 
     # The re-prompt replaces the original prompt, and is what's tracked now.
-    assert context.chat_data["awaiting_kontext"] == {NO_TOPIC: ("abc123", 78)}
+    assert context.chat_data["awaiting_kontext"] == {NO_TOPIC: ("abc123", 78, False)}
     context.bot.delete_message.assert_awaited_once_with(1, 77)
     message.reply_text.assert_awaited_once()
 
@@ -2867,7 +2867,7 @@ async def test_consume_awaiting_kontext_reports_a_failed_source_fetch_on_its_sta
     profile = ModelProfile(match=["*"], display_name="x")
     context = MagicMock()
     context.bot = AsyncMock()
-    context.chat_data = {"awaiting_kontext": {NO_TOPIC: ("abc123", 77)}}
+    context.chat_data = {"awaiting_kontext": {NO_TOPIC: ("abc123", 77, False)}}
     context.bot_data = {
         "storage": _pending_result_mock(profile, "a fox"),
         "comfy_client": _comfy_client_mock(),
@@ -2889,3 +2889,86 @@ async def test_consume_awaiting_kontext_reports_a_failed_source_fetch_on_its_sta
     context.bot.delete_message.assert_awaited_once_with(1, 77)
     status_message.edit_text.assert_awaited_once()
     assert "Kontext edit failed" in status_message.edit_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_kontext_redo_reruns_the_original_source_and_chains():
+    """ "🔁 Redo Kontext" must edit the *pre-edit* source again (not the
+    edited result it sits under), and its own result gets a redo too."""
+    context = _page_toggle_context()
+    storage = context.bot_data["storage"]
+    storage.get_kontext_redo.return_value = {
+        "source_file_id": "orig_file",
+        "source_filename": "orig.png",
+        "instruction": "make it night",
+    }
+    status_message = AsyncMock()
+    query = AsyncMock()
+    query.data = "pp:kontext_redo:abc123"
+    query.message.reply_text = AsyncMock(return_value=status_message)
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+    edited = GeneratedImage(data=b"png", filename="out.png", full_params=MagicMock())
+
+    with (
+        patch(
+            "comfytelegram.handlers._fetch_source_image", new=AsyncMock(return_value=b"src")
+        ) as fetch_mock,
+        patch("comfytelegram.handlers.kontext_edit", new=AsyncMock(return_value=edited)) as edit,
+        patch("comfytelegram.handlers._send_and_store_result", new=AsyncMock()) as send_mock,
+    ):
+        await postprocess_callback(update, context)
+
+    assert fetch_mock.await_args.args[2:] == ("orig.png", "orig_file")
+    assert edit.await_args.args[4] == "make it night"
+    new_id = send_mock.await_args.kwargs["result_id"]
+    redo_button = send_mock.await_args.kwargs["extra_keyboard_rows"][0][0]
+    assert redo_button.callback_data == f"pp:kontext_redo:{new_id}"
+    storage.store_kontext_redo.assert_called_once_with(
+        new_id, "orig_file", "orig.png", "make it night"
+    )
+    assert [b.callback_data for b in send_mock.await_args.kwargs["extra_keyboard_rows"][0]] == [
+        f"pp:kontext_redo:{new_id}",
+        f"pp:kontext_redo_new:{new_id}",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_kontext_redo_new_prompt_edits_the_original_source():
+    """ "✏️ New prompt" asks for an instruction, then applies it to the
+    pre-edit source rather than the edited image the button sat under."""
+    context = _page_toggle_context()
+    context.chat_data = {}
+    storage = context.bot_data["storage"]
+    storage.get_kontext_redo.return_value = {
+        "source_file_id": "orig_file",
+        "source_filename": "orig.png",
+        "instruction": "make it night",
+    }
+    query = AsyncMock()
+    query.data = "pp:kontext_redo_new:abc123"
+    query.message.message_thread_id = None
+    query.message.reply_text = AsyncMock(return_value=MagicMock(message_id=77))
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    await postprocess_callback(update, context)
+
+    assert context.chat_data["awaiting_kontext"] == {NO_TOPIC: ("abc123", 77, True)}
+    assert "make it night" in query.message.reply_text.await_args.args[0]
+
+    message = AsyncMock()
+    message.text = "make it snow"
+    message.message_thread_id = None
+    message.chat_id = 1
+    follow_up = MagicMock()
+    follow_up.effective_message = message
+    context.bot = AsyncMock()
+    with patch("comfytelegram.handlers._run_kontext_and_send", new=AsyncMock()) as run_mock:
+        assert await _consume_awaiting_kontext(follow_up, context) is True
+
+    args = run_mock.await_args.args
+    assert args[3:5] == ("orig_file", "orig.png")
+    assert args[6] == "make it snow"

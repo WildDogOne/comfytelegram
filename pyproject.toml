@@ -1,6 +1,6 @@
 [project]
 name = "comfytelegram"
-version = "0.1.0"
+version = "0.2.0"
 description = "Telegram bot front-end for a local ComfyUI installation"
 readme = "README.md"
 requires-python = ">=3.11"

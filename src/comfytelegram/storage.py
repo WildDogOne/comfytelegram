@@ -181,6 +181,14 @@ CREATE TABLE IF NOT EXISTS inpaint_redo (
     detailer_disable_lora INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS kontext_redo (
+    result_id TEXT PRIMARY KEY,
+    source_file_id TEXT NOT NULL,
+    source_filename TEXT NOT NULL,
+    instruction TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS favorite (
     user_id INTEGER NOT NULL,
     name TEXT NOT NULL,
@@ -861,6 +869,40 @@ class Storage:
             "detailer_disable_lora": (
                 None if detailer_disable_lora is None else bool(detailer_disable_lora)
             ),
+        }
+
+    def store_kontext_redo(
+        self, result_id: str, source_file_id: str, source_filename: str, instruction: str
+    ) -> None:
+        """Record what "🔁 Redo Kontext" (`handlers.py`'s
+        `KONTEXT_REDO_CALLBACK_KIND`) needs to re-run a Kontext edit for a
+        fresh seed: the *pre-edit* source image (redoing against the edited
+        result would compound the edit instead of retrying it) and the
+        instruction. Keyed by the edited result's `result_id`, same as
+        `inpaint_redo`, and TTL'd the same way so the two expire together."""
+        self._prune("kontext_redo")
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO kontext_redo "
+                "(result_id, source_file_id, source_filename, instruction, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (result_id, source_file_id, source_filename, instruction, time.time()),
+            )
+
+    def get_kontext_redo(self, result_id: str) -> dict[str, Any] | None:
+        """The row `store_kontext_redo` wrote for `result_id`, or None."""
+        row = self._conn.execute(
+            "SELECT source_file_id, source_filename, instruction FROM kontext_redo "
+            "WHERE result_id = ?",
+            (result_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        source_file_id, source_filename, instruction = row
+        return {
+            "source_file_id": source_file_id,
+            "source_filename": source_filename,
+            "instruction": instruction,
         }
 
     def save_favorite(

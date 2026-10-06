@@ -6,8 +6,15 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.2.0 - 2026-10-06
+
 ### Added
 
+- **Kontext redo buttons** under every Kontext edit result, both working
+  from the original, pre-edit image: **🔁 Same prompt** retries the same
+  instruction with a fresh seed, and **✏️ New prompt** asks for a different
+  instruction (showing the previous one, with a copy button) instead. Redo
+  results get the same buttons.
 - **Favorites**: a personal library for tags, artist names and short prompt
   phrases you want to reuse.
   - `/fav <category> <name> | <text> [| <note>]` saves one, and

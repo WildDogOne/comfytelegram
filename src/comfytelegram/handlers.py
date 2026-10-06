@@ -215,6 +215,13 @@ DETAIL_REDO4_CALLBACK_KIND = "detail_redo4"
 #: same one-field-flag pattern as "⚙️ Customize" upscale.
 KONTEXT_CALLBACK_KIND = "kontext"
 KONTEXT_CANCEL_CALLBACK_DATA = "kontext:cancel"
+#: The redo row under every Kontext result, both against the same
+#: *pre-edit* source (see `storage.py`'s `kontext_redo`) and chaining like
+#: "🔁 Redo (same mask)": "🔁 Same prompt" re-runs the stored instruction
+#: for a fresh seed; "✏️ New prompt" asks for a different instruction first
+#: (consumed by `_consume_awaiting_kontext`, same as a fresh edit).
+KONTEXT_REDO_CALLBACK_KIND = "kontext_redo"
+KONTEXT_REDO_NEW_CALLBACK_KIND = "kontext_redo_new"
 
 #: What `storage.py`'s `inpaint_job.kind`/a drawn-mask redo tap actually
 #: means in terms of `generation.post_process`'s API — looked up by
@@ -492,6 +499,8 @@ _REDO_CALLBACK_KINDS = frozenset(
         FIX_REDO4_CALLBACK_KIND,
         DETAIL_REDO_CALLBACK_KIND,
         DETAIL_REDO4_CALLBACK_KIND,
+        KONTEXT_REDO_CALLBACK_KIND,
+        KONTEXT_REDO_NEW_CALLBACK_KIND,
     }
 )
 
@@ -1208,8 +1217,9 @@ def _carried_extra_rows(
     markup: InlineKeyboardMarkup | None,
 ) -> list[list[InlineKeyboardButton]]:
     """The extra rows on an existing post-processing keyboard that have to
-    survive a page flip — today just the "🔁 Redo (same mask)"/"🔁 x4" pair
-    a drawn-mask result carries (`_REDO_CALLBACK_KINDS`).
+    survive a page flip — the "🔁 Redo (same mask)"/"🔁 x4" pair a
+    drawn-mask result carries, or a Kontext result's "🔁 Same prompt"/
+    "✏️ New prompt" pair (`_REDO_CALLBACK_KINDS`).
 
     They're recovered by reading the message's current keyboard rather than
     looked up, because nothing else knows they're there: `inpaint_redo`
@@ -3322,23 +3332,31 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    if kind == KONTEXT_CALLBACK_KIND:
-        prompt_message = await query.message.reply_text(
-            "🪄 Kontext Edit — describe the change in plain English. Be specific "
-            'and say what to keep, e.g. "Change the jacket to red leather while '
-            'keeping the face, pose and background unchanged". The result comes '
-            "back at ~1MP whatever this image's size.",
-            reply_markup=_kontext_cancel_keyboard(),
-        )
-        # The prompt message's id rides along so `_consume_awaiting_kontext`
-        # can delete it once the edit starts — it's served its purpose, and
-        # a stale Cancel button left under it would only confuse.
-        set_pending(
-            context.chat_data,
-            "awaiting_kontext",
+    if kind in (KONTEXT_REDO_CALLBACK_KIND, KONTEXT_REDO_NEW_CALLBACK_KIND):
+        redo = storage.get_kontext_redo(result_id)
+        if redo is None:
+            await query.message.reply_text(
+                "That Kontext edit has expired — start a new one with 🪄 Kontext Edit."
+            )
+            return
+        if kind == KONTEXT_REDO_NEW_CALLBACK_KIND:
+            await _ask_kontext_instruction(
+                query.message, context, result_id, from_original=True, previous=redo["instruction"]
+            )
+            return
+        await _run_kontext_and_send(
             query.message,
-            (result_id, prompt_message.message_id),
+            context,
+            pending["chat_id"],
+            redo["source_file_id"],
+            redo["source_filename"],
+            full_params,
+            redo["instruction"],
         )
+        return
+
+    if kind == KONTEXT_CALLBACK_KIND:
+        await _ask_kontext_instruction(query.message, context, result_id, from_original=False)
         return
 
     if kind == HAND_MANUAL_CALLBACK_KIND:
@@ -4378,7 +4396,7 @@ async def _consume_awaiting_kontext(update: Update, context: ContextTypes.DEFAUL
     pending_entry = pop_pending(context.chat_data, "awaiting_kontext", message)
     if pending_entry is None:
         return False
-    result_id, prompt_message_id = pending_entry
+    result_id, prompt_message_id, from_original = pending_entry
 
     instruction = (message_text(message) or "").strip()
     if not instruction:
@@ -4392,7 +4410,10 @@ async def _consume_awaiting_kontext(update: Update, context: ContextTypes.DEFAUL
             reply_markup=_kontext_cancel_keyboard(),
         )
         set_pending(
-            context.chat_data, "awaiting_kontext", message, (result_id, reprompt.message_id)
+            context.chat_data,
+            "awaiting_kontext",
+            message,
+            (result_id, reprompt.message_id, from_original),
         )
         return True
 
@@ -4404,9 +4425,82 @@ async def _consume_awaiting_kontext(update: Update, context: ContextTypes.DEFAUL
         await message.reply_text("That image has expired — nothing to edit.")
         return True
 
+    source_file_id, source_filename = pending["file_id"], pending["filename"]
+    if from_original:
+        redo = storage.get_kontext_redo(result_id)
+        if redo is None:
+            await message.reply_text("That Kontext edit has expired — nothing to redo.")
+            return True
+        source_file_id, source_filename = redo["source_file_id"], redo["source_filename"]
+
+    await _run_kontext_and_send(
+        message,
+        context,
+        pending["chat_id"],
+        source_file_id,
+        source_filename,
+        _deserialize_generation_params(pending["base_params"]),
+        instruction,
+    )
+    return True
+
+
+async def _ask_kontext_instruction(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    result_id: str,
+    *,
+    from_original: bool,
+    previous: str | None = None,
+) -> None:
+    """Ask for a Kontext instruction as a follow-up message. `from_original`
+    (the "✏️ New prompt" redo) makes `_consume_awaiting_kontext` edit the
+    `kontext_redo` row's pre-edit source instead of `result_id`'s own image;
+    `previous` is that row's instruction, shown (and copyable, when it fits
+    Telegram's cap) so it can be tweaked rather than retyped."""
+    if previous is None:
+        text = (
+            "🪄 Kontext Edit — describe the change in plain English. Be specific "
+            'and say what to keep, e.g. "Change the jacket to red leather while '
+            'keeping the face, pose and background unchanged". The result comes '
+            "back at ~1MP whatever this image's size."
+        )
+    else:
+        text = (
+            "✏️ Redo with a new prompt — describe the change to make to the "
+            f"original image instead.\n\nPrevious prompt:\n{previous}"
+        )
+    prompt_message = await message.reply_text(
+        text, reply_markup=_kontext_cancel_keyboard(copy_text=previous)
+    )
+    # The prompt message's id rides along so `_consume_awaiting_kontext`
+    # can delete it once the edit starts — it's served its purpose, and
+    # a stale Cancel button left under it would only confuse.
+    set_pending(
+        context.chat_data,
+        "awaiting_kontext",
+        message,
+        (result_id, prompt_message.message_id, from_original),
+    )
+
+
+async def _run_kontext_and_send(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    source_file_id: str,
+    source_filename: str,
+    full_params: GenerationParams,
+    instruction: str,
+) -> None:
+    """Run `instruction` as a Kontext edit on the source image and reply
+    with the result plus the "🔁 Same prompt"/"✏️ New prompt" redo row — shared by the first
+    edit (`_consume_awaiting_kontext`) and every redo, which always pass
+    the original pre-edit source so a redo retries the edit rather than
+    stacking a second one on top of it."""
     settings: Settings = context.bot_data["settings"]
     client: ComfyClient = context.bot_data["comfy_client"]
-    full_params = _deserialize_generation_params(pending["base_params"])
+    storage: Storage = context.bot_data["storage"]
 
     label = "Kontext editing"
     status_message = await message.reply_text(f"{label}…", disable_notification=True)
@@ -4418,14 +4512,14 @@ async def _consume_awaiting_kontext(update: Update, context: ContextTypes.DEFAUL
         source_bytes = await _fetch_source_image(
             client,
             context.bot,
-            pending["filename"],
-            pending["file_id"],
+            source_filename,
+            source_file_id,
             on_fallback=_source_fallback_notifier(message),
         )
         return await kontext_edit(
             client,
             source_bytes,
-            pending["filename"],
+            source_filename,
             full_params,
             instruction,
             files=_kontext_model_files(settings),
@@ -4439,11 +4533,22 @@ async def _consume_awaiting_kontext(update: Update, context: ContextTypes.DEFAUL
         status_message, "Kontext edit", "Kontext edit", fetch_and_edit()
     )
     if result is None:
-        return True
+        return
 
     await status_message.delete()
-    await _send_and_store_result(message, pending["chat_id"], storage, result)
-    return True
+    result_id = uuid.uuid4().hex[:12]
+    redo_row = [
+        InlineKeyboardButton(
+            "🔁 Same prompt", callback_data=f"pp:{KONTEXT_REDO_CALLBACK_KIND}:{result_id}"
+        ),
+        InlineKeyboardButton(
+            "✏️ New prompt", callback_data=f"pp:{KONTEXT_REDO_NEW_CALLBACK_KIND}:{result_id}"
+        ),
+    ]
+    await _send_and_store_result(
+        message, chat_id, storage, result, result_id=result_id, extra_keyboard_rows=[redo_row]
+    )
+    storage.store_kontext_redo(result_id, source_file_id, source_filename, instruction)
 
 
 async def _delete_message_quietly(bot: Bot, chat_id: int, message_id: int) -> None:
@@ -4466,11 +4571,14 @@ def _kontext_model_files(settings: Settings) -> KontextModelFiles:
     )
 
 
-def _kontext_cancel_keyboard() -> InlineKeyboardMarkup:
-    """Attached to "🪄 Kontext Edit"'s "describe the change" follow-up."""
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("❌ Cancel", callback_data=KONTEXT_CANCEL_CALLBACK_DATA)]]
-    )
+def _kontext_cancel_keyboard(copy_text: str | None = None) -> InlineKeyboardMarkup:
+    """Attached to "🪄 Kontext Edit"'s "describe the change" follow-up, with
+    a "📋 Copy previous" button too when `copy_text` fits Telegram's cap."""
+    row = []
+    if copy_text and len(copy_text) <= InlineKeyboardButtonLimit.MAX_COPY_TEXT:
+        row.append(InlineKeyboardButton("📋 Copy previous", copy_text=CopyTextButton(copy_text)))
+    row.append(InlineKeyboardButton("❌ Cancel", callback_data=KONTEXT_CANCEL_CALLBACK_DATA))
+    return InlineKeyboardMarkup([row])
 
 
 def _make_cancel_callback(

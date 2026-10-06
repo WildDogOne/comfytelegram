@@ -376,6 +376,16 @@ def test_inpaint_job_message_thread_id_column_is_added_to_a_pre_existing_table(t
     s2.close()
 
 
+def test_kontext_redo_roundtrip(storage: Storage):
+    assert storage.get_kontext_redo("result1") is None
+    storage.store_kontext_redo("result1", "file123", "source.png", "make it night")
+    assert storage.get_kontext_redo("result1") == {
+        "source_file_id": "file123",
+        "source_filename": "source.png",
+        "instruction": "make it night",
+    }
+
+
 def test_inpaint_redo_roundtrip(storage: Storage):
     assert storage.get_inpaint_redo("result1") is None
     storage.store_inpaint_redo("result1", "file123", "source.png", b"\x89PNGmaskbytes")
