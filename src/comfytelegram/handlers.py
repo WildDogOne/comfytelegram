@@ -49,6 +49,7 @@ from comfytelegram.auth import (
     validate_webapp_init_data,
 )
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
+from comfytelegram.fav_menu import handle_fav_edit_message
 from comfytelegram.generation import (
     GeneratedImage,
     generate,
@@ -445,7 +446,7 @@ HAND_POINT_PREVIEW_MAX_DIM = 1280
 #: run ends, so the chat always shows *either* this or `_STREAMING_KEYBOARD`,
 #: never both and never neither.
 _MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [["/model", "/settings"], ["/characters", "/stream"], ["/help"]],
+    [["/model", "/settings"], ["/characters", "/favs"], ["/stream", "/help"]],
     resize_keyboard=True,
 )
 
@@ -2066,6 +2067,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "no restart needed\n"
         "/character save <name> | <prompt> — save a reusable character design\n"
         "/characters — list saved characters, activate one, or ✏️ edit/🔤 rename it\n"
+        "/fav <category> <name> | <text> [| <note>] — save a tag, artist or phrase\n"
+        "/favs — browse your saved favorites\n"
         f"/stream [prompt] — generate single images back-to-back (up to {STREAM_HARD_LIMIT}) "
         "until /stop, sending each one immediately; omit the prompt and I'll ask for it\n"
         "/stop — stop a running /stream\n"
@@ -2524,6 +2527,7 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     A pending "custom value" `/settings` entry (see
     `handle_custom_value_message`), a custom LoRA-strength entry from
     `/lora`'s strength-editing screen (`handle_lora_custom_value_message`),
+    a favorite being edited from `/favs` (`handle_fav_edit_message`),
     or an in-progress `/stream` prompt, character-edit/-rename entry, or
     "⚙️ Customize" upscale denoise/tile-strength entry
     (`_consume_awaiting_upscale_custom`) takes priority over treating the
@@ -2538,6 +2542,9 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if await handle_lora_custom_value_message(update, context):
+        return
+
+    if await handle_fav_edit_message(update, context):
         return
 
     if await _consume_awaiting_stream_prompt(update, context):

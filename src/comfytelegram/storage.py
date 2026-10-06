@@ -7,9 +7,11 @@ per-message generation-snapshot registry that backs each "🔁 Generate
 Again" button (keyed like `pending_result`, by an id embedded in that
 specific message's callback_data, not by chat_id — so an older message's
 button always repeats *its own* generation, not whatever the chat most
-recently generated), and the derived-prompt registry that backs each
+recently generated), the derived-prompt registry that backs each
 "🎨 Generate" button under a "🏷️ Analyze Image" result (which specific analyzer
-output — WD14 tags or Qwen-VL caption — that button should generate from).
+output — WD14 tags or Qwen-VL caption — that button should generate from),
+and each user's saved favorites (`/fav`/`/favs` — tags, artist names, short
+prompt phrases worth reusing; keyed per Telegram user, not per chat).
 
 That last one used to live only in an in-memory dict (`state.py`, now
 removed) with the reasoning "there's no point persisting raw image bytes
@@ -177,6 +179,16 @@ CREATE TABLE IF NOT EXISTS inpaint_redo (
     detail_denoise REAL,
     tile_controlnet INTEGER,
     detailer_disable_lora INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS favorite (
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    text TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    PRIMARY KEY (user_id, name)
 );
 """
 
@@ -850,6 +862,97 @@ class Storage:
                 None if detailer_disable_lora is None else bool(detailer_disable_lora)
             ),
         }
+
+    def save_favorite(
+        self, user_id: int, name: str, category: str, text: str, note: str = ""
+    ) -> None:
+        """Create or overwrite one of this user's saved favorites. Keyed by
+        Telegram user, not chat — favorites are personal and follow the user
+        into every chat/topic, unlike characters. Overwriting keeps
+        `created_at`, same as `save_character`."""
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO favorite (user_id, name, category, text, note, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(user_id, name) DO UPDATE SET "
+                "category = excluded.category, text = excluded.text, note = excluded.note",
+                (user_id, name, category, text, note, time.time()),
+            )
+
+    def get_favorite(self, user_id: int, name: str) -> dict[str, Any] | None:
+        """One of this user's favorites by name, or None if it doesn't
+        exist."""
+        row = self._conn.execute(
+            "SELECT category, text, note FROM favorite WHERE user_id = ? AND name = ?",
+            (user_id, name),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"name": name, "category": row[0], "text": row[1], "note": row[2]}
+
+    def list_favorites(self, user_id: int, category: str | None = None) -> list[dict[str, Any]]:
+        """This user's favorites, optionally limited to one category,
+        alphabetical (case-insensitive) by name."""
+        query = "SELECT name, category, text, note FROM favorite WHERE user_id = ?"
+        args: tuple[Any, ...] = (user_id,)
+        if category is not None:
+            query += " AND category = ?"
+            args += (category,)
+        rows = self._conn.execute(query + " ORDER BY name COLLATE NOCASE", args).fetchall()
+        return [
+            {"name": name, "category": cat, "text": text, "note": note}
+            for name, cat, text, note in rows
+        ]
+
+    def list_favorite_categories(self, user_id: int) -> list[tuple[str, int]]:
+        """`(category, count)` for every category this user has at least one
+        favorite in, alphabetical."""
+        rows = self._conn.execute(
+            "SELECT category, COUNT(*) FROM favorite WHERE user_id = ? "
+            "GROUP BY category ORDER BY category COLLATE NOCASE",
+            (user_id,),
+        ).fetchall()
+        return [(category, count) for category, count in rows]
+
+    def update_favorite(
+        self,
+        user_id: int,
+        name: str,
+        *,
+        category: str | None = None,
+        text: str | None = None,
+        note: str | None = None,
+    ) -> None:
+        """Change any of an existing favorite's category/text/note, leaving
+        fields passed as None untouched."""
+        with self._conn:
+            self._conn.execute(
+                "UPDATE favorite SET category = COALESCE(?, category), "
+                "text = COALESCE(?, text), note = COALESCE(?, note) "
+                "WHERE user_id = ? AND name = ?",
+                (category, text, note, user_id, name),
+            )
+
+    def rename_favorite(self, user_id: int, old_name: str, new_name: str) -> bool:
+        """Rename one of this user's favorites, keeping everything else.
+        Returns False (changing nothing) if `new_name` is already taken."""
+        if self.get_favorite(user_id, new_name) is not None:
+            return False
+        with self._conn:
+            self._conn.execute(
+                "UPDATE favorite SET name = ? WHERE user_id = ? AND name = ?",
+                (new_name, user_id, old_name),
+            )
+        return True
+
+    def delete_favorite(self, user_id: int, name: str) -> bool:
+        """Delete one of this user's favorites. Returns whether a row was
+        actually deleted."""
+        with self._conn:
+            cursor = self._conn.execute(
+                "DELETE FROM favorite WHERE user_id = ? AND name = ?", (user_id, name)
+            )
+        return cursor.rowcount > 0
 
     def close(self) -> None:
         """Close the underlying sqlite connection."""

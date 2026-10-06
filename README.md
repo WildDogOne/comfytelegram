@@ -171,6 +171,9 @@ docker compose up -d --build
 | `/character save <name> \| <positive> [\| <negative>]` | Save a reusable prompt snippet |
 | `/character delete <name>` | Delete one |
 | `/characters` | List, activate, edit or rename saved characters. The active one is folded into every prompt |
+| `/fav <category> <name> \| <text> [\| <note>]` | Save a tag, artist name or short phrase to your personal favorites |
+| `/fav delete <name>` | Delete one |
+| `/favs` | Browse your favorites by category, copy, edit or delete them |
 | `/stream [prompt]` | Generate single images back-to-back (max 100) until `/stop`. Asks for the prompt if you leave it out |
 | `/stop` | Stop a running stream |
 | `/tags <query>` | Search the tag database. Prefix `danbooru:` / `e621:` to pick a source |

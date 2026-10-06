@@ -19,6 +19,7 @@ from telegram.ext import (
 )
 
 from comfytelegram.comfy_client import ComfyClient
+from comfytelegram.fav_menu import fav_callback, fav_command, favs_command
 from comfytelegram.handlers import (
     AGAIN_CALLBACK_PREFIX,
     GENERATE_FROM_PROMPT_CALLBACK_PREFIX,
@@ -83,6 +84,8 @@ _COMMANDS = (
     ("reload", reload_command, "Reload model_profiles/*.json and check for new LoRAs"),
     ("character", character_command, "Save or delete a reusable character design"),
     ("characters", characters_command, "List, activate, edit, or rename saved characters"),
+    ("fav", fav_command, "Save a tag, artist or prompt phrase to your favorites"),
+    ("favs", favs_command, "Browse your saved favorites"),
     ("stream", stream_command, "Generate images back-to-back until /stop"),
     ("stop", stop_command, "Stop a running /stream"),
     ("tags", tags_command, "Search danbooru/e621 tags to build a prompt"),
@@ -375,6 +378,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^st:"))
     application.add_handler(CallbackQueryHandler(lora_callback, pattern=r"^lr:"))
     application.add_handler(CallbackQueryHandler(character_callback, pattern=r"^char:"))
+    application.add_handler(CallbackQueryHandler(fav_callback, pattern=r"^fv:"))
     application.add_handler(
         CallbackQueryHandler(stream_cancel_callback, pattern=rf"^{STREAM_CANCEL_CALLBACK_DATA}$")
     )
