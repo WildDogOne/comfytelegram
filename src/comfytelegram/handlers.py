@@ -3322,7 +3322,9 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if kind == UPSCALE_CUSTOM_CALLBACK_KIND:
         set_pending(context.chat_data, "awaiting_upscale_custom", query.message, result_id)
-        await query.message.reply_text(
+        anchor = _dialog_reply_anchor(query.message)
+        await _delete_messages(context.bot, query.message.chat_id, [query.message.message_id])
+        await anchor.reply_text(
             "Send the denoise and tile ControlNet strength to use for this "
             "upscale, e.g. `0.35 0.3` (denoise, then tile strength — send `-` "
             "for either one to keep it at its live default).",
@@ -3530,7 +3532,13 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if kind == HAND_AUTO_CALLBACK_KIND:
         kind = "hand"
 
+    # Where this run's status/result replies go. Normally the tapped image
+    # itself; for "✅ Use Defaults" the dialog it was tapped on is deleted
+    # first, so replies go to what that dialog was replying to instead.
+    anchor = query.message
     if kind == UPSCALE_DEFAULTS_CALLBACK_KIND:
+        anchor = _dialog_reply_anchor(query.message)
+        await _delete_messages(context.bot, query.message.chat_id, [query.message.message_id])
         kind = "upscale"
 
     source_bytes: bytes | None = None
@@ -3555,12 +3563,12 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             context.bot,
             pending["filename"],
             pending["file_id"],
-            on_fallback=_source_fallback_notifier(query.message),
+            on_fallback=_source_fallback_notifier(anchor),
         )
         if kind == "upscale":
             width, height = Image.open(io.BytesIO(source_bytes)).size
             if max(width, height) >= UPSCALE_CONFIRM_THRESHOLD_PX:
-                await query.message.reply_text(
+                await anchor.reply_text(
                     f"This image is already {width}×{height} — a 4x upscale would "
                     f"produce a {width * 4}×{height * 4} image. Upscale anyway?",
                     reply_markup=_upscale_confirm_keyboard(result_id),
@@ -3569,7 +3577,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         kind = "upscale"
 
     label = POSTPROCESS_STATUS_LABELS.get(kind, kind.title())
-    status_message = await query.message.reply_text(f"{label}…", disable_notification=True)
+    status_message = await anchor.reply_text(f"{label}…", disable_notification=True)
 
     async def _download_and_post_process() -> GeneratedImage:
         """Bundle the file download and the post-process call into one
@@ -3583,7 +3591,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 context.bot,
                 pending["filename"],
                 pending["file_id"],
-                on_fallback=_source_fallback_notifier(query.message),
+                on_fallback=_source_fallback_notifier(anchor),
             )
         return await post_process(
             client,
@@ -3605,9 +3613,9 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await status_message.delete()
     if result.unchanged:
         subject = "face" if kind == "face" else "hand"
-        await query.message.reply_text(f"⚠️ No {subject} detected — image unchanged.")
+        await anchor.reply_text(f"⚠️ No {subject} detected — image unchanged.")
         return
-    await _send_and_store_result(query.message, pending["chat_id"], storage, result)
+    await _send_and_store_result(anchor, pending["chat_id"], storage, result)
 
 
 async def _show_keyboard_page(query, result_id: str, page: int) -> None:
@@ -3705,16 +3713,17 @@ async def redo_tweak_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer()
         return
     await query.answer(f"Redoing at denoise {denoise:g}")
-    anchor = _redo_tweak_reply_anchor(query.message)
+    anchor = _dialog_reply_anchor(query.message)
     await _delete_messages(context.bot, query.message.chat_id, [query.message.message_id])
     await _run_drawn_mask_redos(
         anchor, context, pending, full_params, result_id, mask_kind, 1, denoise
     )
 
 
-def _redo_tweak_reply_anchor(picker: Message) -> Message:
-    """What to reply the redo's status/result into once the picker is
-    deleted. In a group PTB's `reply_*` quotes the message it's called on,
+def _dialog_reply_anchor(picker: Message) -> Message:
+    """What to reply a status/result into once the dialog it was chosen
+    from (the "🎚️ Redo…" picker, the "🔍 Upscale 4x" defaults-or-customize
+    choice) is deleted. In a group PTB's `reply_*` quotes the message it's called on,
     which fails for a deleted one, so use whatever the picker itself was
     replying to (the result image) when there is one. In a private chat
     nothing is quoted and the picker has no `reply_to_message`, so the

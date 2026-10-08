@@ -1625,6 +1625,7 @@ async def test_upscale_customize_choice_sets_the_awaiting_flag():
     query = AsyncMock()
     query.data = f"pp:{UPSCALE_CUSTOM_CALLBACK_KIND}:abc123"
     query.message.message_thread_id = None
+    query.message.reply_to_message = None
     update = MagicMock()
     update.callback_query = query
     update.effective_user.id = 1
@@ -1633,10 +1634,15 @@ async def test_upscale_customize_choice_sets_the_awaiting_flag():
     storage = _pending_result_mock(profile, "a fox")
     context = _postprocess_context(storage, profile)
     context.chat_data = {}
+    context.bot.delete_message = AsyncMock()
 
     await postprocess_callback(update, context)
 
     assert context.chat_data["awaiting_upscale_custom"][NO_TOPIC] == "abc123"
+    # The "use defaults or customize?" dialog is removed once a choice is made.
+    context.bot.delete_message.assert_awaited_once_with(
+        chat_id=query.message.chat_id, message_id=query.message.message_id
+    )
     query.message.reply_text.assert_awaited_once()
     assert "denoise" in query.message.reply_text.await_args.args[0].lower()
 
@@ -1645,6 +1651,7 @@ async def test_upscale_customize_choice_sets_the_awaiting_flag():
 async def test_upscale_defaults_choice_runs_like_a_bare_upscale_tap():
     query = AsyncMock()
     query.data = f"pp:{UPSCALE_DEFAULTS_CALLBACK_KIND}:abc123"
+    query.message.reply_to_message = None
     update = MagicMock()
     update.callback_query = query
     update.effective_user.id = 1
@@ -1653,6 +1660,7 @@ async def test_upscale_defaults_choice_runs_like_a_bare_upscale_tap():
     storage = _pending_result_mock(profile, "a fox")
     context = _postprocess_context(storage, profile)
     context.chat_data = {}
+    context.bot.delete_message = AsyncMock()
     # The "upscale" path measures the source image (already-large-image
     # gate) before post-processing it — needs real PNG bytes, unlike the
     # face/hand tests this fixture otherwise serves.
@@ -1682,6 +1690,9 @@ async def test_upscale_defaults_choice_runs_like_a_bare_upscale_tap():
     assert post_process_mock.await_args.kwargs["upscale_denoise_override"] is None
     assert post_process_mock.await_args.kwargs["tile_controlnet_strength_override"] is None
     query.message.reply_photo.assert_awaited_once()
+    context.bot.delete_message.assert_awaited_once_with(
+        chat_id=query.message.chat_id, message_id=query.message.message_id
+    )
 
 
 @pytest.mark.asyncio
