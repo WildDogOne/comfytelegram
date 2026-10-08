@@ -281,12 +281,14 @@ def resolve_generation_params(
     shows the folded-in result via `positive_prompt`, so an injected
     trigger word is never invisible.
 
-    `regions` (`/rp`) get the same profile prefix and trigger words folded
-    in front of each region's own prompt, not just the global one: a
-    region's mask outweighs the global prompt inside its box (see
-    `GenerationParams.regional_base_weight`), so quality tags or a LoRA
-    trigger only carried by the global prompt would fade out exactly where
-    the subjects are.
+    `regions` (regional prompts) each get the whole resolved global prompt
+    — profile prefix, trigger words and the user's global text — in front
+    of their own (A1111 Regional Prompter's "common prompt"). Attention
+    Couple does blend the global prompt into every region, but only at its
+    `GenerationParams.regional_base_weight` share; anything carried by the
+    global prompt alone (quality tags, a LoRA trigger, the scene, Anima's
+    `safe`) fades out exactly where the subjects are — measured on Anima at
+    0.2, where the background drifted and a global-only `safe` didn't hold.
     """
     overrides = dict(overrides or {})
 
@@ -297,7 +299,6 @@ def resolve_generation_params(
             [profile.positive_prompt_prefix, lora_trigger_words, user_prompt]
         )
         negative_prompt = profile.negative_prompt_prefix
-        region_prefix = join_nonempty([profile.positive_prompt_prefix, lora_trigger_words])
         loras = [lora.to_spec() for lora in active_loras]
         field_defaults = profile.defaults.model_dump(exclude_none=True)
         # Architecture facts about the checkpoint, not a tunable generation
@@ -309,7 +310,6 @@ def resolve_generation_params(
     else:
         positive_prompt = user_prompt
         negative_prompt = ""
-        region_prefix = ""
         loras = []
         field_defaults = {}
         architecture_fields = {}
@@ -324,7 +324,7 @@ def resolve_generation_params(
         "raw_positive_prompt": raw_positive_prompt,
         "raw_negative_prompt": raw_negative_prompt,
         "regions": [
-            replace(region, prompt=join_nonempty([region_prefix, region.prompt]))
+            replace(region, prompt=join_nonempty([positive_prompt, region.prompt]))
             for region in regions or []
         ],
         **architecture_fields,

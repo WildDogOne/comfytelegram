@@ -5,6 +5,7 @@ import pytest
 from comfytelegram.handlers import (
     RP_CANCEL_CALLBACK_DATA,
     _consume_awaiting_rp_prompt,
+    generate_message,
     rp_cancel_callback,
     rp_command,
 )
@@ -20,6 +21,7 @@ from comfytelegram.regional import (
     RegionalPromptError,
     expand_characters,
     format_regional_prompt,
+    is_regional_prompt,
     parse_regional_prompt,
 )
 from comfytelegram.topics import NO_TOPIC
@@ -115,6 +117,21 @@ def test_format_round_trips_through_parse():
 
     assert text == "scene\n[top] a, b\n[bottom] c"
     assert parse_regional_prompt(text).regions == parsed.regions
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("scene\n[left] a\n[right] b", True),
+        ("  [ Top ] a", True),
+        ("[centre] a", True),
+        ("1girl, [left] hand raised", False),
+        ("[artist name] style, 1girl", False),
+        ("just a prompt", False),
+    ],
+)
+def test_is_regional_prompt_needs_a_line_starting_with_a_known_tag(text, expected):
+    assert is_regional_prompt(text) is expected
 
 
 # --- $name characters ---------------------------------------------------------
@@ -214,13 +231,16 @@ def _profile(**defaults) -> ModelProfile:
     )
 
 
-def test_resolve_folds_prefix_and_active_trigger_words_into_each_region():
+def test_resolve_prepends_the_whole_global_prompt_to_each_region():
     regions = parse_regional_prompt("[left] a\n[right] b").regions
 
     params = resolve_generation_params("c", "scene", _profile(), regions=regions)
 
     assert params.positive_prompt == "masterpiece, trig, scene"
-    assert [r.prompt for r in params.regions] == ["masterpiece, trig, a", "masterpiece, trig, b"]
+    assert [r.prompt for r in params.regions] == [
+        "masterpiece, trig, scene, a",
+        "masterpiece, trig, scene, b",
+    ]
     # The caller's own RegionSpecs aren't mutated.
     assert regions[0].prompt == "a"
 
@@ -237,7 +257,7 @@ def test_resolve_takes_regional_weights_from_the_profile():
 def test_resolve_keeps_generic_weights_without_a_profile_setting():
     params = resolve_generation_params("c", "scene", _profile())
 
-    assert (params.regional_base_weight, params.regional_region_weight) == (0.6, 0.4)
+    assert (params.regional_base_weight, params.regional_region_weight) == (0.1, 0.9)
 
 
 def test_serialization_round_trips_regions():
@@ -393,3 +413,31 @@ async def test_consume_awaiting_rp_prompt_re_arms_on_an_unknown_character():
 
     assert context.chat_data["awaiting_rp_prompt"][NO_TOPIC] is True
     assert message.reply_text.await_args.args[0].startswith("⚠️ No saved character named $nobody")
+
+
+@pytest.mark.asyncio
+async def test_generate_message_routes_regional_syntax_without_re_arming():
+    update, message = _update_mock()
+    message.text = "scene\n[left] a\n[right] b"
+    context = _context()
+
+    with patch("comfytelegram.handlers._generate_regional", new=AsyncMock()) as regional:
+        await generate_message(update, context)
+
+    regional.assert_awaited_once_with(
+        context, 1, message, "scene\n[left] a\n[right] b", rearm_on_error=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_detected_regional_error_does_not_arm_the_rp_follow_up():
+    update, message = _update_mock()
+    message.text = "[left] a\n[top] b"
+    context = _context()
+
+    await generate_message(update, context)
+
+    assert "awaiting_rp_prompt" not in context.chat_data
+    assert message.reply_text.await_args.args[0].startswith("⚠️ Mixing left/right")
+    (row,) = message.reply_text.await_args.kwargs["reply_markup"].inline_keyboard
+    assert [b.text for b in row] == ["📋 Copy template"]

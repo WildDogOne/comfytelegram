@@ -107,6 +107,6 @@ def deserialize_generation_params(data: dict[str, Any]) -> GenerationParams:
         raw_positive_prompt=data.get("raw_positive_prompt", ""),
         raw_negative_prompt=data.get("raw_negative_prompt", ""),
         regions=[RegionSpec(**region) for region in data.get("regions", [])],
-        regional_base_weight=data.get("regional_base_weight", 0.6),
-        regional_region_weight=data.get("regional_region_weight", 0.4),
+        regional_base_weight=data.get("regional_base_weight", 0.1),
+        regional_region_weight=data.get("regional_region_weight", 0.9),
     )

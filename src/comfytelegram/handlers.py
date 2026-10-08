@@ -91,6 +91,7 @@ from comfytelegram.regional import (
     RegionalPromptError,
     expand_characters,
     format_regional_prompt,
+    is_regional_prompt,
     parse_regional_prompt,
 )
 from comfytelegram.settings import Settings
@@ -913,21 +914,15 @@ def _stream_prompt_cancel_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _rp_prompt_keyboard() -> InlineKeyboardMarkup:
-    """Attached to `/rp`'s format explanation (and to a parse-error reply,
-    which keeps the follow-up open): a native copy button for
-    `REGIONAL_TEMPLATE`, so the format can be pasted and edited instead of
-    retyped, plus a way back out."""
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "📋 Copy template", copy_text=CopyTextButton(REGIONAL_TEMPLATE)
-                ),
-                InlineKeyboardButton("❌ Cancel", callback_data=RP_CANCEL_CALLBACK_DATA),
-            ]
-        ]
-    )
+def _rp_prompt_keyboard(*, cancel: bool = True) -> InlineKeyboardMarkup:
+    """Attached to `/rp`'s format explanation and to a regional parse-error
+    reply: a native copy button for `REGIONAL_TEMPLATE`, so the format can
+    be pasted and edited instead of retyped, plus — only while
+    `awaiting_rp_prompt` is armed — a way back out."""
+    row = [InlineKeyboardButton("📋 Copy template", copy_text=CopyTextButton(REGIONAL_TEMPLATE))]
+    if cancel:
+        row.append(InlineKeyboardButton("❌ Cancel", callback_data=RP_CANCEL_CALLBACK_DATA))
+    return InlineKeyboardMarkup([row])
 
 
 def _character_edit_cancel_keyboard() -> InlineKeyboardMarkup:
@@ -2113,7 +2108,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"/stream [prompt] — generate single images back-to-back (up to {STREAM_HARD_LIMIT}) "
         "until /stop, sending each one immediately; omit the prompt and I'll ask for it\n"
         "/stop — stop a running /stream\n"
-        "/rp — regional prompt: a different prompt for each side of the image\n"
+        "/rp — how to write a regional prompt (a different prompt for each side "
+        "of the image), with a template to copy\n"
         "/tags <query> — search danbooru/e621 tags to build a prompt\n"
         "/tagcheck <prompt> — check a prompt's tags against the tag database\n"
         "/help — show this message",
@@ -2623,6 +2619,10 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     chat_id = update.effective_chat.id
+    if is_regional_prompt(prompt_text):
+        await _generate_regional(context, chat_id, message, prompt_text, rearm_on_error=False)
+        return
+
     storage: Storage = context.bot_data["storage"]
     client: ComfyClient = context.bot_data["comfy_client"]
     profiles: list[ModelProfile] = context.bot_data["profiles"]
@@ -3170,10 +3170,6 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             copy_text = _raw_prompt_copy_text(
                 full_params.raw_positive_prompt, full_params.raw_negative_prompt
             )
-            if full_params.regions:
-                # Only means something to `/rp` — prefixed so pasting it
-                # back in regenerates regionally instead of as one prompt.
-                copy_text = f"/rp\n{copy_text}"
             keyboard = None
             if len(copy_text) <= InlineKeyboardButtonLimit.MAX_COPY_TEXT:
                 keyboard = InlineKeyboardMarkup(
@@ -4240,15 +4236,15 @@ async def _consume_awaiting_stream_prompt(
 
 
 async def rp_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/rp [regional prompt]` — generate with a separate prompt per region
-    of the image (see `regional.py` for the syntax and
-    `GenerationParams.regions` for how it reaches the graph). The syntax is
-    unusual enough that a bare `/rp` — which is also what the
-    `_MAIN_KEYBOARD` button sends — explains it, offers the template as a
-    copy button, and waits for the prompt as a follow-up message
+    """`/rp [regional prompt]` — the explain-the-format entry point for
+    regional prompts (see `regional.py` for the syntax and
+    `GenerationParams.regions` for how it reaches the graph). A plain
+    prompt message using the syntax is already regional on its own (see
+    `generate_message`), so `/rp`'s job is a bare `/rp` — also what the
+    `_MAIN_KEYBOARD` button sends — explaining it, offering the template as
+    a copy button, and waiting for the prompt as a follow-up message
     (`awaiting_rp_prompt`, the same topic-scoped pattern as `/stream`'s).
-    Text after the command on the same message skips straight to
-    generating."""
+    Text after the command on the same message still generates directly."""
     settings: Settings = context.bot_data["settings"]
     if await reject_if_unauthorized(update, settings):
         return
@@ -4282,13 +4278,24 @@ async def _consume_awaiting_rp_prompt(update: Update, context: ContextTypes.DEFA
 
 
 async def _generate_regional(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, message: Message, prompt_text: str
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message: Message,
+    prompt_text: str,
+    *,
+    rearm_on_error: bool = True,
 ) -> None:
-    """Parse an `/rp` message and run it — `generate_message`'s flow with
-    regions added. A message that doesn't parse re-arms
-    `awaiting_rp_prompt`, so the corrected version can just be sent again
-    rather than starting over with `/rp`. `$name` character references are
-    expanded (`expand_characters`) — an unknown one re-arms the same way.
+    """Parse a regional prompt and run it — `generate_message`'s flow with
+    regions added. Reached from `/rp` and its follow-up, and from
+    `generate_message` itself for a plain message `is_regional_prompt`
+    recognizes. A message that doesn't parse (including an unknown `$name`
+    — `$name` character references are expanded by `expand_characters`)
+    gets the reason back; `rearm_on_error` additionally re-arms
+    `awaiting_rp_prompt` so the `/rp` follow-up stays open for the
+    corrected version. The auto-detected path passes False: a plain
+    message never armed that state, and arming it there would make the
+    user's next, ordinary prompt fail as a "regional prompt with no
+    regions".
     The global part then goes through the same `_resolve_profile_and_prompt`
     as a plain prompt (`-token` negatives) minus the active character; the
     `---` block is handed back to it in the same shape
@@ -4300,9 +4307,11 @@ async def _generate_regional(
         parsed = parse_regional_prompt(prompt_text)
         expanded, character_negative = expand_characters(parsed, storage.list_characters(chat_id))
     except RegionalPromptError as exc:
-        set_pending(context.chat_data, "awaiting_rp_prompt", message, True)
+        if rearm_on_error:
+            set_pending(context.chat_data, "awaiting_rp_prompt", message, True)
         await message.reply_text(
-            f"⚠️ {exc}\n\nSend the corrected prompt.", reply_markup=_rp_prompt_keyboard()
+            f"⚠️ {exc}\n\nSend the corrected prompt.",
+            reply_markup=_rp_prompt_keyboard(cancel=rearm_on_error),
         )
         return
 

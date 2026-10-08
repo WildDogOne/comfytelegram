@@ -8,14 +8,15 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **/rp — regional prompting**: give each side of the image its own prompt
-  so two characters stop swapping hair, ears and outfits. `/rp` explains
-  the format and offers a 📋 template to copy; send the prompt next, or put
-  it right after `/rp`. Regions are `[left]`/`[right]` or `[top]`/`[bottom]`,
+- **Regional prompting**: give each side of the image its own prompt so two
+  characters stop swapping hair, ears and outfits. Any prompt with lines
+  starting `[left]`/`[right]` (etc.) is regional, no command needed; `/rp`
+  explains the format and offers a 📋 template to copy. The lines above the
+  first tag are the global prompt, also added to every region, so scene,
+  quality tags and the character count only need writing once. Regions are `[left]`/`[right]` or `[top]`/`[bottom]`,
   plus `[center]`/`[middle]` for three. Needs the ComfyUI-ppm node pack.
-  The global/region balance is a per-model profile setting
-  (`regional_base_weight`/`regional_region_weight`); the Anima profiles use
-  stronger regions. `$name` inserts a saved character's prompt into a region
+  The global/region balance can be tuned per model profile
+  (`regional_base_weight`/`regional_region_weight`). `$name` inserts a saved character's prompt into a region
   (its negative prompt goes to the negatives); the active character is not
   applied in /rp. Generate Again, Show Prompt and downloaded PNGs keep the
   regions. Post-processing (upscale, detailers) uses the global prompt only.

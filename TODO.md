@@ -58,10 +58,10 @@ Still open:
 - [ ] **Region-aware detailers**: Face/Hand Detail on a regional image only
   sees the global prompt, so character-specific tags are missing there.
   Pick the region whose box contains the detected face and add its prompt.
+- [ ] **Regional `/stream`**: a `/stream` prompt with `[left]`/`[right]`
+  lines currently generates as one plain prompt, tags included.
 - [ ] **Weights in `/settings`**: `regional_base_weight`/
   `regional_region_weight` can only be set in profile JSON for now.
-- [ ] **Middle ground for Anima**: 0.2/0.8 binds characters but lets the
-  background drift away from the global prompt. Try 0.3/0.7.
 - [ ] **Per-region LoRAs** with core hook nodes (`CreateHookLora`,
   `PairConditioningSetProperties`). Probably doesn't combine with Attention
   Couple; needs testing.

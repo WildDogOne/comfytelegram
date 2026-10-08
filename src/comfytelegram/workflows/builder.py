@@ -236,20 +236,26 @@ class GenerationParams:
     #: before this field existed.
     raw_positive_prompt: str = ""
     raw_negative_prompt: str = ""
-    #: `/rp` regional prompting: each region's prompt applies only inside
-    #: its own box, on top of `positive_prompt` (the global prompt, which
-    #: still covers the whole image). Empty (the default) builds the plain
+    #: Regional prompting: each region's prompt applies only inside its own
+    #: box, on top of `positive_prompt` (the global prompt, which still
+    #: covers the whole image — and is already prepended to each region's
+    #: `prompt`, see `resolve_generation_params`). Empty (the default) builds the plain
     #: single-prompt graph. Only `build_txt2img` reads this — post-processing
     #: passes condition on `positive_prompt` alone.
     regions: list[RegionSpec] = field(default_factory=list)
     #: `/rp` only: the mask values `AttentionCouplePPM` blends the global
     #: prompt and each region with. The node normalizes them per pixel, so
     #: inside a region the global prompt gets `base / (base + region)` of the
-    #: attention. 0.6/0.4 held characters apart on an Illustrious checkpoint;
-    #: Anima needed 0.2/0.8 before outfits and ears stopped going missing —
-    #: hence a per-profile `ProfileDefaults` setting rather than a constant.
-    regional_base_weight: float = 0.6
-    regional_region_weight: float = 0.4
+    #: attention. Since every region's prompt already contains the global one
+    #: (see `resolve_generation_params`), the global share mostly dilutes the
+    #: region's own tags: at 0.6/0.4 held items (an umbrella, a fan) went
+    #: missing on an Illustrious checkpoint, at 0.1/0.9 they showed up on it
+    #: and on Anima alike, with no bleeding between regions. Still a
+    #: per-profile `ProfileDefaults` setting for a model that turns out to
+    #: want otherwise. Must stay above 0: the node rejects any pixel with no
+    #: mask weight at all, and the global mask is the only full-canvas one.
+    regional_base_weight: float = 0.1
+    regional_region_weight: float = 0.9
 
     def resolved_seed(self) -> int:
         """This request's seed, or a freshly-rolled random one if unset."""

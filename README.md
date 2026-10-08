@@ -29,8 +29,9 @@ The bot talks to ComfyUI's HTTP + WebSocket API directly. It doesn't use the
 - **Prompt → image.** Any plain-text message is a prompt. You can write
   negatives inline as `-blurry -watermark`, or put a whole negative block
   below a `---` line.
-- **Regional prompts.** `/rp` gives each side of the image its own prompt,
-  so two characters keep their own hair, ears and outfits.
+- **Regional prompts.** `[left]`/`[right]` lines give each side of the
+  image its own prompt, so two characters keep their own hair, ears and
+  outfits. `/rp` explains the format.
 - **Per-model defaults.** `/model` lists the checkpoints ComfyUI has
   installed. A matching [model profile](model_profiles/README.md) supplies
   cfg, steps, sampler, clip skip, prompt prefixes and default LoRAs.
@@ -180,7 +181,7 @@ docker compose up -d --build
 | `/favs` | Browse your favorites by category, copy, edit or delete them |
 | `/stream [prompt]` | Generate single images back-to-back (max 100) until `/stop`. Asks for the prompt if you leave it out |
 | `/stop` | Stop a running stream |
-| `/rp [regional prompt]` | Generate with a separate prompt per region of the image (see [Regional prompts](#regional-prompts)). Without a prompt it explains the format and offers a template to copy |
+| `/rp` | Explain the regional prompt format, with a template to copy (see [Regional prompts](#regional-prompts)). Any prompt using the format is regional without it |
 | `/tags <query>` | Search the tag database. Prefix `danbooru:` / `e621:` to pick a source |
 | `/tagcheck <prompt>` | Flag unknown or rarely-used tags in a prompt |
 | `/start`, `/help` | Show help and install the command keyboard |
@@ -202,20 +203,22 @@ character's prompt.
 ### Regional prompts
 
 ```
-/rp
 masterpiece, best quality, 2girls, standing side by side, park
-[left] 2girls, blonde hair, green eyes, cat ears, black hoodie
-[right] 2girls, black hair, purple eyes, fox ears, white kimono
+[left] blonde hair, green eyes, cat ears, black hoodie
+[right] black hair, purple eyes, fox ears, white kimono
 ---
 lowres, bad anatomy
 ```
 
-Lines before the first tag are the global prompt for the whole image. Each
+Any prompt message with a line starting with a position tag is regional;
+`/rp` just explains the format and offers this template to copy. Lines
+before the first tag are the global prompt for the whole image, and are
+also added to the front of every region, so keep them to what the regions
+share (scene, style, character count, rating tags). Each
 `[position]` line applies only to its part of the image: `[left]`/`[right]`
 for side by side, `[top]`/`[bottom]` for stacked, plus `[center]`/`[middle]`
-for three equal parts. Repeating the character count in every region helps
-each region draw one character. `$name` inserts a saved character's prompt
-(`[left] 2girls, $alice`) and adds its negative prompt to the negatives; the
+for three equal parts. `$name` inserts a saved character's prompt
+(`[left] $alice, waving`) and adds its negative prompt to the negatives; the
 active character is not applied in `/rp`. Regions don't move people: two characters
 standing together still end up side by side, so use left/right with a
 landscape size for them. The global/region balance is set per model

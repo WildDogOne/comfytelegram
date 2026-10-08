@@ -91,7 +91,7 @@ _COMMANDS = (
     ("favs", favs_command, "Browse your saved favorites"),
     ("stream", stream_command, "Generate images back-to-back until /stop"),
     ("stop", stop_command, "Stop a running /stream"),
-    ("rp", rp_command, "Regional prompt: a different prompt per side of the image"),
+    ("rp", rp_command, "How to write a regional prompt, with a template"),
     ("tags", tags_command, "Search danbooru/e621 tags to build a prompt"),
     ("tagcheck", tagcheck_command, "Check a prompt's tags against the tag database"),
 )

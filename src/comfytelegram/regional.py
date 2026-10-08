@@ -5,12 +5,15 @@ help/template text `handlers.py` shows for it.
 A message looks like::
 
     2girls, standing side by side, park
-    [left] 2girls, blonde hair, cat ears, black hoodie
-    [right] 2girls, black hair, fox ears, white kimono
+    [left] blonde hair, cat ears, black hoodie
+    [right] black hair, fox ears, white kimono
     ---
     lowres, bad anatomy
 
-Lines before the first `[position]` tag are the global prompt (whole image);
+Any plain prompt message with such a tag line is regional (`is_regional_prompt`);
+`/rp` itself only explains the format and offers the template.
+Lines before the first `[position]` tag are the global prompt (whole image,
+and prepended to every region — see `resolve_generation_params`);
 each tag's text runs until the next tag or the `---` negative separator.
 Positions split the image into equal columns (`left`/`center`/`right`) or
 rows (`top`/`middle`/`bottom`) — two slots, or three when the centre one is
@@ -43,6 +46,15 @@ _VERTICAL = ("top", "bottom")
 #: The centre slot — which name it ends up displayed under depends on the
 #: axis the other tags pick (see `_layout`).
 _CENTRE_ALIASES = {"center": "center", "centre": "center", "middle": "center"}
+
+#: A line opening with one of the position tags — what makes a plain prompt
+#: message regional without `/rp` (see `is_regional_prompt`). Only the known
+#: tags count, so a prompt that happens to start a line with some other
+#: bracketed text stays an ordinary prompt.
+_KNOWN_TAG_LINE_RE = re.compile(
+    r"^[ \t]*\[[ \t]*(?:left|right|top|bottom|center|centre|middle)[ \t]*\]",
+    re.IGNORECASE | re.MULTILINE,
+)
 _VALID_TAGS = "[left] [center] [right] or [top] [middle] [bottom]"
 
 #: `$name` — a saved character to insert (see `expand_characters`). Same
@@ -52,8 +64,8 @@ _CHARACTER_REF_RE = re.compile(r"\$([A-Za-z0-9_-]{1,32})")
 
 REGIONAL_TEMPLATE = (
     "masterpiece, best quality, 2girls, standing side by side, park\n"
-    "[left] 2girls, blonde hair, green eyes, cat ears, black hoodie\n"
-    "[right] 2girls, black hair, purple eyes, fox ears, white kimono\n"
+    "[left] blonde hair, green eyes, cat ears, black hoodie\n"
+    "[right] black hair, purple eyes, fox ears, white kimono\n"
     "---\n"
     "lowres, bad anatomy"
 )
@@ -61,25 +73,23 @@ REGIONAL_TEMPLATE = (
 REGIONAL_HELP = (
     "🧩 Regional prompt — give each part of the image its own prompt, so "
     "two characters stop swapping hair, ears and outfits.\n\n"
-    "Send your next message in this format (📋 copies a template):\n\n"
+    "Send your next message in this format (📋 copies a template). You don't "
+    "need /rp for it — any prompt with these [position] lines is regional:\n\n"
     f"{REGIONAL_TEMPLATE}\n\n"
-    "• First lines: the global prompt for the whole image — scene, style, "
-    "how many characters.\n"
+    "• First lines: the global prompt — scene, style, how many characters. "
+    "It's also added to every region, so keep it to what they share and put "
+    "anything about one character in its region.\n"
     f"• Then one line per region: {_VALID_TAGS}. Use left/right (side by "
     "side) or top/bottom (stacked), not both; add center/middle for three "
     "regions.\n"
-    "• Repeat the character count (2girls, 1boy 1girl, ...) in every "
-    "region — it helps each region draw one of the characters, not a "
-    "whole new scene.\n"
     "• $name inserts a saved character's prompt (/characters), e.g. "
-    "[left] 2girls, $alice. Its negative prompt is added to the negatives. "
+    "[left] $alice, waving. Its negative prompt is added to the negatives. "
     "The active character isn't applied in /rp — place characters with "
     "$name instead.\n"
     "• Optional: a --- line, then negative tags.\n\n"
     "Regions don't move people: top/bottom only helps if the scene really "
     "stacks them, so for characters standing together use left/right with "
-    "a landscape size (/settings). On Anima, put a rating tag (e.g. safe) "
-    "in every region — the global prompt has little weight there."
+    "a landscape size (/settings)."
 )
 
 
@@ -103,6 +113,14 @@ class RegionalPrompt:
 def _normalize(text: str) -> str:
     parts = [part.strip() for part in re.split(r"[,\n]", text)]
     return ", ".join(part for part in parts if part)
+
+
+def is_regional_prompt(text: str) -> bool:
+    """Whether a plain prompt message uses the regional syntax — any line
+    starting with a known position tag. Lets `handlers.generate_message`
+    route it to the regional flow without `/rp`, which stays the way to get
+    the format explained and a template to copy."""
+    return _KNOWN_TAG_LINE_RE.search(text) is not None
 
 
 def parse_regional_prompt(text: str) -> RegionalPrompt:
