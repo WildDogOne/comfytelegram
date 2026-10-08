@@ -34,6 +34,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Mask editor: the brush size is now measured on screen, so it's the same
+  in Draw Mask, Fix Artifact and Detail Prompt and on every image. It used
+  to depend on the image's resolution and on how much room the editor had
+  at load, so Fix Artifact's default brush came out much bigger than Detail
+  Prompt's. The slider's default and range changed to match.
+
 - Draw Mask, Fix Artifact and Detail Prompt: the "Draw over the area…, then
   tap Done in the editor" message (with its editor button) is now deleted
   once the drawn mask arrives and generation starts.

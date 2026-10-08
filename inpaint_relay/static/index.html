@@ -367,7 +367,7 @@
 
   <div id="controls">
     <label for="brush-size">Brush</label>
-    <input type="range" id="brush-size" min="8" max="120" value="36" />
+    <input type="range" id="brush-size" min="4" max="100" value="20" />
     <button id="autofill-btn" type="button" class="active">🪣 Fill</button>
     <button id="erase-btn" type="button">🧹 Erase</button>
     <button id="undo-btn" type="button" class="icon-btn" disabled title="Undo">↩</button>
@@ -769,18 +769,28 @@
     statusEl.textContent = text;
   }
 
+  // The brush slider is in on-screen CSS pixels at 1x zoom, converted here
+  // to `displayCanvas` pixels for painting. It used to *be* canvas pixels,
+  // but that raster's resolution is picked at load from the space
+  // `#canvas-wrap` happens to have (see `image.onload`), so the same slider
+  // value covered a different share of the image depending on the screen,
+  // the image's resolution, and whether the options panel was taking room
+  // — "🩹 Fix Artifact" (no panel) and "✏️ Detail Prompt" opened with
+  // visibly different default brushes. `clientWidth` is the canvas's
+  // layout width, before the zoom transform, so zooming in still makes the
+  // brush cover less of the image, as before.
+  function brushDiameter() {
+    var layoutWidth = displayCanvas.clientWidth || displayCanvas.width;
+    return (Number(brushSizeInput.value) * displayCanvas.width) / layoutWidth;
+  }
+
   // `#brush-cursor` is `position: fixed`, sized/positioned straight from
   // viewport coordinates — no relative-ancestor math needed, and it stays
   // correct across the canvas's own centering/scaling inside `#canvas-wrap`.
-  // Its diameter is set in *CSS* pixels, not `displayCanvas`'s own pixel
-  // buffer size — those differ whenever `max-width`/`max-height` scales the
-  // canvas down to fit the screen (see `image.onload`), so brush size (a
-  // canvas-pixel value) has to be converted through the canvas's current
-  // on-screen size, same conversion `pointFromEvent` does in reverse.
+  // Its diameter is the slider value (CSS pixels at 1x, see
+  // `brushDiameter`) times the current zoom.
   function updateCursorSize() {
-    var rect = displayCanvas.getBoundingClientRect();
-    var cssPxPerCanvasPx = rect.width / displayCanvas.width;
-    var diameterCss = Number(brushSizeInput.value) * cssPxPerCanvasPx;
+    var diameterCss = Number(brushSizeInput.value) * view.zoom;
     brushCursor.style.width = diameterCss + "px";
     brushCursor.style.height = diameterCss + "px";
   }
@@ -861,7 +871,7 @@
 
   function paintAt(x, y) {
     lastPaintPoint = { x: x, y: y };
-    var radius = Number(brushSizeInput.value) / 2;
+    var radius = brushDiameter() / 2;
     var erase = erasing !== invertStroke;
     applyDab(x, y, radius, erase);
     // `beginStroke`/`paintLineTo` always open `currentAction` before the
@@ -909,7 +919,7 @@
   // `endStroke`, the same one-shot-then-flood-fill-then-commit shape a
   // freehand stroke gets.
   function paintLineTo(x, y) {
-    var displayRadius = Number(brushSizeInput.value) / 2;
+    var displayRadius = brushDiameter() / 2;
     var from = lastPaintPoint;
     var dx = x - from.x;
     var dy = y - from.y;
@@ -1278,7 +1288,7 @@
     moveCursor(t.clientX, t.clientY);
     showCursor();
     var p = pointFromClient(t.clientX, t.clientY);
-    var displayRadius = Number(brushSizeInput.value) / 2;
+    var displayRadius = brushDiameter() / 2;
     var overlaySnap = snapshotBrushRegion(overlayCtx, p.x, p.y, displayRadius);
     var maskSnap = snapshotBrushRegion(maskCtx, p.x * scale, p.y * scale, displayRadius * scale);
     beginStroke(p.x, p.y);
