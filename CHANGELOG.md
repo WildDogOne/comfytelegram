@@ -6,6 +6,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Added
+
+- Mask editor: Alt+click (or Alt+drag) uses the opposite tool for that one
+  stroke, erasing in brush mode and painting in erase mode. Works with
+  Shift-click lines too. The brush cursor changes colour while Alt is held.
+
 ## 0.2.0 - 2026-10-06
 
 ### Added

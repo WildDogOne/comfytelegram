@@ -440,6 +440,11 @@
   var image = new Image();
   var drawing = false;
   var erasing = false;
+  // Alt+click inverts `erasing` for that one stroke/line only: brush mode
+  // erases, erase mode paints. Latched at pointerdown (`onPointerDown`) and
+  // cleared by `finishAction`, so letting go of Alt mid-drag doesn't flip
+  // the stroke halfway through. Mouse/pen only, like shift-click.
+  var invertStroke = false;
   var scale = 1; // maskCanvas pixels per displayCanvas pixel
 
   // Photoshop-style shift-click straight line: updated by every dab
@@ -811,12 +816,13 @@
   function paintAt(x, y) {
     lastPaintPoint = { x: x, y: y };
     var radius = Number(brushSizeInput.value) / 2;
-    applyDab(x, y, radius, erasing);
+    var erase = erasing !== invertStroke;
+    applyDab(x, y, radius, erase);
     // `beginStroke`/`paintLineTo` always open `currentAction` before the
     // first call here, so this is really unconditional in practice — the
     // guard just keeps `paintAt` safe to call on its own without also
     // requiring an open action.
-    if (currentAction) currentAction.dabs.push({ x: x, y: y, radius: radius, erase: erasing });
+    if (currentAction) currentAction.dabs.push({ x: x, y: y, radius: radius, erase: erase });
     renderDisplay();
   }
 
@@ -878,6 +884,7 @@
   function finishAction() {
     var action = currentAction;
     currentAction = null;
+    invertStroke = false;
     // Can be empty if every dab this action would have recorded was
     // rolled back by `undoRevocableDab` (a touch that turned out to be the
     // first finger of a pinch, not a tap) — nothing actually changed, so
@@ -897,6 +904,7 @@
     if (!drawing) return;
     drawing = false;
     finishAction();
+    syncCursorMode(false);
   }
 
   // Flood fill from every edge cell of a `painted` grid (1 = wall,
@@ -1140,6 +1148,7 @@
     moveCursor(evt.clientX, evt.clientY);
     showCursor();
     var p = pointFromEvent(evt);
+    invertStroke = evt.altKey;
     if (evt.shiftKey && lastPaintPoint) {
       paintLineTo(p.x, p.y);
       return;
@@ -1306,7 +1315,35 @@
   eraseBtn.addEventListener("click", function () {
     erasing = !erasing;
     eraseBtn.classList.toggle("active", erasing);
-    brushCursor.classList.toggle("erasing", erasing);
+    syncCursorMode(false);
+  });
+
+  // The cursor previews what the *next* dab will do, so holding Alt flips
+  // it the same way Alt+click flips the stroke (see `invertStroke`).
+  // Mid-stroke it keeps showing the latched mode instead of tracking the
+  // key. The button itself stays on the toggle's real state, since Alt is
+  // only a momentary override.
+  function syncCursorMode(altHeld) {
+    var invert = drawing ? invertStroke : altHeld;
+    brushCursor.classList.toggle("erasing", erasing !== invert);
+  }
+
+  function onAltKey(evt) {
+    if (evt.key !== "Alt") return;
+    syncCursorMode(evt.type === "keydown");
+    // A bare Alt release focuses the menu bar in some browsers (Firefox,
+    // most things on Windows), which would swallow the next keystroke.
+    var tag = evt.target && evt.target.tagName;
+    if (tag !== "TEXTAREA" && tag !== "INPUT") evt.preventDefault();
+  }
+  window.addEventListener("keydown", onAltKey);
+  window.addEventListener("keyup", onAltKey);
+  // Alt released while the window was unfocused never sends a keyup here.
+  window.addEventListener("blur", function () {
+    syncCursorMode(false);
+  });
+  displayCanvas.addEventListener("pointermove", function (evt) {
+    if (evt.pointerType !== "touch") syncCursorMode(evt.altKey);
   });
 
   undoBtn.addEventListener("click", undo);
