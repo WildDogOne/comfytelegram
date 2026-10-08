@@ -23,7 +23,10 @@ the bot itself.
   present).
 - Serves the editor page (`static/index.html` — its own JS reads
   `GET /jobs/{token}/meta`'s `mode` to decide whether to show the prompt
-  fields, that's the only branch) and the source image to whatever opens
+  fields, that's the only branch; a "mask_prompt" job's `references` —
+  names and short previews of the chat's characters and the user's
+  favorites — feed a `$name` autocomplete menu in those fields, which
+  comfytelegram expands on the way back) and the source image to whatever opens
   the per-job URL — no ComfyUI or Telegram bot-token access needed or
   wanted here.
 - Does **not** validate that a submission genuinely came from Telegram

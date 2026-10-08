@@ -147,6 +147,51 @@
     font-size: 13px;
     font-weight: 600;
   }
+  .field-hint {
+    font-weight: 400;
+    opacity: 0.6;
+  }
+  /* `$name` autocomplete for the prompt fields. Fixed rather than absolute,
+     since #prompt-fields scrolls internally and would clip it; placed above
+     or below the focused textarea by placeRefMenu, whichever has more room
+     (above, usually — the on-screen keyboard takes the space below). */
+  #ref-menu {
+    position: fixed;
+    z-index: 20;
+    display: none;
+    overflow-y: auto;
+    background: #1c1c1c;
+    border: 1px solid #333;
+    border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  }
+  .ref-item {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 9px 10px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .ref-item + .ref-item {
+    border-top: 1px solid #262626;
+  }
+  .ref-item.active {
+    background: #26394a;
+  }
+  .ref-name {
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .ref-preview {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+    color: #9a9a9a;
+  }
   textarea {
     width: 100%;
     box-sizing: border-box;
@@ -260,6 +305,7 @@
     <canvas id="display-canvas"></canvas>
   </div>
   <div id="brush-cursor"></div>
+  <div id="ref-menu" role="listbox"></div>
 
   <!-- "✏️ Detail Prompt" only (`Job.mode == "mask_prompt"`) — hidden by
        default; shown by `applyMeta` once `GET /jobs/{token}/meta` says so.
@@ -275,7 +321,7 @@
   <div id="prompt-fields" style="display: none;">
     <div id="readonly-info"></div>
     <div>
-      <div class="field-label">Positive</div>
+      <div class="field-label">Positive <span class="field-hint" id="positive-hint">— $name inserts a character or favorite</span></div>
       <textarea
         id="positive-input"
         rows="2"
@@ -1482,6 +1528,11 @@
     // default), so its override checkbox starts unchecked regardless.
     positiveInput.value = meta.positive || "";
     negativeInput.value = meta.negative || "";
+    references = Array.isArray(meta.references) ? meta.references : [];
+    if (references.length) {
+      document.getElementById("positive-hint").textContent =
+        "— type $ for characters and favorites";
+    }
     denoiseOverride.addEventListener("change", function () {
       denoiseInput.disabled = !denoiseOverride.checked;
       updateDenoiseReadout();
@@ -1597,6 +1648,137 @@
     };
     image.src = "/jobs/" + encodeURIComponent(token) + "/image";
   }
+
+  // `$name` autocomplete for the prompt fields. `references` (from
+  // `meta.references`) is the chat's saved characters plus this user's
+  // favorites — comfytelegram expands the `$name`s when the submission
+  // comes back, so this only helps type a name that exists. Typing `$`
+  // (or `$ab`) at the caret opens a menu of matching names, prefix matches
+  // first; tapping one (or Enter/Tab) replaces the partial name.
+  var references = [];
+  var refMenu = document.getElementById("ref-menu");
+  var refState = null; // {input, start, end, items, index} while open
+
+  function refQueryAt(input) {
+    if (input.selectionStart !== input.selectionEnd) return null;
+    var caret = input.selectionStart;
+    var match = /(^|[^\w$])\$([A-Za-z0-9_-]*)$/.exec(input.value.slice(0, caret));
+    if (!match) return null;
+    return { start: caret - match[2].length - 1, end: caret, query: match[2].toLowerCase() };
+  }
+
+  function matchingReferences(query) {
+    var prefix = [];
+    var inner = [];
+    references.forEach(function (ref) {
+      var name = ref.name.toLowerCase();
+      if (name.indexOf(query) === 0) prefix.push(ref);
+      else if (query && name.indexOf(query) > 0) inner.push(ref);
+    });
+    return prefix.concat(inner);
+  }
+
+  function closeRefMenu() {
+    refState = null;
+    refMenu.style.display = "none";
+  }
+
+  function placeRefMenu() {
+    var rect = refState.input.getBoundingClientRect();
+    var viewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+    var above = rect.top;
+    var below = viewportHeight - rect.bottom;
+    refMenu.style.left = rect.left + "px";
+    refMenu.style.width = rect.width + "px";
+    if (above >= below) {
+      refMenu.style.top = "auto";
+      refMenu.style.bottom = window.innerHeight - rect.top + 4 + "px";
+      refMenu.style.maxHeight = Math.max(80, Math.min(240, above - 8)) + "px";
+    } else {
+      refMenu.style.bottom = "auto";
+      refMenu.style.top = rect.bottom + 4 + "px";
+      refMenu.style.maxHeight = Math.max(80, Math.min(240, below - 8)) + "px";
+    }
+  }
+
+  function renderRefMenu() {
+    refMenu.textContent = "";
+    refState.items.forEach(function (ref, i) {
+      var item = document.createElement("div");
+      item.className = "ref-item" + (i === refState.index ? " active" : "");
+      item.setAttribute("role", "option");
+      var name = document.createElement("span");
+      name.className = "ref-name";
+      name.textContent = (ref.kind === "character" ? "👤 $" : "⭐ $") + ref.name;
+      var preview = document.createElement("span");
+      preview.className = "ref-preview";
+      preview.textContent = ref.preview || "";
+      item.appendChild(name);
+      item.appendChild(preview);
+      // pointerdown + preventDefault keeps focus (and the on-screen
+      // keyboard) on the textarea; a click would blur it first.
+      item.addEventListener("pointerdown", function (evt) {
+        evt.preventDefault();
+        pickReference(i);
+      });
+      refMenu.appendChild(item);
+    });
+    refMenu.style.display = "block";
+    placeRefMenu();
+    var active = refMenu.children[refState.index];
+    if (active) active.scrollIntoView({ block: "nearest" });
+  }
+
+  function updateRefMenu(input) {
+    if (!references.length) return;
+    var query = refQueryAt(input);
+    var items = query ? matchingReferences(query.query) : [];
+    if (!items.length) {
+      closeRefMenu();
+      return;
+    }
+    refState = { input: input, start: query.start, end: query.end, items: items, index: 0 };
+    renderRefMenu();
+  }
+
+  function pickReference(i) {
+    var input = refState.input;
+    var insert = "$" + refState.items[i].name;
+    input.value = input.value.slice(0, refState.start) + insert + input.value.slice(refState.end);
+    var caret = refState.start + insert.length;
+    input.setSelectionRange(caret, caret);
+    closeRefMenu();
+    input.focus();
+  }
+
+  [positiveInput, negativeInput].forEach(function (input) {
+    input.addEventListener("input", function () { updateRefMenu(input); });
+    input.addEventListener("click", function () { updateRefMenu(input); });
+    input.addEventListener("blur", closeRefMenu);
+    input.addEventListener("keydown", function (evt) {
+      if (!refState || refState.input !== input) return;
+      if (evt.key === "ArrowDown" || evt.key === "ArrowUp") {
+        var step = evt.key === "ArrowDown" ? 1 : -1;
+        var count = refState.items.length;
+        refState.index = (refState.index + step + count) % count;
+        renderRefMenu();
+      } else if (evt.key === "Enter" || evt.key === "Tab") {
+        pickReference(refState.index);
+      } else if (evt.key === "Escape") {
+        closeRefMenu();
+      } else {
+        return;
+      }
+      evt.preventDefault();
+      evt.stopPropagation();
+    });
+  });
+  promptFieldsEl.addEventListener("scroll", function () {
+    if (refState) placeRefMenu();
+  });
+  window.addEventListener("resize", function () {
+    if (refState) placeRefMenu();
+  });
 
   fetch("/jobs/" + encodeURIComponent(token) + "/meta")
     .then(function (resp) {

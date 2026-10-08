@@ -29,8 +29,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
-from typing import Any
 
+from comfytelegram.prompt_refs import ReferenceExpander, UnknownReferenceError
 from comfytelegram.workflows import RegionSpec
 
 #: Same rule as `handlers._NEGATIVE_BLOCK_SEP_RE`: a line of 3+ dashes on
@@ -57,11 +57,6 @@ _KNOWN_TAG_LINE_RE = re.compile(
 )
 _VALID_TAGS = "[left] [center] [right] or [top] [middle] [bottom]"
 
-#: `$name` — a saved character to insert (see `expand_characters`). Same
-#: character set as `handlers.CHARACTER_NAME_RE`, so every name `/character
-#: save` accepts can be referenced.
-_CHARACTER_REF_RE = re.compile(r"\$([A-Za-z0-9_-]{1,32})")
-
 REGIONAL_TEMPLATE = (
     "masterpiece, best quality, 2girls, standing side by side, park\n"
     "[left] blonde hair, green eyes, cat ears, black hoodie\n"
@@ -82,10 +77,10 @@ REGIONAL_HELP = (
     f"• Then one line per region: {_VALID_TAGS}. Use left/right (side by "
     "side) or top/bottom (stacked), not both; add center/middle for three "
     "regions.\n"
-    "• $name inserts a saved character's prompt (/characters), e.g. "
-    "[left] $alice, waving. Its negative prompt is added to the negatives. "
-    "The active character isn't applied in /rp — place characters with "
-    "$name instead.\n"
+    "• $name inserts a saved character (/characters) or favorite (/favs), "
+    "e.g. [left] $alice, waving. A character's negative prompt is added to "
+    "the negatives. The active character isn't applied here — place "
+    "characters with $name instead.\n"
     "• Optional: a --- line, then negative tags.\n\n"
     "Regions don't move people: top/bottom only helps if the scene really "
     "stacks them, so for characters standing together use left/right with "
@@ -196,44 +191,25 @@ def _layout(prompts: dict[str, str]) -> list[RegionSpec]:
     return regions
 
 
-def expand_characters(
-    parsed: RegionalPrompt, characters: list[dict[str, Any]]
-) -> tuple[RegionalPrompt, str]:
+def expand_references(parsed: RegionalPrompt, references: ReferenceExpander) -> RegionalPrompt:
     """Replace every `$name` in the global prompt and the regions with that
-    saved character's positive prompt. `characters` is the chat's saved
-    list (`Storage.list_characters`); names match exactly first, then
-    case-insensitively, since `$Alice` for a character saved as `alice` is
-    an obvious intent. Returns the expanded prompt plus the referenced
-    characters' negative prompts (in order of first use, each once) — the
-    negative is global under Attention Couple, so there's nowhere more
-    specific to put them. Raises `RegionalPromptError` naming the saved
-    characters for an unknown `$name`, rather than leaving a literal
-    `$name` in the prompt for the model to puzzle over."""
-    by_name = {c["name"]: c for c in characters}
-    by_folded = {c["name"].casefold(): c for c in characters}
-    used: list[dict[str, Any]] = []
-
-    def substitute(match: re.Match[str]) -> str:
-        name = match.group(1)
-        character = by_name.get(name) or by_folded.get(name.casefold())
-        if character is None:
-            saved = ", ".join(f"${c['name']}" for c in characters)
-            hint = f"Saved characters: {saved}." if saved else "No characters are saved yet."
-            raise RegionalPromptError(f"No saved character named ${name}. {hint}")
-        if character not in used:
-            used.append(character)
-        return character["positive_prompt"]
-
-    expanded = RegionalPrompt(
-        global_prompt=_CHARACTER_REF_RE.sub(substitute, parsed.global_prompt),
-        regions=[
-            replace(region, prompt=_normalize(_CHARACTER_REF_RE.sub(substitute, region.prompt)))
-            for region in parsed.regions
-        ],
-        negative=parsed.negative,
-    )
-    negatives = ", ".join(c["negative_prompt"] for c in used if c["negative_prompt"])
-    return expanded, negatives
+    saved character's or favorite's text (see `prompt_refs`). The
+    referenced characters' negative prompts are left on `references.negatives`
+    for the caller — the negative is global under Attention Couple, so
+    there's nowhere more specific to put them. Raises `RegionalPromptError`
+    listing what's saved for an unknown `$name`, rather than leaving a
+    literal `$name` in the prompt for the model to puzzle over."""
+    try:
+        return RegionalPrompt(
+            global_prompt=references.expand(parsed.global_prompt),
+            regions=[
+                replace(region, prompt=_normalize(references.expand(region.prompt)))
+                for region in parsed.regions
+            ],
+            negative=references.expand(parsed.negative),
+        )
+    except UnknownReferenceError as exc:
+        raise RegionalPromptError(str(exc)) from exc
 
 
 def format_regional_prompt(global_prompt: str, regions: list[RegionSpec]) -> str:

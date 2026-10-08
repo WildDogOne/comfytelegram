@@ -200,6 +200,16 @@ whole message into a positive block above and a negative block below. Both
 are added on top of the profile's default negative and any active
 character's prompt.
 
+`$name` inserts a saved character (`/characters`) or one of your favorites
+(`/favs`): `1girl, $alice, $wlop, forest`. A character's negative prompt is
+added to the negatives. If a character and a favorite share a name, the
+character wins. An unknown name is rejected with a list of what's saved.
+This works in plain prompts, `/stream`, regional prompts and the
+"✏️ Detail Prompt" editor. In the editor, an unknown name is left out with a
+warning instead, so the drawn mask isn't lost; typing `$` there opens a
+menu of your characters and favorites. "🐛 Show Prompt" shows the
+prompt as typed, with the `$name`s.
+
 ### Regional prompts
 
 ```
@@ -217,9 +227,9 @@ also added to the front of every region, so keep them to what the regions
 share (scene, style, character count, rating tags). Each
 `[position]` line applies only to its part of the image: `[left]`/`[right]`
 for side by side, `[top]`/`[bottom]` for stacked, plus `[center]`/`[middle]`
-for three equal parts. `$name` inserts a saved character's prompt
-(`[left] $alice, waving`) and adds its negative prompt to the negatives; the
-active character is not applied in `/rp`. Regions don't move people: two characters
+for three equal parts. `$name` inserts a saved character or favorite
+(`[left] $alice, waving`), so place characters per region that way; the
+active character is not applied to regional prompts. Regions don't move people: two characters
 standing together still end up side by side, so use left/right with a
 landscape size for them. The global/region balance is set per model
 profile (see [model profiles](model_profiles/README.md)). Upscale and the

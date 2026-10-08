@@ -137,6 +137,12 @@ class Job:
     detailer_disable_lora_available: bool = False
     detailer_disable_lora_default: bool = False
     detailer_disable_lora: bool | None = None
+    #: `$name` autocomplete entries for a `mode == "mask_prompt"` job's
+    #: prompt fields — `{"name", "kind", "preview"}` for the chat's saved
+    #: characters and the user's favorites, which comfytelegram expands
+    #: when the submission comes back. Display-only here, like
+    #: `readonly_info`.
+    references: list[dict[str, str]] = field(default_factory=list)
     init_data: str | None = None
 
 
@@ -229,6 +235,22 @@ def _parse_job_meta(header_value: str | None) -> dict[str, Any]:
     return decoded if isinstance(decoded, dict) else {}
 
 
+def _parse_references(value: Any) -> list[dict[str, str]]:
+    """`meta["references"]`, keeping only well-formed entries — the page
+    renders these, so anything else is dropped rather than passed on."""
+    if not isinstance(value, list):
+        return []
+    return [
+        {
+            "name": item["name"],
+            "kind": str(item.get("kind", "")),
+            "preview": str(item.get("preview", "")),
+        }
+        for item in value
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    ]
+
+
 @app.post("/jobs", dependencies=[Depends(require_shared_secret)])
 async def create_job(request: Request) -> dict[str, str]:
     """comfytelegram pushes the source image here (raw bytes body) and gets
@@ -241,7 +263,8 @@ async def create_job(request: Request) -> dict[str, str]:
     these are only ever read back once, off `GET /jobs/{token}/result`;
     nothing is saved beyond that one submission), read-only reference info
     to display, and whether/how to pre-check the tile-ControlNet checkbox
-    (`tile_controlnet_available`/`tile_controlnet_default` — see `Job`) —
+    (`tile_controlnet_available`/`tile_controlnet_default` — see `Job`)
+    and the `$name` autocomplete entries (`Job.references`) —
     a plain "mask" job (the common case) sends none of this, though it can
     still send `detailer_disable_lora_available`/`detailer_disable_lora_default`
     (see `Job.detailer_disable_lora_available`), which isn't tied to
@@ -269,6 +292,7 @@ async def create_job(request: Request) -> dict[str, str]:
         tile_controlnet_default=bool(meta.get("tile_controlnet_default", False)),
         detailer_disable_lora_available=bool(meta.get("detailer_disable_lora_available", False)),
         detailer_disable_lora_default=bool(meta.get("detailer_disable_lora_default", False)),
+        references=_parse_references(meta.get("references")),
     )
     return {"token": token}
 
@@ -312,6 +336,7 @@ async def job_meta(token: str) -> JSONResponse:
             "tile_controlnet_default": job.tile_controlnet_default,
             "detailer_disable_lora_available": job.detailer_disable_lora_available,
             "detailer_disable_lora_default": job.detailer_disable_lora_default,
+            "references": job.references,
         }
     )
 

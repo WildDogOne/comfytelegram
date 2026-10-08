@@ -5,23 +5,17 @@ here ships, move it to `CHANGELOG.md` under "Unreleased".
 
 ## Favorites
 
-Step 1 (`/fav`, `/favs`, edit, delete) is done. Still open:
+Step 1 (`/fav`, `/favs`, edit, delete) and `$name` expansion in prompts are done. Still open:
 
 ### Use favorites in prompts (step 2)
 
-- [ ] **`$name` expansion**: typing `1girl, $pose, $wlop, forest` swaps in the
-  saved text. `/rp` already uses `$name` for saved *characters*
-  (`regional.expand_characters`), so decide how a name that's both a
-  character and a favorite resolves (characters first, or an error). This belongs in `handlers._resolve_effective_prompt`, so it
-  also works in `/stream`, "🔁 Generate Again" and everywhere else prompts
-  are resolved.
 - [ ] **`$category?` wildcards**: picks a random favorite from that category
   for each image. Combined with `/stream`, this gives an exploration mode
   ("50 images, each with a random artist from my list").
-  - Decide what to do with an unknown `$name` or an empty category: leave the
-    text as is, or reply with an error.
-  - "🔁 Generate Again" should probably re-roll the wildcard. Check what
-    `raw_positive_prompt` stores before deciding.
+  - Plain `$name` expansion shipped (`prompt_refs.py`): an unknown name is an
+    error. An empty category should probably be one too.
+  - "🔁 Generate Again" reruns the *resolved* params, so a wildcard would
+    not re-roll. Re-rolling means re-expanding `raw_positive_prompt`.
 
 ### Saving more easily
 

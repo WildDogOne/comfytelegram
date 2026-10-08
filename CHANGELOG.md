@@ -16,10 +16,18 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   quality tags and the character count only need writing once. Regions are `[left]`/`[right]` or `[top]`/`[bottom]`,
   plus `[center]`/`[middle]` for three. Needs the ComfyUI-ppm node pack.
   The global/region balance can be tuned per model profile
-  (`regional_base_weight`/`regional_region_weight`). `$name` inserts a saved character's prompt into a region
-  (its negative prompt goes to the negatives); the active character is not
-  applied in /rp. Generate Again, Show Prompt and downloaded PNGs keep the
+  (`regional_base_weight`/`regional_region_weight`). Place characters with
+  `$name` per region; the active character is not applied to regional
+  prompts. Generate Again, Show Prompt and downloaded PNGs keep the
   regions. Post-processing (upscale, detailers) uses the global prompt only.
+- **`$name` in prompts**: `$alice` inserts a saved character, `$wlop` one of
+  your `/favs`, in any prompt: plain messages, `/stream`, regional prompts and
+  the ✏️ Detail Prompt editor. A character's negative prompt joins the
+  negatives; a character wins over a favorite with the same name. An
+  unknown name gets a reply listing what's saved (in Detail Prompt it's left
+  out with a warning instead, so the drawn mask isn't lost). In the Detail
+  Prompt editor, typing `$` opens a menu of your characters and favorites
+  (needs the updated `inpaint_relay`).
 - Mask editor: Alt+click (or Alt+drag) uses the opposite tool for that one
   stroke, erasing in brush mode and painting in erase mode. Works with
   Shift-click lines too. The brush cursor changes colour while Alt is held.

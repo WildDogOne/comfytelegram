@@ -60,6 +60,9 @@ FAV_HELP = (
     "/fav <category> <name> | <text> [| <note>]\n"
     "/fav delete <name>\n"
     "/favs — browse your favorites by category\n\n"
+    'Use one in any prompt with $name, e.g. "1girl, $dyn, forest" — also '
+    "in regional prompts and ✏️ Detail Prompt. A character with the same "
+    "name wins.\n\n"
     "Examples:\n"
     "/fav artist wlop | by wlop | painterly, great on Illustrious\n"
     "/fav pose dyn | dynamic pose, foreshortening\n\n"

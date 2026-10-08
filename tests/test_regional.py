@@ -15,11 +15,12 @@ from comfytelegram.params_serde import (
 )
 from comfytelegram.profiles import resolve_generation_params
 from comfytelegram.profiles.schema import LoraDefault, ModelProfile, ProfileDefaults
+from comfytelegram.prompt_refs import ReferenceExpander
 from comfytelegram.regional import (
     REGIONAL_HELP,
     REGIONAL_TEMPLATE,
     RegionalPromptError,
-    expand_characters,
+    expand_references,
     format_regional_prompt,
     is_regional_prompt,
     parse_regional_prompt,
@@ -142,34 +143,44 @@ _CHARACTERS = [
 ]
 
 
-def test_expand_characters_substitutes_in_regions_and_global():
-    parsed = parse_regional_prompt("2girls, $Bob nearby\n[left] 2girls, $alice\n[right] $Bob")
+_FAVORITES = [{"name": "wlop", "category": "artist", "text": "by wlop", "note": ""}]
 
-    expanded, negative = expand_characters(parsed, _CHARACTERS)
 
-    assert expanded.global_prompt == "2girls, fox ears nearby"
+def test_expand_references_substitutes_in_regions_global_and_negative():
+    parsed = parse_regional_prompt(
+        "2girls, $Bob nearby, $wlop\n[left] 2girls, $alice\n[right] $Bob\n---\nlowres, $wlop"
+    )
+    references = ReferenceExpander(_CHARACTERS, _FAVORITES)
+
+    expanded = expand_references(parsed, references)
+
+    assert expanded.global_prompt == "2girls, fox ears nearby, by wlop"
     assert [r.prompt for r in expanded.regions] == ["2girls, blonde hair, cat ears", "fox ears"]
-    assert negative == "tail"
+    assert expanded.negative == "lowres, by wlop"
+    assert references.negatives == "tail"
     # The parsed prompt itself keeps its $names for "as typed".
     assert parsed.regions[0].prompt == "2girls, $alice"
 
 
-def test_expand_characters_matches_names_case_insensitively_and_dedupes_negatives():
+def test_expand_references_matches_names_case_insensitively_and_dedupes_negatives():
     parsed = parse_regional_prompt("[left] $ALICE\n[right] $alice")
+    references = ReferenceExpander(_CHARACTERS, [])
 
-    expanded, negative = expand_characters(parsed, _CHARACTERS)
+    expanded = expand_references(parsed, references)
 
     assert expanded.regions[0].prompt == expanded.regions[1].prompt == "blonde hair, cat ears"
-    assert negative == "tail"
+    assert references.negatives == "tail"
 
 
-def test_expand_characters_rejects_an_unknown_name_listing_saved_ones():
+def test_expand_references_rejects_an_unknown_name_listing_saved_ones():
     parsed = parse_regional_prompt("[left] $carol\n[right] b")
 
-    with pytest.raises(RegionalPromptError, match=r"No saved character named \$carol\. "):
-        expand_characters(parsed, _CHARACTERS)
-    with pytest.raises(RegionalPromptError, match="No characters are saved yet"):
-        expand_characters(parsed, [])
+    with pytest.raises(RegionalPromptError, match=r"Nothing saved under \$carol\.") as exc:
+        expand_references(parsed, ReferenceExpander(_CHARACTERS, _FAVORITES))
+    assert "Characters: $alice, $Bob" in str(exc.value)
+    assert "Favorites: $wlop" in str(exc.value)
+    with pytest.raises(RegionalPromptError, match="No characters or favorites are saved yet"):
+        expand_references(parsed, ReferenceExpander([], []))
 
 
 # --- graph -----------------------------------------------------------------
@@ -301,6 +312,7 @@ def _context(chat_data: dict | None = None) -> MagicMock:
     context = MagicMock()
     storage = MagicMock()
     storage.list_characters.return_value = []
+    storage.list_favorites.return_value = []
     context.bot_data = {"settings": MagicMock(allowed_user_ids=None), "storage": storage}
     context.chat_data = {} if chat_data is None else chat_data
     return context
@@ -412,7 +424,7 @@ async def test_consume_awaiting_rp_prompt_re_arms_on_an_unknown_character():
     assert await _consume_awaiting_rp_prompt(update, context) is True
 
     assert context.chat_data["awaiting_rp_prompt"][NO_TOPIC] is True
-    assert message.reply_text.await_args.args[0].startswith("⚠️ No saved character named $nobody")
+    assert message.reply_text.await_args.args[0].startswith("⚠️ Nothing saved under $nobody")
 
 
 @pytest.mark.asyncio

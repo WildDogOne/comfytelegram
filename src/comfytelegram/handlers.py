@@ -85,11 +85,17 @@ from comfytelegram.profiles import (
     join_nonempty,
     resolve_profile,
 )
+from comfytelegram.prompt_refs import (
+    ReferenceExpander,
+    UnknownReferenceError,
+    has_references,
+    reference_suggestions,
+)
 from comfytelegram.regional import (
     REGIONAL_HELP,
     REGIONAL_TEMPLATE,
     RegionalPromptError,
-    expand_characters,
+    expand_references,
     format_regional_prompt,
     is_regional_prompt,
     parse_regional_prompt,
@@ -426,7 +432,8 @@ CHARACTER_HELP = (
     "/character delete <name>\n"
     "/characters — list saved characters, activate one, or ✏️ edit/🔤 rename it\n\n"
     "While a character is active, its prompt is folded into every image "
-    "you generate until you switch or clear it."
+    "you generate until you switch or clear it. Or write $name anywhere in a "
+    "prompt (also in regional prompts and ✏️ Detail Prompt) to insert it there."
 )
 
 # Minimum interval between progress-message edits, to stay well under
@@ -1852,8 +1859,16 @@ async def _process_one_inpaint_job(
         message_thread_id=message_thread_id,
     )
     full_params = _deserialize_generation_params(pending["base_params"])
-    detail_prompt = result.get("positive")
-    detail_negative_prompt = result.get("negative")
+    detail_prompt, detail_negative_prompt = await _expand_detail_prompt_references(
+        application.bot,
+        storage,
+        chat_id,
+        message_thread_id,
+        _init_data_user_id(verified),
+        full_params,
+        result.get("positive"),
+        result.get("negative"),
+    )
     detail_denoise = result.get("denoise")
     tile_controlnet_choice = result.get("tile_controlnet")
     detailer_disable_lora_choice = result.get("detailer_disable_lora")
@@ -1907,6 +1922,54 @@ async def _process_one_inpaint_job(
         tile_controlnet=tile_controlnet_choice,
         detailer_disable_lora=detailer_disable_lora_choice,
     )
+
+
+def _init_data_user_id(init_data: dict[str, str]) -> int | None:
+    """The submitting Telegram user's id from validated WebApp `initData`
+    (its `user` field is a JSON object), or None if it's missing."""
+    try:
+        return int(json.loads(init_data["user"])["id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+async def _expand_detail_prompt_references(
+    bot: Any,
+    storage: Storage,
+    chat_id: int,
+    message_thread_id: int | None,
+    user_id: int | None,
+    full_params: GenerationParams,
+    positive: str | None,
+    negative: str | None,
+) -> tuple[str | None, str | None]:
+    """Expand `$name`s (characters, then the submitter's favorites — see
+    `prompt_refs`) in a "✏️ Detail Prompt" submission's fields. A
+    referenced character's negative joins the negative, on top of the
+    image's own when that field was left blank (blank means "keep the
+    image's", which shouldn't silently turn into "only the character's").
+    Unlike a typed prompt, an unknown name is dropped with a warning
+    instead of rejecting the submission — that would also throw away the
+    mask that was just drawn. Redo stores the expanded text, so it replays
+    exactly what ran."""
+    if not (has_references(positive) or has_references(negative)):
+        return positive, negative
+    references = _reference_expander(storage, chat_id, user_id, strict=False)
+    if positive is not None:
+        positive = references.expand(positive)
+    if negative is not None:
+        negative = references.expand(negative)
+    if references.negatives:
+        base_negative = full_params.negative_prompt if negative is None else negative
+        negative = join_nonempty([base_negative, references.negatives])
+    if references.unknown:
+        names = ", ".join(f"${name}" for name in references.unknown)
+        await bot.send_message(
+            chat_id,
+            f"⚠️ Nothing saved under {names} — left it out of the detail prompt.",
+            message_thread_id=message_thread_id,
+        )
+    return positive, negative
 
 
 async def poll_inpaint_jobs(application: Application) -> None:
@@ -2095,7 +2158,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Send me a prompt and I'll generate an image with ComfyUI, or a "
         "photo and I'll analyze it into a prompt. Prefix any word with - to "
         'send it as a negative instead, e.g. "1girl, outdoors, -blurry, '
-        '-watermark".\n\n'
+        '-watermark". Write $name to insert a saved character or favorite, e.g. '
+        '"$alice, $wlop, forest".\n\n'
         "/model — pick a checkpoint\n"
         "/settings — view or change generation defaults for the current model\n"
         "/lora — toggle which of the current model's LoRAs are applied\n"
@@ -2506,7 +2570,9 @@ def _split_negative_prompt(text: str) -> tuple[str, str]:
 
 
 def _resolve_effective_prompt(
-    prompt_text: str, character: dict[str, str] | None
+    prompt_text: str,
+    character: dict[str, str] | None,
+    references: ReferenceExpander | None = None,
 ) -> tuple[str, str, str, str]:
     """Combine a raw prompt message with the active character (if any) into
     `(effective_prompt, extra_negative_prompt, raw_positive, raw_negative)`
@@ -2517,15 +2583,33 @@ def _resolve_effective_prompt(
     negative defaults for `generate()`/`resolve_generation_params` to layer
     underneath. `raw_positive`/`raw_negative` are that same split, *before*
     the character folding — exactly what the user typed, for "🐛 Show
-    Prompt"'s second output (see `GenerationParams.raw_positive_prompt`)."""
+    Prompt"'s second output (see `GenerationParams.raw_positive_prompt`).
+    `references` expands `$name`s (see `prompt_refs`) on both sides — still
+    unexpanded in `raw_*`, so Show Prompt's copy re-expands against the
+    current definitions — and adds the referenced characters' negatives;
+    raises `UnknownReferenceError` for a name that isn't saved."""
     raw_positive, raw_negative = _split_negative_prompt(prompt_text)
+    positive, negative = raw_positive, raw_negative
+    if references is not None:
+        positive = references.expand(positive)
+        negative = join_nonempty([references.expand(negative), references.negatives])
     effective_prompt = (
-        join_nonempty([character["positive_prompt"], raw_positive]) if character else raw_positive
+        join_nonempty([character["positive_prompt"], positive]) if character else positive
     )
     extra_negative = (
-        join_nonempty([character["negative_prompt"], raw_negative]) if character else raw_negative
+        join_nonempty([character["negative_prompt"], negative]) if character else negative
     )
     return effective_prompt, extra_negative, raw_positive, raw_negative
+
+
+def _reference_expander(
+    storage: Storage, chat_id: int, user_id: int | None, *, strict: bool = True
+) -> ReferenceExpander:
+    """`$name` lookup for a prompt typed in `chat_id` by `user_id`: this
+    chat's characters, then that user's own favorites (none without a user,
+    e.g. an anonymous channel post)."""
+    favorites = storage.list_favorites(user_id) if user_id is not None else []
+    return ReferenceExpander(storage.list_characters(chat_id), favorites, strict=strict)
 
 
 def _resolve_profile_and_prompt(
@@ -2536,6 +2620,7 @@ def _resolve_profile_and_prompt(
     profiles: list[ModelProfile],
     *,
     use_active_character: bool = True,
+    references: ReferenceExpander | None = None,
 ) -> tuple[ModelProfile, str, str, str | None, str | None]:
     """This chat's profile (with its `/settings` and `/lora` overrides
     applied) plus the active character folded into `prompt_text` via
@@ -2544,7 +2629,9 @@ def _resolve_profile_and_prompt(
     effective_prompt, extra_negative, raw_positive, raw_negative)`.
     `use_active_character=False` skips the active character — `/rp` places
     characters per region with `$name` instead, and folding one into the
-    global prompt would put it on every character at once."""
+    global prompt would put it on every character at once. `references`
+    is passed through to `_resolve_effective_prompt` (`$name` expansion,
+    which can raise `UnknownReferenceError`)."""
     profile = resolve_profile(checkpoint, profiles)
     profile = apply_profile_override(profile, checkpoint, storage.get_override(chat_id, checkpoint))
     profile = apply_lora_overrides(profile, storage.get_lora_overrides(chat_id, checkpoint))
@@ -2559,7 +2646,7 @@ def _resolve_profile_and_prompt(
         storage.get_character(chat_id, active_character_name) if active_character_name else None
     )
     effective_prompt, extra_negative, raw_positive, raw_negative = _resolve_effective_prompt(
-        prompt_text, character
+        prompt_text, character, references
     )
     return profile, effective_prompt, extra_negative, raw_positive, raw_negative
 
@@ -2631,9 +2718,21 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if checkpoint is None:
         return
 
-    profile, effective_prompt, extra_negative, raw_positive, raw_negative = (
-        _resolve_profile_and_prompt(chat_id, checkpoint, prompt_text, storage, profiles)
-    )
+    user_id = update.effective_user.id if update.effective_user else None
+    try:
+        profile, effective_prompt, extra_negative, raw_positive, raw_negative = (
+            _resolve_profile_and_prompt(
+                chat_id,
+                checkpoint,
+                prompt_text,
+                storage,
+                profiles,
+                references=_reference_expander(storage, chat_id, user_id),
+            )
+        )
+    except UnknownReferenceError as exc:
+        await message.reply_text(f"⚠️ {exc}")
+        return
 
     status_message = await message.reply_text("Generating… 0%", disable_notification=True)
 
@@ -3473,6 +3572,13 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                         "tile_controlnet_default": bool(
                             live_profile and live_profile.detail_prompt_tile_controlnet
                         ),
+                        # For the editor's `$name` autocomplete — the same
+                        # characters/favorites `_expand_detail_prompt_references`
+                        # will look the submission up against.
+                        "references": reference_suggestions(
+                            storage.list_characters(pending["chat_id"]),
+                            storage.list_favorites(update.effective_user.id),
+                        ),
                     }
                 )
         # Uploading a large source image to a remote relay host can take a
@@ -4289,7 +4395,8 @@ async def _generate_regional(
     regions added. Reached from `/rp` and its follow-up, and from
     `generate_message` itself for a plain message `is_regional_prompt`
     recognizes. A message that doesn't parse (including an unknown `$name`
-    — `$name` character references are expanded by `expand_characters`)
+    — `$name` character/favorite references are expanded by
+    `expand_references`)
     gets the reason back; `rearm_on_error` additionally re-arms
     `awaiting_rp_prompt` so the `/rp` follow-up stays open for the
     corrected version. The auto-detected path passes False: a plain
@@ -4305,7 +4412,9 @@ async def _generate_regional(
     storage: Storage = context.bot_data["storage"]
     try:
         parsed = parse_regional_prompt(prompt_text)
-        expanded, character_negative = expand_characters(parsed, storage.list_characters(chat_id))
+        user_id = message.from_user.id if message.from_user else None
+        references = _reference_expander(storage, chat_id, user_id)
+        expanded = expand_references(parsed, references)
     except RegionalPromptError as exc:
         if rearm_on_error:
             set_pending(context.chat_data, "awaiting_rp_prompt", message, True)
@@ -4323,7 +4432,8 @@ async def _generate_regional(
         return
 
     negative_block = f"\n---\n{parsed.negative}" if parsed.negative else ""
-    global_text = expanded.global_prompt + negative_block
+    expanded_negative_block = f"\n---\n{expanded.negative}" if expanded.negative else ""
+    global_text = expanded.global_prompt + expanded_negative_block
     profile, effective_prompt, extra_negative, _raw_global, raw_negative = (
         _resolve_profile_and_prompt(
             chat_id, checkpoint, global_text, storage, profiles, use_active_character=False
@@ -4343,7 +4453,7 @@ async def _generate_regional(
             checkpoint,
             effective_prompt,
             profile,
-            extra_negative_prompt=join_nonempty([extra_negative, character_negative]),
+            extra_negative_prompt=join_nonempty([extra_negative, references.negatives]),
             raw_positive_prompt=format_regional_prompt(raw_global, parsed.regions),
             raw_negative_prompt=raw_negative,
             regions=expanded.regions,
@@ -4827,9 +4937,21 @@ async def _run_stream(
         if checkpoint is None:
             return
 
-        profile, effective_prompt, extra_negative, raw_positive, raw_negative = (
-            _resolve_profile_and_prompt(chat_id, checkpoint, prompt_text, storage, profiles)
-        )
+        user_id = message.from_user.id if message.from_user else None
+        try:
+            profile, effective_prompt, extra_negative, raw_positive, raw_negative = (
+                _resolve_profile_and_prompt(
+                    chat_id,
+                    checkpoint,
+                    prompt_text,
+                    storage,
+                    profiles,
+                    references=_reference_expander(storage, chat_id, user_id),
+                )
+            )
+        except UnknownReferenceError as exc:
+            await message.reply_text(f"⚠️ {exc}")
+            return
 
         status_message = await message.reply_text(
             f"🔁 Streaming started (up to {STREAM_HARD_LIMIT} images) — "
