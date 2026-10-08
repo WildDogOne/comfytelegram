@@ -338,7 +338,12 @@ async def test_detail_prompt_button_uploads_and_opens_the_mask_editor():
     assert meta["detailer_disable_lora_default"] is False
 
     storage.store_inpaint_job.assert_called_once_with(
-        "tok1", "abc123", 1, query.message.message_thread_id, kind="detail"
+        "tok1",
+        "abc123",
+        1,
+        query.message.message_thread_id,
+        kind="detail",
+        editor_message_id=status_message.message_id,
     )
     status_message.edit_text.assert_awaited_once()
     button = status_message.edit_text.await_args.kwargs["reply_markup"].inline_keyboard[0][0]

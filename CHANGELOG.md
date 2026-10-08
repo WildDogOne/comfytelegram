@@ -12,6 +12,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stroke, erasing in brush mode and painting in erase mode. Works with
   Shift-click lines too. The brush cursor changes colour while Alt is held.
 
+### Changed
+
+- Draw Mask, Fix Artifact and Detail Prompt: the "Draw over the area…, then
+  tap Done in the editor" message (with its editor button) is now deleted
+  once the drawn mask arrives and generation starts.
+
 ## 0.2.0 - 2026-10-06
 
 ### Added

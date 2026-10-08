@@ -2001,7 +2001,12 @@ async def test_hand_draw_shows_an_uploading_status_before_the_editor_button():
     button = edit_call.kwargs["reply_markup"].inline_keyboard[0][0]
     assert button.web_app.url == "https://inpaint.example.com/jobs/tok1"
     storage.store_inpaint_job.assert_called_once_with(
-        "tok1", "abc123", 1, query.message.message_thread_id, kind="hand"
+        "tok1",
+        "abc123",
+        1,
+        query.message.message_thread_id,
+        kind="hand",
+        editor_message_id=status_message.message_id,
     )
 
 
@@ -2029,7 +2034,12 @@ async def test_fix_draw_stores_the_job_with_fix_kind():
         await postprocess_callback(update, context)
 
     storage.store_inpaint_job.assert_called_once_with(
-        "tok1", "abc123", 1, query.message.message_thread_id, kind="fix"
+        "tok1",
+        "abc123",
+        1,
+        query.message.message_thread_id,
+        kind="fix",
+        editor_message_id=status_message.message_id,
     )
 
 
@@ -2502,6 +2512,7 @@ async def test_process_one_inpaint_job_fix_kind_runs_fix_drawn_post_process():
         return_value=MagicMock(download_as_bytearray=AsyncMock(return_value=bytearray(b"orig")))
     )
     application.bot.send_photo = AsyncMock(return_value=MagicMock())
+    application.bot.delete_message = AsyncMock()
 
     settings = _settings(
         inpaint_relay_url="https://inpaint.example.com", inpaint_relay_shared_secret="shh"
@@ -2513,6 +2524,7 @@ async def test_process_one_inpaint_job_fix_kind_runs_fix_drawn_post_process():
         "message_thread_id": None,
         "result_id": "abc123",
         "kind": "fix",
+        "editor_message_id": 555,
     }
 
     refined = GeneratedImage(
@@ -2536,6 +2548,8 @@ async def test_process_one_inpaint_job_fix_kind_runs_fix_drawn_post_process():
         await _process_one_inpaint_job(application, settings, storage, client, job)
 
     assert mock.await_args.args[1] == "fix_drawn"
+    # The spent "Draw over the area…" editor-button message is cleaned up.
+    application.bot.delete_message.assert_awaited_once_with(42, 555)
     # 2 calls: the "Fixing artifact…" status message, then
     # `_fetch_source_image`'s fallback notice (`_comfy_client_mock` always
     # raises ComfyUIError, simulating "ComfyUI no longer has this file").

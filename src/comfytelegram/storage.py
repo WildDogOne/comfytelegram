@@ -165,6 +165,7 @@ CREATE TABLE IF NOT EXISTS inpaint_job (
     chat_id INTEGER NOT NULL,
     message_thread_id INTEGER,
     kind TEXT NOT NULL DEFAULT 'hand',
+    editor_message_id INTEGER,
     created_at REAL NOT NULL
 );
 
@@ -229,6 +230,7 @@ class Storage:
         self._add_column_if_missing("derived_prompt", "negative_prompt", "TEXT NOT NULL DEFAULT ''")
         self._add_column_if_missing("inpaint_job", "message_thread_id", "INTEGER")
         self._add_column_if_missing("inpaint_job", "kind", "TEXT NOT NULL DEFAULT 'hand'")
+        self._add_column_if_missing("inpaint_job", "editor_message_id", "INTEGER")
         self._add_column_if_missing("inpaint_redo", "detail_prompt", "TEXT")
         self._add_column_if_missing("inpaint_redo", "detail_negative_prompt", "TEXT")
         self._add_column_if_missing("inpaint_redo", "detail_denoise", "REAL")
@@ -712,6 +714,7 @@ class Storage:
         chat_id: int,
         message_thread_id: int | None = None,
         kind: str = "hand",
+        editor_message_id: int | None = None,
     ) -> None:
         """Record that `token` (an inpaint_relay job id — see
         `handlers.py`'s `hand_draw_callback`) is waiting on a freehand mask
@@ -729,14 +732,25 @@ class Storage:
         run `post_process(kind="hand_drawn")` or `kind="fix_drawn")` and
         which status label/redo button to use. Defaults to "hand" so a row
         written before this field existed still resolves to its original
-        behavior."""
+        behavior. `editor_message_id` is the "Draw over the area…" message
+        carrying the "🎨 Open mask editor" button, which the poller deletes
+        once the mask comes back (None for rows written before this field
+        existed — nothing to delete then)."""
         self._prune_inpaint_jobs()
         with self._conn:
             self._conn.execute(
                 "INSERT OR REPLACE INTO inpaint_job "
-                "(token, result_id, chat_id, message_thread_id, kind, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (token, result_id, chat_id, message_thread_id, kind, time.time()),
+                "(token, result_id, chat_id, message_thread_id, kind, editor_message_id, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    token,
+                    result_id,
+                    chat_id,
+                    message_thread_id,
+                    kind,
+                    editor_message_id,
+                    time.time(),
+                ),
             )
 
     def list_inpaint_jobs(self) -> list[dict[str, Any]]:
@@ -744,7 +758,8 @@ class Storage:
         check against the relay each tick."""
         self._prune_inpaint_jobs()
         rows = self._conn.execute(
-            "SELECT token, result_id, chat_id, message_thread_id, kind FROM inpaint_job"
+            "SELECT token, result_id, chat_id, message_thread_id, kind, editor_message_id "
+            "FROM inpaint_job"
         ).fetchall()
         return [
             {
@@ -753,8 +768,9 @@ class Storage:
                 "chat_id": chat_id,
                 "message_thread_id": message_thread_id,
                 "kind": kind,
+                "editor_message_id": editor_message_id,
             }
-            for token, result_id, chat_id, message_thread_id, kind in rows
+            for token, result_id, chat_id, message_thread_id, kind, editor_message_id in rows
         ]
 
     def delete_inpaint_job(self, token: str) -> None:

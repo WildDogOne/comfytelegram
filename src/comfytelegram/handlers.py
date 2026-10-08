@@ -1796,6 +1796,11 @@ async def _process_one_inpaint_job(
     # clear it locally and tell the relay it can forget it too.
     storage.delete_inpaint_job(token)
     await _relay_delete_job(settings, token)
+    # The "Draw over the area…, then tap Done" message and its editor
+    # button are spent once the mask is in — the status/result messages
+    # below take over from here.
+    if job.get("editor_message_id") is not None:
+        await _delete_message_quietly(application.bot, chat_id, job["editor_message_id"])
 
     verified = validate_webapp_init_data(result["init_data"], settings.telegram_bot_token)
     if verified is None:
@@ -3473,6 +3478,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 pending["chat_id"],
                 query.message.message_thread_id,
                 kind=job_kind,
+                editor_message_id=status_message.message_id,
             )
             editor_prompt = (
                 "Draw over the region to detail, describe what should be there, then "

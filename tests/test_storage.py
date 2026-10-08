@@ -318,6 +318,7 @@ def test_inpaint_job_roundtrip_carries_message_thread_id(storage: Storage):
         "chat_id": 42,
         "message_thread_id": 827915,
         "kind": "hand",
+        "editor_message_id": None,
     }
 
 
@@ -336,6 +337,13 @@ def test_inpaint_job_roundtrip_carries_kind(storage: Storage):
     storage.store_inpaint_job("tok1", "result1", 42, kind="fix")
     (job,) = storage.list_inpaint_jobs()
     assert job["kind"] == "fix"
+
+
+def test_inpaint_job_roundtrip_carries_editor_message_id(storage: Storage):
+    # The "Draw over the area…" message the poller deletes once the mask lands.
+    storage.store_inpaint_job("tok1", "result1", 42, editor_message_id=777)
+    (job,) = storage.list_inpaint_jobs()
+    assert job["editor_message_id"] == 777
 
 
 def test_delete_inpaint_job_removes_it(storage: Storage):
@@ -371,6 +379,7 @@ def test_inpaint_job_message_thread_id_column_is_added_to_a_pre_existing_table(t
             "chat_id": 42,
             "message_thread_id": 5,
             "kind": "hand",
+            "editor_message_id": None,
         }
     ]
     s2.close()
