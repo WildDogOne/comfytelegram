@@ -10,7 +10,9 @@ Step 1 (`/fav`, `/favs`, edit, delete) is done. Still open:
 ### Use favorites in prompts (step 2)
 
 - [ ] **`$name` expansion**: typing `1girl, $pose, $wlop, forest` swaps in the
-  saved text. This belongs in `handlers._resolve_effective_prompt`, so it
+  saved text. `/rp` already uses `$name` for saved *characters*
+  (`regional.expand_characters`), so decide how a name that's both a
+  character and a favorite resolves (characters first, or an error). This belongs in `handlers._resolve_effective_prompt`, so it
   also works in `/stream`, "🔁 Generate Again" and everywhere else prompts
   are resolved.
 - [ ] **`$category?` wildcards**: picks a random favorite from that category
@@ -41,6 +43,28 @@ Step 1 (`/fav`, `/favs`, edit, delete) is done. Still open:
   model's `tag_dictionary` (danbooru vs. e621) before the others.
 - [ ] **Basket**: toggle several favorites in `/favs`, then "🎨 Generate with
   these".
+
+## Regional prompts (/rp)
+
+Step 1 (`/rp` text syntax, Attention Couple, per-profile weights) is done.
+Still open:
+
+- [ ] **Painted regions**: a "regions" mode in the `inpaint_relay` editor.
+  You paint one colour per region, with a prompt box each, either on a
+  blank canvas or over an earlier result as a layout guide. Core
+  `ImageColorToMask` can split one colour-coded PNG into masks. This would
+  be the first relay job that starts a generation rather than
+  post-processing.
+- [ ] **Region-aware detailers**: Face/Hand Detail on a regional image only
+  sees the global prompt, so character-specific tags are missing there.
+  Pick the region whose box contains the detected face and add its prompt.
+- [ ] **Weights in `/settings`**: `regional_base_weight`/
+  `regional_region_weight` can only be set in profile JSON for now.
+- [ ] **Middle ground for Anima**: 0.2/0.8 binds characters but lets the
+  background drift away from the global prompt. Try 0.3/0.7.
+- [ ] **Per-region LoRAs** with core hook nodes (`CreateHookLora`,
+  `PairConditioningSetProperties`). Probably doesn't combine with Attention
+  Couple; needs testing.
 
 ## Housekeeping
 

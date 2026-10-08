@@ -13,7 +13,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from comfytelegram.profiles.schema import ModelProfile
-from comfytelegram.workflows.builder import GenerationParams
+from comfytelegram.workflows.builder import GenerationParams, RegionSpec
 
 #: `positive_prompt_prefix`/`negative_prompt_prefix` live on `ModelProfile`
 #: itself, not `ProfileDefaults` (they're not `GenerationParams` fields —
@@ -26,7 +26,8 @@ PROMPT_OVERRIDE_FIELDS = {"positive_prompt_prefix", "negative_prompt_prefix"}
 #: `apply_checkpoint_switch`'s `new_profile=None` branch resets every other
 #: `GenerationParams` field to its generic default — these are the ones a
 #: checkpoint switch must never touch: the image's own identity (`seed`,
-#: `filename_prefix`), its scene content (prompt/raw-prompt pairs), and
+#: `filename_prefix`), its scene content (prompt/raw-prompt pairs, `/rp`
+#: regions), and
 #: `loras` (reset separately, to `[]`, rather than `GenerationParams`' own
 #: default_factory — spelled out here for clarity even though the two are
 #: actually the same value).
@@ -39,6 +40,7 @@ _CHECKPOINT_SWITCH_PRESERVED_FIELDS = {
     "seed",
     "filename_prefix",
     "loras",
+    "regions",
 }
 
 logger = logging.getLogger(__name__)
@@ -247,6 +249,7 @@ def resolve_generation_params(
     extra_negative_prompt: str = "",
     raw_positive_prompt: str = "",
     raw_negative_prompt: str = "",
+    regions: list[RegionSpec] | None = None,
 ) -> GenerationParams:
     """Combine a model profile's defaults with the user's prompt and any explicit
     overrides (highest priority, e.g. a user-set /cfg or /steps command) into a
@@ -277,6 +280,13 @@ def resolve_generation_params(
     still drops it, same as ever) — "🐛 Show Prompt" on the resulting image
     shows the folded-in result via `positive_prompt`, so an injected
     trigger word is never invisible.
+
+    `regions` (`/rp`) get the same profile prefix and trigger words folded
+    in front of each region's own prompt, not just the global one: a
+    region's mask outweighs the global prompt inside its box (see
+    `GenerationParams.regional_base_weight`), so quality tags or a LoRA
+    trigger only carried by the global prompt would fade out exactly where
+    the subjects are.
     """
     overrides = dict(overrides or {})
 
@@ -287,6 +297,7 @@ def resolve_generation_params(
             [profile.positive_prompt_prefix, lora_trigger_words, user_prompt]
         )
         negative_prompt = profile.negative_prompt_prefix
+        region_prefix = join_nonempty([profile.positive_prompt_prefix, lora_trigger_words])
         loras = [lora.to_spec() for lora in active_loras]
         field_defaults = profile.defaults.model_dump(exclude_none=True)
         # Architecture facts about the checkpoint, not a tunable generation
@@ -298,6 +309,7 @@ def resolve_generation_params(
     else:
         positive_prompt = user_prompt
         negative_prompt = ""
+        region_prefix = ""
         loras = []
         field_defaults = {}
         architecture_fields = {}
@@ -311,6 +323,10 @@ def resolve_generation_params(
         "loras": loras,
         "raw_positive_prompt": raw_positive_prompt,
         "raw_negative_prompt": raw_negative_prompt,
+        "regions": [
+            replace(region, prompt=join_nonempty([region_prefix, region.prompt]))
+            for region in regions or []
+        ],
         **architecture_fields,
         **field_defaults,
     }

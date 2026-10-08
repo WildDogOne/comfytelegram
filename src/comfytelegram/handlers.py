@@ -85,6 +85,14 @@ from comfytelegram.profiles import (
     join_nonempty,
     resolve_profile,
 )
+from comfytelegram.regional import (
+    REGIONAL_HELP,
+    REGIONAL_TEMPLATE,
+    RegionalPromptError,
+    expand_characters,
+    format_regional_prompt,
+    parse_regional_prompt,
+)
 from comfytelegram.settings import Settings
 from comfytelegram.settings_menu import _safe_edit_message, handle_custom_value_message
 from comfytelegram.storage import IMAGE_FORMAT_PNG, Storage
@@ -390,6 +398,7 @@ LORA_SWITCH_TOGGLE_CALLBACK_PREFIX = "swl:"
 AGAIN_CALLBACK_PREFIX = "again:"
 GENERATE_FROM_PROMPT_CALLBACK_PREFIX = "genp:"
 STREAM_CANCEL_CALLBACK_DATA = "stream:cancel"
+RP_CANCEL_CALLBACK_DATA = "rp:cancel"
 CHARACTER_EDIT_CANCEL_CALLBACK_DATA = "char:edit_cancel"
 CHARACTER_RENAME_CANCEL_CALLBACK_DATA = "char:rename_cancel"
 
@@ -453,7 +462,7 @@ HAND_POINT_PREVIEW_MAX_DIM = 1280
 #: run ends, so the chat always shows *either* this or `_STREAMING_KEYBOARD`,
 #: never both and never neither.
 _MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [["/model", "/settings"], ["/characters", "/favs"], ["/stream", "/help"]],
+    [["/model", "/settings"], ["/characters", "/favs"], ["/stream", "/rp"], ["/help"]],
     resize_keyboard=True,
 )
 
@@ -901,6 +910,23 @@ def _stream_prompt_cancel_keyboard() -> InlineKeyboardMarkup:
     send a throwaway prompt just to get past it."""
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("❌ Cancel", callback_data=STREAM_CANCEL_CALLBACK_DATA)]]
+    )
+
+
+def _rp_prompt_keyboard() -> InlineKeyboardMarkup:
+    """Attached to `/rp`'s format explanation (and to a parse-error reply,
+    which keeps the follow-up open): a native copy button for
+    `REGIONAL_TEMPLATE`, so the format can be pasted and edited instead of
+    retyped, plus a way back out."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📋 Copy template", copy_text=CopyTextButton(REGIONAL_TEMPLATE)
+                ),
+                InlineKeyboardButton("❌ Cancel", callback_data=RP_CANCEL_CALLBACK_DATA),
+            ]
+        ]
     )
 
 
@@ -2087,6 +2113,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"/stream [prompt] — generate single images back-to-back (up to {STREAM_HARD_LIMIT}) "
         "until /stop, sending each one immediately; omit the prompt and I'll ask for it\n"
         "/stop — stop a running /stream\n"
+        "/rp — regional prompt: a different prompt for each side of the image\n"
         "/tags <query> — search danbooru/e621 tags to build a prompt\n"
         "/tagcheck <prompt> — check a prompt's tags against the tag database\n"
         "/help — show this message",
@@ -2511,12 +2538,17 @@ def _resolve_profile_and_prompt(
     prompt_text: str,
     storage: Storage,
     profiles: list[ModelProfile],
+    *,
+    use_active_character: bool = True,
 ) -> tuple[ModelProfile, str, str, str | None, str | None]:
     """This chat's profile (with its `/settings` and `/lora` overrides
     applied) plus the active character folded into `prompt_text` via
     `_resolve_effective_prompt` — the shared setup `generate_message` and
     `_run_stream` both need before calling `generate()`. Returns `(profile,
-    effective_prompt, extra_negative, raw_positive, raw_negative)`."""
+    effective_prompt, extra_negative, raw_positive, raw_negative)`.
+    `use_active_character=False` skips the active character — `/rp` places
+    characters per region with `$name` instead, and folding one into the
+    global prompt would put it on every character at once."""
     profile = resolve_profile(checkpoint, profiles)
     profile = apply_profile_override(profile, checkpoint, storage.get_override(chat_id, checkpoint))
     profile = apply_lora_overrides(profile, storage.get_lora_overrides(chat_id, checkpoint))
@@ -2524,7 +2556,9 @@ def _resolve_profile_and_prompt(
         profile, storage.get_lora_strength_overrides(chat_id, checkpoint)
     )
 
-    active_character_name = storage.get_active_character_name(chat_id)
+    active_character_name = (
+        storage.get_active_character_name(chat_id) if use_active_character else None
+    )
     character = (
         storage.get_character(chat_id, active_character_name) if active_character_name else None
     )
@@ -2543,7 +2577,7 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     `handle_custom_value_message`), a custom LoRA-strength entry from
     `/lora`'s strength-editing screen (`handle_lora_custom_value_message`),
     a favorite being edited from `/favs` (`handle_fav_edit_message`),
-    or an in-progress `/stream` prompt, character-edit/-rename entry, or
+    or an in-progress `/stream` or `/rp` prompt, character-edit/-rename entry, or
     "⚙️ Customize" upscale denoise/tile-strength entry
     (`_consume_awaiting_upscale_custom`) takes priority over treating the
     text as a prompt. "✏️ Detail Prompt" has no entry here to take priority
@@ -2563,6 +2597,9 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if await _consume_awaiting_stream_prompt(update, context):
+        return
+
+    if await _consume_awaiting_rp_prompt(update, context):
         return
 
     if await _consume_awaiting_character_edit(update, context):
@@ -3123,13 +3160,20 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if kind == SHOW_PROMPT_CALLBACK_KIND:
         negative = full_params.negative_prompt or "(none)"
+        regions = "".join(
+            f"\n\n[{region.label}]:\n{region.prompt}" for region in full_params.regions
+        )
         await query.message.reply_text(
-            f"Positive:\n{full_params.positive_prompt}\n\nNegative:\n{negative}"
+            f"Positive:\n{full_params.positive_prompt}{regions}\n\nNegative:\n{negative}"
         )
         if full_params.raw_positive_prompt or full_params.raw_negative_prompt:
             copy_text = _raw_prompt_copy_text(
                 full_params.raw_positive_prompt, full_params.raw_negative_prompt
             )
+            if full_params.regions:
+                # Only means something to `/rp` — prefixed so pasting it
+                # back in regenerates regionally instead of as one prompt.
+                copy_text = f"/rp\n{copy_text}"
             keyboard = None
             if len(copy_text) <= InlineKeyboardButtonLimit.MAX_COPY_TEXT:
                 keyboard = InlineKeyboardMarkup(
@@ -4195,6 +4239,114 @@ async def _consume_awaiting_stream_prompt(
     return True
 
 
+async def rp_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/rp [regional prompt]` — generate with a separate prompt per region
+    of the image (see `regional.py` for the syntax and
+    `GenerationParams.regions` for how it reaches the graph). The syntax is
+    unusual enough that a bare `/rp` — which is also what the
+    `_MAIN_KEYBOARD` button sends — explains it, offers the template as a
+    copy button, and waits for the prompt as a follow-up message
+    (`awaiting_rp_prompt`, the same topic-scoped pattern as `/stream`'s).
+    Text after the command on the same message skips straight to
+    generating."""
+    settings: Settings = context.bot_data["settings"]
+    if await reject_if_unauthorized(update, settings):
+        return
+
+    message = update.effective_message
+    parts = (message.text or "").split(maxsplit=1)
+    prompt_text = parts[1].strip() if len(parts) > 1 else ""
+    if not prompt_text:
+        set_pending(context.chat_data, "awaiting_rp_prompt", message, True)
+        await message.reply_text(REGIONAL_HELP, reply_markup=_rp_prompt_keyboard())
+        return
+
+    await _generate_regional(context, update.effective_chat.id, message, prompt_text)
+
+
+async def _consume_awaiting_rp_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """If this chat is waiting for an `/rp` prompt (see `rp_command`),
+    consume the incoming text as one and return True. Mirrors
+    `_consume_awaiting_stream_prompt`."""
+    message = update.effective_message
+    if not pop_pending(context.chat_data, "awaiting_rp_prompt", message):
+        return False
+
+    prompt_text = (message_text(message) or "").strip()
+    if not prompt_text:
+        await message.reply_text("Cancelled — no prompt received.")
+        return True
+
+    await _generate_regional(context, update.effective_chat.id, message, prompt_text)
+    return True
+
+
+async def _generate_regional(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, message: Message, prompt_text: str
+) -> None:
+    """Parse an `/rp` message and run it — `generate_message`'s flow with
+    regions added. A message that doesn't parse re-arms
+    `awaiting_rp_prompt`, so the corrected version can just be sent again
+    rather than starting over with `/rp`. `$name` character references are
+    expanded (`expand_characters`) — an unknown one re-arms the same way.
+    The global part then goes through the same `_resolve_profile_and_prompt`
+    as a plain prompt (`-token` negatives) minus the active character; the
+    `---` block is handed back to it in the same shape
+    `_split_negative_prompt` splits a plain message on. "As typed" keeps the
+    unexpanded `$name`s, so Show Prompt's copy re-expands against the
+    character's current definition."""
+    storage: Storage = context.bot_data["storage"]
+    try:
+        parsed = parse_regional_prompt(prompt_text)
+        expanded, character_negative = expand_characters(parsed, storage.list_characters(chat_id))
+    except RegionalPromptError as exc:
+        set_pending(context.chat_data, "awaiting_rp_prompt", message, True)
+        await message.reply_text(
+            f"⚠️ {exc}\n\nSend the corrected prompt.", reply_markup=_rp_prompt_keyboard()
+        )
+        return
+
+    client: ComfyClient = context.bot_data["comfy_client"]
+    profiles: list[ModelProfile] = context.bot_data["profiles"]
+
+    checkpoint = await _resolve_checkpoint_or_default(message, chat_id, storage, client, context)
+    if checkpoint is None:
+        return
+
+    negative_block = f"\n---\n{parsed.negative}" if parsed.negative else ""
+    global_text = expanded.global_prompt + negative_block
+    profile, effective_prompt, extra_negative, _raw_global, raw_negative = (
+        _resolve_profile_and_prompt(
+            chat_id, checkpoint, global_text, storage, profiles, use_active_character=False
+        )
+    )
+    # The unexpanded global prompt, put through the same split, for "as typed".
+    raw_global, _ = _split_negative_prompt(parsed.global_prompt + negative_block)
+
+    status_message = await message.reply_text("Generating… 0%", disable_notification=True)
+
+    images = await _run_reporting_errors(
+        status_message,
+        "Generation",
+        "regional generation",
+        generate(
+            client,
+            checkpoint,
+            effective_prompt,
+            profile,
+            extra_negative_prompt=join_nonempty([extra_negative, character_negative]),
+            raw_positive_prompt=format_regional_prompt(raw_global, parsed.regions),
+            raw_negative_prompt=raw_negative,
+            regions=expanded.regions,
+            on_progress=_make_progress_callback(status_message),
+        ),
+    )
+    if images is None:
+        return
+
+    await _deliver_generation_result(status_message, message, chat_id, storage, images)
+
+
 async def _consume_awaiting_character_edit(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> bool:
@@ -4633,6 +4785,11 @@ kontext_cancel_callback = _make_cancel_callback(
 #: `stream_command`'s promptless branch and `_stream_prompt_cancel_keyboard`.
 stream_cancel_callback = _make_cancel_callback(
     "awaiting_stream_prompt", "Cancelled — no stream started."
+)
+
+#: "❌ Cancel" on `/rp`'s format explanation — see `rp_command`.
+rp_cancel_callback = _make_cancel_callback(
+    "awaiting_rp_prompt", "Cancelled — no regional prompt started."
 )
 
 

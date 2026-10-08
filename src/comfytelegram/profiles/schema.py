@@ -73,6 +73,11 @@ class ProfileDefaults(BaseModel):
     detailer_cfg: float | None = None
     detailer_steps: int | None = None
     detailer_disable_lora: bool | None = None
+    #: `/rp` regional prompting's global/region mask weights — see
+    #: `GenerationParams.regional_base_weight` for what they do and why they
+    #: differ per model.
+    regional_base_weight: float | None = Field(None, gt=0, le=1)
+    regional_region_weight: float | None = Field(None, gt=0, le=1)
 
 
 class ModelProfile(BaseModel):

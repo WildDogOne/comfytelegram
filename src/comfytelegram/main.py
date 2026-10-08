@@ -28,6 +28,7 @@ from comfytelegram.handlers import (
     KONTEXT_CANCEL_CALLBACK_DATA,
     LORA_SWITCH_TOGGLE_CALLBACK_PREFIX,
     REDO_TWEAK_CALLBACK_PREFIX,
+    RP_CANCEL_CALLBACK_DATA,
     STREAM_CANCEL_CALLBACK_DATA,
     SWITCH_MODEL_PICK_CALLBACK_PREFIX,
     again_callback,
@@ -48,6 +49,8 @@ from comfytelegram.handlers import (
     postprocess_callback,
     redo_tweak_callback,
     reload_command,
+    rp_cancel_callback,
+    rp_command,
     start,
     stop_command,
     stream_cancel_callback,
@@ -88,6 +91,7 @@ _COMMANDS = (
     ("favs", favs_command, "Browse your saved favorites"),
     ("stream", stream_command, "Generate images back-to-back until /stop"),
     ("stop", stop_command, "Stop a running /stream"),
+    ("rp", rp_command, "Regional prompt: a different prompt per side of the image"),
     ("tags", tags_command, "Search danbooru/e621 tags to build a prompt"),
     ("tagcheck", tagcheck_command, "Check a prompt's tags against the tag database"),
 )
@@ -381,6 +385,9 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CallbackQueryHandler(fav_callback, pattern=r"^fv:"))
     application.add_handler(
         CallbackQueryHandler(stream_cancel_callback, pattern=rf"^{STREAM_CANCEL_CALLBACK_DATA}$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(rp_cancel_callback, pattern=rf"^{RP_CANCEL_CALLBACK_DATA}$")
     )
     application.add_handler(
         CallbackQueryHandler(kontext_cancel_callback, pattern=rf"^{KONTEXT_CANCEL_CALLBACK_DATA}$")

@@ -16,9 +16,10 @@ metadata is written by us rather than read back out of ComfyUI's graph.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Any
 
-from comfytelegram.workflows import GenerationParams, LoraSpec
+from comfytelegram.workflows import GenerationParams, LoraSpec, RegionSpec
 
 
 def serialize_generation_params(params: GenerationParams) -> dict[str, Any]:
@@ -63,6 +64,9 @@ def serialize_generation_params(params: GenerationParams) -> dict[str, Any]:
         "detailer_disable_lora": params.detailer_disable_lora,
         "raw_positive_prompt": params.raw_positive_prompt,
         "raw_negative_prompt": params.raw_negative_prompt,
+        "regions": [asdict(region) for region in params.regions],
+        "regional_base_weight": params.regional_base_weight,
+        "regional_region_weight": params.regional_region_weight,
     }
 
 
@@ -102,4 +106,7 @@ def deserialize_generation_params(data: dict[str, Any]) -> GenerationParams:
         detailer_disable_lora=data.get("detailer_disable_lora"),
         raw_positive_prompt=data.get("raw_positive_prompt", ""),
         raw_negative_prompt=data.get("raw_negative_prompt", ""),
+        regions=[RegionSpec(**region) for region in data.get("regions", [])],
+        regional_base_weight=data.get("regional_base_weight", 0.6),
+        regional_region_weight=data.get("regional_region_weight", 0.4),
     )

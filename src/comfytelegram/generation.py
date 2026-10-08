@@ -38,6 +38,7 @@ from comfytelegram.workflows import (
     KontextParams,
     ManualHandDetailerParams,
     PostProcessBaseParams,
+    RegionSpec,
     TiledRefineParams,
     UpscaleParams,
     build_face_detailer,
@@ -745,6 +746,7 @@ async def generate(
     extra_negative_prompt: str = "",
     raw_positive_prompt: str = "",
     raw_negative_prompt: str = "",
+    regions: list[RegionSpec] | None = None,
     overrides: dict[str, Any] | None = None,
     on_progress: ProgressCallback | None = None,
 ) -> list[GeneratedImage]:
@@ -762,7 +764,9 @@ async def generate(
     to display. `overrides` wins over both the profile and its own
     defaults (see `resolve_generation_params`) — used by "/stream" to force
     `batch_size=1` per request without touching the chat's persisted
-    `/settings` override.
+    `/settings` override. `regions` turns this into an `/rp` regional
+    generation, with `user_prompt` as the global prompt (see
+    `GenerationParams.regions`).
     """
     params = resolve_generation_params(
         checkpoint,
@@ -772,10 +776,15 @@ async def generate(
         extra_negative_prompt=extra_negative_prompt,
         raw_positive_prompt=raw_positive_prompt,
         raw_negative_prompt=raw_negative_prompt,
+        regions=regions,
     )
     prompt_graph, save_node_id = build_txt2img(params)
     logger.info(
-        "Submitting txt2img: checkpoint=%s cfg=%s steps=%s", checkpoint, params.cfg, params.steps
+        "Submitting txt2img: checkpoint=%s cfg=%s steps=%s regions=%s",
+        checkpoint,
+        params.cfg,
+        params.steps,
+        len(params.regions),
     )
 
     raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)

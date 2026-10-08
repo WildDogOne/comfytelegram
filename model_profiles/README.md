@@ -29,7 +29,9 @@ Files starting with `_` are ignored (reserved for docs/schema files).
     "detailer_denoise": null,           // overrides the face/hand-detailer passes' own denoise for this checkpoint (omit/null to use each graph's own default) — see below
     "detailer_cfg": null,               // same idea, for cfg (omit/null to use each graph's own default, 5.0) — see below
     "detailer_steps": null,             // same idea, for steps (omit/null to use each graph's own default, 25) — see below
-    "detailer_disable_lora": null       // true = skip applying LoRAs for detailer passes on this checkpoint (omit/null = apply them normally) — see below
+    "detailer_disable_lora": null,      // true = skip applying LoRAs for detailer passes on this checkpoint (omit/null = apply them normally) — see below
+    "regional_base_weight": 0.6,        // /rp: global prompt's mask weight (omit for 0.6) — see below
+    "regional_region_weight": 0.4       // /rp: each region's mask weight (omit for 0.4) — see below
   },
   "positive_prompt_prefix": "quality tags prepended before the user's prompt",
   "negative_prompt_prefix": "used as the negative prompt whenever the user doesn't supply one",
@@ -294,6 +296,24 @@ isn't re-resolved live off the current profile; it still inherits whatever
 was frozen into the image at generation time (or, if
 `fix_artifact_checkpoint` is set, that override profile's own value).
 `false`/omitted (the default) changes nothing.
+
+### `defaults.regional_base_weight` / `defaults.regional_region_weight` — `/rp` balance
+
+`/rp` (regional prompting, via ComfyUI-ppm's `AttentionCouplePPM`) masks the
+global prompt over the whole image at `regional_base_weight` and each
+region's prompt over its own box at `regional_region_weight`. The node
+normalizes them per pixel, so inside a region the global prompt gets
+`base / (base + region)` of the attention. Raise the region weight if
+per-character details (outfits, ears, held items) go missing; lower it if
+the scene/background stops following the global prompt.
+
+Measured on this install with two characters side by side: `0.6`/`0.4` (the
+default) kept them apart on furrytoonmix Illustrious, while Anima needed
+`0.2`/`0.8` before outfits and ears stopped going missing — which is why the
+two Anima profiles set it. At `0.2` the background drifted from the global
+prompt somewhat; something in between is untested. A side effect of the
+weak global prompt: tags that only appear there (an Anima rating tag like
+`safe`) barely apply where the regions are, so put those in every region.
 
 ### `detail_prompt_tile_controlnet` — the same idea, tried on "✏️ Detail Prompt"
 

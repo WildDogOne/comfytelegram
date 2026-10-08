@@ -29,6 +29,8 @@ The bot talks to ComfyUI's HTTP + WebSocket API directly. It doesn't use the
 - **Prompt → image.** Any plain-text message is a prompt. You can write
   negatives inline as `-blurry -watermark`, or put a whole negative block
   below a `---` line.
+- **Regional prompts.** `/rp` gives each side of the image its own prompt,
+  so two characters keep their own hair, ears and outfits.
 - **Per-model defaults.** `/model` lists the checkpoints ComfyUI has
   installed. A matching [model profile](model_profiles/README.md) supplies
   cfg, steps, sampler, clip skip, prompt prefixes and default LoRAs.
@@ -79,6 +81,8 @@ The bot talks to ComfyUI's HTTP + WebSocket API directly. It doesn't use the
 
 Optional:
 
+- [ComfyUI-ppm](https://github.com/pamparamm/ComfyUI-ppm), for `/rp`
+  regional prompts (its `AttentionCouplePPM` node)
 - [Ollama](https://ollama.com) with a vision model, for Qwen-VL captions
 - WD14 tagger files, for tag-style analysis (see [Image analysis](#image-analysis))
 - A public HTTPS host for `inpaint_relay/`, needed for 🖌️ Draw Mask,
@@ -176,6 +180,7 @@ docker compose up -d --build
 | `/favs` | Browse your favorites by category, copy, edit or delete them |
 | `/stream [prompt]` | Generate single images back-to-back (max 100) until `/stop`. Asks for the prompt if you leave it out |
 | `/stop` | Stop a running stream |
+| `/rp [regional prompt]` | Generate with a separate prompt per region of the image (see [Regional prompts](#regional-prompts)). Without a prompt it explains the format and offers a template to copy |
 | `/tags <query>` | Search the tag database. Prefix `danbooru:` / `e621:` to pick a source |
 | `/tagcheck <prompt>` | Flag unknown or rarely-used tags in a prompt |
 | `/start`, `/help` | Show help and install the command keyboard |
@@ -193,6 +198,29 @@ such as `well-lit` is left alone. A line of three or more dashes splits the
 whole message into a positive block above and a negative block below. Both
 are added on top of the profile's default negative and any active
 character's prompt.
+
+### Regional prompts
+
+```
+/rp
+masterpiece, best quality, 2girls, standing side by side, park
+[left] 2girls, blonde hair, green eyes, cat ears, black hoodie
+[right] 2girls, black hair, purple eyes, fox ears, white kimono
+---
+lowres, bad anatomy
+```
+
+Lines before the first tag are the global prompt for the whole image. Each
+`[position]` line applies only to its part of the image: `[left]`/`[right]`
+for side by side, `[top]`/`[bottom]` for stacked, plus `[center]`/`[middle]`
+for three equal parts. Repeating the character count in every region helps
+each region draw one character. `$name` inserts a saved character's prompt
+(`[left] 2girls, $alice`) and adds its negative prompt to the negatives; the
+active character is not applied in `/rp`. Regions don't move people: two characters
+standing together still end up side by side, so use left/right with a
+landscape size for them. The global/region balance is set per model
+profile (see [model profiles](model_profiles/README.md)). Upscale and the
+detailers condition on the global prompt only.
 
 ### Image buttons
 

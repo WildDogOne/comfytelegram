@@ -68,6 +68,25 @@ class LoraSpec:
 
 
 @dataclass
+class RegionSpec:
+    """One `/rp` region: a prompt that only applies inside a box of the
+    image, wired through ComfyUI-ppm's `AttentionCouplePPM` (see
+    `build_txt2img`). The box is fractional (0-1) relative to the image —
+    `LatentToMaskBB`'s own coordinate system — so it survives a later
+    `/settings` width/height change unchanged. `label` is the user-facing
+    position name ("left", "top", ...) it was parsed from, kept for "🐛 Show
+    Prompt" and for rebuilding the `/rp` syntax; the graph only reads the
+    rest."""
+
+    label: str
+    prompt: str
+    x: float
+    y: float
+    w: float
+    h: float
+
+
+@dataclass
 class GenerationParams:
     """Everything needed to build the base txt2img graph for one request.
 
@@ -217,6 +236,20 @@ class GenerationParams:
     #: before this field existed.
     raw_positive_prompt: str = ""
     raw_negative_prompt: str = ""
+    #: `/rp` regional prompting: each region's prompt applies only inside
+    #: its own box, on top of `positive_prompt` (the global prompt, which
+    #: still covers the whole image). Empty (the default) builds the plain
+    #: single-prompt graph. Only `build_txt2img` reads this — post-processing
+    #: passes condition on `positive_prompt` alone.
+    regions: list[RegionSpec] = field(default_factory=list)
+    #: `/rp` only: the mask values `AttentionCouplePPM` blends the global
+    #: prompt and each region with. The node normalizes them per pixel, so
+    #: inside a region the global prompt gets `base / (base + region)` of the
+    #: attention. 0.6/0.4 held characters apart on an Illustrious checkpoint;
+    #: Anima needed 0.2/0.8 before outfits and ears stopped going missing —
+    #: hence a per-profile `ProfileDefaults` setting rather than a constant.
+    regional_base_weight: float = 0.6
+    regional_region_weight: float = 0.4
 
     def resolved_seed(self) -> int:
         """This request's seed, or a freshly-rolled random one if unset."""
@@ -265,13 +298,16 @@ def build_txt2img(params: GenerationParams) -> tuple[dict[str, Any], str]:
     """Build the base generation graph. Returns (prompt_dict, save_image_node_id)."""
     g = PromptGraph()
 
-    model_ref, _clip_ref, vae_ref, positive, negative = _build_model_clip_vae(g, params)
+    model_ref, clip_ref, vae_ref, positive, negative = _build_model_clip_vae(g, params)
 
     latent = g.add(
         "EmptyLatentImage",
         {"width": params.width, "height": params.height, "batch_size": params.batch_size},
         title="Empty Latent",
     )
+
+    if params.regions:
+        model_ref = _apply_attention_couple(g, params, model_ref, clip_ref, positive, latent)
 
     sampler = g.add(
         "KSampler",
@@ -299,6 +335,58 @@ def build_txt2img(params: GenerationParams) -> tuple[dict[str, Any], str]:
     )
 
     return g.as_prompt(), save
+
+
+def _apply_attention_couple(
+    g: PromptGraph,
+    params: GenerationParams,
+    model_ref: NodeRef,
+    clip_ref: NodeRef,
+    positive: str,
+    latent: str,
+) -> NodeRef:
+    """Patch `model_ref` with ComfyUI-ppm's `AttentionCouplePPM` so each of
+    `params.regions` only steers its own box. The global prompt (`positive`)
+    is the node's `base_cond`, masked over the whole image — the node raises
+    if any pixel has no mask weight at all, so that full-canvas base mask is
+    load-bearing, not just a style choice. The sampler's own positive input
+    stays the global prompt. `cond_N`/`mask_N` are inputs the node's
+    frontend JS adds on demand: `/object_info` doesn't list them, but the
+    API accepts them and the node reads them out of its kwargs. Masks come
+    from ppm's own `LatentToMaskBB`, which reads the target size off the
+    latent itself."""
+
+    def box_mask(x: float, y: float, w: float, h: float, value: float, title: str) -> str:
+        return g.add(
+            "LatentToMaskBB",
+            {"latent": [latent, 0], "x": x, "y": y, "w": w, "h": h, "value": value},
+            title=title,
+        )
+
+    couple_inputs: dict[str, Any] = {
+        "model": list(model_ref),
+        "base_cond": [positive, 0],
+        "base_mask": [box_mask(0.0, 0.0, 1.0, 1.0, params.regional_base_weight, "Mask: global"), 0],
+    }
+    for index, region in enumerate(params.regions, start=1):
+        cond = g.add(
+            "CLIPTextEncode",
+            {"clip": list(clip_ref), "text": region.prompt},
+            title=f"Prompt Region: {region.label}",
+        )
+        mask = box_mask(
+            region.x,
+            region.y,
+            region.w,
+            region.h,
+            params.regional_region_weight,
+            f"Mask: {region.label}",
+        )
+        couple_inputs[f"cond_{index}"] = [cond, 0]
+        couple_inputs[f"mask_{index}"] = [mask, 0]
+
+    couple = g.add("AttentionCouplePPM", couple_inputs, title="Attention Couple")
+    return (couple, 0)
 
 
 @dataclass
