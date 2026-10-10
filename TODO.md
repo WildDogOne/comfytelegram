@@ -60,6 +60,19 @@ Still open:
   `PairConditioningSetProperties`). Probably doesn't combine with Attention
   Couple; needs testing.
 
+## Mask editor
+
+- [ ] **Superpixel brush, alongside ✨ Smart select**: SAM picks whole
+  objects, but sometimes the region to mask isn't an object (part of a
+  background, a smudge, a gradient). Split the image into a few thousand
+  small same-colour regions that follow its edges (SLIC, ~100 lines of JS,
+  computed once in the page on a ~1024px copy), then let a brush stroke
+  select every region it touches and the eraser remove them. Edge-snapping
+  like quick selection, no tolerance to tune, no model needed — so it also
+  works when no SAM encoder is staged. Undo can store touched region ids
+  instead of bitmaps, since the regions never change. A coarse/fine choice
+  for region size could go in the options panel.
+
 ## Housekeeping
 
 - [ ] `scripts/smoke_test.py` and `scripts/smoke_test_postprocess.py` aren't

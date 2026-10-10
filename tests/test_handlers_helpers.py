@@ -2011,6 +2011,50 @@ async def test_hand_draw_shows_an_uploading_status_before_the_editor_button():
 
 
 @pytest.mark.asyncio
+async def test_fix_draw_offers_smart_select_when_an_encoder_is_staged(tmp_path):
+    """With a SAM encoder on disk, the job meta tells the editor to offer
+    "✨ Smart" select (even "🩹 Fix Artifact", which otherwise sends no meta
+    at all), and the embedding upload is kicked off in the background
+    rather than holding up the editor button."""
+    query = AsyncMock()
+    query.data = f"pp:{FIX_DRAW_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    encoder = tmp_path / "enc.onnx"
+    encoder.write_bytes(b"model")
+    context.bot_data["settings"] = _settings(
+        inpaint_relay_url="https://inpaint.example.com", sam_encoder_path=encoder
+    )
+    query.message.reply_text.return_value = AsyncMock()
+    source_png = io.BytesIO()
+    Image.new("RGB", (64, 32)).save(source_png, format="PNG")
+    context.bot.get_file = AsyncMock(
+        return_value=MagicMock(
+            download_as_bytearray=AsyncMock(return_value=bytearray(source_png.getvalue()))
+        )
+    )
+
+    create_job = AsyncMock(return_value="tok1")
+    upload = AsyncMock()
+    with (
+        patch("comfytelegram.handlers._relay_create_job", new=create_job),
+        patch("comfytelegram.handlers._relay_upload_embedding", new=upload),
+    ):
+        await postprocess_callback(update, context)
+        await asyncio.gather(*context.bot_data["background_tasks"])
+
+    segmentation = create_job.await_args.kwargs["meta"]["segmentation"]
+    assert (segmentation["width"], segmentation["height"]) == (1024, 512)
+    upload.assert_awaited_once()
+    assert upload.await_args.args[1] == "tok1"
+
+
+@pytest.mark.asyncio
 async def test_fix_draw_stores_the_job_with_fix_kind():
     """ "🩹 Fix Artifact" shares `HAND_DRAW_CALLBACK_KIND`'s upload/relay
     machinery — the only difference is `inpaint_job.kind`, which

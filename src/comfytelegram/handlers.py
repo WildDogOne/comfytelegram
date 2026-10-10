@@ -100,6 +100,7 @@ from comfytelegram.regional import (
     is_regional_prompt,
     parse_regional_prompt,
 )
+from comfytelegram.segmentation import encode_image, sam_input_size
 from comfytelegram.settings import Settings
 from comfytelegram.settings_menu import _safe_edit_message, handle_custom_value_message
 from comfytelegram.storage import IMAGE_FORMAT_PNG, Storage
@@ -1418,7 +1419,9 @@ async def _relay_create_job(
     canvas — just for `detailer_disable_lora_available`/`_default` (the
     "Disable LoRAs for this detailer pass" checkbox, relevant to any
     detailer pass, not only "✏️ Detail Prompt"'s tile-ControlNet
-    experiment).
+    experiment). Any of the three also gets a `segmentation` entry when
+    "✨ Smart" select is available (`_segmentation_meta`), which is the one
+    way "🩹 Fix Artifact" ends up sending a header at all.
 
     The image is compressed here (`_to_display_jpeg`) rather than on the
     relay, which is where this used to happen: the relay re-encoded on
@@ -1449,6 +1452,47 @@ async def _relay_create_job(
         resp.raise_for_status()
         payload = await resp.json()
     return payload["token"]
+
+
+def _segmentation_meta(settings: Settings, image_bytes: bytes) -> dict[str, Any] | None:
+    """The `X-Job-Meta` `segmentation` entry offering the editor's "✨ Smart"
+    select, or `None` when there's no encoder staged (the feature's off) or
+    the image won't even open. Only reads the image header, so it's cheap
+    enough to call inline; the actual encoding is `_relay_upload_embedding`'s
+    job, after the relay job exists."""
+    if not settings.sam_encoder_path.is_file():
+        return None
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            width, height = sam_input_size(*im.size)
+    except Exception:
+        logger.warning("Couldn't read image size; smart select disabled", exc_info=True)
+        return None
+    return {"decoder_url": settings.sam_decoder_url, "width": width, "height": height}
+
+
+async def _relay_upload_embedding(settings: Settings, token: str, image_bytes: bytes) -> None:
+    """Encode `image_bytes` for "✨ Smart" select and PUT the embedding to
+    the relay job `token`. Runs as a background task after the editor
+    button is already up — the page polls for the embedding and enables
+    the button once it lands — so a failure only costs the smart button,
+    and is logged rather than raised (nothing awaits this)."""
+    try:
+        embedding = await asyncio.to_thread(encode_image, image_bytes, settings.sam_encoder_path)
+        async with (
+            aiohttp.ClientSession(timeout=_INPAINT_RELAY_UPLOAD_TIMEOUT) as session,
+            session.put(
+                f"{settings.inpaint_relay_url}/jobs/{token}/embedding",
+                data=embedding.data,
+                headers={
+                    "Authorization": f"Bearer {settings.inpaint_relay_shared_secret}",
+                    "Content-Type": "application/octet-stream",
+                },
+            ) as resp,
+        ):
+            resp.raise_for_status()
+    except Exception:
+        logger.warning("Smart-select embedding upload failed for job %s", token, exc_info=True)
 
 
 async def _relay_poll_result(settings: Settings, token: str) -> dict[str, Any] | None:
@@ -3536,7 +3580,8 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         # `_relay_create_job`); HAND_DRAW_CALLBACK_KIND draws a plain mask
         # (`Job.mode` defaults to "mask" whenever `meta` omits it) but still
         # gets a `meta` dict, for the "Disable LoRAs" checkbox below — only
-        # FIX_DRAW_CALLBACK_KIND stays at `meta=None` outright, since
+        # FIX_DRAW_CALLBACK_KIND starts at `meta=None` (until a
+        # `segmentation` entry gets added below, if any), since
         # detailer_disable_lora isn't live-refreshed for "fix_drawn" either
         # (see generation.py's `_DETAILER_TUNABLE_KINDS`) and there's no
         # tile-ControlNet checkbox for it. The prompt fields pre-fill with
@@ -3610,6 +3655,9 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 pending["file_id"],
                 on_fallback=_source_fallback_notifier(query.message),
             )
+            segmentation = _segmentation_meta(settings, source_bytes)
+            if segmentation is not None:
+                meta = {**(meta or {}), "segmentation": segmentation}
             try:
                 token = await _relay_create_job(settings, source_bytes, meta=meta)
             except Exception:
@@ -3626,6 +3674,15 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 kind=job_kind,
                 editor_message_id=status_message.message_id,
             )
+            if segmentation is not None:
+                # Held in bot_data so the task isn't garbage-collected
+                # mid-flight; it removes itself when done.
+                background: set[asyncio.Task] = context.bot_data.setdefault(
+                    "background_tasks", set()
+                )
+                task = asyncio.create_task(_relay_upload_embedding(settings, token, source_bytes))
+                background.add(task)
+                task.add_done_callback(background.discard)
             editor_prompt = (
                 "Draw over the region to detail, describe what should be there, then "
                 "tap Done in the editor:"

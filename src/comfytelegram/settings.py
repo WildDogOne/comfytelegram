@@ -181,6 +181,25 @@ class Settings(BaseSettings):
         ),
     )
 
+    sam_encoder_path: Path = Field(
+        default=PROJECT_ROOT / "models" / "mobilesam" / "mobile_sam_image_encoder.onnx",
+        description=(
+            'MobileSAM image encoder (ONNX) behind the mask editor\'s "✨ Smart" select '
+            "(see segmentation.py). Staged manually like the WD14 files — "
+            "https://huggingface.co/Acly/MobileSAM's mobile_sam_image_encoder.onnx. "
+            "The feature is simply off while this file doesn't exist."
+        ),
+    )
+    sam_decoder_url: str = Field(
+        "https://huggingface.co/Acly/MobileSAM/resolve/"
+        "0d3b403339b4674a82493d5e97964dd78089ddc8/sam_mask_decoder_multi.onnx",
+        description=(
+            "Where the mask editor page downloads the matching SAM mask decoder from "
+            "(it runs in the browser, via onnxruntime-web). Must serve CORS headers; "
+            "pinned to a commit so it can't drift from the encoder above."
+        ),
+    )
+
     @field_validator("inpaint_relay_url")
     @classmethod
     def _require_scheme_and_strip_trailing_slash(cls, value: str | None) -> str | None:

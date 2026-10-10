@@ -20,11 +20,11 @@ its side instead of waiting forever. See the main repo's plan/README for
 the full architecture.
 
 Two trust boundaries:
-  - `POST /jobs`, `GET /jobs/{token}/result`, `DELETE /jobs/{token}` are
-    gated by a shared secret (`INPAINT_RELAY_SHARED_SECRET`) known only to
+  - `POST /jobs`, `PUT /jobs/{token}/embedding`, `GET /jobs/{token}/result`,
+    `DELETE /jobs/{token}` are gated by a shared secret (`INPAINT_RELAY_SHARED_SECRET`) known only to
     comfytelegram and this relay.
   - `GET /jobs/{token}`, `GET /jobs/{token}/image`, `GET /jobs/{token}/meta`,
-    `POST /jobs/{token}/mask` have no such auth — they're the URLs
+    `GET /jobs/{token}/embedding`, `POST /jobs/{token}/mask` have no such auth — they're the URLs
     Telegram's client itself opens/calls from the user's phone, so they're
     only as secret as the unguessable per-job token (same trust model as a
     Telegram file_id download link). This relay can't validate that a
@@ -143,6 +143,16 @@ class Job:
     #: when the submission comes back. Display-only here, like
     #: `readonly_info`.
     references: list[dict[str, str]] = field(default_factory=list)
+    #: "✨ Smart" select (a SAM point-prompted segmenter) — `{"decoder_url",
+    #: "width", "height"}` from `meta` when comfytelegram has an image
+    #: encoder staged, else `None` and the page never offers the button.
+    #: `width`/`height` are the frame the encoder saw (the image resized to
+    #: a longest side of 1024), which the page's decoder points live in.
+    #: `embedding` is that encoder's output, uploaded separately after the
+    #: job exists (`PUT /jobs/{token}/embedding`) so encoding never delays
+    #: the editor button; opaque bytes here, decoded by the page.
+    segmentation: dict[str, Any] | None = None
+    embedding: bytes | None = None
     init_data: str | None = None
 
 
@@ -251,6 +261,17 @@ def _parse_references(value: Any) -> list[dict[str, str]]:
     ]
 
 
+def _parse_segmentation(value: Any) -> dict[str, Any] | None:
+    """`meta["segmentation"]` if well-formed, else `None` — the page builds
+    a decoder off these, so a partial entry is dropped rather than passed on."""
+    if not isinstance(value, dict):
+        return None
+    url, width, height = value.get("decoder_url"), value.get("width"), value.get("height")
+    if not isinstance(url, str) or not isinstance(width, int) or not isinstance(height, int):
+        return None
+    return {"decoder_url": url, "width": width, "height": height}
+
+
 @app.post("/jobs", dependencies=[Depends(require_shared_secret)])
 async def create_job(request: Request) -> dict[str, str]:
     """comfytelegram pushes the source image here (raw bytes body) and gets
@@ -293,8 +314,34 @@ async def create_job(request: Request) -> dict[str, str]:
         detailer_disable_lora_available=bool(meta.get("detailer_disable_lora_available", False)),
         detailer_disable_lora_default=bool(meta.get("detailer_disable_lora_default", False)),
         references=_parse_references(meta.get("references")),
+        segmentation=_parse_segmentation(meta.get("segmentation")),
     )
     return {"token": token}
+
+
+@app.put("/jobs/{token}/embedding", dependencies=[Depends(require_shared_secret)])
+async def put_embedding(token: str, request: Request) -> dict[str, bool]:
+    """comfytelegram uploads the "✨ Smart" select image embedding here once
+    it has one (see `Job.segmentation`) — after `POST /jobs`, not with it,
+    so the editor button never waits on the encoder."""
+    _prune_expired_jobs()
+    job = _get_job_or_404(token)
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+    job.embedding = body
+    return {"ok": True}
+
+
+@app.get("/jobs/{token}/embedding")
+async def get_embedding(token: str) -> Response:
+    """The embedding for the page's decoder, or 204 while comfytelegram is
+    still encoding/uploading it — the page polls until it shows up."""
+    _prune_expired_jobs()
+    job = _get_job_or_404(token)
+    if job.embedding is None:
+        return Response(status_code=204)
+    return Response(content=job.embedding, media_type="application/octet-stream")
 
 
 @app.get("/jobs/{token}")
@@ -337,6 +384,7 @@ async def job_meta(token: str) -> JSONResponse:
             "detailer_disable_lora_available": job.detailer_disable_lora_available,
             "detailer_disable_lora_default": job.detailer_disable_lora_default,
             "references": job.references,
+            "segmentation": job.segmentation,
         }
     )
 

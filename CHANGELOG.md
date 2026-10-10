@@ -8,6 +8,14 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **✨ Smart select in the mask editor**: tap an object (a hand, a shirt
+  print, the sky) and it's masked in one go, edges and all. Tap it again to
+  cycle through sizes (finger → hand → arm); with 🧹 Erase on, tap inside
+  the selection to cut a part out, or tap elsewhere to remove a whole object
+  from the mask. Mixes freely with the brush and undo/redo. Runs MobileSAM:
+  the bot encodes the image (needs `mobile_sam_image_encoder.onnx` staged,
+  see `env.example`), the decoder runs on your phone. A folded-away "Smart
+  select debug" log under the editor shows load and decode timings.
 - **Regional prompting**: give each side of the image its own prompt so two
   characters stop swapping hair, ears and outfits. Any prompt with lines
   starting `[left]`/`[right]` (etc.) is regional, no command needed; `/rp`

@@ -106,6 +106,47 @@
     border-color: rgba(255, 255, 255, 0.9);
     background: rgba(255, 255, 255, 0.15);
   }
+  /* Smart select is tap-to-pick, not painting, so the cursor shrinks to a
+     fixed-size target with no fill (see `updateCursorSize`). */
+  #brush-cursor.smart {
+    background: none;
+    border-style: dashed;
+  }
+  #smart-btn {
+    display: none;
+  }
+  #smart-btn.active {
+    background: var(--accent);
+    color: #fff;
+  }
+  /* Smart-select diagnostics, folded away by default — there's no other
+     way to see how the decoder behaves on a given phone. */
+  #smart-debug {
+    display: none;
+    padding: 0 14px calc(8px + env(safe-area-inset-bottom));
+    font-size: 12px;
+    color: #9a9a9a;
+  }
+  #smart-debug summary {
+    cursor: pointer;
+  }
+  #smart-debug-log {
+    max-height: 30vh;
+    overflow: auto;
+    margin: 6px 0;
+    padding: 6px 8px;
+    background: #1c1c1c;
+    border-radius: 6px;
+    font-size: 11px;
+    line-height: 1.35;
+    white-space: pre-wrap;
+    word-break: break-word;
+    user-select: text;
+  }
+  #smart-debug-copy {
+    font-size: 12px;
+    padding: 6px 10px;
+  }
   /* Undo/redo share `#controls` with the brush slider and Fill/Erase
      toggles rather than getting a row of their own — screen space in the
      WebApp is tight, and unlike those two toggles these have no persistent
@@ -375,8 +416,14 @@
   </div>
   <div id="button-row">
     <button id="clear-btn">Clear</button>
+    <button id="smart-btn" type="button" disabled>✨ Smart</button>
     <button id="done-btn">Done</button>
   </div>
+  <details id="smart-debug">
+    <summary>Smart select debug</summary>
+    <pre id="smart-debug-log"></pre>
+    <button id="smart-debug-copy" type="button">Copy log</button>
+  </details>
 
 <script>
 (function () {
@@ -544,6 +591,10 @@
   function applyAction(action) {
     if (action.type === "clear") {
       resetMask();
+      return;
+    }
+    if (action.type === "smart") {
+      applySmartAction(action);
       return;
     }
     for (var i = 0; i < action.dabs.length; i++) {
@@ -790,7 +841,7 @@
   // Its diameter is the slider value (CSS pixels at 1x, see
   // `brushDiameter`) times the current zoom.
   function updateCursorSize() {
-    var diameterCss = Number(brushSizeInput.value) * view.zoom;
+    var diameterCss = smart.enabled ? SMART_CURSOR_PX : Number(brushSizeInput.value) * view.zoom;
     brushCursor.style.width = diameterCss + "px";
     brushCursor.style.height = diameterCss + "px";
   }
@@ -1153,6 +1204,542 @@
     renderDisplay();
   }
 
+  // "✨ Smart" select: tap an object and a SAM mask decoder (MobileSAM, run
+  // here via onnxruntime-web) selects it. SAM's heavy half, the image
+  // encoder, already ran on comfytelegram (its segmentation.py) and its
+  // output arrives via `GET /jobs/{token}/embedding`, so a tap costs one
+  // small decoder pass on this device and no round trip. Offered only when
+  // the job's meta carries a `segmentation` entry (the bot has an encoder
+  // staged); `initSmartSelect` loads everything in the background and
+  // enables the button once a warm-up decode has gone through.
+  //
+  // A tap is read against the latest smart selection, in the current mode
+  // (Erase toggle, flipped by Alt like a stroke) versus the mode that
+  // selection was made in:
+  //   same mode, inside it   -> cycle to the next candidate size (SAM
+  //                             returns several: finger / hand / arm)
+  //   other mode, inside it  -> refine: cut that part out (negative point)
+  //   outside it, either way -> a new, separate selection in the current mode
+  // A selection made in Erase mode removes the object from the mask. Each
+  // selection is one undo step; cycling and refining rewrite that step in
+  // place instead of stacking new ones, and anything else committed after
+  // it (a stroke, Clear, an undo) ends that selection's turn.
+  //
+  // Undo/redo replay stays synchronous: an action stores the chosen mask
+  // itself (a bitmap in SAM's ~1024px frame, ~1MB) rather than the points,
+  // since re-running the decoder during replay would be async.
+  var ORT_VERSION = "1.29.0";
+  var ORT_BASE = "https://cdn.jsdelivr.net/npm/onnxruntime-web@" + ORT_VERSION + "/dist/";
+  var SMART_MODEL_CACHE = "smart-select-models-v1";
+  var EMBEDDING_FLOATS = 256 * 64 * 64;
+  var EMBEDDING_POLL_MS = 1000;
+  var EMBEDDING_POLL_LIMIT_MS = 120000;
+  var SMART_CURSOR_PX = 22;
+  var SMART_HINT =
+    "Tap an object to select it, tap it again to change the size. " +
+    "With Erase on, tap inside a selection to cut that part out.";
+  // A candidate within this area ratio of a smaller one already in the
+  // cycle is dropped — SAM often returns near-duplicates, and cycling to an
+  // identical-looking mask reads as a tap that did nothing.
+  var SMART_DEDUPE_RATIO = 0.97;
+
+  var smartBtn = document.getElementById("smart-btn");
+  var smartDebugEl = document.getElementById("smart-debug");
+  var smartDebugLog = document.getElementById("smart-debug-log");
+  var smartDebugCopy = document.getElementById("smart-debug-copy");
+
+  var smart = {
+    width: 0, // SAM's frame: the image resized to a longest side of 1024
+    height: 0,
+    ready: false,
+    enabled: false,
+    busy: false,
+    session: null,
+    embedding: null,
+    // The latest selection: {erase, points: [{x, y, label}], candidates,
+    // order (candidate indexes, smallest first), pos (into order), action}
+    current: null,
+  };
+  // A press in smart mode, held until release so a drag (or a second
+  // finger, for a pinch) can cancel it — smart mode never paints.
+  var smartTap = null;
+  var statusBeforeSmart = "";
+  var smartShapeCanvas = document.createElement("canvas");
+  var smartShapeCtx = smartShapeCanvas.getContext("2d");
+  var smartLogStart = performance.now();
+  var smartLogLines = [];
+
+  function elapsed(t0) {
+    return (performance.now() - t0).toFixed(0) + " ms";
+  }
+
+  function smartLog(text) {
+    var t = ((performance.now() - smartLogStart) / 1000).toFixed(2);
+    smartLogLines.push("[" + t + "s] " + text);
+    if (smartLogLines.length > 300) smartLogLines.shift();
+    smartDebugLog.textContent = smartLogLines.join("\n");
+    smartDebugLog.scrollTop = smartDebugLog.scrollHeight;
+    if (window.console) console.log("[smart] " + text);
+  }
+
+  smartDebugCopy.addEventListener("click", function () {
+    var done = function (label) {
+      smartDebugCopy.textContent = label;
+    };
+    if (!navigator.clipboard || !navigator.clipboard.writeText) {
+      done("No clipboard here — select the text instead");
+      return;
+    }
+    navigator.clipboard.writeText(smartLogLines.join("\n")).then(
+      function () { done("Copied"); },
+      function () { done("Copy failed — select the text instead"); }
+    );
+  });
+
+  function loadScript(src) {
+    return new Promise(function (resolve, reject) {
+      var el = document.createElement("script");
+      el.src = src;
+      el.onload = resolve;
+      el.onerror = function () {
+        reject(new Error("couldn't load " + src));
+      };
+      document.head.appendChild(el);
+    });
+  }
+
+  // The decoder is ~16MB, served through signed redirect URLs that change
+  // per request, so the browser's own HTTP cache never hits — Cache Storage
+  // keyed by the stable URL does. Any trouble with that store just falls
+  // back to downloading.
+  function fetchModel(url) {
+    function download() {
+      return fetch(url).then(function (resp) {
+        if (!resp.ok) throw new Error("decoder download failed: " + resp.status);
+        return resp;
+      });
+    }
+    function downloadBuffer() {
+      return download().then(function (resp) {
+        return resp.arrayBuffer();
+      });
+    }
+    if (!window.caches) {
+      smartLog("decoder: no Cache Storage, downloading");
+      return downloadBuffer();
+    }
+    return caches.open(SMART_MODEL_CACHE).then(
+      function (cache) {
+        return cache.match(url).then(function (hit) {
+          if (hit) {
+            smartLog("decoder: cache hit");
+            return hit.arrayBuffer();
+          }
+          smartLog("decoder: downloading");
+          return download().then(function (resp) {
+            return cache
+              .put(url, resp.clone())
+              .catch(function (err) {
+                smartLog("decoder: couldn't cache (" + err.message + ")");
+              })
+              .then(function () {
+                return resp.arrayBuffer();
+              });
+          });
+        });
+      },
+      function (err) {
+        smartLog("decoder: Cache Storage unavailable (" + err.message + "), downloading");
+        return downloadBuffer();
+      }
+    );
+  }
+
+  // comfytelegram uploads the embedding after the job exists, so it may
+  // still be on its way when the page opens — 204 means "not yet".
+  function fetchEmbedding() {
+    var url = "/jobs/" + encodeURIComponent(token) + "/embedding";
+    var started = performance.now();
+    var attempts = 0;
+    return new Promise(function (resolve, reject) {
+      function attempt() {
+        attempts++;
+        fetch(url)
+          .then(function (resp) {
+            if (resp.status === 204) {
+              if (performance.now() - started > EMBEDDING_POLL_LIMIT_MS) {
+                throw new Error("embedding never arrived");
+              }
+              setTimeout(attempt, EMBEDDING_POLL_MS);
+              return;
+            }
+            if (!resp.ok) throw new Error("embedding fetch failed: " + resp.status);
+            return resp.arrayBuffer().then(function (buf) {
+              smartLog(
+                "embedding: " + (buf.byteLength / 1e6).toFixed(2) + " MB after " +
+                attempts + " request(s), " + elapsed(started)
+              );
+              resolve(buf);
+            });
+          })
+          .catch(reject);
+      }
+      attempt();
+    });
+  }
+
+  // The embedding comes as float16 (half the download); the decoder wants
+  // float32. A full 65536-entry lookup table beats per-value bit fiddling
+  // over a million values.
+  function halfToFloat(bits) {
+    var sign = bits & 0x8000 ? -1 : 1;
+    var exp = (bits >> 10) & 0x1f;
+    var frac = bits & 0x3ff;
+    if (exp === 0) return sign * Math.pow(2, -14) * (frac / 1024);
+    if (exp === 31) return frac ? NaN : sign * Infinity;
+    return sign * Math.pow(2, exp - 15) * (1 + frac / 1024);
+  }
+
+  function float16ToFloat32(buf) {
+    var table = new Float32Array(65536);
+    for (var b = 0; b < 65536; b++) table[b] = halfToFloat(b);
+    var src = new Uint16Array(buf);
+    var out = new Float32Array(src.length);
+    for (var i = 0; i < src.length; i++) out[i] = table[src[i]];
+    return out;
+  }
+
+  function initSmartSelect(seg) {
+    smart.width = seg.width;
+    smart.height = seg.height;
+    smartBtn.style.display = "block";
+    smartBtn.title = "Smart select is loading…";
+    smartDebugEl.style.display = "block";
+    smartLog("ua: " + navigator.userAgent);
+    smartLog(
+      "cores " + (navigator.hardwareConcurrency || "?") +
+      ", crossOriginIsolated " + Boolean(window.crossOriginIsolated) +
+      ", SAM frame " + seg.width + "x" + seg.height
+    );
+    var t0 = performance.now();
+    var sessionReady = loadScript(ORT_BASE + "ort.wasm.min.js").then(function () {
+      smartLog("onnxruntime-web " + ORT_VERSION + " loaded, " + elapsed(t0));
+      ort.env.wasm.wasmPaths = ORT_BASE;
+      // Threads need SharedArrayBuffer, i.e. a cross-origin-isolated page,
+      // which this one isn't (it loads telegram-web-app.js cross-origin).
+      ort.env.wasm.numThreads = window.crossOriginIsolated
+        ? Math.min(4, navigator.hardwareConcurrency || 1)
+        : 1;
+      var t1 = performance.now();
+      return fetchModel(seg.decoder_url).then(function (buf) {
+        smartLog("decoder: " + (buf.byteLength / 1e6).toFixed(1) + " MB, " + elapsed(t1));
+        var t2 = performance.now();
+        return ort.InferenceSession.create(new Uint8Array(buf), {
+          executionProviders: ["wasm"],
+        }).then(function (session) {
+          smartLog("decoder session created, " + elapsed(t2));
+          return session;
+        });
+      });
+    });
+    var embeddingReady = fetchEmbedding().then(function (buf) {
+      if (buf.byteLength !== EMBEDDING_FLOATS * 2) {
+        throw new Error("unexpected embedding size " + buf.byteLength);
+      }
+      var t = performance.now();
+      var data = float16ToFloat32(buf);
+      smartLog("embedding converted to float32, " + elapsed(t));
+      return data;
+    });
+    Promise.all([sessionReady, embeddingReady])
+      .then(function (results) {
+        smart.session = results[0];
+        smart.embedding = new ort.Tensor("float32", results[1], [1, 256, 64, 64]);
+        // The first run pays for wasm warm-up; better here than on a tap.
+        return runDecoder([{ x: smart.width / 2, y: smart.height / 2, label: 1 }], null);
+      })
+      .then(function (out) {
+        smartLog("warm-up decode " + out.ms.toFixed(0) + " ms");
+        smart.ready = true;
+        smartBtn.disabled = false;
+        smartBtn.title = "";
+        smartLog("ready, " + elapsed(t0) + " after page load");
+      })
+      .catch(function (err) {
+        smartLog("FAILED: " + (err && err.message ? err.message : err));
+        smartBtn.title = "Smart select couldn't load — see the debug log";
+      });
+  }
+
+  // `points` are in SAM's frame. `maskInput` is a previous pass's 256x256
+  // low-res logits, which SAM refines from when adding a negative point.
+  function runDecoder(points, maskInput) {
+    var n = points.length + 1;
+    var coords = new Float32Array(n * 2);
+    var labels = new Float32Array(n);
+    points.forEach(function (p, i) {
+      coords[i * 2] = p.x;
+      coords[i * 2 + 1] = p.y;
+      labels[i] = p.label;
+    });
+    // No box prompt, so SAM expects one padding point labelled -1 instead.
+    labels[n - 1] = -1;
+    var feeds = {
+      image_embeddings: smart.embedding,
+      point_coords: new ort.Tensor("float32", coords, [1, n, 2]),
+      point_labels: new ort.Tensor("float32", labels, [1, n]),
+      mask_input: new ort.Tensor("float32", maskInput || new Float32Array(256 * 256), [1, 1, 256, 256]),
+      has_mask_input: new ort.Tensor("float32", new Float32Array([maskInput ? 1 : 0]), [1]),
+      // Output masks at SAM's own frame size rather than the full image's:
+      // much cheaper, and they get scaled onto the canvases anyway.
+      orig_im_size: new ort.Tensor("float32", new Float32Array([smart.height, smart.width]), [2]),
+    };
+    var t = performance.now();
+    return smart.session.run(feeds).then(function (out) {
+      return {
+        masks: out.masks,
+        iou: out.iou_predictions.data,
+        lowRes: out.low_res_masks.data,
+        ms: performance.now() - t,
+      };
+    });
+  }
+
+  function buildCandidates(out) {
+    var dims = out.masks.dims; // [1, candidates, h, w]
+    var h = dims[2];
+    var w = dims[3];
+    var plane = w * h;
+    var logits = out.masks.data;
+    var candidates = [];
+    for (var c = 0; c < dims[1]; c++) {
+      var bitmap = new Uint8Array(plane);
+      var area = 0;
+      for (var i = 0; i < plane; i++) {
+        if (logits[c * plane + i] > 0) {
+          bitmap[i] = 1;
+          area++;
+        }
+      }
+      candidates.push({
+        bitmap: bitmap,
+        w: w,
+        h: h,
+        area: area,
+        iou: out.iou[c],
+        lowRes: out.lowRes.slice(c * 65536, (c + 1) * 65536),
+      });
+    }
+    return candidates;
+  }
+
+  // Candidate indexes smallest-first, near-duplicates collapsed — keeping
+  // `preferred` whenever it's one of a duplicate pair.
+  function cycleOrder(candidates, preferred) {
+    var idx = [];
+    for (var i = 0; i < candidates.length; i++) {
+      if (candidates[i].area > 0) idx.push(i);
+    }
+    idx.sort(function (a, b) {
+      return candidates[a].area - candidates[b].area;
+    });
+    var kept = [];
+    idx.forEach(function (i) {
+      var last = kept.length ? candidates[kept[kept.length - 1]] : null;
+      if (last && last.area / candidates[i].area >= SMART_DEDUPE_RATIO) {
+        if (i === preferred) kept[kept.length - 1] = i;
+        return;
+      }
+      kept.push(i);
+    });
+    return kept;
+  }
+
+  // SAM's own default: a lone point is ambiguous, so pick the best-scored
+  // of the three multimask outputs (1..3); once there are more points,
+  // output 0 is the one trained for that.
+  function preferredCandidate(candidates, points) {
+    if (points.length > 1 || candidates.length < 2) return 0;
+    var best = 1;
+    for (var i = 2; i < candidates.length; i++) {
+      if (candidates[i].iou > candidates[best].iou) best = i;
+    }
+    return best;
+  }
+
+  function selectedCandidate(sel) {
+    return sel.candidates[sel.order[sel.pos]];
+  }
+
+  function makeSmartAction(sel) {
+    var c = selectedCandidate(sel);
+    return { type: "smart", erase: sel.erase, bitmap: c.bitmap, w: c.w, h: c.h };
+  }
+
+  // Scales a bitmap onto `ctx` in one solid colour, smoothing its edges on
+  // the way, same idea as `runEnclosedFill`'s upscale.
+  function paintBitmap(ctx, action, rgb, compositeOp, destW, destH) {
+    smartShapeCanvas.width = action.w;
+    smartShapeCanvas.height = action.h;
+    var img = smartShapeCtx.createImageData(action.w, action.h);
+    var d = img.data;
+    for (var i = 0; i < action.bitmap.length; i++) {
+      if (!action.bitmap[i]) continue;
+      var o = i * 4;
+      d[o] = rgb[0];
+      d[o + 1] = rgb[1];
+      d[o + 2] = rgb[2];
+      d[o + 3] = 255;
+    }
+    smartShapeCtx.putImageData(img, 0, 0);
+    ctx.save();
+    ctx.globalCompositeOperation = compositeOp;
+    ctx.drawImage(smartShapeCanvas, 0, 0, destW, destH);
+    ctx.restore();
+  }
+
+  function applySmartAction(action) {
+    if (action.erase) {
+      paintBitmap(maskCtx, action, [0, 0, 0], "source-over", maskCanvas.width, maskCanvas.height);
+      paintBitmap(overlayCtx, action, [0, 0, 0], "destination-out", overlayCanvas.width, overlayCanvas.height);
+    } else {
+      paintBitmap(maskCtx, action, [255, 255, 255], "source-over", maskCanvas.width, maskCanvas.height);
+      paintBitmap(overlayCtx, action, [255, 45, 45], "source-over", overlayCanvas.width, overlayCanvas.height);
+    }
+  }
+
+  // The latest selection, if it's still the newest applied action.
+  function currentSmartSelection() {
+    var sel = smart.current;
+    if (!sel || historyIndex === 0 || actionHistory[historyIndex - 1] !== sel.action) return null;
+    return sel;
+  }
+
+  function selectionContains(sel, x, y) {
+    var c = selectedCandidate(sel);
+    var xi = Math.min(c.w - 1, Math.max(0, Math.floor(x)));
+    var yi = Math.min(c.h - 1, Math.max(0, Math.floor(y)));
+    return c.bitmap[yi * c.w + xi] === 1;
+  }
+
+  // Swaps the selection's undo step for its new state and redraws from the
+  // log. Also drops any redo entries past it, same as any fresh edit.
+  function replaceSmartAction(sel) {
+    sel.action = makeSmartAction(sel);
+    actionHistory.length = historyIndex;
+    actionHistory[historyIndex - 1] = sel.action;
+    replayHistory();
+  }
+
+  function describeSelection(verb, sel, out) {
+    var sizes = sel.order.map(function (i) {
+      var c = sel.candidates[i];
+      return "c" + i + " " + ((c.area / (c.w * c.h)) * 100).toFixed(1) + "% iou " + c.iou.toFixed(2);
+    });
+    smartLog(
+      verb + (sel.erase ? " (erase)" : "") +
+      (out ? ": decode " + out.ms.toFixed(0) + " ms" : "") +
+      ", picked c" + sel.order[sel.pos] + " of [" + sizes.join(", ") + "]"
+    );
+  }
+
+  function decodeSelection(points, maskInput) {
+    return runDecoder(points, maskInput).then(function (out) {
+      var candidates = buildCandidates(out);
+      var preferred = preferredCandidate(candidates, points);
+      var order = cycleOrder(candidates, preferred);
+      var pos = order.indexOf(preferred);
+      return { out: out, candidates: candidates, order: order, pos: pos < 0 ? 0 : pos };
+    });
+  }
+
+  function newSmartSelection(x, y, erase) {
+    var points = [{ x: x, y: y, label: 1 }];
+    return decodeSelection(points, null).then(function (r) {
+      if (!r.order.length) {
+        smartLog("nothing found at (" + x.toFixed(0) + ", " + y.toFixed(0) + ")");
+        return;
+      }
+      var sel = { erase: erase, points: points, candidates: r.candidates, order: r.order, pos: r.pos };
+      sel.action = makeSmartAction(sel);
+      commitAction(sel.action);
+      applySmartAction(sel.action);
+      renderDisplay();
+      smart.current = sel;
+      describeSelection("new", sel, r.out);
+    });
+  }
+
+  function refineSmartSelection(sel, x, y) {
+    var points = sel.points.concat([{ x: x, y: y, label: 0 }]);
+    return decodeSelection(points, selectedCandidate(sel).lowRes).then(function (r) {
+      if (!r.order.length) {
+        smartLog("refine left nothing selected; ignoring that point");
+        return;
+      }
+      sel.points = points;
+      sel.candidates = r.candidates;
+      sel.order = r.order;
+      sel.pos = r.pos;
+      replaceSmartAction(sel);
+      describeSelection("refine (" + (points.length - 1) + " point(s) cut)", sel, r.out);
+    });
+  }
+
+  function cycleSmartSelection(sel) {
+    if (sel.order.length < 2) {
+      smartLog("only one size for this selection");
+      return;
+    }
+    sel.pos = (sel.pos + 1) % sel.order.length;
+    replaceSmartAction(sel);
+    describeSelection("cycle", sel, null);
+  }
+
+  function smartTapAt(clientX, clientY, invert) {
+    if (!smart.ready) return;
+    if (smart.busy) {
+      smartLog("tap ignored: still decoding the last one");
+      return;
+    }
+    var p = pointFromClient(clientX, clientY);
+    if (p.x < 0 || p.y < 0 || p.x >= displayCanvas.width || p.y >= displayCanvas.height) return;
+    var x = (p.x * smart.width) / displayCanvas.width;
+    var y = (p.y * smart.height) / displayCanvas.height;
+    var erase = erasing !== invert;
+    var sel = currentSmartSelection();
+    var inside = Boolean(sel) && selectionContains(sel, x, y);
+    if (inside && sel.erase === erase) {
+      cycleSmartSelection(sel);
+      return;
+    }
+    smart.busy = true;
+    var work = inside ? refineSmartSelection(sel, x, y) : newSmartSelection(x, y, erase);
+    work
+      .catch(function (err) {
+        smartLog("decode failed: " + (err && err.message ? err.message : err));
+      })
+      .then(function () {
+        smart.busy = false;
+      });
+  }
+
+  smartBtn.addEventListener("click", function () {
+    if (!smart.ready) return;
+    endStroke();
+    smartTap = null;
+    smart.enabled = !smart.enabled;
+    smartBtn.classList.toggle("active", smart.enabled);
+    brushCursor.classList.toggle("smart", smart.enabled);
+    updateCursorSize();
+    if (smart.enabled) {
+      statusBeforeSmart = statusEl.textContent;
+      setStatus(SMART_HINT);
+    } else {
+      setStatus(statusBeforeSmart);
+    }
+  });
+
   // Middle- or right-button drag pans instead of drawing — desktop's
   // equivalent of the second-finger pinch/pan below, for a mouse that only
   // ever has one point of contact. `setPointerCapture` keeps `pointermove`
@@ -1203,6 +1790,10 @@
     if (evt.button !== 0 || drawing) return;
     moveCursor(evt.clientX, evt.clientY);
     showCursor();
+    if (smart.enabled) {
+      smartTap = { clientX: evt.clientX, clientY: evt.clientY, invert: evt.altKey };
+      return;
+    }
     var p = pointFromEvent(evt);
     invertStroke = evt.altKey;
     if (evt.shiftKey && lastPaintPoint) {
@@ -1220,6 +1811,9 @@
       return;
     }
     moveCursor(evt.clientX, evt.clientY);
+    if (smartTap && exceedsTouchSlop(evt.clientX, evt.clientY, smartTap.clientX, smartTap.clientY)) {
+      smartTap = null; // a drag, not a tap
+    }
     var p = pointFromEvent(evt);
     continueStroke(p.x, p.y);
   }
@@ -1228,6 +1822,12 @@
     if (evt.pointerType === "touch") return;
     if (panState) {
       panState = null;
+      return;
+    }
+    if (smartTap) {
+      var tap = smartTap;
+      smartTap = null;
+      smartTapAt(tap.clientX, tap.clientY, tap.invert);
       return;
     }
     endStroke();
@@ -1276,6 +1876,7 @@
       // means this was a pinch all along — undo it so the net result is
       // exactly as if both fingers had landed together.
       undoRevocableDab();
+      smartTap = null;
       multiTouchActive = true;
       endStroke();
       hideCursor();
@@ -1287,6 +1888,10 @@
     var t = evt.touches[0];
     moveCursor(t.clientX, t.clientY);
     showCursor();
+    if (smart.enabled) {
+      smartTap = { clientX: t.clientX, clientY: t.clientY, invert: false };
+      return;
+    }
     var p = pointFromClient(t.clientX, t.clientY);
     var displayRadius = brushDiameter() / 2;
     var overlaySnap = snapshotBrushRegion(overlayCtx, p.x, p.y, displayRadius);
@@ -1316,6 +1921,12 @@
     evt.preventDefault();
     var t = evt.touches[0];
     moveCursor(t.clientX, t.clientY);
+    if (smart.enabled) {
+      if (smartTap && exceedsTouchSlop(t.clientX, t.clientY, smartTap.clientX, smartTap.clientY)) {
+        smartTap = null; // a drag, not a tap
+      }
+      return;
+    }
     if (
       pendingTouch &&
       !exceedsTouchSlop(t.clientX, t.clientY, pendingTouch.clientX, pendingTouch.clientY)
@@ -1337,6 +1948,10 @@
 
   function handleTouchEnd(evt) {
     if (evt.touches.length === 0) {
+      if (smartTap && !multiTouchActive) {
+        smartTapAt(smartTap.clientX, smartTap.clientY, smartTap.invert);
+      }
+      smartTap = null;
       // Released without a second finger ever showing up — the dab was
       // never undone, so it just stands as-is; nothing to do here beyond
       // stopping the now-moot timer.
@@ -1799,6 +2414,7 @@
       applyMeta(meta);
       initOptionsPanel();
       loadImage();
+      if (meta.segmentation) initSmartSelect(meta.segmentation);
     })
     .catch(function () {
       setStatus("Couldn't load this job — the link may have expired.");

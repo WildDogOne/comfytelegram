@@ -29,6 +29,11 @@ the bot itself.
   comfytelegram expands on the way back) and the source image to whatever opens
   the per-job URL — no ComfyUI or Telegram bot-token access needed or
   wanted here.
+- Carries the "✨ Smart" select embedding: comfytelegram uploads it after
+  creating the job (`PUT /jobs/{token}/embedding`, shared-secret auth'd)
+  and the page fetches it (`GET /jobs/{token}/embedding`, 204 until it
+  arrives) to run the mask decoder in the browser. Opaque bytes here, like
+  everything else; `meta.segmentation` says whether to expect one.
 - Does **not** validate that a submission genuinely came from Telegram
   (`Telegram.WebApp.initData`) — it has no way to, since it never holds the
   bot token. comfytelegram validates that itself after pulling a job back

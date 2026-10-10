@@ -47,6 +47,10 @@ services:
       # them) — just bind-mount the same directory `uv run comfytelegram`
       # would read outside Docker.
       - ./models/wd14:/app/models/wd14:ro
+      # MobileSAM's image encoder (~27MB) for the mask editor's "✨ Smart"
+      # select — staged by hand like the WD14 files (see env.example's
+      # SAM_ENCODER_PATH). Without it the feature is simply off.
+      - ./models/mobilesam:/app/models/mobilesam:ro
       # Read-only access to ComfyUI's own models/loras directory, so the
       # "ℹ️ Info" button on /lora can hash a LoRA file locally and look up
       # its trigger words/base-model compatibility on CivitAI by that hash
