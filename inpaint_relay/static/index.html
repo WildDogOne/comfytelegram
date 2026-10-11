@@ -119,8 +119,9 @@
     background: var(--accent);
     color: #fff;
   }
-  /* Smart-select diagnostics, folded away by default — there's no other
-     way to see how the decoder behaves on a given phone. */
+  /* Smart-select diagnostics — hidden by default (see SMART_DEBUG_ENABLED
+     in the script below); there's no other way to see how the decoder
+     behaves on a given phone. */
   #smart-debug {
     display: none;
     padding: 0 14px calc(8px + env(safe-area-inset-bottom));
@@ -1242,6 +1243,13 @@
   // cycle is dropped — SAM often returns near-duplicates, and cycling to an
   // identical-looking mask reads as a tap that did nothing.
   var SMART_DEDUPE_RATIO = 0.97;
+  // The on-screen "Smart select debug" panel (see #smart-debug markup) is
+  // hidden by default — it existed to see how the decoder behaves on a
+  // given phone during development, and performance testing is done. Set
+  // this to true to bring the panel (and its live log + copy button) back
+  // without touching anything else; smartLog's console output and in-memory
+  // line buffer are unaffected either way.
+  var SMART_DEBUG_ENABLED = false;
 
   var smartBtn = document.getElementById("smart-btn");
   var smartDebugEl = document.getElementById("smart-debug");
@@ -1277,8 +1285,10 @@
     var t = ((performance.now() - smartLogStart) / 1000).toFixed(2);
     smartLogLines.push("[" + t + "s] " + text);
     if (smartLogLines.length > 300) smartLogLines.shift();
-    smartDebugLog.textContent = smartLogLines.join("\n");
-    smartDebugLog.scrollTop = smartDebugLog.scrollHeight;
+    if (SMART_DEBUG_ENABLED) {
+      smartDebugLog.textContent = smartLogLines.join("\n");
+      smartDebugLog.scrollTop = smartDebugLog.scrollHeight;
+    }
     if (window.console) console.log("[smart] " + text);
   }
 
@@ -1414,7 +1424,7 @@
     smart.height = seg.height;
     smartBtn.style.display = "block";
     smartBtn.title = "Smart select is loading…";
-    smartDebugEl.style.display = "block";
+    if (SMART_DEBUG_ENABLED) smartDebugEl.style.display = "block";
     smartLog("ua: " + navigator.userAgent);
     smartLog(
       "cores " + (navigator.hardwareConcurrency || "?") +
