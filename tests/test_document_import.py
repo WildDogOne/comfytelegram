@@ -103,7 +103,9 @@ async def test_import_restores_a_pending_result_with_the_full_original_params():
     result_id, chat_id, file_id, filename, stored = storage.store_pending_result.call_args.args
     assert chat_id == 42
     assert file_id == "doc-1"  # the uploaded document, re-downloadable later
-    assert filename == "comfytelegram_00042_.png"
+    # Telegram-only: the uploaded PNG is the source, never whatever ComfyUI
+    # has under the embedded name (a different install's, or the pre-edit one)
+    assert filename == "tgonly_comfytelegram_00042_.png"
     assert stored == serialize_generation_params(_params())
 
     keyboard = message.reply_text.await_args.kwargs["reply_markup"]
@@ -278,3 +280,7 @@ async def test_archive_button_resends_the_original_png_with_metadata_embedded():
     metadata = extract_metadata(sent["document"].getvalue())
     assert metadata["params"] == serialize_generation_params(params)
     assert metadata["seed"] == 4242  # recovered from ComfyUI's own chunk
+    # the copy carries the result's keyboard, so an edit of it can be sent
+    # back as a reply to it
+    callbacks = [b.callback_data for row in sent["reply_markup"].inline_keyboard for b in row]
+    assert "pp:upscale:res1" in callbacks

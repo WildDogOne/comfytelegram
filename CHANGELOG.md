@@ -8,6 +8,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Bring back an edited image**: edited one of the bot's images in another
+  app? Send the edit as a reply to the original (or to its 📥 Download file
+  copy) and it gets the original's settings and all its buttons back, even
+  if the editor wiped the embedded metadata. Works as a photo or as a file,
+  and skips the automatic image analysis. The downloaded copy now has the
+  buttons too.
 - **✨ Smart select in the mask editor**: tap an object (a hand, a shirt
   print, the sky) and it's masked in one go, edges and all. Tap it again to
   cycle through sizes (finger → hand → arm); with 🧹 Erase on, tap inside

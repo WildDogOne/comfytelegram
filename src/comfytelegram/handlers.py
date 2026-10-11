@@ -1008,6 +1008,18 @@ _SOURCE_FALLBACK_NOTICE = (
     "Telegram copy instead, which may already be JPEG-compressed."
 )
 
+#: `pending_result.filename` prefix marking a row whose source image exists
+#: *only* as its Telegram `file_id` — an image the user uploaded (see
+#: `_link_edit_to_result`, `document_message`) rather than one ComfyUI
+#: wrote. `_fetch_source_image` normally tries ComfyUI's output directory
+#: by `filename` first, and for these rows that lookup would be actively
+#: wrong rather than merely missing: a hand-edited image keeps settings
+#: whose original `filename` still resolves on ComfyUI, to the *unedited*
+#: original, and every button would silently undo the edit. The rest of
+#: the name is still a usable upload filename, since `post_process` and
+#: friends pass it to ComfyUI's `/upload/image` as-is.
+TELEGRAM_ONLY_FILENAME_PREFIX = "tgonly_"
+
 
 async def _fetch_source_image(
     client: ComfyClient,
@@ -1038,7 +1050,13 @@ async def _fetch_source_image(
     `_SOURCE_FALLBACK_NOTICE` through whatever reply mechanism it has
     (`query.message.reply_text`, or `bot.send_message` for
     `_process_one_inpaint_job`'s background task), so a quieter-than-usual
-    result doesn't look like an unexplained regression."""
+    result doesn't look like an unexplained regression.
+
+    A `TELEGRAM_ONLY_FILENAME_PREFIX` row skips ComfyUI entirely, and
+    without the notice: the Telegram copy is the only correct source
+    there, not a fallback."""
+    if filename.startswith(TELEGRAM_ONLY_FILENAME_PREFIX):
+        return await _download_telegram_file(bot, file_id)
     try:
         return await client.get_image_bytes(filename, "", "output")
     except (ComfyUIError, aiohttp.ClientError, TimeoutError):
@@ -2801,6 +2819,87 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await _deliver_generation_result(status_message, message, chat_id, storage, images)
 
 
+def _result_id_from_message(message: Message) -> str | None:
+    """The `pending_result` id a bot result message's keyboard is scoped
+    to, read off any `pp:<kind>:<result_id>` button on it (every page of
+    `_post_process_keyboard` has some, as does the "📥 Download file"
+    copy), or None for a message with no such keyboard."""
+    markup = message.reply_markup
+    if markup is None:
+        return None
+    for row in markup.inline_keyboard:
+        for button in row:
+            data = button.callback_data
+            if isinstance(data, str) and data.startswith("pp:"):
+                parts = data.split(":", 2)
+                if len(parts) == 3:
+                    return parts[2]
+    return None
+
+
+async def _link_edit_to_result(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    file_id: str,
+    *,
+    from_photo: bool,
+) -> bool:
+    """Attach the settings of the bot result `message` replies to onto the
+    image `message` itself carries — the "edited it in another app, sent it
+    back" round trip. Returns False (caller carries on as usual) unless
+    `message` replies to a bot result.
+
+    Exists because an outside editor typically drops `png_metadata`'s
+    chunk, so `document_message`'s own import can't recover anything; the
+    reply itself is both the link to the settings and the signal that the
+    upload isn't meant to be analyzed, so nothing slow runs. Writes a
+    *fresh* `pending_result` from the original's `base_params` — nothing
+    else carries over, so the old image's drawn-mask/Kontext redo rows
+    (which belong to the old pixels) don't follow — and marks it
+    `TELEGRAM_ONLY_FILENAME_PREFIX`, since the original's `filename` on
+    ComfyUI is exactly the unedited image this replaces. No file download
+    happens here: a `file_id` is all `pending_result` stores."""
+    replied = message.reply_to_message
+    if replied is None:
+        return False
+    source_id = _result_id_from_message(replied)
+    if source_id is None:
+        return False
+
+    storage: Storage = context.bot_data["storage"]
+    pending = storage.get_pending_result(source_id)
+    if pending is None:
+        await message.reply_text(
+            "The image you replied to has expired, so its settings are gone and "
+            "can't be attached to this one. Send it without replying to have it "
+            "analyzed instead."
+        )
+        return True
+
+    result_id = uuid.uuid4().hex[:12]
+    storage.store_pending_result(
+        result_id,
+        chat_id,
+        file_id,
+        f"{TELEGRAM_ONLY_FILENAME_PREFIX}edited_{result_id}.png",
+        pending["base_params"],
+    )
+    params = _deserialize_generation_params(pending["base_params"])
+    text = (
+        "🔗 Linked to the image you replied to — its settings now apply to this "
+        f"edited version.\n\nModel: {params.checkpoint}\n"
+        f"Positive:\n{_elide(params.positive_prompt)}"
+    )
+    if from_photo:
+        text += (
+            "\n\nℹ️ Sent as a photo, so Telegram compressed it (and capped its size). "
+            "Send it as a file instead for full quality."
+        )
+    await message.reply_text(text, reply_markup=_post_process_keyboard(result_id))
+    return True
+
+
 async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle a directly-uploaded photo — as opposed to one of the bot's own
     generated images, which get analyzed via `_post_process_keyboard`'s
@@ -2823,6 +2922,11 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     chat_id = update.effective_chat.id
     storage: Storage = context.bot_data["storage"]
     client: ComfyClient = context.bot_data["comfy_client"]
+
+    if await _link_edit_to_result(
+        message, context, chat_id, message.photo[-1].file_id, from_photo=True
+    ):
+        return
 
     checkpoint = await _resolve_checkpoint_or_default(message, chat_id, storage, client, context)
     if checkpoint is None:
@@ -2960,6 +3064,9 @@ async def document_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
+    if await _link_edit_to_result(message, context, chat_id, document.file_id, from_photo=False):
+        return
+
     status_message = await message.reply_text("Reading image…", disable_notification=True)
 
     async def _download() -> bytes:
@@ -2983,11 +3090,15 @@ async def document_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     params = _deserialize_generation_params(metadata["params"])
     result_id = uuid.uuid4().hex[:12]
+    # Telegram-only: the uploaded document *is* the lossless PNG, while the
+    # embedded `filename` may name a different (or pre-edit) file on this
+    # ComfyUI — see TELEGRAM_ONLY_FILENAME_PREFIX.
     storage.store_pending_result(
         result_id,
         chat_id,
         document.file_id,
-        metadata.get("filename") or document.file_name or "imported.png",
+        TELEGRAM_ONLY_FILENAME_PREFIX
+        + (metadata.get("filename") or document.file_name or "imported.png"),
         metadata["params"],
     )
     await status_message.delete()
@@ -3081,9 +3192,19 @@ async def _import_without_metadata(
 ARCHIVE_SEND_TIMEOUT_SECONDS = 300
 
 
+def _to_png(data: bytes) -> bytes:
+    """`data` (any format Pillow reads) re-encoded as PNG, losslessly from
+    whatever pixels it decodes to."""
+    buf = io.BytesIO()
+    Image.open(io.BytesIO(data)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
 async def _send_archive_copy(
     message: Message,
     client: ComfyClient,
+    bot: Bot,
+    result_id: str,
     pending: dict[str, Any],
     full_params: GenerationParams,
 ) -> None:
@@ -3104,32 +3225,56 @@ async def _send_archive_copy(
     file untouched. The seed is recovered from ComfyUI's `prompt` chunk on
     the fetched file, which is the only place it survives (see
     `png_metadata.extract_seed`).
+
+    A `TELEGRAM_ONLY_FILENAME_PREFIX` row (an uploaded edit or an import)
+    is the exception: ComfyUI never had that image, and the Telegram copy
+    is the source of truth. It's converted to PNG if it isn't one (a photo
+    upload arrives as JPEG) so the chunk has somewhere to live; the seed
+    then only survives if the upload itself still carried our chunk.
+
+    The copy gets the same keyboard as the image it came from, partly so
+    it's workable on its own, mostly so `_result_id_from_message` can find
+    the settings when an edit of *this* file is sent back as a reply to it.
     """
     status_message = await message.reply_text(
         "Fetching the original file…", disable_notification=True
     )
 
     async def _fetch_and_send() -> None:
-        data = await client.get_image_bytes(pending["filename"], "", "output")
-        graph = extract_comfy_graph(data)
+        filename = pending["filename"]
+        if filename.startswith(TELEGRAM_ONLY_FILENAME_PREFIX):
+            data = await _download_telegram_file(bot, pending["file_id"])
+            if not is_png(data):
+                data = await asyncio.to_thread(_to_png, data)
+            own = extract_metadata(data)
+            seed = own.get("seed") if own else None
+            filename = (
+                Path(filename.removeprefix(TELEGRAM_ONLY_FILENAME_PREFIX)).with_suffix(".png").name
+            )
+        else:
+            data = await client.get_image_bytes(filename, "", "output")
+            graph = extract_comfy_graph(data)
+            seed = extract_seed(graph) if graph else None
         stamped = embed_metadata(
             data,
             build_metadata(
                 params=pending["base_params"],
                 kind="archive",
-                filename=pending["filename"],
-                seed=extract_seed(graph) if graph else None,
+                filename=filename,
+                seed=seed,
                 checkpoint=full_params.checkpoint,
             ),
         )
         await message.reply_document(
             document=io.BytesIO(stamped),
-            filename=pending["filename"],
+            filename=filename,
             caption=(
                 "Full-quality PNG — this is the copy to save. Its generation "
                 "settings are stored inside the file, so sending it back to me "
-                "as a file (not a photo) restores all its buttons."
+                "as a file (not a photo) restores all its buttons. Edited it "
+                "elsewhere? Send the edit as a reply to this message."
             ),
+            reply_markup=_post_process_keyboard(result_id),
         )
 
     try:
@@ -3298,7 +3443,9 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if kind == ARCHIVE_CALLBACK_KIND:
-        await _send_archive_copy(query.message, client, pending, full_params)
+        await _send_archive_copy(
+            query.message, client, context.bot, result_id, pending, full_params
+        )
         return
 
     if kind == SHOW_PROMPT_CALLBACK_KIND:
