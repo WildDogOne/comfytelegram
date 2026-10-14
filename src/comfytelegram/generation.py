@@ -54,6 +54,7 @@ from comfytelegram.workflows import (
     build_txt2img,
     build_upscale,
     kontext_resolution,
+    region_mask_filename,
 )
 
 logger = logging.getLogger(__name__)
@@ -867,6 +868,7 @@ async def generate(
         len(params.regions),
     )
 
+    await _upload_region_masks(client, params)
     raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
     raw = _tag_images(raw, params, kind="txt2img", graph=prompt_graph)
     images = [GeneratedImage(data=data, filename=name, full_params=params) for data, name in raw]
@@ -875,6 +877,22 @@ async def generate(
             client, images, profiles=[profile] if profile else None, on_stage=on_stage
         )
     return images
+
+
+async def _upload_region_masks(client: ComfyClient, params: GenerationParams) -> None:
+    """Put every painted region mask where `build_txt2img`'s `LoadImageMask`
+    looks for it (`region_mask_filename`). Done on every submission rather
+    than once when the mask was painted: the bytes travel with the params
+    (see `RegionSpec.mask_png`), ComfyUI's input folder doesn't have to
+    keep anything, and a content-named overwrite is idempotent."""
+    uploaded: set[str] = set()
+    for region in params.regions:
+        if region.mask_png is None:
+            continue
+        name = region_mask_filename(region.mask_png)
+        if name not in uploaded:
+            await client.upload_image(region.mask_png, filename=name, overwrite=True)
+            uploaded.add(name)
 
 
 def _fix_base_params(
@@ -1407,6 +1425,7 @@ async def repeat(
         fresh_params.steps,
     )
 
+    await _upload_region_masks(client, fresh_params)
     raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
     raw = _tag_images(raw, fresh_params, kind="repeat", graph=prompt_graph)
     images = [
@@ -1453,22 +1472,35 @@ def has_region_loras(params: GenerationParams) -> bool:
 
 def region_lora_mask(people: np.ndarray, region: RegionSpec) -> tuple[np.ndarray, bool]:
     """The mask a region's LoRA pass repaints: `people` (a boolean
-    foreground mask, full image size) inside the region's box, grown by
-    `_REGION_MASK_GROW`. Returns `(mask, from_people)` — `from_people` is
-    False when too little of the box was people and the box itself was used
-    instead."""
+    foreground mask, full image size) inside the region's area, grown by
+    `_REGION_MASK_GROW`. The area is the region's box, or for a painted
+    region its painted side — which, unlike a box edge, can follow the line
+    between two touching characters. Returns `(mask, from_people)` —
+    `from_people` is False when too little of the area was people and the
+    area itself was used instead."""
     height, width = people.shape
-    x0, y0 = round(region.x * width), round(region.y * height)
-    x1, y1 = round((region.x + region.w) * width), round((region.y + region.h) * height)
-    mask = np.zeros_like(people)
-    mask[y0:y1, x0:x1] = people[y0:y1, x0:x1]
-    box_area = max(1, (x1 - x0) * (y1 - y0))
-    if mask.sum() < _REGION_MIN_PEOPLE_SHARE * box_area:
-        mask[y0:y1, x0:x1] = True
-        return mask, False
+    area = region_area(region, width, height)
+    mask = people & area
+    if mask.sum() < _REGION_MIN_PEOPLE_SHARE * max(1, area.sum()):
+        return area, False
     radius = max(1, round(_REGION_MASK_GROW * min(width, height)))
     grown = Image.fromarray(mask.astype(np.uint8) * 255).filter(ImageFilter.GaussianBlur(radius))
     return np.asarray(grown) >= 16, True
+
+
+def region_area(region: RegionSpec, width: int, height: int) -> np.ndarray:
+    """Where `region` applies, as a boolean `height` x `width` mask: its
+    painted side scaled to that size (the image may since have been
+    upscaled), or its box."""
+    if region.mask_png is not None:
+        painted = Image.open(io.BytesIO(region.mask_png)).convert("L")
+        painted = np.asarray(painted.resize((width, height), Image.Resampling.NEAREST)) >= 128
+        return ~painted if region.invert_mask else painted
+    x0, y0 = round(region.x * width), round(region.y * height)
+    x1, y1 = round((region.x + region.w) * width), round((region.y + region.h) * height)
+    area = np.zeros((height, width), dtype=bool)
+    area[y0:y1, x0:x1] = True
+    return area
 
 
 def mask_to_png(mask: np.ndarray) -> bytes:

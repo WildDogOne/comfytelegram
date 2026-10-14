@@ -8,6 +8,18 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **🎨 Paint Regions** (under "⋯ More"): paint the two regions of a
+  regional prompt instead of splitting the picture into straight halves.
+  Generate something like "2boys, cuddling", tap the button, and the mask
+  editor opens over that image with the left half already painted. Fix
+  the line where the characters meet, write a prompt for the red side and
+  one for the blue rest (plus the whole-image prompt), then Done. The new
+  image uses the same checkpoint, size and seed, so it tends to keep the
+  layout you painted over. Paint a character *plus roughly their half* —
+  the blue side covers everything you didn't paint, background included.
+  `$names` and `<lora:…>` work as in `/rp`; a region's LoRA is applied
+  afterwards like any region LoRA, and now follows the painted line
+  instead of a straight box edge.
 - **LoRAs in the prompt**: write `<lora:name>` (or `<lora:name:0.8>`, or
   `<lora:name:0.8:0.5>` for model/clip strength) anywhere in a prompt to
   switch on one of the checkpoint's LoRAs for that image, trigger words

@@ -43,12 +43,13 @@ Step 1 (`/fav`, `/favs`, edit, delete) and `$name` expansion in prompts are done
 Step 1 (`/rp` text syntax, Attention Couple, per-profile weights) is done.
 Still open:
 
-- [ ] **Painted regions**: a "regions" mode in the `inpaint_relay` editor.
-  You paint one colour per region, with a prompt box each, either on a
-  blank canvas or over an earlier result as a layout guide. Core
-  `ImageColorToMask` can split one colour-coded PNG into masks. This would
-  be the first relay job that starts a generation rather than
-  post-processing.
+- [ ] **Painted regions: follow-ups.** Shipped (see CHANGELOG). Open:
+  - The seed only reproduces the layout of a batch's *first* image —
+    ComfyUI derives a batch's noise from one seed, and nothing records
+    which batch index a result was. A batch of 4 painted over image 3
+    starts from image 1's noise.
+  - Show Prompt's copy of a painted image gives its nearest box layout
+    (`[left]`/`[right]`), not the painting — there's no text form for it.
 - [ ] **Region-aware detailers**: Face/Hand Detail on a regional image only
   sees the global prompt, so character-specific tags are missing there.
   Pick the region whose box contains the detected face and add its prompt.

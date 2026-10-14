@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 import aiohttp
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from telegram import (
     Bot,
@@ -60,6 +61,7 @@ from comfytelegram.generation import (
     kontext_edit,
     mask_to_png,
     post_process,
+    region_area,
     region_lora_mask,
     repeat,
     resolve_drawn_mask_denoise,
@@ -115,6 +117,7 @@ from comfytelegram.regional import (
     expand_references,
     format_regional_prompt,
     is_regional_prompt,
+    painted_regions,
     parse_regional_prompt,
 )
 from comfytelegram.segmentation import encode_image, sam_input_size
@@ -130,6 +133,7 @@ from comfytelegram.workflows import (
     KontextParams,
     LoraSpec,
     ManualHandDetailerParams,
+    RegionSpec,
 )
 
 logger = logging.getLogger(__name__)
@@ -262,6 +266,21 @@ REGION_LORAS_CALLBACK_KIND = "region_loras"
 #: `HAND_POINT_CALLBACK_PREFIX`: it carries more than `pp:` parsing allows.
 REGION_LORA_CALLBACK_PREFIX = "rl:"
 REGION_LORA_ALL = "all"
+
+#: "🎨 Paint Regions" (keyboard page 2) — open the mask editor in its
+#: "regions" mode over this image as a layout guide: paint one character plus
+#: roughly their half, the rest is the other region, a prompt for each.
+#: Done starts a regional generation (`_run_paint_regions_job`) with this
+#: image's checkpoint, size and — for a plain txt2img — seed, so the new
+#: picture tends to keep the layout the painting was drawn over. The editor
+#: opens with the left half painted (or this image's own first region, when
+#: it already has regions), so the default is `/rp`'s `[left]`/`[right]` and
+#: only the line where the characters meet needs correcting. Unlike the
+#: other relay flows this is a fresh generation, not post-processing, so
+#: its `inpaint_job.kind` (`PAINT_REGIONS_JOB_KIND`) is handled outside
+#: `_DRAWN_MASK_KINDS`.
+PAINT_REGIONS_CALLBACK_KIND = "paint_regions"
+PAINT_REGIONS_JOB_KIND = "regions"
 
 #: "🪄 Kontext Edit" — an instruction-driven FLUX.1 Kontext edit of the whole
 #: image (`generation.kontext_edit`). The tap only asks for the instruction;
@@ -574,7 +593,8 @@ def _post_process_keyboard(result_id: str, page: int = 1) -> InlineKeyboardMarku
     ✏️ Detail Prompt beside them (a third, general-purpose region-detail
     action — draw a mask, describe it, run immediately — that belongs with
     the other two more than anywhere else on the keyboard), then
-    📥 Download file and 🐛 Show Prompt. Page 2 holds the rest — 🧵 Homogenize,
+    📥 Download file and 🐛 Show Prompt. Page 2 holds the rest — 🎨 Paint
+    Regions (a new generation rather than work on this one), 🧵 Homogenize,
     the three analyzers, and 🔀 Switch Model / 🎛 LoRAs (see
     `SWITCH_MODEL_CALLBACK_KIND`/`LORA_SWITCH_CALLBACK_KIND` — deliberately
     page 2, not 1: switching a checkpoint mid-pipeline is a rare, deliberate
@@ -598,6 +618,12 @@ def _post_process_keyboard(result_id: str, page: int = 1) -> InlineKeyboardMarku
     if page == 2:
         return InlineKeyboardMarkup(
             [
+                [
+                    InlineKeyboardButton(
+                        "🎨 Paint Regions",
+                        callback_data=f"pp:{PAINT_REGIONS_CALLBACK_KIND}:{result_id}",
+                    ),
+                ],
                 [
                     InlineKeyboardButton(
                         POSTPROCESS_KEYBOARD_LABELS["homogenize"],
@@ -1659,7 +1685,8 @@ async def _relay_poll_result(settings: Settings, token: str) -> dict[str, Any] |
     too (the editor shows that checkbox whenever the image has any LoRAs
     attached at all, not just for "✏️ Detail Prompt" — see
     `postprocess_callback`'s `meta` construction), still always `None` for
-    "🩹 Fix Artifact"."""
+    "🩹 Fix Artifact". `region_prompts` (`[painted, rest]`) is only ever set
+    for a "🎨 Paint Regions" job — see `_run_paint_regions_job`."""
     async with (
         aiohttp.ClientSession(timeout=_INPAINT_RELAY_TIMEOUT) as session,
         session.get(
@@ -1680,6 +1707,7 @@ async def _relay_poll_result(settings: Settings, token: str) -> dict[str, Any] |
         "denoise": payload.get("denoise"),
         "tile_controlnet": payload.get("tile_controlnet"),
         "detailer_disable_lora": payload.get("detailer_disable_lora"),
+        "region_prompts": payload.get("region_prompts"),
         "init_data": payload["init_data"],
     }
 
@@ -2005,7 +2033,6 @@ async def _process_one_inpaint_job(
     token = job["token"]
     chat_id = job["chat_id"]
     message_thread_id = job["message_thread_id"]
-    drawn_mask_kind = _DRAWN_MASK_KINDS[job["kind"]]
     result = await _relay_poll_result(settings, token)
     if result is None:
         return  # still pending, or the relay lost track of it — try again next tick
@@ -2042,6 +2069,12 @@ async def _process_one_inpaint_job(
         )
         return
 
+    if job["kind"] == PAINT_REGIONS_JOB_KIND:
+        await _run_paint_regions_job(
+            application, storage, client, job, pending, result, _init_data_user_id(verified)
+        )
+        return
+    drawn_mask_kind = _DRAWN_MASK_KINDS[job["kind"]]
     status_message = await application.bot.send_message(
         chat_id,
         f"{drawn_mask_kind['label']} (drawn mask)…",
@@ -2112,6 +2145,242 @@ async def _process_one_inpaint_job(
         detail_denoise=detail_denoise,
         tile_controlnet=tile_controlnet_choice,
         detailer_disable_lora=detailer_disable_lora_choice,
+    )
+
+
+def _paint_regions_meta(
+    full_params: GenerationParams,
+    storage: Storage,
+    chat_id: int,
+    user_id: int | None,
+    profiles: list[ModelProfile],
+) -> dict[str, Any]:
+    """The editor meta for a "🎨 Paint Regions" job: `mode="regions"`, the
+    fields pre-filled with what was typed for this image, and the same
+    `$name`/`<lora:…>` autocomplete as "✏️ Detail Prompt". An image that's
+    regional already (`/rp`, or painted) has its typed prompt split back
+    into the whole-image part and its two regions — first region first,
+    matching the painted side `_paint_regions_initial_mask` draws in. The
+    raw text, not `full_params.positive_prompt`: the run re-resolves the
+    profile, so a resolved prompt would come back with its prefixes twice."""
+    global_prompt = full_params.raw_positive_prompt or ""
+    region_prompts = ["", ""]
+    if is_regional_prompt(global_prompt):
+        try:
+            parsed = parse_regional_prompt(global_prompt)
+        except RegionalPromptError:
+            parsed = None
+        if parsed is not None and len(parsed.regions) == 2:
+            global_prompt = parsed.global_prompt
+            region_prompts = [region.prompt for region in parsed.regions]
+    live_profile = resolve_profile(full_params.checkpoint, profiles)
+    return {
+        "mode": "regions",
+        "positive": global_prompt,
+        "negative": full_params.raw_negative_prompt or "",
+        "regions": region_prompts,
+        "readonly": {
+            "text": (
+                f"Same checkpoint, size ({full_params.width}×{full_params.height}) and, "
+                "for a plain generation, seed as this image."
+            )
+        },
+        "references": reference_suggestions(
+            storage.list_characters(chat_id),
+            storage.list_favorites(user_id) if user_id is not None else [],
+        ),
+        "loras": lora_suggestions(live_profile),
+    }
+
+
+def _paint_regions_initial_mask(source_bytes: bytes, first_region: RegionSpec | None) -> bytes:
+    """What the "🎨 Paint Regions" editor opens with painted, at the source
+    image's size: the image's own first region (its box, or its painted
+    side) when it has regions, else the left half — `/rp`'s `[left]`, so
+    only the line where the characters meet needs repainting."""
+    with Image.open(io.BytesIO(source_bytes)) as im:
+        width, height = im.size
+    if first_region is not None:
+        return mask_to_png(region_area(first_region, width, height))
+    mask = np.zeros((height, width), dtype=bool)
+    mask[:, : width // 2] = True
+    return mask_to_png(mask)
+
+
+async def _txt2img_seed(client: ComfyClient, filename: str) -> int | None:
+    """The seed `filename` was sampled with, if it's a plain txt2img on
+    ComfyUI's disk — read off ComfyUI's own graph chunk, the only place it
+    exists (see `png_metadata.extract_seed`). None for an image ComfyUI
+    doesn't have, or one a post-processing graph made (no
+    `EmptyLatentImage`): that seed belongs to a detailer or upscaler pass and
+    says nothing about the picture's layout."""
+    if filename.startswith(TELEGRAM_ONLY_FILENAME_PREFIX):
+        return None
+    try:
+        graph = extract_comfy_graph(await client.get_image_bytes(filename, "", "output"))
+    except Exception:
+        logger.warning("Couldn't fetch %s to recover its seed", filename, exc_info=True)
+        return None
+    if not graph or not any(
+        isinstance(node, dict) and node.get("class_type") == "EmptyLatentImage"
+        for node in graph.values()
+    ):
+        return None
+    return extract_seed(graph)
+
+
+async def _expand_paint_regions_texts(
+    bot: Any,
+    storage: Storage,
+    chat_id: int,
+    message_thread_id: int | None,
+    user_id: int | None,
+    checkpoint: str,
+    texts: list[str],
+    profiles: list[ModelProfile],
+) -> tuple[list[str], str]:
+    """`$name`s expanded and unknown `<lora:…>` tags dropped across a
+    "🎨 Paint Regions" submission's fields, each with a warning — the
+    "✏️ Detail Prompt" leniency (`_expand_detail_prompt_references`), since
+    rejecting the submission would throw the painting away. Known tags stay
+    in, for `_resolve_profile_and_prompt`/`resolve_region_loras`. Returns the
+    texts and the referenced characters' negatives."""
+    references = _reference_expander(storage, chat_id, user_id, strict=False)
+    texts = [references.expand(text) for text in texts]
+    if references.unknown:
+        names = ", ".join(f"${name}" for name in references.unknown)
+        await bot.send_message(
+            chat_id,
+            f"⚠️ Nothing saved under {names} — left it out of the prompt.",
+            message_thread_id=message_thread_id,
+        )
+    profile = resolve_profile(checkpoint, profiles)
+    unknown = [name for text in texts for name in resolve_detail_loras(text, profile)[2]]
+    if unknown:
+        texts = [strip_lora_tags(text, unknown) or "" for text in texts]
+        names = ", ".join(f"<lora:{name}>" for name in dict.fromkeys(unknown))
+        await bot.send_message(
+            chat_id,
+            f"⚠️ No LoRA called {names} for this checkpoint — left it out of the prompt.",
+            message_thread_id=message_thread_id,
+        )
+    return texts, references.negatives
+
+
+async def _run_paint_regions_job(
+    application: Application,
+    storage: Storage,
+    client: ComfyClient,
+    job: dict[str, Any],
+    pending: dict[str, Any],
+    result: dict[str, Any],
+    user_id: int | None,
+) -> None:
+    """A submitted "🎨 Paint Regions" painting (see
+    `PAINT_REGIONS_CALLBACK_KIND`): a regional generation with the painted
+    side and its inverse as the two regions (`regional.painted_regions`),
+    otherwise the `/rp` flow (`_generate_regional`) — whole-image prompt and
+    negative through `_resolve_profile_and_prompt` without the active
+    character, a region's `<lora:…>` applied afterwards. Checkpoint and size
+    come from the image painted over, and its seed when it's a plain
+    txt2img (`_txt2img_seed`), so the result tends to keep that layout.
+    Delivered like any generation, "🔁 Generate Again" included."""
+    bot = application.bot
+    chat_id = job["chat_id"]
+    message_thread_id = job["message_thread_id"]
+    profiles: list[ModelProfile] = application.bot_data["profiles"]
+    full_params = _deserialize_generation_params(pending["base_params"])
+    checkpoint = full_params.checkpoint
+
+    raw_texts = [
+        result.get("positive") or "",
+        result.get("negative") or "",
+        *((prompt or "") for prompt in (result.get("region_prompts") or [None, None])),
+    ]
+    texts, reference_negatives = await _expand_paint_regions_texts(
+        bot, storage, chat_id, message_thread_id, user_id, checkpoint, raw_texts, profiles
+    )
+    global_text, negative_text, painted_text, rest_text = texts
+    try:
+        regions = painted_regions(
+            result["mask"], painted_text, rest_text, full_params.width, full_params.height
+        )
+        negative_block = f"\n---\n{negative_text}" if negative_text else ""
+        profile, effective_prompt, extra_negative, _raw_global, raw_negative = (
+            _resolve_profile_and_prompt(
+                chat_id,
+                checkpoint,
+                global_text + negative_block,
+                storage,
+                profiles,
+                use_active_character=False,
+            )
+        )
+        resolved_regions = []
+        for region in regions:
+            region_prompt, region_loras = resolve_region_loras(region.prompt, profile)
+            resolved_regions.append(replace(region, prompt=region_prompt, loras=region_loras))
+    except (RegionalPromptError, UnknownLoraError) as exc:
+        await bot.send_message(chat_id, f"⚠️ {exc}", message_thread_id=message_thread_id)
+        return
+
+    overrides: dict[str, Any] = {"width": full_params.width, "height": full_params.height}
+    seed = await _txt2img_seed(client, pending["filename"])
+    if seed is not None:
+        overrides["seed"] = seed
+    status_message = await bot.send_message(
+        chat_id,
+        "Generating regions… 0%",
+        disable_notification=True,
+        message_thread_id=message_thread_id,
+    )
+    images = await _run_reporting_errors(
+        status_message,
+        "Generation",
+        "regional generation",
+        generate(
+            client,
+            checkpoint,
+            effective_prompt,
+            profile,
+            extra_negative_prompt=join_nonempty([extra_negative, reference_negatives]),
+            raw_positive_prompt=format_regional_prompt(
+                raw_texts[0],
+                [
+                    replace(region, prompt=raw)
+                    for region, raw in zip(regions, raw_texts[2:], strict=True)
+                ],
+            ),
+            raw_negative_prompt=raw_negative,
+            regions=resolved_regions,
+            overrides=overrides,
+            on_progress=_make_progress_callback(status_message),
+            auto_region_loras=storage.get_region_lora_auto(chat_id),
+            on_stage=_make_stage_callback(status_message),
+        ),
+    )
+    if images is None:
+        return
+
+    # `_deliver_generation_result`, minus a `Message` to reply into.
+    snapshot_id = uuid.uuid4().hex[:12]
+    storage.store_generation_snapshot(
+        snapshot_id, chat_id, _serialize_generation_params(images[0].full_params)
+    )
+    await asyncio.gather(
+        *(
+            _send_and_store_bot_result(
+                bot, chat_id, storage, img, message_thread_id=message_thread_id
+            )
+            for img in images
+        )
+    )
+    await status_message.delete()
+    await bot.send_message(
+        chat_id,
+        f"Done — {len(images)} image(s).",
+        reply_markup=_again_keyboard(snapshot_id),
+        message_thread_id=message_thread_id,
     )
 
 
@@ -3513,7 +3782,9 @@ async def _open_mask_editor(
     also passes `meta_overrides` (merged over the job meta built here — its
     region prompt instead of the image's) and `initial_mask_for`: given the
     source image's bytes, the mask the editor should open with already
-    drawn (`_relay_create_job`'s `initial_mask`)."""
+    drawn (`_relay_create_job`'s `initial_mask`). "🎨 Paint Regions" uses
+    both too, with `job_kind=PAINT_REGIONS_JOB_KIND`: its whole meta comes
+    from `meta_overrides` (`_paint_regions_meta`)."""
     settings: Settings = context.bot_data["settings"]
     storage: Storage = context.bot_data["storage"]
     client: ComfyClient = context.bot_data["comfy_client"]
@@ -3646,12 +3917,18 @@ async def _open_mask_editor(
             task = asyncio.create_task(_relay_upload_embedding(settings, token, source_bytes))
             background.add(task)
             task.add_done_callback(background.discard)
-        editor_prompt = (
-            "Draw over the region to detail, describe what should be there, then "
-            "tap Done in the editor:"
-            if job_kind == "detail"
-            else "Draw over the area to fix, then tap Done in the editor:"
-        )
+        if job_kind == PAINT_REGIONS_JOB_KIND:
+            editor_prompt = (
+                "Paint one character plus roughly their half, describe both regions, "
+                "then tap Done in the editor:"
+            )
+        elif job_kind == "detail":
+            editor_prompt = (
+                "Draw over the region to detail, describe what should be there, then "
+                "tap Done in the editor:"
+            )
+        else:
+            editor_prompt = "Draw over the area to fix, then tap Done in the editor:"
         await status_message.edit_text(
             editor_prompt,
             reply_markup=InlineKeyboardMarkup(
@@ -4057,6 +4334,30 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             photo=io.BytesIO(gridded),
             caption="Tap the cell over the hand:",
             reply_markup=_hand_point_keyboard(result_id),
+        )
+        return
+
+    if kind == PAINT_REGIONS_CALLBACK_KIND:
+        if not settings.inpaint_relay_url:
+            await query.message.reply_text("Mask drawing isn't configured on this bot.")
+            return
+        first_region = full_params.regions[0] if full_params.regions else None
+
+        async def _starting_mask(source_bytes: bytes) -> bytes:
+            return await asyncio.to_thread(_paint_regions_initial_mask, source_bytes, first_region)
+
+        await _open_mask_editor(
+            query,
+            context,
+            pending=pending,
+            full_params=full_params,
+            result_id=result_id,
+            job_kind=PAINT_REGIONS_JOB_KIND,
+            user_id=user_id,
+            meta_overrides=_paint_regions_meta(
+                full_params, storage, pending["chat_id"], user_id, context.bot_data["profiles"]
+            ),
+            initial_mask_for=_starting_mask,
         )
         return
 

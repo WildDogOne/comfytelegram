@@ -16,6 +16,7 @@ metadata is written by us rather than read back out of ComfyUI's graph.
 
 from __future__ import annotations
 
+import base64
 from dataclasses import asdict
 from typing import Any
 
@@ -64,7 +65,7 @@ def serialize_generation_params(params: GenerationParams) -> dict[str, Any]:
         "detailer_disable_lora": params.detailer_disable_lora,
         "raw_positive_prompt": params.raw_positive_prompt,
         "raw_negative_prompt": params.raw_negative_prompt,
-        "regions": [asdict(region) for region in params.regions],
+        "regions": [_serialize_region(region) for region in params.regions],
         "regional_base_weight": params.regional_base_weight,
         "regional_region_weight": params.regional_region_weight,
         "regional_lora_denoise": params.regional_lora_denoise,
@@ -107,13 +108,30 @@ def deserialize_generation_params(data: dict[str, Any]) -> GenerationParams:
         detailer_disable_lora=data.get("detailer_disable_lora"),
         raw_positive_prompt=data.get("raw_positive_prompt", ""),
         raw_negative_prompt=data.get("raw_negative_prompt", ""),
-        regions=[
-            RegionSpec(
-                **{**region, "loras": [LoraSpec(**lora) for lora in region.get("loras", [])]}
-            )
-            for region in data.get("regions", [])
-        ],
+        regions=[_deserialize_region(region) for region in data.get("regions", [])],
         regional_base_weight=data.get("regional_base_weight", 0.1),
         regional_region_weight=data.get("regional_region_weight", 0.9),
         regional_lora_denoise=data.get("regional_lora_denoise"),
+    )
+
+
+def _serialize_region(region: RegionSpec) -> dict[str, Any]:
+    """`asdict`, with a painted mask's PNG bytes as base64 — the dict has to
+    survive `json.dumps` on its way into SQLite and the PNG metadata."""
+    data = asdict(region)
+    if region.mask_png is not None:
+        data["mask_png"] = base64.b64encode(region.mask_png).decode("ascii")
+    return data
+
+
+def _deserialize_region(data: dict[str, Any]) -> RegionSpec:
+    """Inverse of `_serialize_region`; a box region from before painted
+    masks existed has neither mask field and gets the defaults."""
+    mask_png = data.get("mask_png")
+    return RegionSpec(
+        **{
+            **data,
+            "loras": [LoraSpec(**lora) for lora in data.get("loras", [])],
+            "mask_png": base64.b64decode(mask_png) if mask_png is not None else None,
+        }
     )

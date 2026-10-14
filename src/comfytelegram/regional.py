@@ -27,8 +27,12 @@ flow, this module only turns text into `RegionSpec`s.
 
 from __future__ import annotations
 
+import io
 import re
 from dataclasses import dataclass, replace
+
+import numpy as np
+from PIL import Image
 
 from comfytelegram.prompt_refs import ReferenceExpander, UnknownReferenceError
 from comfytelegram.workflows import RegionSpec
@@ -224,3 +228,72 @@ def format_regional_prompt(global_prompt: str, regions: list[RegionSpec]) -> str
     lines = [global_prompt] if global_prompt else []
     lines += [f"[{region.label}] {region.prompt}" for region in regions]
     return "\n".join(lines)
+
+
+def normalize_region_mask(png: bytes, width: int, height: int) -> bytes:
+    """A painted region mask as `RegionSpec.mask_png` wants it: black/white
+    at exactly the latent's pixel size (`width`/`height` floored to a
+    multiple of 8 — `AttentionCouplePPM` stacks it with box masks of that
+    size), as a 1-bit PNG. The editor's export can come in at the
+    background image's size and with soft brush edges; resizing smoothly
+    and then thresholding handles both. 1-bit keeps it to a few KB, since
+    it's stored in every result's params and PNG metadata."""
+    size = (width // 8 * 8, height // 8 * 8)
+    gray = Image.open(io.BytesIO(png)).convert("L")
+    if gray.size != size:
+        gray = gray.resize(size, Image.Resampling.BILINEAR)
+    out = io.BytesIO()
+    gray.point(lambda v: 255 if v >= 128 else 0).convert("1").save(out, "PNG", optimize=True)
+    return out.getvalue()
+
+
+def painted_regions(
+    mask_png: bytes, painted_prompt: str, rest_prompt: str, width: int, height: int
+) -> list[RegionSpec]:
+    """The two regions of a painting: what was painted, and everything else
+    (the same mask, inverted). Raises `RegionalPromptError` if either side
+    came out empty — `AttentionCouplePPM` would accept that, but it means
+    one of the two prompts silently does nothing.
+
+    Each also gets its side's bounding box as `x`/`y`/`w`/`h`, and a
+    `left`/`right` (or `top`/`bottom`) label from where its pixels lie
+    relative to the other side's. The graph ignores both for a painted
+    region; they're what anything box-based reads instead — "🐛 Show
+    Prompt", `format_regional_prompt` (so a copied prompt comes back as the
+    nearest plain `/rp` layout), and `generation.region_lora_mask`."""
+    mask_png = normalize_region_mask(mask_png, width, height)
+    painted = np.asarray(Image.open(io.BytesIO(mask_png)).convert("L")) >= 128
+    sides = [painted, ~painted]
+    if not all(side.any() for side in sides):
+        raise RegionalPromptError(
+            "Paint one character and roughly their half of the picture, not none or all of it."
+        )
+    rows, cols = painted.shape
+    centroids = [
+        (np.nonzero(side)[1].mean() / cols, np.nonzero(side)[0].mean() / rows) for side in sides
+    ]
+    (px, py), (rx, ry) = centroids
+    if abs(px - rx) >= abs(py - ry):
+        labels = ("left", "right") if px <= rx else ("right", "left")
+    else:
+        labels = ("top", "bottom") if py <= ry else ("bottom", "top")
+
+    regions = []
+    for side, label, prompt, invert in zip(
+        sides, labels, (painted_prompt, rest_prompt), (False, True), strict=True
+    ):
+        ys, xs = np.nonzero(side)
+        x0, y0 = float(xs.min() / cols), float(ys.min() / rows)
+        regions.append(
+            RegionSpec(
+                label=label,
+                prompt=prompt,
+                x=x0,
+                y=y0,
+                w=float((xs.max() + 1) / cols) - x0,
+                h=float((ys.max() + 1) / rows) - y0,
+                mask_png=mask_png,
+                invert_mask=invert,
+            )
+        )
+    return regions

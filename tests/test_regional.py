@@ -1,7 +1,13 @@
+import io
+import json
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
+from PIL import Image
 
+from comfytelegram.generation import generate, repeat
 from comfytelegram.handlers import (
     RP_CANCEL_CALLBACK_DATA,
     _consume_awaiting_rp_prompt,
@@ -23,10 +29,17 @@ from comfytelegram.regional import (
     expand_references,
     format_regional_prompt,
     is_regional_prompt,
+    normalize_region_mask,
+    painted_regions,
     parse_regional_prompt,
 )
 from comfytelegram.topics import NO_TOPIC
-from comfytelegram.workflows import GenerationParams, RegionSpec, build_txt2img
+from comfytelegram.workflows import (
+    GenerationParams,
+    RegionSpec,
+    build_txt2img,
+    region_mask_filename,
+)
 
 
 def _boxes(regions: list[RegionSpec]) -> list[tuple]:
@@ -224,6 +237,136 @@ def test_build_txt2img_with_regions_patches_the_sampler_model():
     assert prompt[couple["inputs"]["cond_1"][0]]["inputs"]["text"] == "a"
     assert prompt[couple["inputs"]["cond_2"][0]]["inputs"]["text"] == "b"
     assert "cond_3" not in couple["inputs"]
+
+
+def _painting(width=64, height=64, *, painted_cols=slice(0, 24)) -> bytes:
+    """A soft-edged grayscale painting the size of the generation: white
+    over `painted_cols`, a grey brush fringe beside it."""
+    pixels = np.zeros((height, width), dtype=np.uint8)
+    pixels[:, painted_cols] = 255
+    pixels[:, painted_cols.stop] = 200  # fringe that rounds up
+    pixels[:, painted_cols.stop + 1] = 60  # fringe that rounds down
+    out = io.BytesIO()
+    Image.fromarray(pixels).save(out, "PNG")
+    return out.getvalue()
+
+
+def _pixels(png: bytes) -> np.ndarray:
+    return np.asarray(Image.open(io.BytesIO(png)).convert("L"))
+
+
+def test_build_txt2img_with_painted_regions_weights_the_mask_and_its_inverse():
+    regions = painted_regions(_painting(), "a", "b", 1020, 1024)
+    params = GenerationParams(
+        checkpoint="c",
+        positive_prompt="global",
+        negative_prompt="",
+        width=1020,
+        height=1024,
+        regions=regions,
+        regional_region_weight=0.8,
+    )
+
+    prompt, _ = build_txt2img(params)
+
+    couple = next(n for n in prompt.values() if n["class_type"] == "AttentionCouplePPM")
+
+    def weighted(ref):
+        composite = prompt[ref[0]]
+        assert composite["class_type"] == "MaskComposite"
+        assert composite["inputs"]["operation"] == "multiply"
+        solid = prompt[composite["inputs"]["destination"][0]]["inputs"]
+        # Sized like the latent (width floored to a multiple of 8), so it
+        # stacks with the LatentToMaskBB base mask.
+        assert (solid["value"], solid["width"], solid["height"]) == (0.8, 1016, 1024)
+        return prompt[composite["inputs"]["source"][0]]
+
+    filename = region_mask_filename(regions[0].mask_png)
+    painted = weighted(couple["inputs"]["mask_1"])
+    assert painted["class_type"] == "LoadImageMask"
+    assert painted["inputs"] == {"image": filename, "channel": "red"}
+    inverted = weighted(couple["inputs"]["mask_2"])
+    assert inverted["class_type"] == "InvertMask"
+    assert prompt[inverted["inputs"]["mask"][0]]["inputs"]["image"] == filename
+    # The global mask stays a full-canvas box.
+    assert prompt[couple["inputs"]["base_mask"][0]]["class_type"] == "LatentToMaskBB"
+
+
+def test_normalize_region_mask_resizes_to_the_latent_size_and_thresholds():
+    mask = normalize_region_mask(_painting(), 85, 40)
+
+    pixels = _pixels(mask)
+    assert pixels.shape == (40, 80)
+    assert set(np.unique(pixels)) == {0, 255}
+    assert Image.open(io.BytesIO(mask)).mode == "1"
+
+
+def test_painted_regions_are_the_painting_and_its_inverse_with_boxes_and_labels():
+    painted, rest = painted_regions(_painting(), "a", "b", 64, 64)
+
+    assert (painted.label, painted.prompt, painted.invert_mask) == ("left", "a", False)
+    assert (rest.label, rest.prompt, rest.invert_mask) == ("right", "b", True)
+    assert painted.mask_png == rest.mask_png
+    # The fringe pixel at column 24 (200) counts as painted, 25 (60) doesn't.
+    assert (painted.x, painted.w) == (0.0, 25 / 64)
+    assert (rest.x, rest.w) == (25 / 64, 39 / 64)
+    assert (painted.y, painted.h) == (0.0, 1.0)
+
+
+def test_painted_regions_label_the_painted_side_by_where_it_is():
+    painted, rest = painted_regions(_painting(painted_cols=slice(40, 62)), "a", "b", 64, 64)
+    assert (painted.label, rest.label) == ("right", "left")
+
+    pixels = np.zeros((64, 64), dtype=np.uint8)
+    pixels[40:, :] = 255
+    out = io.BytesIO()
+    Image.fromarray(pixels).save(out, "PNG")
+    painted, rest = painted_regions(out.getvalue(), "a", "b", 64, 64)
+    assert (painted.label, rest.label) == ("bottom", "top")
+
+
+@pytest.mark.parametrize("value", [0, 255])
+def test_painted_regions_reject_an_empty_or_full_painting(value):
+    out = io.BytesIO()
+    Image.new("L", (64, 64), value).save(out, "PNG")
+
+    with pytest.raises(RegionalPromptError):
+        painted_regions(out.getvalue(), "a", "b", 64, 64)
+
+
+def test_painted_region_survives_serialization():
+    regions = painted_regions(_painting(), "a", "b", 64, 64)
+    params = GenerationParams(
+        checkpoint="c", positive_prompt="", negative_prompt="", regions=regions
+    )
+
+    data = serialize_generation_params(params)
+    json.dumps(data)  # what storage and the PNG metadata both do with it
+    restored = deserialize_generation_params(data)
+
+    assert restored.regions == regions
+
+
+@pytest.mark.asyncio
+async def test_generate_and_repeat_upload_the_painted_mask_once_before_running():
+    regions = painted_regions(_painting(), "a", "b", 64, 64)
+    client = MagicMock()
+    client.upload_image = AsyncMock()
+    order = []
+    client.upload_image.side_effect = lambda *a, **kw: order.append("upload")
+
+    async def run_graph(*args, **kwargs):
+        order.append("run")
+        return [], {}
+
+    with patch("comfytelegram.generation._run_graph", new=run_graph):
+        await generate(client, "c", "scene", _profile(), regions=regions)
+        await repeat(client, replace(GenerationParams("c", "p", ""), regions=regions))
+
+    assert order == ["upload", "run", "upload", "run"]
+    client.upload_image.assert_awaited_with(
+        regions[0].mask_png, filename=region_mask_filename(regions[0].mask_png), overwrite=True
+    )
 
 
 # --- resolution / serialization ---------------------------------------------

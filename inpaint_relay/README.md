@@ -18,7 +18,9 @@ the bot itself.
   editable positive/negative/denoise fields next to the canvas ("mask" for
   "🖌️ Draw Mask"/"🩹 Fix Artifact" — canvas only — vs. "mask_prompt" for
   "✏️ Detail Prompt" — canvas plus those fields, submitted together in one
-  "Done" tap). One blob comes in from comfytelegram (the source image);
+  "Done" tap — vs. "regions" for "🎨 Paint Regions": the painted area and
+  the rest are two regions, tinted red and blue, each with its own prompt
+  field next to the whole-image positive/negative; no denoise). One blob comes in from comfytelegram (the source image);
   one comes back from the browser (the mask, plus the prompt fields when
   present).
 - Serves the editor page (`static/index.html` — its own JS reads

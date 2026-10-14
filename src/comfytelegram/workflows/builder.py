@@ -18,6 +18,7 @@ face-detail packs), not ones that just add convenience widgets.
 
 from __future__ import annotations
 
+import hashlib
 import random
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
@@ -82,7 +83,20 @@ class RegionSpec:
     them — every region shares one model under Attention Couple, so a LoRA
     can't be applied to just one of them during sampling. They're applied
     afterwards instead, by a detailer pass over the region's character
-    (`generation.apply_region_lora`)."""
+    (`generation.apply_region_lora`).
+
+    `mask_png`, when set, replaces the box: a painted black/white PNG
+    (white = this region) at the generation's own size, see
+    `regional.normalize_region_mask`. It's the bytes themselves, not a
+    ComfyUI filename, so it rides `params_serde` into `pending_result` and
+    the PNG metadata like every other field — "🔁 Generate Again" and a
+    re-imported image still have it, whatever happened to ComfyUI's input
+    folder since. A two-region mask is a few KB as a 1-bit PNG. The graph
+    loads it as `region_mask_filename(mask_png)`, which
+    `generation._upload_region_masks` puts there before submitting.
+    `invert_mask` takes the unpainted part instead, so a two-region
+    painting needs only one mask — the second region is the first one's
+    inverse."""
 
     label: str
     prompt: str
@@ -91,6 +105,15 @@ class RegionSpec:
     w: float
     h: float
     loras: list[LoraSpec] = field(default_factory=list)
+    mask_png: bytes | None = None
+    invert_mask: bool = False
+
+
+def region_mask_filename(mask_png: bytes) -> str:
+    """ComfyUI input filename for a painted region mask, named after its
+    content: both regions of a painting share one upload, and re-uploading
+    the same mask for "🔁 Generate Again" just overwrites it with itself."""
+    return f"region-mask-{hashlib.sha256(mask_png).hexdigest()[:16]}.png"
 
 
 @dataclass
@@ -371,15 +394,55 @@ def _apply_attention_couple(
     load-bearing, not just a style choice. The sampler's own positive input
     stays the global prompt. `cond_N`/`mask_N` are inputs the node's
     frontend JS adds on demand: `/object_info` doesn't list them, but the
-    API accepts them and the node reads them out of its kwargs. Masks come
-    from ppm's own `LatentToMaskBB`, which reads the target size off the
-    latent itself."""
+    API accepts them and the node reads them out of its kwargs. Box masks
+    come from ppm's own `LatentToMaskBB`, which reads the target size off
+    the latent itself.
+
+    The node `torch.stack`s every mask, so a painted one (`RegionSpec.mask_png`)
+    has to come out at exactly that size too — the latent's, times 8. It's
+    multiplied onto a `SolidMask` of that size holding the region weight,
+    which both scales its 0/1 values to the weight and, since
+    `MaskComposite` clips its source to the destination, makes a
+    wrong-sized PNG come out cropped (or, where it falls short, left at the
+    full weight) rather than crash the stack. Resizing it to fit is the
+    caller's job."""
 
     def box_mask(x: float, y: float, w: float, h: float, value: float, title: str) -> str:
         return g.add(
             "LatentToMaskBB",
             {"latent": [latent, 0], "x": x, "y": y, "w": w, "h": h, "value": value},
             title=title,
+        )
+
+    def painted_mask(region: RegionSpec, value: float, title: str) -> str:
+        mask_ref: NodeRef = (
+            g.add(
+                "LoadImageMask",
+                {"image": region_mask_filename(region.mask_png), "channel": "red"},
+                title=title,
+            ),
+            0,
+        )
+        if region.invert_mask:
+            mask_ref = (
+                g.add("InvertMask", {"mask": list(mask_ref)}, title=f"{title} (inverted)"),
+                0,
+            )
+        weight = g.add(
+            "SolidMask",
+            {"value": value, "width": params.width // 8 * 8, "height": params.height // 8 * 8},
+            title=f"{title}: weight",
+        )
+        return g.add(
+            "MaskComposite",
+            {
+                "destination": [weight, 0],
+                "source": list(mask_ref),
+                "x": 0,
+                "y": 0,
+                "operation": "multiply",
+            },
+            title=f"{title}: weighted",
         )
 
     couple_inputs: dict[str, Any] = {
@@ -393,14 +456,17 @@ def _apply_attention_couple(
             {"clip": list(clip_ref), "text": region.prompt},
             title=f"Prompt Region: {region.label}",
         )
-        mask = box_mask(
-            region.x,
-            region.y,
-            region.w,
-            region.h,
-            params.regional_region_weight,
-            f"Mask: {region.label}",
-        )
+        if region.mask_png:
+            mask = painted_mask(region, params.regional_region_weight, f"Mask: {region.label}")
+        else:
+            mask = box_mask(
+                region.x,
+                region.y,
+                region.w,
+                region.h,
+                params.regional_region_weight,
+                f"Mask: {region.label}",
+            )
         couple_inputs[f"cond_{index}"] = [cond, 0]
         couple_inputs[f"mask_{index}"] = [mask, 0]
 

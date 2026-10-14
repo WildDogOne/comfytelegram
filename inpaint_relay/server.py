@@ -8,11 +8,11 @@ for — it just shuttles a source image in and a drawn mask (plus, for
 "✏️ Detail Prompt", a one-shot prompt/denoise submitted alongside it) back
 out, between comfytelegram (reachable only outbound, from a home box with
 no public exposure) and a Telegram client opening this page as a WebApp
-(https://core.telegram.org/bots/webapps). `Job.mode` ("mask" or
-"mask_prompt") just picks whether the editor page also shows the
-prompt/denoise fields next to its canvas — every job submits a mask either
-way, through the same endpoint, and this relay never interprets any of it
-beyond that one rendering decision.
+(https://core.telegram.org/bots/webapps). `Job.mode` ("mask",
+"mask_prompt" or "regions") just picks which fields the editor page shows
+next to its canvas — every job submits a mask either way, through the same
+endpoint, and this relay never interprets any of it beyond that one
+rendering decision.
 
 Job state lives in memory only — a restart here just orphans whatever jobs
 were in flight; comfytelegram's own `inpaint_job` table times them out on
@@ -75,11 +75,14 @@ class Job:
     image_content_type: str
     created_at: float = field(default_factory=time.time)
     status: str = "pending"  # "pending" -> "submitted"
-    #: "mask" (default, for "🖌️ Draw Mask"/"🩹 Fix Artifact" — just a canvas)
-    #: or "mask_prompt" (for "✏️ Detail Prompt" — the same canvas, plus
-    #: editable positive/negative/denoise fields shown alongside it). Set at
-    #: creation from the `meta` comfytelegram sends (see `create_job`); pure
-    #: rendering hint for the page, since both modes submit through the same
+    #: "mask" (default, for "🖌️ Draw Mask"/"🩹 Fix Artifact" — just a canvas),
+    #: "mask_prompt" (for "✏️ Detail Prompt" — the same canvas, plus
+    #: editable positive/negative/denoise fields shown alongside it) or
+    #: "regions" (for "🎨 Paint Regions" — the canvas splits the image into
+    #: what's painted and the rest, with the whole-image positive/negative
+    #: plus one prompt per side; see `region_prompts`). Set at creation from
+    #: the `meta` comfytelegram sends (see `create_job`); pure rendering
+    #: hint for the page, since every mode submits through the same
     #: `POST /jobs/{token}/mask`.
     mode: str = "mask"
     mask: bytes | None = None
@@ -171,6 +174,12 @@ class Job:
     #: override unchecked (the detailer's own default), as for any other
     #: "✏️ Detail Prompt".
     denoise_default: float | None = None
+    #: A "regions" job's two region prompts — `[painted, rest]`, pre-filled
+    #: from `meta["regions"]` (served back by `GET /jobs/{token}/meta`) and
+    #: overwritten by `submit_mask` with what was submitted, each `None` if
+    #: left blank. Always `None` for every other mode. `positive_prompt`/`negative_prompt` carry the
+    #: whole-image prompt alongside them, same as for "mask_prompt".
+    region_prompts: list[str | None] | None = None
     init_data: str | None = None
 
 
@@ -323,6 +332,16 @@ def _parse_denoise_default(value: Any) -> float | None:
     return float(value) if 0 < value <= 1 else None
 
 
+def _parse_region_prompts(value: Any) -> list[str | None] | None:
+    """`meta["regions"]` as the two pre-filled region prompts, or `None`
+    unless it's a list of exactly two strings (or nulls)."""
+    if not isinstance(value, list) or len(value) != 2:
+        return None
+    if not all(item is None or isinstance(item, str) for item in value):
+        return None
+    return list(value)
+
+
 def _parse_segmentation(value: Any) -> dict[str, Any] | None:
     """`meta["segmentation"]` if well-formed, else `None` — the page builds
     a decoder off these, so a partial entry is dropped rather than passed on."""
@@ -349,7 +368,9 @@ async def create_job(request: Request) -> dict[str, str]:
     to display, and whether/how to pre-check the tile-ControlNet checkbox
     (`tile_controlnet_available`/`tile_controlnet_default` — see `Job`)
     the `$name` autocomplete entries (`Job.references`) and the
-    `<lora:…>` ones (`Job.loras`/`Job.active_loras`) —
+    `<lora:…>` ones (`Job.loras`/`Job.active_loras`), and for a
+    `mode="regions"` job the two region prompts to pre-fill
+    (`Job.region_prompts`) —
     a plain "mask" job (the common case) sends none of this, though it can
     still send `detailer_disable_lora_available`/`detailer_disable_lora_default`
     (see `Job.detailer_disable_lora_available`), which isn't tied to
@@ -393,6 +414,7 @@ async def create_job(request: Request) -> dict[str, str]:
         segmentation=_parse_segmentation(meta.get("segmentation")),
         initial_mask=initial_mask or None,
         denoise_default=_parse_denoise_default(meta.get("denoise_default")),
+        region_prompts=_parse_region_prompts(meta.get("regions")),
     )
     return {"token": token}
 
@@ -484,6 +506,7 @@ async def job_meta(token: str) -> JSONResponse:
             "segmentation": job.segmentation,
             "has_initial_mask": job.initial_mask is not None,
             "denoise_default": job.denoise_default,
+            "regions": job.region_prompts,
         }
     )
 
@@ -503,7 +526,9 @@ async def submit_mask(token: str, request: Request) -> dict[str, bool]:
     `mask` file field (grayscale PNG, white = inpaint) and an `init_data`
     text field (`Telegram.WebApp.initData`, opaque to this relay — see
     module docstring for why it's forwarded rather than checked here).
-    `mode="mask_prompt"` jobs also submit `positive`/`negative`/`denoise`/
+    `mode="regions"` jobs submit `positive`/`negative` (the whole image)
+    plus `region_painted`/`region_rest` (see `Job.region_prompts`), all
+    possibly blank. `mode="mask_prompt"` jobs also submit `positive`/`negative`/`denoise`/
     `tile_controlnet` fields alongside the mask, in this same POST — one
     Done tap, one request, covering both what got drawn and what should
     happen there (`positive`/`negative`/`denoise` may be blank, meaning "no
@@ -531,6 +556,13 @@ async def submit_mask(token: str, request: Request) -> dict[str, bool]:
         denoise_raw = _none_if_blank(form.get("denoise"))
         job.denoise = float(denoise_raw) if denoise_raw is not None else None
         job.tile_controlnet = str(form.get("tile_controlnet", "")).strip().lower() == "true"
+    elif job.mode == "regions":
+        job.positive_prompt = _none_if_blank(form.get("positive"))
+        job.negative_prompt = _none_if_blank(form.get("negative"))
+        job.region_prompts = [
+            _none_if_blank(form.get("region_painted")),
+            _none_if_blank(form.get("region_rest")),
+        ]
     job.init_data = str(init_data)
     job.status = "submitted"
     return {"ok": True}
@@ -541,7 +573,8 @@ async def job_result(token: str) -> JSONResponse:
     """comfytelegram polls this to find out whether the editor has been
     submitted yet. Every job submits a mask, so the response shape is the
     same regardless of `mode` — `positive`/`negative`/`denoise` are simply
-    `None` for a plain "mask" job. The mask itself is base64-encoded so the
+    `None` for a plain "mask" job, and `region_prompts` is `None` for
+    anything but a "regions" one. The mask itself is base64-encoded so the
     whole response can stay a single JSON body alongside `init_data`,
     rather than needing a second endpoint or a multipart response just for
     the bytes."""
@@ -558,6 +591,7 @@ async def job_result(token: str) -> JSONResponse:
             "denoise": job.denoise,
             "tile_controlnet": job.tile_controlnet,
             "detailer_disable_lora": job.detailer_disable_lora,
+            "region_prompts": job.region_prompts,
             "init_data": job.init_data,
         }
     )

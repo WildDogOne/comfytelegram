@@ -180,6 +180,11 @@
     gap: 8px;
     box-sizing: border-box;
   }
+  #region-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
   #readonly-info,
   #lora-info {
     font-size: 12px;
@@ -365,7 +370,7 @@
     <div id="readonly-info"></div>
     <div id="lora-info" style="display: none;"></div>
     <div>
-      <div class="field-label">Positive <span class="field-hint" id="positive-hint">— $name inserts a character or favorite</span></div>
+      <div class="field-label"><span id="positive-label">Positive</span> <span class="field-hint" id="positive-hint">— $name inserts a character or favorite</span></div>
       <textarea
         id="positive-input"
         rows="2"
@@ -379,6 +384,19 @@
         rows="2"
         placeholder="Leave blank to use this image's own negative prompt"
       ></textarea>
+    </div>
+    <!-- "🎨 Paint Regions" only (`Job.mode == "regions"`): one prompt per
+         side of the painting, shown by applyMeta. Each is folded in after
+         the whole-image prompt, the way an `/rp` region's is. -->
+    <div id="region-fields" style="display: none;">
+      <div>
+        <div class="field-label">🟥 Painted</div>
+        <textarea id="region-painted-input" rows="2" placeholder="e.g. red hair, blue hoodie"></textarea>
+      </div>
+      <div>
+        <div class="field-label">🟦 Rest</div>
+        <textarea id="region-rest-input" rows="2" placeholder="e.g. black hair, white shirt"></textarea>
+      </div>
     </div>
     <div id="denoise-row">
       <label><input type="checkbox" id="denoise-override" /> Override denoise</label>
@@ -467,6 +485,10 @@
   var denoiseOverride = document.getElementById("denoise-override");
   var denoiseInput = document.getElementById("denoise-input");
   var denoiseValueEl = document.getElementById("denoise-value");
+  var denoiseRowEl = document.getElementById("denoise-row");
+  var regionFieldsEl = document.getElementById("region-fields");
+  var regionPaintedInput = document.getElementById("region-painted-input");
+  var regionRestInput = document.getElementById("region-rest-input");
   // Shared row for the tile-ControlNet and "Disable LoRAs" checkboxes (see
   // applyMeta) — outside #prompt-fields since the LoRA one has to show for
   // a plain "mask" job too, not just "mask_prompt".
@@ -925,6 +947,14 @@
     // and rebuilds it from the source image plus the current overlay at
     // one flat opacity, every time.
     displayCtx.drawImage(image, 0, 0, displayCanvas.width, displayCanvas.height);
+    // A "regions" job has two regions, not "masked" and "not masked": tint
+    // the whole image blue for the rest, and let the red overlay below cover
+    // that tint wherever the painted region is. One flat fill per redraw,
+    // rather than a second overlay canvas kept as the red one's inverse.
+    if (regionsMode) {
+      displayCtx.fillStyle = REST_TINT;
+      displayCtx.fillRect(0, 0, displayCanvas.width, displayCanvas.height);
+    }
     displayCtx.save();
     displayCtx.globalAlpha = BRUSH_OPACITY;
     displayCtx.drawImage(overlayCanvas, 0, 0);
@@ -2096,6 +2126,11 @@
   // both whether `#prompt-fields` is shown at all and whether "Done"
   // includes them in its submission.
   var promptFieldsEnabled = false;
+  // A "regions" job (`Job.mode == "regions"`, "🎨 Paint Regions"): the
+  // prompt fields are the whole image's, plus `#region-fields`, and there's
+  // no detailer pass, so no denoise or tile ControlNet. Set by `applyMeta`.
+  var regionsMode = false;
+  var REST_TINT = "rgba(45, 120, 255, 0.35)";
   // Set once, from `GET /jobs/{token}/meta` (`applyMeta`, below) — unlike
   // `promptFieldsEnabled` this isn't tied to `mode`, since the LoRA toggle
   // is relevant to a plain "mask" job ("🖌️ Draw Mask") too, not just
@@ -2112,7 +2147,12 @@
       if (loraAvailable) {
         form.append("detailer_disable_lora", loraToggle.checked ? "true" : "false");
       }
-      if (promptFieldsEnabled) {
+      if (regionsMode) {
+        form.append("positive", positiveInput.value);
+        form.append("negative", negativeInput.value);
+        form.append("region_painted", regionPaintedInput.value);
+        form.append("region_rest", regionRestInput.value);
+      } else if (promptFieldsEnabled) {
         form.append("positive", positiveInput.value);
         form.append("negative", negativeInput.value);
         form.append("denoise", denoiseOverride.checked ? denoiseInput.value : "");
@@ -2192,11 +2232,23 @@
     if (toggleShown) {
       toggleRowEl.style.display = "flex";
     }
-    if (meta.mode !== "mask_prompt") return;
+    if (meta.mode !== "mask_prompt" && meta.mode !== "regions") return;
     promptFieldsEnabled = true;
-    document.title = "Detail prompt";
+    regionsMode = meta.mode === "regions";
+    document.title = regionsMode ? "Paint regions" : "Detail prompt";
     promptFieldsEl.style.display = "flex";
-    readonlyEl.textContent = formatReadonlyInfo(meta.readonly);
+    readonlyEl.textContent = regionsMode
+      ? (meta.readonly && meta.readonly.text) || ""
+      : formatReadonlyInfo(meta.readonly);
+    if (regionsMode) {
+      regionFieldsEl.style.display = "flex";
+      denoiseRowEl.style.display = "none";
+      document.getElementById("positive-label").textContent = "Whole image";
+      positiveInput.placeholder = "What both regions share — the scene, the background";
+      negativeInput.placeholder = "";
+      regionPaintedInput.value = (meta.regions && meta.regions[0]) || "";
+      regionRestInput.value = (meta.regions && meta.regions[1]) || "";
+    }
     // Pre-filled with this image's own current prompt — the usual reason
     // to open this is to cut a scene-wide prompt down to what the marked
     // region needs, not type one from scratch. Denoise has no equivalent
@@ -2223,7 +2275,16 @@
     // replace them when "Disable LoRAs" is checked — say which ones those
     // are, since nothing else on the page does.
     var activeLoras = Array.isArray(meta.active_loras) ? meta.active_loras : [];
-    if (activeLoras.length || loraRefs.length) {
+    if (regionsMode) {
+      // No detailer here: this is a fresh generation, so tags behave as
+      // they do in a typed /rp prompt.
+      if (loraRefs.length) {
+        loraInfoEl.textContent =
+          "<lora:…> in the whole-image prompt applies everywhere; in a " +
+          "region's prompt it's applied to that region afterwards.";
+        loraInfoEl.style.display = "block";
+      }
+    } else if (activeLoras.length || loraRefs.length) {
       loraInfoEl.textContent = activeLoras.length
         ? "LoRAs on this image: " +
           activeLoras.map(formatActiveLora).join(", ") +
@@ -2270,7 +2331,11 @@
   // folded away.
   function updateOptionsSummary() {
     var parts = [];
-    if (promptFieldsEnabled) {
+    if (regionsMode) {
+      [regionPaintedInput, regionRestInput].forEach(function (input, i) {
+        if (input.value.trim()) parts.push((i ? "🟦 " : "🟥 ") + input.value.trim());
+      });
+    } else if (promptFieldsEnabled) {
       if (positiveInput.value.trim()) parts.push(positiveInput.value.trim());
       if (denoiseOverride.checked) {
         parts.push("denoise " + Number(denoiseInput.value).toFixed(2));
@@ -2342,11 +2407,14 @@
 
       replayHistory();
       setStatus(
-        hasPresetMask
-          ? "The suggested mask is drawn in — fix it where it's off, then tap Done."
-          : promptFieldsEnabled
-            ? "Draw over the region to detail, describe it below, then tap Done."
-            : "Draw over the area to fix, then tap Done."
+        regionsMode
+          ? "Paint one character plus roughly their half (🟥); the rest (🟦) is " +
+            "the other. Only the line between them needs care. Describe both below."
+          : hasPresetMask
+            ? "The suggested mask is drawn in — fix it where it's off, then tap Done."
+            : promptFieldsEnabled
+              ? "Draw over the region to detail, describe it below, then tap Done."
+              : "Draw over the area to fix, then tap Done."
       );
     };
     image.onerror = function () {
@@ -2532,7 +2600,7 @@
     input.focus();
   }
 
-  [positiveInput, negativeInput].forEach(function (input) {
+  [positiveInput, negativeInput, regionPaintedInput, regionRestInput].forEach(function (input) {
     input.addEventListener("input", function () { updateRefMenu(input); });
     input.addEventListener("click", function () { updateRefMenu(input); });
     input.addEventListener("blur", closeRefMenu);

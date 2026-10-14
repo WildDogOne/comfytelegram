@@ -23,6 +23,7 @@ from comfytelegram.workflows.builder import (
     build_txt2img,
     build_upscale,
     kontext_resolution,
+    region_mask_filename,
 )
 
 __all__ = [
@@ -50,4 +51,5 @@ __all__ = [
     "build_txt2img",
     "build_upscale",
     "kontext_resolution",
+    "region_mask_filename",
 ]

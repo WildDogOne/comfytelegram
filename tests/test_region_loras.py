@@ -44,6 +44,7 @@ from comfytelegram.params_serde import (
     serialize_generation_params,
 )
 from comfytelegram.profiles import LoraDefault, ModelProfile, apply_checkpoint_switch
+from comfytelegram.regional import painted_regions
 from comfytelegram.storage import Storage
 from comfytelegram.topics import NO_TOPIC
 from comfytelegram.workflows import (
@@ -162,6 +163,36 @@ def test_region_mask_falls_back_to_the_box_without_people_in_it():
 
     assert not from_people
     assert mask[:, :100].all() and not mask[:, 100:].any()
+
+
+def test_region_mask_follows_a_painted_side_instead_of_a_box():
+    pixels = np.zeros((100, 100), dtype=np.uint8)
+    pixels[:, :30] = 255
+    pixels[60:, 30:70] = 255  # the painted side reaches under the other character
+    buffer = io.BytesIO()
+    Image.fromarray(pixels).save(buffer, "PNG")
+    _painted, rest = painted_regions(buffer.getvalue(), "a", "b", 100, 100)
+    people = np.zeros((200, 200), dtype=bool)  # image upscaled 2x since
+    people[20:200, 20:180] = True
+
+    rest_mask, from_people = region_lora_mask(people, rest)
+
+    assert from_people
+    assert rest_mask[50, 150] and not rest_mask[50, 30]
+    assert not rest_mask[180, 100]  # painted side, though inside rest's box
+
+
+def test_region_mask_falls_back_to_the_painted_side_without_people_in_it():
+    pixels = np.zeros((100, 100), dtype=np.uint8)
+    pixels[:, :30] = 255
+    buffer = io.BytesIO()
+    Image.fromarray(pixels).save(buffer, "PNG")
+    painted, _rest = painted_regions(buffer.getvalue(), "a", "b", 100, 100)
+
+    mask, from_people = region_lora_mask(np.zeros((100, 100), dtype=bool), painted)
+
+    assert not from_people
+    assert mask[:, :30].all() and not mask[:, 30:].any()
 
 
 def test_mask_png_is_white_on_black_grayscale():
