@@ -1,0 +1,20 @@
+# Everything the scripts generate: images, captions, _qc reports,
+# manifests, WD14 score caches, A/B and reference-sheet test renders.
+output/
+# Local reference images (screenshots used to steer the prompt) — not read
+# by any script.
+reference/
+__pycache__/
+# Optional experiment tools, not needed for the generate/caption cycle.
+abtest.py
+refsheet.py
+artist_test.py
+# Per-dataset config; the committed templates are the .example files.
+character.json
+wildcards.json
+# Training launch script (cluster paths) and per-character sample prompts.
+train_lora.sh
+train_lora.sbatch
+sample_prompts_*.txt
+# Personal flow notes (cluster host/paths).
+README.md

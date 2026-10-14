@@ -168,6 +168,20 @@
       "strength_clip": 1.0,
       "default_enabled": false,
       "trigger_words": "waspsalad"
+    },
+    {
+      "name": "illustrious/marlowV1/marlowV1.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false,
+      "trigger_words": "marlow, anthro, male, australian shepherd"
+    },
+    {
+      "name": "illustrious/marlowV2/marlowV2.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false,
+      "trigger_words": "marlow"
     }
   ],
   "civitai_base_models": [

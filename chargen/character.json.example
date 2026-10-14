@@ -1,0 +1,26 @@
+{
+  "notes": [
+    "Every field here is specific to one character dataset; copy this file to character.json and edit it.",
+    "character: the identity tags, every colour tied to a body part. A bare 'orange markings' let the model place the orange itself, and with 'australian shepherd' it went above the eyes (tan points of real tricolour Aussies).",
+    "Face tags were picked by A/B test (abtest.py): 'orange freckles' because plain 'freckles' came out white/blue; 'spotted ears' for merle spots, since 'blue spots' spread them over the whole body.",
+    "Tried and dropped: 'mask (marking)' drew literal masks, 'blaze (marking)' drew the word BLAZE, 'white belly' made the character fat.",
+    "extra_positive/extra_negative: not part of the base prompts; keep every image a single, clothed, unwatermarked subject. 'clothed' because the body-part colour tags otherwise pull the model toward showing the body.",
+    "class_tags: fixed prefix of every final caption (finalize_captions.py), trigger word first. kohya only uses a dataset folder's class token (e.g. '50_marlow anthro') for images without a caption file, so the trigger has to be in the captions; train with keep_tokens 1 so shuffle_caption keeps the trigger in front. Some images get the trigger alone (finalize_captions.py's CLASS_TAG_DROPOUT), otherwise the trigger never works without the class tags.",
+    "loras: optional, attached to every generated image, e.g. [{\"name\": \"marlow-000032.safetensors\", \"strength\": 0.7}] — a previous round's character LoRA, for a more consistent next dataset. Keep the strength below 1 so the base model and artist tags still drive variety, and keep the full character prompt; see README 'Next round'.",
+    "artist_exclude: e621 artists never drawn, written with spaces or underscores. thecon: style pulls the character bottomless regardless of outfit."
+  ],
+  "checkpoint": "IllustriousV2.safetensors",
+  "character": "male",
+  "class_tags": [
+    "char_name"
+  ],
+  "base_positive": "masterpiece, best quality, amazing quality, very aesthetic, newest",
+  "base_negative": "(worst quality:1.2), (bad quality:1.2), (low quality:1.2), bad anatomy, author signature, text, breasts, female",
+  "extra_positive": "solo, anthro, 5 fingers, clothed",
+  "extra_negative": "multiple characters, duo, group, nsfw, explicit, nude, watermark, signature, patreon logo, url, wide hips, thick thighs, butt focus, crotch focus, bottomless, open clothing, multiple views, reference sheet, overweight, slightly chubby, big belly, hood up",
+  "loras": [],
+  "artist_exclude": [
+    "manmosu marimo",
+    "mleonheart"
+  ]
+}
