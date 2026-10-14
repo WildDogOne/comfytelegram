@@ -18,11 +18,14 @@ from test_detail_prompt import _callback_update, _context
 from comfytelegram.comfy_client import ComfyUIError
 from comfytelegram.generation import GeneratedImage
 from comfytelegram.handlers import (
+    AGAIN_CALLBACK_PREFIX,
     PAINT_REGIONS_CALLBACK_KIND,
     PAINT_REGIONS_JOB_KIND,
+    _deserialize_generation_params,
     _paint_regions_initial_mask,
     _paint_regions_meta,
     _process_one_inpaint_job,
+    _send_and_store_bot_result,
     _serialize_generation_params,
     _txt2img_seed,
     postprocess_callback,
@@ -166,9 +169,9 @@ async def test_seed_comes_from_a_txt2img_graph_only():
 # --- the submission --------------------------------------------------------------
 
 
-async def _submit(storage, result: dict, *, profiles=(_PROFILE,), seed=1234):
+async def _submit(storage, result: dict, *, profiles=(_PROFILE,), seed=1234, noise_index=None):
     storage.store_pending_result(
-        "abc", 42, "file", "a.png", _serialize_generation_params(_params())
+        "abc", 42, "file", "a.png", _serialize_generation_params(_params()), noise_index
     )
     application = MagicMock()
     application.bot.send_message = AsyncMock(return_value=AsyncMock())
@@ -181,7 +184,12 @@ async def _submit(storage, result: dict, *, profiles=(_PROFILE,), seed=1234):
         "result_id": "abc",
         "kind": PAINT_REGIONS_JOB_KIND,
     }
-    image = GeneratedImage(data=b"img", filename="o.png", full_params=_params())
+
+    async def fake_generate(*args, regions, overrides, **kwargs):
+        # Echo back what it was asked for, the way generate() resolves it.
+        params = _params(regions=regions, **overrides)
+        return [GeneratedImage(data=b"img", filename="o.png", full_params=params)]
+
     with (
         patch(
             "comfytelegram.handlers._relay_poll_result",
@@ -193,7 +201,7 @@ async def _submit(storage, result: dict, *, profiles=(_PROFILE,), seed=1234):
         ),
         patch("comfytelegram.handlers._relay_delete_job", new=AsyncMock()),
         patch("comfytelegram.handlers._txt2img_seed", new=AsyncMock(return_value=seed)),
-        patch("comfytelegram.handlers.generate", new=AsyncMock(return_value=[image])) as gen,
+        patch("comfytelegram.handlers.generate", new=AsyncMock(side_effect=fake_generate)) as gen,
         patch("comfytelegram.handlers._send_and_store_bot_result", new=AsyncMock()) as send,
     ):
         await _process_one_inpaint_job(application, settings, storage, MagicMock(), job)
@@ -220,11 +228,13 @@ async def test_a_painting_generates_with_the_painted_side_and_its_inverse(storag
     assert (rest.prompt, rest.invert_mask) == ("black hair", True)
     assert painted.mask_png == rest.mask_png
     # Same size as the image painted over, and its seed.
-    assert kwargs["overrides"] == {"width": 64, "height": 48, "seed": 1234}
+    # One image: only a batch's first image would share the frozen seed's layout.
+    overrides = {"width": 64, "height": 48, "seed": 1234, "batch_size": 1, "batch_offset": 0}
+    assert kwargs["overrides"] == overrides
     assert kwargs["raw_positive_prompt"] == "2boys, cuddling\n[left] red hair\n[right] black hair"
     send.assert_awaited_once()
     assert send.await_args.kwargs["message_thread_id"] == 9
-    assert send_message.await_args.args[1] == "Done — 1 image(s)."
+    assert send_message.await_args.args[1].startswith("Done — same seed")
     assert storage.list_inpaint_jobs() == []
 
 
@@ -236,7 +246,7 @@ async def test_without_a_seed_the_run_rolls_a_fresh_one(storage):
         seed=None,
     )
 
-    assert "seed" not in gen.await_args.kwargs["overrides"]
+    assert gen.await_args.kwargs["overrides"] == {"width": 64, "height": 48}
 
 
 @pytest.mark.asyncio
@@ -267,3 +277,56 @@ async def test_unknown_names_are_dropped_with_a_warning_and_known_loras_kept(sto
     painted, rest = gen.await_args.kwargs["regions"]
     assert [lora.name for lora in painted.loras] == ["chars/marlow.safetensors"]
     assert rest.loras == [] and "missing" not in rest.prompt
+
+
+@pytest.mark.asyncio
+async def test_generate_again_rerolls_the_painting_at_the_normal_batch_size(storage):
+    storage.set_override_fields(42, "ckpt.safetensors", {"batch_size": 4})
+    gen, _send, send_message = await _submit(
+        storage,
+        {"mask": _left_painting(), "positive": "x", "region_prompts": ["a", "b"]},
+    )
+
+    assert gen.await_args.kwargs["overrides"]["batch_size"] == 1
+    assert "tries 4 new one(s)" in send_message.await_args.args[1]
+    button = send_message.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+    snapshot_id = button.callback_data.removeprefix(AGAIN_CALLBACK_PREFIX)
+    snapshot = _deserialize_generation_params(
+        storage.get_generation_snapshot(snapshot_id)["params"]
+    )
+    assert snapshot.batch_size == 4
+    # Serialization never keeps the seed, so Generate Again always rerolls —
+    # but the painting itself comes along.
+    assert snapshot.seed is None
+    assert [region.invert_mask for region in snapshot.regions] == [False, True]
+    assert snapshot.regions[0].mask_png
+
+
+@pytest.mark.asyncio
+async def test_painting_over_a_later_batch_image_replays_its_noise_draw(storage):
+    """Image 3 of a batch is draw 2 of the seed's noise — the seed alone
+    would reproduce image 1 instead, a different picture."""
+    gen, _send, _msg = await _submit(
+        storage,
+        {"mask": _left_painting(), "positive": "x", "region_prompts": ["a", "b"]},
+        noise_index=2,
+    )
+
+    assert gen.await_args.kwargs["overrides"]["batch_offset"] == 2
+    assert gen.await_args.kwargs["overrides"]["batch_size"] == 1
+
+
+@pytest.mark.asyncio
+async def test_bot_results_store_their_noise_index(storage):
+    bot = MagicMock()
+    bot.send_photo = AsyncMock(return_value=MagicMock(photo=[MagicMock(file_id="f")]))
+    image = GeneratedImage(
+        data=_png(np.zeros((4, 4), dtype=np.uint8)),
+        filename="o.png",
+        full_params=_params(),
+        noise_index=3,
+    )
+
+    result_id = await _send_and_store_bot_result(bot, 42, storage, image)
+
+    assert storage.get_pending_result(result_id)["noise_index"] == 3

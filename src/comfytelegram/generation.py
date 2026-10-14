@@ -86,6 +86,13 @@ class GeneratedImage:
     #: warning instead of silently handing back what looks like a
     #: successful refinement.
     unchanged: bool = False
+    #: Which draw of its seed's noise this image was sampled from —
+    #: `batch_offset` plus its position in the batch (`/history` lists a
+    #: batch's outputs in order) — for a txt2img/`repeat()` image; None for
+    #: anything post-processed. With the seed, it's what reproduces this
+    #: exact image's noise (`GenerationParams.batch_offset`): image 3 of a
+    #: batch of 4 is draw 2, not draw 0.
+    noise_index: int | None = None
 
 
 #: Max grayscale pixel value `_detailer_found_nothing` still treats as "no
@@ -871,12 +878,22 @@ async def generate(
     await _upload_region_masks(client, params)
     raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
     raw = _tag_images(raw, params, kind="txt2img", graph=prompt_graph)
-    images = [GeneratedImage(data=data, filename=name, full_params=params) for data, name in raw]
+    images = _batch_images(raw, params)
     if auto_region_loras:
         images = await _apply_region_loras_to_all(
             client, images, profiles=[profile] if profile else None, on_stage=on_stage
         )
     return images
+
+
+def _batch_images(raw: list[tuple[bytes, str]], params: GenerationParams) -> list[GeneratedImage]:
+    """A txt2img batch's images, each with its `noise_index`."""
+    return [
+        GeneratedImage(
+            data=data, filename=name, full_params=params, noise_index=params.batch_offset + i
+        )
+        for i, (data, name) in enumerate(raw)
+    ]
 
 
 async def _upload_region_masks(client: ComfyClient, params: GenerationParams) -> None:
@@ -1416,7 +1433,7 @@ async def repeat(
     "🔁 Generate Again" button, for quickly cranking out more variations of
     the same prompt without retyping it or picking a specific image.
     `auto_region_loras`/`on_stage` as in `generate`."""
-    fresh_params = replace(full_params, seed=None)
+    fresh_params = replace(full_params, seed=None, batch_offset=0)
     prompt_graph, save_node_id = build_txt2img(fresh_params)
     logger.info(
         "Repeating: checkpoint=%s cfg=%s steps=%s",
@@ -1428,9 +1445,7 @@ async def repeat(
     await _upload_region_masks(client, fresh_params)
     raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
     raw = _tag_images(raw, fresh_params, kind="repeat", graph=prompt_graph)
-    images = [
-        GeneratedImage(data=data, filename=name, full_params=fresh_params) for data, name in raw
-    ]
+    images = _batch_images(raw, fresh_params)
     if auto_region_loras:
         images = await _apply_region_loras_to_all(
             client, images, profiles=profiles, on_stage=on_stage

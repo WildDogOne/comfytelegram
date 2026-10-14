@@ -233,6 +233,7 @@ class Storage:
         # migrations framework, a new column on an existing table needs its
         # own guarded ALTER TABLE instead.
         self._add_column_if_missing("derived_prompt", "negative_prompt", "TEXT NOT NULL DEFAULT ''")
+        self._add_column_if_missing("pending_result", "noise_index", "INTEGER")
         self._add_column_if_missing("inpaint_job", "message_thread_id", "INTEGER")
         self._add_column_if_missing("inpaint_job", "kind", "TEXT NOT NULL DEFAULT 'hand'")
         self._add_column_if_missing("inpaint_job", "editor_message_id", "INTEGER")
@@ -522,38 +523,50 @@ class Storage:
         file_id: str,
         filename: str,
         base_params: dict[str, Any],
+        noise_index: int | None = None,
     ) -> None:
         """Record what a post-processing/regenerate button (result_id) refers
         to: the Telegram file_id to re-download the source image from, and
         the full resolved generation params (already a plain dict — see
         handlers.py's (de)serialization helpers) needed to build the next
         graph, whether that's an upscale/face-detail pass or a fresh
-        "🔁 Regenerate" run."""
+        "🔁 Regenerate" run. `noise_index` is `GeneratedImage.noise_index`
+        — which draw of its seed's noise a txt2img image is, None for
+        anything else (and for rows from before it was recorded)."""
         self._prune("pending_result")
         with self._conn:
             self._conn.execute(
                 "INSERT OR REPLACE INTO pending_result "
-                "(result_id, chat_id, file_id, filename, base_params_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (result_id, chat_id, file_id, filename, json.dumps(base_params), time.time()),
+                "(result_id, chat_id, file_id, filename, base_params_json, created_at, "
+                "noise_index) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    result_id,
+                    chat_id,
+                    file_id,
+                    filename,
+                    json.dumps(base_params),
+                    time.time(),
+                    noise_index,
+                ),
             )
 
     def get_pending_result(self, result_id: str) -> dict[str, Any] | None:
         """The row `store_pending_result` wrote for `result_id`, or None if
         it doesn't exist (never stored, or pruned past its TTL)."""
         row = self._conn.execute(
-            "SELECT chat_id, file_id, filename, base_params_json FROM pending_result "
-            "WHERE result_id = ?",
+            "SELECT chat_id, file_id, filename, base_params_json, noise_index "
+            "FROM pending_result WHERE result_id = ?",
             (result_id,),
         ).fetchone()
         if row is None:
             return None
-        chat_id, file_id, filename, base_params_json = row
+        chat_id, file_id, filename, base_params_json, noise_index = row
         return {
             "chat_id": chat_id,
             "file_id": file_id,
             "filename": filename,
             "base_params": json.loads(base_params_json),
+            "noise_index": noise_index,
         }
 
     def _prune(self, table: str, ttl_seconds: float = PENDING_RESULT_TTL_SECONDS) -> None:

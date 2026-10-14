@@ -102,6 +102,7 @@ from comfytelegram.profiles import (
     apply_lora_strength_overrides,
     apply_profile_override,
     join_nonempty,
+    resolve_generation_params,
     resolve_profile,
 )
 from comfytelegram.prompt_refs import (
@@ -1457,6 +1458,7 @@ async def _send_and_store_result(
         _extract_file_id(sent),
         img.filename,
         _serialize_generation_params(img.full_params),
+        noise_index=img.noise_index,
     )
     return result_id
 
@@ -1500,6 +1502,7 @@ async def _send_and_store_bot_result(
         _extract_file_id(sent),
         img.filename,
         _serialize_generation_params(img.full_params),
+        noise_index=img.noise_index,
     )
     return result_id
 
@@ -2284,7 +2287,16 @@ async def _run_paint_regions_job(
     character, a region's `<lora:…>` applied afterwards. Checkpoint and size
     come from the image painted over, and its seed when it's a plain
     txt2img (`_txt2img_seed`), so the result tends to keep that layout.
-    Delivered like any generation, "🔁 Generate Again" included."""
+
+    A frozen seed means one image: ComfyUI draws a whole batch's noise from
+    one seed, image after image, so a batch would share the layout in one
+    image at most. That one image is the same noise draw as the image
+    painted over (`pending_result.noise_index`, as `batch_offset`) — the
+    seed alone would give draw 0, i.e. the *first* image of that image's
+    batch, which is why painting over image 3 used to change everything. "🔁 Generate Again" (its snapshot
+    reset to the chat's normal batch size) is the way to new seeds — same
+    painting and prompts, `repeat()` drops the seed. With no seed to
+    freeze, the run is a normal batch straight away."""
     bot = application.bot
     chat_id = job["chat_id"]
     message_thread_id = job["message_thread_id"]
@@ -2325,9 +2337,13 @@ async def _run_paint_regions_job(
         return
 
     overrides: dict[str, Any] = {"width": full_params.width, "height": full_params.height}
+    normal_batch_size = resolve_generation_params(checkpoint, "", profile).batch_size
     seed = await _txt2img_seed(client, pending["filename"])
     if seed is not None:
-        overrides["seed"] = seed
+        # Image k of a batch is draw k of the seed's noise, not draw 0. A row
+        # stored before `noise_index` was recorded has None; 0 is the best
+        # guess there (right for a batch's first image, or a batch of one).
+        overrides.update(seed=seed, batch_size=1, batch_offset=pending.get("noise_index") or 0)
     status_message = await bot.send_message(
         chat_id,
         "Generating regions… 0%",
@@ -2365,7 +2381,9 @@ async def _run_paint_regions_job(
     # `_deliver_generation_result`, minus a `Message` to reply into.
     snapshot_id = uuid.uuid4().hex[:12]
     storage.store_generation_snapshot(
-        snapshot_id, chat_id, _serialize_generation_params(images[0].full_params)
+        snapshot_id,
+        chat_id,
+        _serialize_generation_params(replace(images[0].full_params, batch_size=normal_batch_size)),
     )
     await asyncio.gather(
         *(
@@ -2376,9 +2394,15 @@ async def _run_paint_regions_job(
         )
     )
     await status_message.delete()
+    done_text = (
+        "Done — same seed as the image you painted over. "
+        f"🔁 Generate Again tries {normal_batch_size} new one(s)."
+        if seed is not None
+        else f"Done — {len(images)} image(s)."
+    )
     await bot.send_message(
         chat_id,
-        f"Done — {len(images)} image(s).",
+        done_text,
         reply_markup=_again_keyboard(snapshot_id),
         message_thread_id=message_thread_id,
     )

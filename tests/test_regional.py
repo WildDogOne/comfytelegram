@@ -292,6 +292,34 @@ def test_build_txt2img_with_painted_regions_weights_the_mask_and_its_inverse():
     assert prompt[couple["inputs"]["base_mask"][0]]["class_type"] == "LatentToMaskBB"
 
 
+def test_batch_offset_skips_to_that_noise_draw():
+    plain, _ = build_txt2img(GenerationParams("c", "p", "", batch_size=4))
+    assert not any(n["class_type"] == "LatentFromBatch" for n in plain.values())
+
+    prompt, _ = build_txt2img(GenerationParams("c", "p", "", batch_size=1, batch_offset=2))
+
+    sampler = next(n for n in prompt.values() if n["class_type"] == "KSampler")
+    picked = prompt[sampler["inputs"]["latent_image"][0]]
+    assert picked["class_type"] == "LatentFromBatch"
+    assert (picked["inputs"]["batch_index"], picked["inputs"]["length"]) == (2, 1)
+    empty = prompt[picked["inputs"]["samples"][0]]
+    assert empty["class_type"] == "EmptyLatentImage"
+    assert empty["inputs"]["batch_size"] == 3
+
+
+@pytest.mark.asyncio
+async def test_batch_images_record_their_noise_index_and_repeat_starts_over():
+    client = MagicMock(upload_image=AsyncMock())
+    raw = [(b"a", "a.png"), (b"b", "b.png")]
+    with patch("comfytelegram.generation._run_graph", new=AsyncMock(return_value=(raw, {}))):
+        fresh = await generate(client, "c", "scene", _profile(), overrides={"batch_offset": 3})
+        again = await repeat(client, fresh[0].full_params)
+
+    assert [image.noise_index for image in fresh] == [3, 4]
+    assert [image.noise_index for image in again] == [0, 1]
+    assert again[0].full_params.batch_offset == 0
+
+
 def test_normalize_region_mask_resizes_to_the_latent_size_and_thresholds():
     mask = normalize_region_mask(_painting(), 85, 40)
 
