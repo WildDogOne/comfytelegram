@@ -59,7 +59,8 @@ Still open:
 - [ ] **Region LoRAs: follow-ups.** Shipped (see CHANGELOG): a region's
   `<lora:…>` is applied after generating by a detailer pass over that
   region's character, mask checked in the editor first or run
-  automatically. Open ends:
+  automatically. Tested and working as is, so these are parked — kept for
+  reference in case problems show up, not planned:
   - **Masks where characters touch.** The suggested mask is "people inside
     the region's box", so between touching characters its edge is the
     box's straight line. Neither the COCO person segmenter (one merged
