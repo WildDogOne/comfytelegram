@@ -2303,12 +2303,15 @@ async def _run_paint_regions_job(
     come from the image painted over, and its seed when it's a plain
     txt2img (`_txt2img_seed`), so the result tends to keep that layout.
 
-    A frozen seed means one image: ComfyUI draws a whole batch's noise from
-    one seed, image after image, so a batch would share the layout in one
-    image at most. That one image is the same noise draw as the image
-    painted over (`pending_result.noise_index`, as `batch_offset`) — the
-    seed alone would give draw 0, i.e. the *first* image of that image's
-    batch, which is why painting over image 3 used to change everything. "🔁 Generate Again" (its snapshot
+    A frozen seed re-runs the painted-over image's whole batch — same seed,
+    batch size, steps, cfg, sampler, scheduler and clip skip — and keeps
+    only that image's slice (`pending_result.noise_index`). ComfyUI draws a
+    batch's noise all at once, per step too for ancestral/SDE samplers, so
+    nothing smaller reproduces image k (see `GeneratedImage.noise_index`);
+    the other images would only share the layout of *their* originals, not
+    the one painted over, so they're dropped. That costs the batch's GPU
+    time for one image. "Region LoRAs: Automatic" runs on the kept image
+    only. "🔁 Generate Again" (its snapshot
     reset to the chat's normal batch size) is the way to new seeds — same
     painting and prompts, `repeat()` drops the seed. With no seed to
     freeze, the run is a normal batch straight away."""
@@ -2354,11 +2357,19 @@ async def _run_paint_regions_job(
     overrides: dict[str, Any] = {"width": full_params.width, "height": full_params.height}
     normal_batch_size = resolve_generation_params(checkpoint, "", profile).batch_size
     seed = await _txt2img_seed(client, bot, pending)
+    # A row stored before `noise_index` was recorded has None; 0 is the best
+    # guess there (right for a batch's first image, or a batch of one).
+    keep_index = pending.get("noise_index") or 0
     if seed is not None:
-        # Image k of a batch is draw k of the seed's noise, not draw 0. A row
-        # stored before `noise_index` was recorded has None; 0 is the best
-        # guess there (right for a batch's first image, or a batch of one).
-        overrides.update(seed=seed, batch_size=1, batch_offset=pending.get("noise_index") or 0)
+        overrides.update(
+            seed=seed,
+            batch_size=max(full_params.batch_size, keep_index + 1),
+            steps=full_params.steps,
+            cfg=full_params.cfg,
+            sampler_name=full_params.sampler_name,
+            scheduler=full_params.scheduler,
+            clip_skip=full_params.clip_skip,
+        )
     status_message = await bot.send_message(
         chat_id,
         "Generating regions… 0%",
@@ -2386,12 +2397,29 @@ async def _run_paint_regions_job(
             regions=resolved_regions,
             overrides=overrides,
             on_progress=_make_progress_callback(status_message),
-            auto_region_loras=storage.get_region_lora_auto(chat_id),
+            auto_region_loras=seed is None and storage.get_region_lora_auto(chat_id),
             on_stage=_make_stage_callback(status_message),
         ),
     )
     if images is None:
         return
+    if seed is not None:
+        images = [images[keep_index]]
+        if storage.get_region_lora_auto(chat_id) and has_region_loras(images[0].full_params):
+            kept = await _run_reporting_errors(
+                status_message,
+                "Region LoRAs",
+                "region LoRA pass",
+                apply_region_loras(
+                    client,
+                    images[0],
+                    profiles=profiles,
+                    on_stage=_make_stage_callback(status_message),
+                ),
+            )
+            if kept is None:
+                return
+            images = [kept]
 
     # `_deliver_generation_result`, minus a `Message` to reply into.
     snapshot_id = uuid.uuid4().hex[:12]

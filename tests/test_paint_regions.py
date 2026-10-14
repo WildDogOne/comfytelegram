@@ -210,9 +210,18 @@ async def test_an_imported_file_gives_its_seed_back_from_its_own_chunks():
 # --- the submission --------------------------------------------------------------
 
 
-async def _submit(storage, result: dict, *, profiles=(_PROFILE,), seed=1234, noise_index=None):
+async def _submit(
+    storage,
+    result: dict,
+    *,
+    profiles=(_PROFILE,),
+    seed=1234,
+    noise_index=None,
+    source_batch_size=1,
+):
+    source = _params(batch_size=source_batch_size, sampler_name="euler_ancestral", clip_skip=-2)
     storage.store_pending_result(
-        "abc", 42, "file", "a.png", _serialize_generation_params(_params()), noise_index
+        "abc", 42, "file", "a.png", _serialize_generation_params(source), noise_index
     )
     application = MagicMock()
     application.bot.send_message = AsyncMock(return_value=AsyncMock())
@@ -229,7 +238,10 @@ async def _submit(storage, result: dict, *, profiles=(_PROFILE,), seed=1234, noi
     async def fake_generate(*args, regions, overrides, **kwargs):
         # Echo back what it was asked for, the way generate() resolves it.
         params = _params(regions=regions, **overrides)
-        return [GeneratedImage(data=b"img", filename="o.png", full_params=params)]
+        return [
+            GeneratedImage(data=b"img", filename=f"o{i}.png", full_params=params, noise_index=i)
+            for i in range(params.batch_size)
+        ]
 
     with (
         patch(
@@ -268,10 +280,19 @@ async def test_a_painting_generates_with_the_painted_side_and_its_inverse(storag
     assert (painted.prompt, painted.invert_mask) == ("red hair", False)
     assert (rest.prompt, rest.invert_mask) == ("black hair", True)
     assert painted.mask_png == rest.mask_png
-    # Same size as the image painted over, and its seed.
-    # One image: only a batch's first image would share the frozen seed's layout.
-    overrides = {"width": 64, "height": 48, "seed": 1234, "batch_size": 1, "batch_offset": 0}
-    assert kwargs["overrides"] == overrides
+    # The painted-over image's whole batch again: same seed, size and
+    # sampling settings — nothing smaller reproduces its noise.
+    assert kwargs["overrides"] == {
+        "width": 64,
+        "height": 48,
+        "seed": 1234,
+        "batch_size": 1,
+        "steps": 30,
+        "cfg": 7.0,
+        "sampler_name": "euler_ancestral",
+        "scheduler": "normal",
+        "clip_skip": -2,
+    }
     assert kwargs["raw_positive_prompt"] == "2boys, cuddling\n[left] red hair\n[right] black hair"
     send.assert_awaited_once()
     assert send.await_args.kwargs["message_thread_id"] == 9
@@ -344,17 +365,20 @@ async def test_generate_again_rerolls_the_painting_at_the_normal_batch_size(stor
 
 
 @pytest.mark.asyncio
-async def test_painting_over_a_later_batch_image_replays_its_noise_draw(storage):
-    """Image 3 of a batch is draw 2 of the seed's noise — the seed alone
-    would reproduce image 1 instead, a different picture."""
-    gen, _send, _msg = await _submit(
+async def test_painting_over_a_later_batch_image_reruns_its_batch_and_keeps_it(storage):
+    """Image 3 of a batch of 4 is slice 2 of every noise draw that batch made
+    — only the whole batch again reproduces it, and only its slice is sent."""
+    gen, send, _msg = await _submit(
         storage,
         {"mask": _left_painting(), "positive": "x", "region_prompts": ["a", "b"]},
         noise_index=2,
+        source_batch_size=4,
     )
 
-    assert gen.await_args.kwargs["overrides"]["batch_offset"] == 2
-    assert gen.await_args.kwargs["overrides"]["batch_size"] == 1
+    assert gen.await_args.kwargs["overrides"]["batch_size"] == 4
+    assert gen.await_args.kwargs["auto_region_loras"] is False
+    send.assert_awaited_once()
+    assert send.await_args.args[3].filename == "o2.png"
 
 
 @pytest.mark.asyncio

@@ -14,9 +14,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   editor opens over that image with the left half already painted. Fix
   the line where the characters meet, write a prompt for the red side and
   one for the blue rest (plus the whole-image prompt), then Done. You get
-  one image with the same checkpoint, size and noise as the image you
-  painted over — even if it was the third image of a batch — so it tends
-  to keep that layout; **🔁 Generate Again** then tries your usual batch
+  one image with the same checkpoint, settings and noise as the image you
+  painted over — even if it was the third image of a batch, which takes
+  as long as generating that batch again — so it tends to keep that
+  layout; **🔁 Generate Again** then tries your usual batch
   with new seeds, same painting. This also works on a "📥 Download file"
   PNG sent back to the bot later: the file now records which image of its
   batch it was, next to the seed. Paint a character *plus roughly their half* —

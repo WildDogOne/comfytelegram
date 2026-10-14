@@ -136,16 +136,6 @@ class GenerationParams:
     width: int = 1024
     height: int = 1024
     batch_size: int = 1
-    #: Start this batch's noise at draw `batch_offset` of `seed`'s sequence
-    #: instead of draw 0 — how one image out of an earlier batch is
-    #: reproduced (`handlers._run_paint_regions_job`). ComfyUI draws a
-    #: batch's noise one image after another from the one seed, so image k
-    #: of a batch is draw k; `build_txt2img` asks for it with an empty latent
-    #: `batch_offset + batch_size` long cut down by `LatentFromBatch`, which
-    #: tags the latent with its `batch_index` and makes `prepare_noise` skip
-    #: ahead. Like `seed`, a per-run instruction: `params_serde` leaves it
-    #: out, so a stored image never replays it.
-    batch_offset: int = 0
     clip_skip: int = -1
     loras: list[LoraSpec] = field(default_factory=list)
     filename_prefix: str = "comfytelegram"
@@ -354,23 +344,9 @@ def build_txt2img(params: GenerationParams) -> tuple[dict[str, Any], str]:
 
     latent = g.add(
         "EmptyLatentImage",
-        {
-            "width": params.width,
-            "height": params.height,
-            "batch_size": params.batch_offset + params.batch_size,
-        },
+        {"width": params.width, "height": params.height, "batch_size": params.batch_size},
         title="Empty Latent",
     )
-    if params.batch_offset:
-        latent = g.add(
-            "LatentFromBatch",
-            {
-                "samples": [latent, 0],
-                "batch_index": params.batch_offset,
-                "length": params.batch_size,
-            },
-            title="Skip To Noise Index",
-        )
 
     if params.regions:
         model_ref = _apply_attention_couple(g, params, model_ref, clip_ref, positive, latent)
