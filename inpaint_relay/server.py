@@ -161,6 +161,16 @@ class Job:
     #: the editor button; opaque bytes here, decoded by the page.
     segmentation: dict[str, Any] | None = None
     embedding: bytes | None = None
+    #: A mask the editor opens with already drawn (white = masked, the
+    #: source's size) — comfytelegram's suggestion for a "🎭 Region LoRAs"
+    #: region, from the optional `initial_mask` part of `POST /jobs`.
+    #: Served verbatim by `GET /jobs/{token}/initial-mask`.
+    initial_mask: bytes | None = None
+    #: Where the editor's denoise override starts, checked: the regional
+    #: LoRA pass's denoise for a "🎭 Region LoRAs" job. `None` leaves the
+    #: override unchecked (the detailer's own default), as for any other
+    #: "✏️ Detail Prompt".
+    denoise_default: float | None = None
     init_data: str | None = None
 
 
@@ -306,6 +316,13 @@ def _parse_active_loras(value: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _parse_denoise_default(value: Any) -> float | None:
+    """`meta["denoise_default"]` if it's a usable denoise, else `None`."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if 0 < value <= 1 else None
+
+
 def _parse_segmentation(value: Any) -> dict[str, Any] | None:
     """`meta["segmentation"]` if well-formed, else `None` — the page builds
     a decoder off these, so a partial entry is dropped rather than passed on."""
@@ -350,6 +367,12 @@ async def create_job(request: Request) -> dict[str, str]:
             raise HTTPException(status_code=400, detail="Missing image part")
         image = await upload.read()
         meta = _parse_job_meta(form.get("meta"))
+        mask_part = form.get("initial_mask")
+        initial_mask = (
+            await mask_part.read()
+            if mask_part is not None and not isinstance(mask_part, str)
+            else None
+        )
     if not image:
         raise HTTPException(status_code=400, detail="Empty image")
     token = secrets.token_urlsafe(24)
@@ -368,6 +391,8 @@ async def create_job(request: Request) -> dict[str, str]:
         loras=_parse_loras(meta.get("loras")),
         active_loras=_parse_active_loras(meta.get("active_loras")),
         segmentation=_parse_segmentation(meta.get("segmentation")),
+        initial_mask=initial_mask or None,
+        denoise_default=_parse_denoise_default(meta.get("denoise_default")),
     )
     return {"token": token}
 
@@ -421,6 +446,18 @@ async def job_image(token: str) -> Response:
     return Response(content=job.image, media_type=job.image_content_type)
 
 
+@app.get("/jobs/{token}/initial-mask")
+async def job_initial_mask(token: str) -> Response:
+    """The mask the editor opens with already drawn (`Job.initial_mask`) —
+    404 when the job has none, which the page only asks for when
+    `GET /jobs/{token}/meta` said it does."""
+    _prune_expired_jobs()
+    job = _get_job_or_404(token)
+    if job.initial_mask is None:
+        raise HTTPException(status_code=404, detail="No initial mask")
+    return Response(content=job.initial_mask, media_type="image/png")
+
+
 @app.get("/jobs/{token}/meta")
 async def job_meta(token: str) -> JSONResponse:
     """What the editor page needs before it can even decide what to render:
@@ -445,6 +482,8 @@ async def job_meta(token: str) -> JSONResponse:
             "loras": job.loras,
             "active_loras": job.active_loras,
             "segmentation": job.segmentation,
+            "has_initial_mask": job.initial_mask is not None,
+            "denoise_default": job.denoise_default,
         }
     )
 

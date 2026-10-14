@@ -214,29 +214,6 @@ async def test_generate_message_reports_an_unknown_lora_without_generating(stora
     assert message.reply_text.await_args.args[0].startswith("⚠️ No LoRA called nobody")
 
 
-@pytest.mark.asyncio
-async def test_regional_prompt_rejects_a_lora_inside_a_region():
-    message = AsyncMock()
-    message.text = "scene\n[left] <lora:alice_v2>, a\n[right] b"
-    message.message_thread_id = None
-    update = MagicMock()
-    update.effective_message = message
-    update.effective_chat.id = 1
-    update.effective_user.id = 1
-    storage = MagicMock()
-    storage.list_characters.return_value = []
-    storage.list_favorites.return_value = []
-    context = MagicMock()
-    context.chat_data = {}
-    context.bot_data = {"settings": MagicMock(allowed_user_ids=None), "storage": storage}
-
-    with patch("comfytelegram.handlers.generate", new=AsyncMock()) as generate:
-        await generate_message(update, context)
-
-    generate.assert_not_called()
-    assert message.reply_text.await_args.args[0].startswith("⚠️ [left] has a <lora:…> tag")
-
-
 # --- "✏️ Detail Prompt" -------------------------------------------------------------
 
 

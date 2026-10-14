@@ -609,8 +609,46 @@
     if (action.fill) runEnclosedFill();
   }
 
+  // The mask a job opens with already drawn (`meta.has_initial_mask` — a
+  // "🎭 Region LoRAs" suggestion), as a bitmap in the shape `paintBitmap`
+  // takes, downscaled to at most PRESET_MASK_MAX_DIM a side so replaying
+  // it stays cheap. It's the base every replay starts from rather than an
+  // action in the log: undo can't take it away, Clear can (a "clear"
+  // action wipes everything before it, this included).
+  var presetMask = null;
+  var hasPresetMask = false;
+  var PRESET_MASK_MAX_DIM = 1024;
+
+  function applyPresetMask() {
+    if (!presetMask || !maskCanvas.width) return;
+    paintBitmap(maskCtx, presetMask, [255, 255, 255], "source-over", maskCanvas.width, maskCanvas.height);
+    paintBitmap(overlayCtx, presetMask, [255, 45, 45], "source-over", overlayCanvas.width, overlayCanvas.height);
+  }
+
+  function loadPresetMask() {
+    var img = new Image();
+    img.onload = function () {
+      var s = Math.min(1, PRESET_MASK_MAX_DIM / Math.max(img.naturalWidth, img.naturalHeight));
+      var w = Math.max(1, Math.round(img.naturalWidth * s));
+      var h = Math.max(1, Math.round(img.naturalHeight * s));
+      var c = document.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      var cx = c.getContext("2d");
+      cx.drawImage(img, 0, 0, w, h);
+      var px = cx.getImageData(0, 0, w, h).data;
+      var bitmap = new Uint8Array(w * h);
+      for (var i = 0; i < bitmap.length; i++) bitmap[i] = px[i * 4] > 127 ? 1 : 0;
+      presetMask = { w: w, h: h, bitmap: bitmap };
+      // The image may still be loading — `loadImage`'s onload replays then.
+      if (maskCanvas.width) replayHistory();
+    };
+    img.src = "/jobs/" + encodeURIComponent(token) + "/initial-mask";
+  }
+
   function replayHistory() {
     resetMask();
+    applyPresetMask();
     for (var i = 0; i < historyIndex; i++) {
       applyAction(actionHistory[i]);
     }
@@ -2198,6 +2236,14 @@
       updateDenoiseReadout();
     });
     denoiseInput.addEventListener("input", updateDenoiseReadout);
+    // A "🎭 Region LoRAs" job starts with the override on, at the regional
+    // LoRA pass's denoise — a character LoRA needs more than a touch-up.
+    if (typeof meta.denoise_default === "number") {
+      denoiseOverride.checked = true;
+      denoiseInput.disabled = false;
+      denoiseInput.value = String(meta.denoise_default);
+      updateDenoiseReadout();
+    }
   }
 
   // Collapsed/expanded is remembered per viewer (it's a layout preference,
@@ -2294,11 +2340,13 @@
       maskCanvas.height = image.naturalHeight;
       scale = image.naturalWidth / displayCanvas.width;
 
-      resetMask();
+      replayHistory();
       setStatus(
-        promptFieldsEnabled
-          ? "Draw over the region to detail, describe it below, then tap Done."
-          : "Draw over the area to fix, then tap Done."
+        hasPresetMask
+          ? "The suggested mask is drawn in — fix it where it's off, then tap Done."
+          : promptFieldsEnabled
+            ? "Draw over the region to detail, describe it below, then tap Done."
+            : "Draw over the area to fix, then tap Done."
       );
     };
     image.onerror = function () {
@@ -2521,6 +2569,8 @@
     .then(function (meta) {
       applyMeta(meta);
       initOptionsPanel();
+      hasPresetMask = Boolean(meta.has_initial_mask);
+      if (hasPresetMask) loadPresetMask();
       loadImage();
       if (meta.segmentation) initSmartSelect(meta.segmentation);
     })

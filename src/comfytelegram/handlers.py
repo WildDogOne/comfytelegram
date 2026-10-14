@@ -51,10 +51,16 @@ from comfytelegram.auth import (
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
 from comfytelegram.fav_menu import handle_fav_edit_message
 from comfytelegram.generation import (
+    REGION_LORA_DEFAULT_DENOISE,
     GeneratedImage,
+    apply_region_loras,
+    detect_people,
     generate,
+    has_region_loras,
     kontext_edit,
+    mask_to_png,
     post_process,
+    region_lora_mask,
     repeat,
     resolve_drawn_mask_denoise,
     resolve_live_upscale_defaults,
@@ -67,7 +73,9 @@ from comfytelegram.lora_refs import (
     extract_lora_tags,
     has_lora_tags,
     lora_suggestions,
+    lora_tag_for_spec,
     resolve_detail_loras,
+    resolve_region_loras,
     strip_lora_tags,
 )
 from comfytelegram.message_text import message_text
@@ -120,6 +128,7 @@ from comfytelegram.workflows import (
     GenerationParams,
     KontextModelFiles,
     KontextParams,
+    LoraSpec,
     ManualHandDetailerParams,
 )
 
@@ -233,6 +242,26 @@ FIX_REDO4_CALLBACK_KIND = "fix_redo4"
 DETAIL_PROMPT_CALLBACK_KIND = "detail_prompt"
 DETAIL_REDO_CALLBACK_KIND = "detail_redo"
 DETAIL_REDO4_CALLBACK_KIND = "detail_redo4"
+
+#: "🎭 Region LoRAs" — under every image whose `/rp` regions carry their own
+#: `<lora:…>` (`generation.has_region_loras`), including every image derived
+#: from one, since post-processing keeps `full_params`. A region's LoRA
+#: can't apply while sampling (one shared model), so it's applied after, by
+#: a detailer pass over that region's character (`generation.
+#: apply_region_lora`). The tap replies with `_region_lora_keyboard`: one
+#: button per LoRA region (`REGION_LORA_CALLBACK_PREFIX`), which opens the
+#: "✏️ Detail Prompt" editor with the suggested mask already drawn and the
+#: region's prompt and LoRA tags filled in — check it, fix it, Done — plus
+#: "🤖 All, automatically" for running every region unattended, which is
+#: also what the `/settings` "🎭 Region LoRAs: Automatic" toggle does right
+#: after generating. Carried across a keyboard page flip like the redo rows
+#: (`_carried_extra_rows`), since rebuilding it would need the params.
+REGION_LORAS_CALLBACK_KIND = "region_loras"
+#: `rl:<result_id>:<region index>` / `rl:<result_id>:all` — see
+#: `region_lora_callback`. Its own namespace for the same reason as
+#: `HAND_POINT_CALLBACK_PREFIX`: it carries more than `pp:` parsing allows.
+REGION_LORA_CALLBACK_PREFIX = "rl:"
+REGION_LORA_ALL = "all"
 
 #: "🪄 Kontext Edit" — an instruction-driven FLUX.1 Kontext edit of the whole
 #: image (`generation.kontext_edit`). The tap only asks for the instruction;
@@ -528,6 +557,7 @@ _REDO_CALLBACK_KINDS = frozenset(
         DETAIL_REDO4_CALLBACK_KIND,
         KONTEXT_REDO_CALLBACK_KIND,
         KONTEXT_REDO_NEW_CALLBACK_KIND,
+        REGION_LORAS_CALLBACK_KIND,
     }
 )
 
@@ -1232,6 +1262,21 @@ def _make_progress_callback(status_message: Message, label: str = "Generating"):
     return on_progress
 
 
+def _make_stage_callback(status_message: Message):
+    """`generation.StageCallback` that shows each extra stage of a run (a
+    regional LoRA pass) on `status_message`, like `_make_progress_callback`
+    does for sampling progress — no throttle, since stages are seconds
+    apart at the least."""
+
+    async def on_stage(stage: str) -> None:
+        try:
+            await status_message.edit_text(f"{stage}…")
+        except Exception:
+            logger.debug("Stage edit skipped", exc_info=True)
+
+    return on_stage
+
+
 async def _run_reporting_errors(
     status_message: Message, label: str, log_label: str, awaitable: Awaitable[T]
 ) -> T | None:
@@ -1267,6 +1312,57 @@ def _post_process_keyboard_with_extra_rows(
     if not extra_keyboard_rows:
         return keyboard
     return InlineKeyboardMarkup(list(keyboard.inline_keyboard) + extra_keyboard_rows)
+
+
+def _region_lora_rows(result_id: str, params: GenerationParams) -> list[list[InlineKeyboardButton]]:
+    """The "🎭 Region LoRAs" row (`REGION_LORAS_CALLBACK_KIND`) for an image
+    whose regions carry LoRAs, else nothing."""
+    if not has_region_loras(params):
+        return []
+    return [
+        [
+            InlineKeyboardButton(
+                "🎭 Region LoRAs", callback_data=f"pp:{REGION_LORAS_CALLBACK_KIND}:{result_id}"
+            )
+        ]
+    ]
+
+
+def _short_lora_name(spec: LoraSpec) -> str:
+    """A LoRA's file name without folder or extension, for a button."""
+    name = spec.name.replace("\\", "/").rsplit("/", 1)[-1]
+    return name.rsplit(".", 1)[0] if "." in name else name
+
+
+def _region_lora_keyboard(
+    result_id: str, params: GenerationParams, *, editor_available: bool
+) -> InlineKeyboardMarkup:
+    """`REGION_LORAS_CALLBACK_KIND`'s reply: one button per LoRA region (by
+    its index in `params.regions`) when the mask editor is configured, then
+    "🤖 All, automatically"."""
+    rows = []
+    if editor_available:
+        for index, region in enumerate(params.regions):
+            if not region.loras:
+                continue
+            names = ", ".join(_short_lora_name(lora) for lora in region.loras)
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"🎭 {region.label}: {names}",
+                        callback_data=f"{REGION_LORA_CALLBACK_PREFIX}{result_id}:{index}",
+                    )
+                ]
+            )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🤖 All, automatically",
+                callback_data=f"{REGION_LORA_CALLBACK_PREFIX}{result_id}:{REGION_LORA_ALL}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
 def _carried_extra_rows(
@@ -1322,7 +1418,9 @@ async def _send_and_store_result(
     `postprocess_callback`'s `HAND_REDO_CALLBACK_KIND` branch) can pass one
     in instead. Returns whichever id was actually used."""
     result_id = result_id or uuid.uuid4().hex[:12]
-    reply_markup = _post_process_keyboard_with_extra_rows(result_id, extra_keyboard_rows)
+    reply_markup = _post_process_keyboard_with_extra_rows(
+        result_id, _region_lora_rows(result_id, img.full_params) + (extra_keyboard_rows or [])
+    )
     use_jpeg = storage.get_image_format(chat_id) != IMAGE_FORMAT_PNG
     sent = await _send_result_image(
         message, img.data, img.filename, reply_markup, use_jpeg=use_jpeg
@@ -1358,7 +1456,9 @@ async def _send_and_store_bot_result(
     chat's General topic otherwise. `result_id`/`extra_keyboard_rows` mirror
     `_send_and_store_result`'s — see there."""
     result_id = result_id or uuid.uuid4().hex[:12]
-    reply_markup = _post_process_keyboard_with_extra_rows(result_id, extra_keyboard_rows)
+    reply_markup = _post_process_keyboard_with_extra_rows(
+        result_id, _region_lora_rows(result_id, img.full_params) + (extra_keyboard_rows or [])
+    )
     use_jpeg = storage.get_image_format(chat_id) != IMAGE_FORMAT_PNG
     sent = await _send_photo_or_document(
         lambda **kw: bot.send_photo(chat_id, message_thread_id=message_thread_id, **kw),
@@ -1424,7 +1524,11 @@ def _to_display_jpeg(source: bytes, quality: int = _RELAY_DISPLAY_JPEG_QUALITY) 
 
 
 async def _relay_create_job(
-    settings: Settings, image_bytes: bytes, *, meta: dict[str, Any] | None = None
+    settings: Settings,
+    image_bytes: bytes,
+    *,
+    meta: dict[str, Any] | None = None,
+    initial_mask: bytes | None = None,
 ) -> str:
     """POST the source image to inpaint_relay's `POST /jobs`, returning the
     job token it assigns. Raises on any HTTP/network failure — the caller
@@ -1477,6 +1581,12 @@ async def _relay_create_job(
     )
     if meta is not None:
         form.add_field("meta", json.dumps(meta), content_type="application/json")
+    if initial_mask is not None:
+        # Grayscale PNG at the source's size, white = masked — what the
+        # editor opens with already drawn (`_open_mask_editor`).
+        form.add_field(
+            "initial_mask", initial_mask, filename="initial_mask.png", content_type="image/png"
+        )
     async with (
         aiohttp.ClientSession(timeout=_INPAINT_RELAY_UPLOAD_TIMEOUT) as session,
         session.post(
@@ -3383,6 +3493,182 @@ def _detail_prompt_readonly_info(live_profile: ModelProfile | None) -> dict[str,
     }
 
 
+async def _open_mask_editor(
+    query: Any,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    pending: dict[str, Any],
+    full_params: GenerationParams,
+    result_id: str,
+    job_kind: str,
+    user_id: int | None,
+    meta_overrides: dict[str, Any] | None = None,
+    initial_mask_for: Callable[[bytes], Awaitable[bytes]] | None = None,
+) -> None:
+    """Upload `pending`'s image to inpaint_relay as a `job_kind` job
+    ("hand"/"fix"/"detail", see `_DRAWN_MASK_KINDS`) and reply with the
+    button that opens the mask editor on it — "🖌️ Draw Mask"/"🩹 Fix
+    Artifact"/"✏️ Detail Prompt" (`postprocess_callback`), and
+    "🎭 Region LoRAs" picking one region (`region_lora_callback`), which
+    also passes `meta_overrides` (merged over the job meta built here — its
+    region prompt instead of the image's) and `initial_mask_for`: given the
+    source image's bytes, the mask the editor should open with already
+    drawn (`_relay_create_job`'s `initial_mask`)."""
+    settings: Settings = context.bot_data["settings"]
+    storage: Storage = context.bot_data["storage"]
+    client: ComfyClient = context.bot_data["comfy_client"]
+    # DETAIL_PROMPT_CALLBACK_KIND is the one caller that wants the
+    # editor's prompt fields too (`Job.mode="mask_prompt"` — see
+    # `_relay_create_job`); HAND_DRAW_CALLBACK_KIND draws a plain mask
+    # (`Job.mode` defaults to "mask" whenever `meta` omits it) but still
+    # gets a `meta` dict, for the "Disable LoRAs" checkbox below — only
+    # FIX_DRAW_CALLBACK_KIND starts at `meta=None` (until a
+    # `segmentation` entry gets added below, if any), since
+    # detailer_disable_lora isn't live-refreshed for "fix_drawn" either
+    # (see generation.py's `_DETAILER_TUNABLE_KINDS`) and there's no
+    # tile-ControlNet checkbox for it. The prompt fields pre-fill with
+    # this image's own current prompt — the usual reason to open this is
+    # to cut most of a scene-wide prompt down to what the marked region
+    # actually needs, not type one from scratch — but nothing about them
+    # is saved anywhere once the editor closes (see
+    # `DETAIL_PROMPT_CALLBACK_KIND`'s docstring). Both checkboxes'
+    # availability/starting state come off the checkpoint's *current*
+    # profile (not `full_params`' own frozen values, which could be
+    # stale for an image generated before a profile edit) — same "live,
+    # not frozen" reasoning `generation._refresh_detail_prompt_tile_controlnet`/
+    # `_refresh_detailer_tunables` apply on the way back in.
+    meta = None
+    if job_kind in ("hand", "detail"):
+        live_profile = resolve_profile(full_params.checkpoint, context.bot_data["profiles"])
+        meta = {
+            "detailer_disable_lora_available": bool(full_params.loras),
+            "detailer_disable_lora_default": bool(
+                live_profile and live_profile.defaults.detailer_disable_lora
+            ),
+        }
+        if job_kind == "detail":
+            meta.update(
+                {
+                    "mode": "mask_prompt",
+                    "positive": full_params.positive_prompt,
+                    "negative": full_params.negative_prompt,
+                    "readonly": _detail_prompt_readonly_info(live_profile),
+                    "tile_controlnet_available": bool(
+                        live_profile and live_profile.tile_controlnet
+                    ),
+                    "tile_controlnet_default": bool(
+                        live_profile and live_profile.detail_prompt_tile_controlnet
+                    ),
+                    # For the editor's `$name` autocomplete — the same
+                    # characters/favorites `_expand_detail_prompt_references`
+                    # will look the submission up against.
+                    "references": reference_suggestions(
+                        storage.list_characters(pending["chat_id"]),
+                        storage.list_favorites(user_id) if user_id is not None else [],
+                    ),
+                    # `<lora:…>` autocomplete — the live profile's
+                    # LoRAs, the same list `post_process` resolves the
+                    # submitted tags against — plus what the image was
+                    # actually made with, shown read-only, since typed
+                    # tags add to those unless "Disable LoRAs" is on.
+                    "loras": lora_suggestions(live_profile),
+                    "active_loras": [
+                        {
+                            "name": lora.name,
+                            "strength_model": lora.strength_model,
+                            "strength_clip": lora.strength_clip,
+                        }
+                        for lora in full_params.loras
+                    ],
+                }
+            )
+    # Uploading a large source image to a remote relay host can take a
+    # few seconds, with nothing on screen to show for it in the
+    # meantime — long enough that a user unsure whether their tap
+    # registered taps "Draw Mask" again. `uploads_in_progress` (checked
+    # and set synchronously, no `await` in between, so two concurrently
+    # scheduled taps on the same result_id can't both pass the check)
+    # turns a repeat tap into a no-op reply instead of a second relay
+    # job/editor button; `status_message`, sent before the upload even
+    # starts, is the actual "yes, this registered" feedback.
+    uploads_in_progress: set[str] = context.bot_data.setdefault(
+        "inpaint_uploads_in_progress", set()
+    )
+    if result_id in uploads_in_progress:
+        await query.message.reply_text(
+            "Still uploading that image to the mask editor — hang tight."
+        )
+        return
+    uploads_in_progress.add(result_id)
+    try:
+        status_message = await query.message.reply_text(
+            "Uploading image to the mask editor…", disable_notification=True
+        )
+        source_bytes = await _fetch_source_image(
+            client,
+            context.bot,
+            pending["filename"],
+            pending["file_id"],
+            on_fallback=_source_fallback_notifier(query.message),
+        )
+        if meta_overrides:
+            meta = {**(meta or {}), **meta_overrides}
+        segmentation = _segmentation_meta(settings, source_bytes)
+        if segmentation is not None:
+            meta = {**(meta or {}), "segmentation": segmentation}
+        initial_mask = None
+        if initial_mask_for is not None:
+            await status_message.edit_text("Finding the characters…")
+            initial_mask = await initial_mask_for(source_bytes)
+            await status_message.edit_text("Uploading image to the mask editor…")
+        try:
+            token = await _relay_create_job(
+                settings, source_bytes, meta=meta, initial_mask=initial_mask
+            )
+        except Exception:
+            logger.exception("Failed to create inpaint_relay job")
+            await status_message.edit_text(
+                "Couldn't reach the mask editor server — try again later."
+            )
+            return
+        storage.store_inpaint_job(
+            token,
+            result_id,
+            pending["chat_id"],
+            query.message.message_thread_id,
+            kind=job_kind,
+            editor_message_id=status_message.message_id,
+        )
+        if segmentation is not None:
+            # Held in bot_data so the task isn't garbage-collected
+            # mid-flight; it removes itself when done.
+            background: set[asyncio.Task] = context.bot_data.setdefault("background_tasks", set())
+            task = asyncio.create_task(_relay_upload_embedding(settings, token, source_bytes))
+            background.add(task)
+            task.add_done_callback(background.discard)
+        editor_prompt = (
+            "Draw over the region to detail, describe what should be there, then "
+            "tap Done in the editor:"
+            if job_kind == "detail"
+            else "Draw over the area to fix, then tap Done in the editor:"
+        )
+        await status_message.edit_text(
+            editor_prompt,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🎨 Open mask editor",
+                            web_app=WebAppInfo(url=f"{settings.inpaint_relay_url}/jobs/{token}"),
+                        )
+                    ]
+                ]
+            ),
+        )
+    finally:
+        uploads_in_progress.discard(result_id)
+
+
 async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle a `pp:<kind>:<result_id>` tap from `_post_process_keyboard`:
     `kind` is `"analyze_only"` (run *both* analyzers — WD14 tags and
@@ -3485,6 +3771,23 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if kind in (MORE_CALLBACK_KIND, BACK_CALLBACK_KIND):
         await _show_keyboard_page(query, result_id, 2 if kind == MORE_CALLBACK_KIND else 1)
+        return
+
+    if kind == REGION_LORAS_CALLBACK_KIND:
+        editor_available = bool(settings.inpaint_relay_url)
+        await query.message.reply_text(
+            (
+                "Pick a region: the editor opens with that character masked and the "
+                "region's prompt and LoRA filled in — fix the mask if it's off (where "
+                "the characters touch, mostly), then Done. Or run them all without "
+                "checking."
+                if editor_available
+                else "Apply every region's LoRA (no mask editor configured to check them)."
+            ),
+            reply_markup=_region_lora_keyboard(
+                result_id, full_params, editor_available=editor_available
+            ),
+        )
         return
 
     if kind == ARCHIVE_CALLBACK_KIND:
@@ -3767,151 +4070,15 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             job_kind = "fix"
         else:
             job_kind = "detail"
-        # DETAIL_PROMPT_CALLBACK_KIND is the one caller that wants the
-        # editor's prompt fields too (`Job.mode="mask_prompt"` — see
-        # `_relay_create_job`); HAND_DRAW_CALLBACK_KIND draws a plain mask
-        # (`Job.mode` defaults to "mask" whenever `meta` omits it) but still
-        # gets a `meta` dict, for the "Disable LoRAs" checkbox below — only
-        # FIX_DRAW_CALLBACK_KIND starts at `meta=None` (until a
-        # `segmentation` entry gets added below, if any), since
-        # detailer_disable_lora isn't live-refreshed for "fix_drawn" either
-        # (see generation.py's `_DETAILER_TUNABLE_KINDS`) and there's no
-        # tile-ControlNet checkbox for it. The prompt fields pre-fill with
-        # this image's own current prompt — the usual reason to open this is
-        # to cut most of a scene-wide prompt down to what the marked region
-        # actually needs, not type one from scratch — but nothing about them
-        # is saved anywhere once the editor closes (see
-        # `DETAIL_PROMPT_CALLBACK_KIND`'s docstring). Both checkboxes'
-        # availability/starting state come off the checkpoint's *current*
-        # profile (not `full_params`' own frozen values, which could be
-        # stale for an image generated before a profile edit) — same "live,
-        # not frozen" reasoning `generation._refresh_detail_prompt_tile_controlnet`/
-        # `_refresh_detailer_tunables` apply on the way back in.
-        meta = None
-        if job_kind in ("hand", "detail"):
-            live_profile = resolve_profile(full_params.checkpoint, context.bot_data["profiles"])
-            meta = {
-                "detailer_disable_lora_available": bool(full_params.loras),
-                "detailer_disable_lora_default": bool(
-                    live_profile and live_profile.defaults.detailer_disable_lora
-                ),
-            }
-            if job_kind == "detail":
-                meta.update(
-                    {
-                        "mode": "mask_prompt",
-                        "positive": full_params.positive_prompt,
-                        "negative": full_params.negative_prompt,
-                        "readonly": _detail_prompt_readonly_info(live_profile),
-                        "tile_controlnet_available": bool(
-                            live_profile and live_profile.tile_controlnet
-                        ),
-                        "tile_controlnet_default": bool(
-                            live_profile and live_profile.detail_prompt_tile_controlnet
-                        ),
-                        # For the editor's `$name` autocomplete — the same
-                        # characters/favorites `_expand_detail_prompt_references`
-                        # will look the submission up against.
-                        "references": reference_suggestions(
-                            storage.list_characters(pending["chat_id"]),
-                            storage.list_favorites(update.effective_user.id),
-                        ),
-                        # `<lora:…>` autocomplete — the live profile's
-                        # LoRAs, the same list `post_process` resolves the
-                        # submitted tags against — plus what the image was
-                        # actually made with, shown read-only, since typed
-                        # tags add to those unless "Disable LoRAs" is on.
-                        "loras": lora_suggestions(live_profile),
-                        "active_loras": [
-                            {
-                                "name": lora.name,
-                                "strength_model": lora.strength_model,
-                                "strength_clip": lora.strength_clip,
-                            }
-                            for lora in full_params.loras
-                        ],
-                    }
-                )
-        # Uploading a large source image to a remote relay host can take a
-        # few seconds, with nothing on screen to show for it in the
-        # meantime — long enough that a user unsure whether their tap
-        # registered taps "Draw Mask" again. `uploads_in_progress` (checked
-        # and set synchronously, no `await` in between, so two concurrently
-        # scheduled taps on the same result_id can't both pass the check)
-        # turns a repeat tap into a no-op reply instead of a second relay
-        # job/editor button; `status_message`, sent before the upload even
-        # starts, is the actual "yes, this registered" feedback.
-        uploads_in_progress: set[str] = context.bot_data.setdefault(
-            "inpaint_uploads_in_progress", set()
+        await _open_mask_editor(
+            query,
+            context,
+            pending=pending,
+            full_params=full_params,
+            result_id=result_id,
+            job_kind=job_kind,
+            user_id=user_id,
         )
-        if result_id in uploads_in_progress:
-            await query.message.reply_text(
-                "Still uploading that image to the mask editor — hang tight."
-            )
-            return
-        uploads_in_progress.add(result_id)
-        try:
-            status_message = await query.message.reply_text(
-                "Uploading image to the mask editor…", disable_notification=True
-            )
-            source_bytes = await _fetch_source_image(
-                client,
-                context.bot,
-                pending["filename"],
-                pending["file_id"],
-                on_fallback=_source_fallback_notifier(query.message),
-            )
-            segmentation = _segmentation_meta(settings, source_bytes)
-            if segmentation is not None:
-                meta = {**(meta or {}), "segmentation": segmentation}
-            try:
-                token = await _relay_create_job(settings, source_bytes, meta=meta)
-            except Exception:
-                logger.exception("Failed to create inpaint_relay job")
-                await status_message.edit_text(
-                    "Couldn't reach the mask editor server — try again later."
-                )
-                return
-            storage.store_inpaint_job(
-                token,
-                result_id,
-                pending["chat_id"],
-                query.message.message_thread_id,
-                kind=job_kind,
-                editor_message_id=status_message.message_id,
-            )
-            if segmentation is not None:
-                # Held in bot_data so the task isn't garbage-collected
-                # mid-flight; it removes itself when done.
-                background: set[asyncio.Task] = context.bot_data.setdefault(
-                    "background_tasks", set()
-                )
-                task = asyncio.create_task(_relay_upload_embedding(settings, token, source_bytes))
-                background.add(task)
-                task.add_done_callback(background.discard)
-            editor_prompt = (
-                "Draw over the region to detail, describe what should be there, then "
-                "tap Done in the editor:"
-                if job_kind == "detail"
-                else "Draw over the area to fix, then tap Done in the editor:"
-            )
-            await status_message.edit_text(
-                editor_prompt,
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "🎨 Open mask editor",
-                                web_app=WebAppInfo(
-                                    url=f"{settings.inpaint_relay_url}/jobs/{token}"
-                                ),
-                            )
-                        ]
-                    ]
-                ),
-            )
-        finally:
-            uploads_in_progress.discard(result_id)
         return
 
     if kind in (
@@ -4199,6 +4366,97 @@ async def _consume_awaiting_redo_denoise(
     return True
 
 
+async def region_lora_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle a `rl:<result_id>:<region index>` or `rl:<result_id>:all` tap
+    from `_region_lora_keyboard`. A region opens the "✏️ Detail Prompt"
+    editor (`_open_mask_editor`, job kind "detail") on this image with:
+    the suggested mask already drawn (`generation.region_lora_mask` — the
+    people inside the region's box), the region's resolved prompt with its
+    LoRAs as `<lora:…>` tags in front, and the regional LoRA denoise preset.
+    From there it's an ordinary Detail Prompt submission — the result,
+    redo included, goes through `_process_one_inpaint_job` — and the
+    result keeps this button, for the next region. `all` runs every
+    region unattended (`generation.apply_region_loras`)."""
+    query = update.callback_query
+    settings: Settings = context.bot_data["settings"]
+    user_id = update.effective_user.id if update.effective_user else None
+    if await reject_if_unauthorized_callback(query, user_id, settings):
+        return
+
+    _, result_id, which = query.data.split(":")
+    storage: Storage = context.bot_data["storage"]
+    pending = storage.get_pending_result(result_id)
+    if pending is None:
+        await query.answer("That result has expired — generate a new image.", show_alert=True)
+        return
+    full_params = _deserialize_generation_params(pending["base_params"])
+    if which != REGION_LORA_ALL and (
+        not which.isdigit()
+        or int(which) >= len(full_params.regions)
+        or not full_params.regions[int(which)].loras
+    ):
+        await query.answer("That region no longer has a LoRA.", show_alert=True)
+        return
+    await query.answer()
+    client: ComfyClient = context.bot_data["comfy_client"]
+    profiles: list[ModelProfile] = context.bot_data["profiles"]
+
+    if which == REGION_LORA_ALL:
+        status_message = await query.message.reply_text(
+            "Finding the characters…", disable_notification=True
+        )
+
+        async def _download_and_apply() -> GeneratedImage:
+            data = await _fetch_source_image(
+                client,
+                context.bot,
+                pending["filename"],
+                pending["file_id"],
+                on_fallback=_source_fallback_notifier(query.message),
+            )
+            return await apply_region_loras(
+                client,
+                GeneratedImage(data=data, filename=pending["filename"], full_params=full_params),
+                profiles=profiles,
+                on_stage=_make_stage_callback(status_message),
+            )
+
+        result = await _run_reporting_errors(
+            status_message, "Region LoRAs", "region LoRA pass", _download_and_apply()
+        )
+        if result is None:
+            return
+        await status_message.delete()
+        await _send_and_store_result(query.message, pending["chat_id"], storage, result)
+        return
+
+    if not settings.inpaint_relay_url:
+        await query.message.reply_text("Mask drawing isn't configured on this bot.")
+        return
+    region = full_params.regions[int(which)]
+
+    async def _suggested_mask(source_bytes: bytes) -> bytes:
+        people = await detect_people(client, source_bytes, pending["filename"])
+        mask, _from_people = region_lora_mask(people, region)
+        return mask_to_png(mask)
+
+    tags = " ".join(lora_tag_for_spec(lora) for lora in region.loras)
+    await _open_mask_editor(
+        query,
+        context,
+        pending=pending,
+        full_params=full_params,
+        result_id=result_id,
+        job_kind="detail",
+        user_id=user_id,
+        meta_overrides={
+            "positive": f"{tags} {region.prompt}",
+            "denoise_default": full_params.regional_lora_denoise or REGION_LORA_DEFAULT_DENOISE,
+        },
+        initial_mask_for=_suggested_mask,
+    )
+
+
 async def hand_point_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle a `hp:<result_id>:<grid_size>:<row>:<col>` tap from
     `_hand_point_keyboard` (the "✋ Tap to mark" grid
@@ -4458,7 +4716,14 @@ async def again_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         status_message,
         "Generation",
         "repeat generation",
-        repeat(client, full_params, on_progress=_make_progress_callback(status_message)),
+        repeat(
+            client,
+            full_params,
+            on_progress=_make_progress_callback(status_message),
+            auto_region_loras=storage.get_region_lora_auto(chat_id),
+            on_stage=_make_stage_callback(status_message),
+            profiles=context.bot_data["profiles"],
+        ),
     )
     if images is None:
         return
@@ -4678,13 +4943,6 @@ async def _generate_regional(
         user_id = message.from_user.id if message.from_user else None
         references = _reference_expander(storage, chat_id, user_id)
         expanded = expand_references(parsed, references)
-        for region in expanded.regions:
-            if has_lora_tags(region.prompt):
-                raise RegionalPromptError(
-                    f"[{region.label}] has a <lora:…> tag — every region shares one model, "
-                    "so a LoRA can only go on the global lines, where it applies to the "
-                    "whole image."
-                )
     except RegionalPromptError as exc:
         if rearm_on_error:
             set_pending(context.chat_data, "awaiting_rp_prompt", message, True)
@@ -4710,6 +4968,12 @@ async def _generate_regional(
                 chat_id, checkpoint, global_text, storage, profiles, use_active_character=False
             )
         )
+        # A region's own `<lora:…>` is applied after sampling, by a
+        # detailer pass over that region (see `generation.apply_region_lora`).
+        regions = []
+        for region in expanded.regions:
+            region_prompt, region_loras = resolve_region_loras(region.prompt, profile)
+            regions.append(replace(region, prompt=region_prompt, loras=region_loras))
     except UnknownLoraError as exc:
         if rearm_on_error:
             set_pending(context.chat_data, "awaiting_rp_prompt", message, True)
@@ -4735,8 +4999,10 @@ async def _generate_regional(
             extra_negative_prompt=join_nonempty([extra_negative, references.negatives]),
             raw_positive_prompt=format_regional_prompt(raw_global, parsed.regions),
             raw_negative_prompt=raw_negative,
-            regions=expanded.regions,
+            regions=regions,
             on_progress=_make_progress_callback(status_message),
+            auto_region_loras=storage.get_region_lora_auto(chat_id),
+            on_stage=_make_stage_callback(status_message),
         ),
     )
     if images is None:

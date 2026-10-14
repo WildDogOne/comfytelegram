@@ -14,7 +14,16 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   included. Folders work (`<lora:chars/alice>`), `:0` switches off one
   that's on by default, and a saved character or favorite can carry its
   own tag. Only LoRAs listed under `/lora` for the checkpoint can be used.
-  In a regional prompt they go on the global lines, not in a region.
+- **A LoRA per character in regional prompts**: put a `<lora:…>` in a
+  region (`[left] <lora:alice>, red hoodie`) and that character gets its
+  own LoRA instead of it bleeding onto everyone. It's applied after the
+  image is generated: tap **🎭 Region LoRAs** under the image, pick the
+  region, and the mask editor opens with that character already masked
+  and the region's prompt and LoRA filled in — fix the mask where it's off
+  (mostly where the characters touch), then Done. Do the next region on
+  the result. **🤖 All, automatically** skips the checking, and
+  `/settings` → "🎭 Region LoRAs: Automatic" does that for every new image
+  right away.
 - **LoRAs in ✏️ Detail Prompt**: type `<` in the editor's prompt fields to
   pick a LoRA — any part of its name finds it (`<marlow`, even `<mlw3`), no
   need to type its folder. It's added to the ones the image was made with for that one

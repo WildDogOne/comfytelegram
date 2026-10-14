@@ -34,6 +34,7 @@ from pathlib import PurePosixPath
 
 from comfytelegram.profiles.schema import LoraDefault, ModelProfile
 from comfytelegram.prompt_refs import UnknownReferenceError, shorten_preview, tidy_commas
+from comfytelegram.workflows.builder import LoraSpec
 
 _NUMBER = r"-?(?:\d+(?:\.\d*)?|\.\d+)"
 
@@ -216,6 +217,33 @@ def resolve_detail_loras(
     return cleaned, list(by_name.values()), unknown
 
 
+def resolve_region_loras(text: str, profile: ModelProfile | None) -> tuple[str, list[LoraSpec]]:
+    """For one `/rp` region's prompt: the prompt without its `<lora:…>`
+    tags but with those LoRAs' trigger words in front, and the LoRAs as
+    specs. Raises `UnknownLoraError` like a typed prompt does. A tag at
+    strength 0 is dropped — there's no region-only LoRA to switch off."""
+    cleaned, tags = extract_lora_tags(text)
+    if not tags:
+        return text, []
+    by_name: dict[str, LoraDefault] = {}
+    for tag in tags:
+        lora = _resolve(tag, profile, strict=True)
+        assert lora is not None
+        by_name[lora.name] = _with_strengths(by_name.get(lora.name, lora), tag)
+    active = [lora for lora in by_name.values() if lora.default_enabled]
+    trigger_words = ", ".join(lora.trigger_words for lora in active if lora.trigger_words)
+    prompt = ", ".join(part for part in (trigger_words, cleaned) if part)
+    return prompt, [lora.to_spec() for lora in active]
+
+
+def lora_tag_for_spec(spec: LoraSpec) -> str:
+    """A tag for an already-resolved `LoraSpec` — its full path, so it
+    can't be ambiguous, at its exact strengths. How a regional LoRA is
+    pre-filled into the "✏️ Detail Prompt" editor."""
+    name = _strip_extension(spec.name.replace("\\", "/"))
+    return f"<lora:{name}:{_strength(spec)}>"
+
+
 def strip_lora_tags(text: str | None, names: list[str]) -> str | None:
     """`text` without the tags naming any of `names` (as typed) — how a
     "✏️ Detail Prompt" submission drops the ones `resolve_detail_loras`
@@ -229,9 +257,9 @@ def strip_lora_tags(text: str | None, names: list[str]) -> str | None:
     return tidy_commas(cleaned)
 
 
-def _strength(lora: LoraDefault) -> str:
-    """`lora`'s configured strength as written after the name in a tag:
-    `0.9`, or `1:0.5` when model and clip differ."""
+def _strength(lora: LoraDefault | LoraSpec) -> str:
+    """`lora`'s strength as written after the name in a tag: `0.9`, or
+    `1:0.5` when model and clip differ."""
     if lora.strength_model == lora.strength_clip:
         return f"{lora.strength_model:g}"
     return f"{lora.strength_model:g}:{lora.strength_clip:g}"
@@ -241,7 +269,7 @@ def lora_tag(lora: LoraDefault) -> str:
     """The tag that inserts `lora` at its configured strength — what the
     editor's autocomplete types (built page-side from `lora_suggestions`'
     `name`/`strength`, the same way)."""
-    return f"<lora:{_display(lora)}:{_strength(lora)}>"
+    return lora_tag_for_spec(lora.to_spec())
 
 
 def lora_suggestions(profile: ModelProfile | None) -> list[dict[str, str]]:

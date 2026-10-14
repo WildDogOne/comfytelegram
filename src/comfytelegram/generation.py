@@ -17,7 +17,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
 from comfytelegram.lora_refs import resolve_detail_loras
@@ -37,6 +37,7 @@ from comfytelegram.workflows import (
     HandDetailerParams,
     KontextModelFiles,
     KontextParams,
+    LoraSpec,
     ManualHandDetailerParams,
     PostProcessBaseParams,
     RegionSpec,
@@ -48,6 +49,7 @@ from comfytelegram.workflows import (
     build_hand_detailer_drawn_mask,
     build_hand_detailer_manual,
     build_kontext_edit,
+    build_person_masks,
     build_tiled_refine,
     build_txt2img,
     build_upscale,
@@ -57,6 +59,9 @@ from comfytelegram.workflows import (
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[JobProgress], Awaitable[None]]
+#: Told the name of each extra stage a run goes through after its main graph
+#: (a regional LoRA pass), for a status line — see `generate`.
+StageCallback = Callable[[str], Awaitable[None]]
 
 
 @dataclass
@@ -318,7 +323,9 @@ def _apply_detail_prompt(
 
 
 def _apply_detail_loras(
-    base: PostProcessBaseParams, profiles: list[ModelProfile] | None
+    base: PostProcessBaseParams,
+    profiles: list[ModelProfile] | None,
+    extra_loras: list[LoraSpec] | None = None,
 ) -> PostProcessBaseParams:
     """ "✏️ Detail Prompt"'s `<lora:…>` tags (see `lora_refs`), taken out of
     `base`'s prompts — already the submitted detail prompt, after
@@ -332,26 +339,37 @@ def _apply_detail_loras(
     editor pre-fills the image's own prompt, which carries the inherited
     LoRAs' trigger words). A name the profile doesn't list is dropped — the
     handler already warned about it when the editor submitted, and stored
-    the prompt without it for redo."""
+    the prompt without it for redo.
+
+    `extra_loras` are already-resolved LoRAs treated exactly like typed
+    ones — a regional LoRA pass (`apply_region_lora`), whose region prompt
+    already carries their trigger words."""
     profile = resolve_profile(base.checkpoint, profiles or [])
     positive, positive_loras, unknown = resolve_detail_loras(base.positive_prompt, profile)
     negative, negative_loras, unknown_negative = resolve_detail_loras(base.negative_prompt, profile)
     if unknown or unknown_negative:
         logger.warning("Dropping unknown detail-prompt LoRA tags: %s", unknown + unknown_negative)
     typed = {lora.name: lora for lora in positive_loras + negative_loras}
-    if not typed:
+    if not typed and not extra_loras:
         return replace(base, positive_prompt=positive or "", negative_prompt=negative or "")
 
+    # name -> spec to apply, or None to drop an inherited one (strength 0).
+    wanted: dict[str, LoraSpec | None] = {
+        name: lora.to_spec() if lora.default_enabled else None for name, lora in typed.items()
+    }
+    for spec in extra_loras or []:
+        wanted[spec.name] = spec
     inherited = [] if base.detailer_disable_lora else base.loras
-    remaining = dict(typed)
+    remaining = dict(wanted)
     loras = []
     for lora in inherited:
-        override = remaining.pop(lora.name, None)
-        if override is None:
+        if lora.name not in remaining:
             loras.append(lora)
-        elif override.default_enabled:
-            loras.append(override.to_spec())
-    loras += [lora.to_spec() for lora in remaining.values() if lora.default_enabled]
+            continue
+        override = remaining.pop(lora.name)
+        if override is not None:
+            loras.append(override)
+    loras += [spec for spec in remaining.values() if spec is not None]
 
     folded = (positive or "").casefold()
     trigger_words = join_nonempty(
@@ -805,6 +823,8 @@ async def generate(
     regions: list[RegionSpec] | None = None,
     overrides: dict[str, Any] | None = None,
     on_progress: ProgressCallback | None = None,
+    auto_region_loras: bool = False,
+    on_stage: StageCallback | None = None,
 ) -> list[GeneratedImage]:
     """Resolve profile defaults, build the base txt2img graph, run it.
 
@@ -822,7 +842,11 @@ async def generate(
     `batch_size=1` per request without touching the chat's persisted
     `/settings` override. `regions` turns this into an `/rp` regional
     generation, with `user_prompt` as the global prompt (see
-    `GenerationParams.regions`).
+    `GenerationParams.regions`). `auto_region_loras` then runs every
+    region's own `<lora:…>` pass on each image straight away
+    (`apply_region_loras`) — the "🎭 Region LoRAs: Automatic" chat setting;
+    otherwise they wait for the image's "🎭 Region LoRAs" button.
+    `on_stage` hears about each of those passes as it starts.
     """
     params = resolve_generation_params(
         checkpoint,
@@ -845,7 +869,12 @@ async def generate(
 
     raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
     raw = _tag_images(raw, params, kind="txt2img", graph=prompt_graph)
-    return [GeneratedImage(data=data, filename=name, full_params=params) for data, name in raw]
+    images = [GeneratedImage(data=data, filename=name, full_params=params) for data, name in raw]
+    if auto_region_loras:
+        images = await _apply_region_loras_to_all(
+            client, images, profiles=[profile] if profile else None, on_stage=on_stage
+        )
+    return images
 
 
 def _fix_base_params(
@@ -1018,6 +1047,7 @@ async def post_process(
     is_detail_prompt: bool = False,
     tile_controlnet_override: bool | None = None,
     detailer_disable_lora_override: bool | None = None,
+    extra_loras: list[LoraSpec] | None = None,
     upscale_denoise_override: float | None = None,
     tile_controlnet_strength_override: float | None = None,
     on_progress: ProgressCallback | None = None,
@@ -1161,7 +1191,9 @@ async def post_process(
 
     `<lora:…>` tags in `detail_prompt`/`detail_negative_prompt` add LoRAs
     to this one pass, or replace the inherited ones when
-    `detailer_disable_lora` ends up set — see `_apply_detail_loras`."""
+    `detailer_disable_lora` ends up set — see `_apply_detail_loras`.
+    `extra_loras` (`"hand_drawn"` only) does the same with LoRAs that are
+    already resolved — a regional LoRA pass (`apply_region_lora`)."""
     base_params = _to_post_process_base(full_params)
     if kind in DETAIL_PROMPT_KINDS:
         base_params = _apply_detail_prompt(base_params, detail_prompt, detail_negative_prompt)
@@ -1174,7 +1206,7 @@ async def post_process(
     if detailer_disable_lora_override is not None:
         base_params = replace(base_params, detailer_disable_lora=detailer_disable_lora_override)
     if kind in DETAIL_PROMPT_KINDS:
-        base_params = _apply_detail_loras(base_params, profiles)
+        base_params = _apply_detail_loras(base_params, profiles, extra_loras)
     if kind == "upscale" and (
         upscale_denoise_override is not None or tile_controlnet_strength_override is not None
     ):
@@ -1357,11 +1389,15 @@ async def repeat(
     full_params: GenerationParams,
     *,
     on_progress: ProgressCallback | None = None,
+    auto_region_loras: bool = False,
+    on_stage: StageCallback | None = None,
+    profiles: list[ModelProfile] | None = None,
 ) -> list[GeneratedImage]:
     """Re-run an entire base txt2img request — all `batch_size` images — with
     the same resolved settings but a forced-fresh seed. Backs the chat-level
     "🔁 Generate Again" button, for quickly cranking out more variations of
-    the same prompt without retyping it or picking a specific image."""
+    the same prompt without retyping it or picking a specific image.
+    `auto_region_loras`/`on_stage` as in `generate`."""
     fresh_params = replace(full_params, seed=None)
     prompt_graph, save_node_id = build_txt2img(fresh_params)
     logger.info(
@@ -1373,6 +1409,166 @@ async def repeat(
 
     raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
     raw = _tag_images(raw, fresh_params, kind="repeat", graph=prompt_graph)
-    return [
+    images = [
         GeneratedImage(data=data, filename=name, full_params=fresh_params) for data, name in raw
+    ]
+    if auto_region_loras:
+        images = await _apply_region_loras_to_all(
+            client, images, profiles=profiles, on_stage=on_stage
+        )
+    return images
+
+
+# --- regional LoRAs -------------------------------------------------------------
+#
+# A `/rp` region's own `<lora:…>` can't be applied while sampling — Attention
+# Couple runs every region through one shared model — so it's applied after:
+# a detailer pass (the same graph "✏️ Detail Prompt" runs) over that region's
+# character, with the region's prompt and the LoRA loaded. The mask is the
+# people in the image (`build_person_masks`) cut to the region's box: the
+# person detector finds characters but merges ones that touch, so it can't
+# tell them apart; the box can, as long as each character mostly stayed in
+# its own region. Where they touch, the box's edge is the mask's edge — the
+# likeliest place for a seam, which is why the default is to show this mask
+# in the editor for a correction first (`handlers`' "🎭 Region LoRAs"), with
+# running it unattended as a chat setting.
+
+#: Denoise of a regional LoRA pass unless the profile sets
+#: `regional_lora_denoise`.
+REGION_LORA_DEFAULT_DENOISE = 0.6
+
+#: Below this share of the region's box covered by people, the person mask
+#: is taken to have missed the character and the whole box is used instead.
+_REGION_MIN_PEOPLE_SHARE = 0.03
+
+#: How far the mask is grown past the people's outline, as a share of the
+#: image's shorter side, so hair/edge pixels the detector left out get
+#: redrawn too.
+_REGION_MASK_GROW = 0.01
+
+
+def has_region_loras(params: GenerationParams) -> bool:
+    return any(region.loras for region in params.regions)
+
+
+def region_lora_mask(people: np.ndarray, region: RegionSpec) -> tuple[np.ndarray, bool]:
+    """The mask a region's LoRA pass repaints: `people` (a boolean
+    foreground mask, full image size) inside the region's box, grown by
+    `_REGION_MASK_GROW`. Returns `(mask, from_people)` — `from_people` is
+    False when too little of the box was people and the box itself was used
+    instead."""
+    height, width = people.shape
+    x0, y0 = round(region.x * width), round(region.y * height)
+    x1, y1 = round((region.x + region.w) * width), round((region.y + region.h) * height)
+    mask = np.zeros_like(people)
+    mask[y0:y1, x0:x1] = people[y0:y1, x0:x1]
+    box_area = max(1, (x1 - x0) * (y1 - y0))
+    if mask.sum() < _REGION_MIN_PEOPLE_SHARE * box_area:
+        mask[y0:y1, x0:x1] = True
+        return mask, False
+    radius = max(1, round(_REGION_MASK_GROW * min(width, height)))
+    grown = Image.fromarray(mask.astype(np.uint8) * 255).filter(ImageFilter.GaussianBlur(radius))
+    return np.asarray(grown) >= 16, True
+
+
+def mask_to_png(mask: np.ndarray) -> bytes:
+    """A boolean mask as the white-on-black grayscale PNG `LoadImageMask`
+    (and the mask editor) read."""
+    buffer = io.BytesIO()
+    Image.fromarray(mask.astype(np.uint8) * 255).save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
+
+
+async def detect_people(client: ComfyClient, image: bytes, filename: str) -> np.ndarray:
+    """Everyone `build_person_masks` finds in `image`, merged into one
+    boolean foreground mask the size of the image."""
+    upload = await client.upload_image(image, filename=f"people_{filename}")
+    prompt_graph, preview_node_id = build_person_masks(upload["name"])
+    raw, _history = await _run_graph(client, prompt_graph, preview_node_id, on_progress=None)
+    size = Image.open(io.BytesIO(image)).size
+    people = np.zeros((size[1], size[0]), dtype=bool)
+    for data, _name in raw:
+        mask = Image.open(io.BytesIO(data)).convert("L")
+        if mask.size != size:
+            mask = mask.resize(size, Image.NEAREST)
+        people |= np.asarray(mask) > 127
+    return people
+
+
+async def apply_region_lora(
+    client: ComfyClient,
+    image: bytes,
+    filename: str,
+    full_params: GenerationParams,
+    region: RegionSpec,
+    mask_png: bytes,
+    *,
+    profiles: list[ModelProfile] | None = None,
+    on_progress: ProgressCallback | None = None,
+) -> GeneratedImage:
+    """One region's LoRA pass on `image`: "✏️ Detail Prompt"'s detailer
+    over `mask_png`, with the region's own prompt (already resolved — the
+    global prompt, then the region's, trigger words included) and its LoRAs
+    added to the image's. The result keeps `full_params`, regions and all,
+    so its own "🎭 Region LoRAs" button still offers every region."""
+    return await post_process(
+        client,
+        "hand_drawn",
+        image,
+        filename,
+        full_params,
+        mask_bytes=mask_png,
+        detail_prompt=region.prompt,
+        denoise=full_params.regional_lora_denoise or REGION_LORA_DEFAULT_DENOISE,
+        is_detail_prompt=True,
+        extra_loras=region.loras,
+        profiles=profiles,
+        on_progress=on_progress,
+    )
+
+
+async def apply_region_loras(
+    client: ComfyClient,
+    image: GeneratedImage,
+    *,
+    profiles: list[ModelProfile] | None = None,
+    on_stage: StageCallback | None = None,
+) -> GeneratedImage:
+    """Every LoRA region's pass on `image`, one after another, unattended.
+    People are detected once, on the image as generated — each pass only
+    redraws inside its own region, so the next region's character is still
+    where it was."""
+    regions = [region for region in image.full_params.regions if region.loras]
+    if not regions:
+        return image
+    people = await detect_people(client, image.data, image.filename)
+    current = image
+    for index, region in enumerate(regions, start=1):
+        if on_stage is not None:
+            await on_stage(f"Region LoRAs {index}/{len(regions)} ({region.label})")
+        mask, _from_people = region_lora_mask(people, region)
+        current = await apply_region_lora(
+            client,
+            current.data,
+            current.filename,
+            current.full_params,
+            region,
+            mask_to_png(mask),
+            profiles=profiles,
+        )
+    return current
+
+
+async def _apply_region_loras_to_all(
+    client: ComfyClient,
+    images: list[GeneratedImage],
+    *,
+    profiles: list[ModelProfile] | None,
+    on_stage: StageCallback | None,
+) -> list[GeneratedImage]:
+    if not images or not has_region_loras(images[0].full_params):
+        return images
+    return [
+        await apply_region_loras(client, image, profiles=profiles, on_stage=on_stage)
+        for image in images
     ]

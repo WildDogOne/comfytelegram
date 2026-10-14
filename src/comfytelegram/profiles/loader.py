@@ -144,6 +144,13 @@ def _architecture_fields(profile: ModelProfile) -> dict[str, Any]:
     }
 
 
+def _without_region_loras(regions: list[RegionSpec]) -> list[RegionSpec]:
+    """`regions` minus their own `<lora:…>` LoRAs — dropped on a checkpoint
+    switch for the same reason `loras` resets: they were picked for the old
+    checkpoint."""
+    return [replace(region, loras=[]) for region in regions]
+
+
 def apply_checkpoint_switch(
     params: GenerationParams, new_checkpoint: str, new_profile: ModelProfile | None
 ) -> GenerationParams:
@@ -161,6 +168,7 @@ def apply_checkpoint_switch(
     silently carrying them over risks an incompatible or simply wrong
     result; `handlers.py`'s "🎛 LoRAs" button is the follow-up for picking
     exactly which of the new checkpoint's LoRAs should actually be active.
+    `/rp` regions' own LoRAs are dropped for the same reason.
     `new_profile=None` (no shipped profile matches `new_checkpoint`) falls
     back to `GenerationParams`' own generic defaults for everything —
     mirrors `resolve_generation_params`'s own `profile is None` branch.
@@ -179,13 +187,20 @@ def apply_checkpoint_switch(
             for f in dataclass_fields(GenerationParams)
             if f.name not in _CHECKPOINT_SWITCH_PRESERVED_FIELDS
         }
-        return replace(params, checkpoint=new_checkpoint, loras=[], **reset_fields)
+        return replace(
+            params,
+            checkpoint=new_checkpoint,
+            loras=[],
+            regions=_without_region_loras(params.regions),
+            **reset_fields,
+        )
     active_loras = [lora.to_spec() for lora in new_profile.loras if lora.default_enabled]
     field_defaults = new_profile.defaults.model_dump(exclude_none=True)
     return replace(
         params,
         checkpoint=new_checkpoint,
         loras=active_loras,
+        regions=_without_region_loras(params.regions),
         **_architecture_fields(new_profile),
         **field_defaults,
     )

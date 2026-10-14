@@ -88,6 +88,11 @@ CREATE TABLE IF NOT EXISTS chat_image_format (
     format TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS chat_region_lora_auto (
+    chat_id INTEGER PRIMARY KEY,
+    auto INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS profile_override (
     chat_id INTEGER NOT NULL,
     checkpoint TEXT NOT NULL,
@@ -283,6 +288,24 @@ class Storage:
                 "INSERT INTO chat_image_format (chat_id, format) VALUES (?, ?) "
                 "ON CONFLICT(chat_id) DO UPDATE SET format = excluded.format",
                 (chat_id, image_format),
+            )
+
+    def get_region_lora_auto(self, chat_id: int) -> bool:
+        """Whether `/rp` regions' own LoRAs are applied straight after
+        generating (the `/settings` "🎭 Region LoRAs: Automatic" toggle),
+        rather than waiting for the image's "🎭 Region LoRAs" button so the
+        mask can be checked first — the default."""
+        row = self._conn.execute(
+            "SELECT auto FROM chat_region_lora_auto WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        return bool(row[0]) if row else False
+
+    def set_region_lora_auto(self, chat_id: int, auto: bool) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO chat_region_lora_auto (chat_id, auto) VALUES (?, ?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET auto = excluded.auto",
+                (chat_id, int(auto)),
             )
 
     def get_override(self, chat_id: int, checkpoint: str) -> dict[str, Any]:

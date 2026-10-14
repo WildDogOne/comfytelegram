@@ -78,6 +78,8 @@ class ProfileDefaults(BaseModel):
     #: differ per model.
     regional_base_weight: float | None = Field(None, gt=0, le=1)
     regional_region_weight: float | None = Field(None, gt=0, le=1)
+    #: See `GenerationParams.regional_lora_denoise`.
+    regional_lora_denoise: float | None = Field(None, gt=0, le=1)
 
 
 class ModelProfile(BaseModel):

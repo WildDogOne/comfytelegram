@@ -28,6 +28,7 @@ from comfytelegram.handlers import (
     KONTEXT_CANCEL_CALLBACK_DATA,
     LORA_SWITCH_TOGGLE_CALLBACK_PREFIX,
     REDO_TWEAK_CALLBACK_PREFIX,
+    REGION_LORA_CALLBACK_PREFIX,
     RP_CANCEL_CALLBACK_DATA,
     STREAM_CANCEL_CALLBACK_DATA,
     SWITCH_MODEL_PICK_CALLBACK_PREFIX,
@@ -48,6 +49,7 @@ from comfytelegram.handlers import (
     poll_inpaint_jobs,
     postprocess_callback,
     redo_tweak_callback,
+    region_lora_callback,
     reload_command,
     rp_cancel_callback,
     rp_command,
@@ -360,6 +362,9 @@ def build_application(settings: Settings) -> Application:
     )
     application.add_handler(
         CallbackQueryHandler(redo_tweak_callback, pattern=rf"^{REDO_TWEAK_CALLBACK_PREFIX}")
+    )
+    application.add_handler(
+        CallbackQueryHandler(region_lora_callback, pattern=rf"^{REGION_LORA_CALLBACK_PREFIX}")
     )
     application.add_handler(
         CallbackQueryHandler(

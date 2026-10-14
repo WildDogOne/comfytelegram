@@ -67,6 +67,7 @@ def serialize_generation_params(params: GenerationParams) -> dict[str, Any]:
         "regions": [asdict(region) for region in params.regions],
         "regional_base_weight": params.regional_base_weight,
         "regional_region_weight": params.regional_region_weight,
+        "regional_lora_denoise": params.regional_lora_denoise,
     }
 
 
@@ -106,7 +107,13 @@ def deserialize_generation_params(data: dict[str, Any]) -> GenerationParams:
         detailer_disable_lora=data.get("detailer_disable_lora"),
         raw_positive_prompt=data.get("raw_positive_prompt", ""),
         raw_negative_prompt=data.get("raw_negative_prompt", ""),
-        regions=[RegionSpec(**region) for region in data.get("regions", [])],
+        regions=[
+            RegionSpec(
+                **{**region, "loras": [LoraSpec(**lora) for lora in region.get("loras", [])]}
+            )
+            for region in data.get("regions", [])
+        ],
         regional_base_weight=data.get("regional_base_weight", 0.1),
         regional_region_weight=data.get("regional_region_weight", 0.9),
+        regional_lora_denoise=data.get("regional_lora_denoise"),
     )

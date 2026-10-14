@@ -76,7 +76,13 @@ class RegionSpec:
     `/settings` width/height change unchanged. `label` is the user-facing
     position name ("left", "top", ...) it was parsed from, kept for "🐛 Show
     Prompt" and for rebuilding the `/rp` syntax; the graph only reads the
-    rest."""
+    rest.
+
+    `loras` are this region's own `<lora:…>` tags. `build_txt2img` ignores
+    them — every region shares one model under Attention Couple, so a LoRA
+    can't be applied to just one of them during sampling. They're applied
+    afterwards instead, by a detailer pass over the region's character
+    (`generation.apply_region_lora`)."""
 
     label: str
     prompt: str
@@ -84,6 +90,7 @@ class RegionSpec:
     y: float
     w: float
     h: float
+    loras: list[LoraSpec] = field(default_factory=list)
 
 
 @dataclass
@@ -256,6 +263,12 @@ class GenerationParams:
     #: mask weight at all, and the global mask is the only full-canvas one.
     regional_base_weight: float = 0.1
     regional_region_weight: float = 0.9
+    #: Denoise of a regional LoRA pass (`generation.apply_region_lora`), the
+    #: detailer pass that applies a region's own `<lora:…>` after sampling.
+    #: Higher than an ordinary detail pass, since a character LoRA has to
+    #: redraw the character, not touch it up. `None` means
+    #: `generation.REGION_LORA_DEFAULT_DENOISE`.
+    regional_lora_denoise: float | None = None
 
     def resolved_seed(self) -> int:
         """This request's seed, or a freshly-rolled random one if unset."""
@@ -1222,6 +1235,44 @@ class DrawnMaskFixParams:
     #: strength up to compensate makes it invent content instead. Capping
     #: the jump keeps the pass in the regime krita actually uses it in.
     refine_max_upscale: float = 2.0
+
+
+#: Impact Subpack's COCO-trained person segmenter. Used only as a
+#: *foreground* mask for regional LoRA passes (`build_person_masks`): it
+#: merges characters who touch into one person, so it can't separate them —
+#: the region's box does that (see `generation.region_lora_mask`).
+PERSON_SEGM_MODEL = "segm/person_yolov8m-seg.pt"
+
+
+def build_person_masks(source_filename: str) -> tuple[dict[str, Any], str]:
+    """A detection-only graph: every person `PERSON_SEGM_MODEL` finds in the
+    image, as one full-image-sized white-on-black mask image each, on the
+    returned `PreviewImage` node (no `SaveImage` — nothing here is a
+    result). An image with nobody in it yields a single all-black mask,
+    since `ImpactSEGSToMaskList` substitutes an empty one for an empty
+    list."""
+    g = PromptGraph()
+    load = g.add("LoadImage", {"image": source_filename}, title="Source Image")
+    detector = g.add(
+        "UltralyticsDetectorProvider", {"model_name": PERSON_SEGM_MODEL}, title="Person Detector"
+    )
+    segs = g.add(
+        "SegmDetectorSEGS",
+        {
+            "segm_detector": [detector, 1],
+            "image": [load, 0],
+            "threshold": 0.4,
+            "dilation": 0,
+            "crop_factor": 1.0,
+            "drop_size": 10,
+            "labels": "all",
+        },
+        title="Detect People",
+    )
+    masks = g.add("ImpactSEGSToMaskList", {"segs": [segs, 0]})
+    images = g.add("MaskToImage", {"mask": [masks, 0]})
+    preview = g.add("PreviewImage", {"images": [images, 0]}, title="Person Masks")
+    return g.as_prompt(), preview
 
 
 def build_hand_detailer_drawn_mask(
