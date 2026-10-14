@@ -182,6 +182,13 @@
       "strength_clip": 1.0,
       "default_enabled": false,
       "trigger_words": "marlow"
+    },
+    {
+      "name": "illustrious/marlowV3/marlowV3.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false,
+      "trigger_words": "marlow"
     }
   ],
   "civitai_base_models": [

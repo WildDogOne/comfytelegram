@@ -143,6 +143,14 @@ class Job:
     #: when the submission comes back. Display-only here, like
     #: `readonly_info`.
     references: list[dict[str, str]] = field(default_factory=list)
+    #: `<lora:…>` autocomplete entries for the same prompt fields —
+    #: `{"name", "strength", "preview"}` for the checkpoint profile's LoRAs —
+    #: and the LoRAs the image was generated with (`{"name",
+    #: "strength_model", "strength_clip"}`), shown read-only since typed
+    #: tags add to them. Display-only here too; comfytelegram resolves the
+    #: tags when the submission comes back.
+    loras: list[dict[str, str]] = field(default_factory=list)
+    active_loras: list[dict[str, Any]] = field(default_factory=list)
     #: "✨ Smart" select (a SAM point-prompted segmenter) — `{"decoder_url",
     #: "width", "height"}` from `meta` when comfytelegram has an image
     #: encoder staged, else `None` and the page never offers the button.
@@ -229,18 +237,19 @@ def _prune_expired_jobs() -> None:
         del _jobs[token]
 
 
-def _parse_job_meta(header_value: str | None) -> dict[str, Any]:
-    """Decode the optional `X-Job-Meta` header on job creation: base64'd
-    JSON, so unicode prompt text can't run into HTTP header encoding rules.
-    Absent or malformed just means "no metadata, this is a plain mask job"
-    — the common case, and the shape every job had before "✏️ Detail Prompt"
-    started sending one."""
-    if not header_value:
+def _parse_job_meta(value: Any) -> dict[str, Any]:
+    """Decode the optional `meta` part of `POST /jobs` (JSON). Absent or
+    malformed just means "no metadata, this is a plain mask job" — the
+    common case, and the shape every job had before "✏️ Detail Prompt"
+    started sending one. It used to be a base64'd `X-Job-Meta` header,
+    until the autocomplete lists in it outgrew uvicorn's 16KB header
+    limit."""
+    if not isinstance(value, str) or not value:
         return {}
     try:
-        decoded = json.loads(base64.b64decode(header_value))
-    except (ValueError, TypeError):
-        logger.warning("Ignoring malformed X-Job-Meta header")
+        decoded = json.loads(value)
+    except ValueError:
+        logger.warning("Ignoring malformed job meta")
         return {}
     return decoded if isinstance(decoded, dict) else {}
 
@@ -261,6 +270,42 @@ def _parse_references(value: Any) -> list[dict[str, str]]:
     ]
 
 
+def _parse_loras(value: Any) -> list[dict[str, str]]:
+    """`meta["loras"]`, keeping only well-formed entries (see `Job.loras`)."""
+    if not isinstance(value, list):
+        return []
+    return [
+        {
+            "name": item["name"],
+            "strength": item["strength"],
+            "preview": str(item.get("preview", "")),
+        }
+        for item in value
+        if isinstance(item, dict)
+        and isinstance(item.get("name"), str)
+        and isinstance(item.get("strength"), str)
+    ]
+
+
+def _parse_active_loras(value: Any) -> list[dict[str, Any]]:
+    """`meta["active_loras"]`, keeping only well-formed entries (see
+    `Job.active_loras`)."""
+    if not isinstance(value, list):
+        return []
+    return [
+        {
+            "name": item["name"],
+            "strength_model": float(item["strength_model"]),
+            "strength_clip": float(item["strength_clip"]),
+        }
+        for item in value
+        if isinstance(item, dict)
+        and isinstance(item.get("name"), str)
+        and isinstance(item.get("strength_model"), (int, float))
+        and isinstance(item.get("strength_clip"), (int, float))
+    ]
+
+
 def _parse_segmentation(value: Any) -> dict[str, Any] | None:
     """`meta["segmentation"]` if well-formed, else `None` — the page builds
     a decoder off these, so a partial entry is dropped rather than passed on."""
@@ -274,9 +319,10 @@ def _parse_segmentation(value: Any) -> dict[str, Any] | None:
 
 @app.post("/jobs", dependencies=[Depends(require_shared_secret)])
 async def create_job(request: Request) -> dict[str, str]:
-    """comfytelegram pushes the source image here (raw bytes body) and gets
-    back an unguessable token to build the WebApp button's URL from. An
-    optional `X-Job-Meta` header (see `_parse_job_meta`) carries the job's
+    """comfytelegram pushes the source image here (multipart: an `image`
+    file part) and gets back an unguessable token to build the WebApp
+    button's URL from. An optional `meta` part (JSON, see
+    `_parse_job_meta`) carries the job's
     `mode` plus, for a `mode="mask_prompt"` job, the image's current
     positive/negative prompt to pre-fill the editable fields with (the
     usual reason to open "✏️ Detail Prompt" is to cut a scene-wide prompt
@@ -285,7 +331,8 @@ async def create_job(request: Request) -> dict[str, str]:
     nothing is saved beyond that one submission), read-only reference info
     to display, and whether/how to pre-check the tile-ControlNet checkbox
     (`tile_controlnet_available`/`tile_controlnet_default` — see `Job`)
-    and the `$name` autocomplete entries (`Job.references`) —
+    the `$name` autocomplete entries (`Job.references`) and the
+    `<lora:…>` ones (`Job.loras`/`Job.active_loras`) —
     a plain "mask" job (the common case) sends none of this, though it can
     still send `detailer_disable_lora_available`/`detailer_disable_lora_default`
     (see `Job.detailer_disable_lora_available`), which isn't tied to
@@ -297,10 +344,14 @@ async def create_job(request: Request) -> dict[str, str]:
     round, as this did originally, meant re-encoding a ~19MB PNG that had
     already spent the whole upload crossing the internet."""
     _prune_expired_jobs()
-    image = await request.body()
+    async with request.form() as form:
+        upload = form.get("image")
+        if upload is None or isinstance(upload, str):
+            raise HTTPException(status_code=400, detail="Missing image part")
+        image = await upload.read()
+        meta = _parse_job_meta(form.get("meta"))
     if not image:
-        raise HTTPException(status_code=400, detail="Empty request body")
-    meta = _parse_job_meta(request.headers.get("x-job-meta"))
+        raise HTTPException(status_code=400, detail="Empty image")
     token = secrets.token_urlsafe(24)
     _jobs[token] = Job(
         image=image,
@@ -314,6 +365,8 @@ async def create_job(request: Request) -> dict[str, str]:
         detailer_disable_lora_available=bool(meta.get("detailer_disable_lora_available", False)),
         detailer_disable_lora_default=bool(meta.get("detailer_disable_lora_default", False)),
         references=_parse_references(meta.get("references")),
+        loras=_parse_loras(meta.get("loras")),
+        active_loras=_parse_active_loras(meta.get("active_loras")),
         segmentation=_parse_segmentation(meta.get("segmentation")),
     )
     return {"token": token}
@@ -384,6 +437,8 @@ async def job_meta(token: str) -> JSONResponse:
             "detailer_disable_lora_available": job.detailer_disable_lora_available,
             "detailer_disable_lora_default": job.detailer_disable_lora_default,
             "references": job.references,
+            "loras": job.loras,
+            "active_loras": job.active_loras,
             "segmentation": job.segmentation,
         }
     )

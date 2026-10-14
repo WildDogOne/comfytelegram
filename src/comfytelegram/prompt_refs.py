@@ -16,7 +16,6 @@ Telegram-independent — callers hand in the already-loaded lists.
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
 
@@ -33,11 +32,6 @@ _MAX_LISTED_FAVORITES = 15
 #: `reference_suggestions` caps each preview at this many characters — it's
 #: a reminder of what a name inserts, not the full text.
 _SUGGESTION_PREVIEW_CHARS = 60
-
-#: Rough JSON-size budget for `reference_suggestions`. They ride to
-#: inpaint_relay in the base64'd `X-Job-Meta` header, next to the image's
-#: prompt, and uvicorn's h11 parser rejects a header block over 16KB.
-SUGGESTION_BUDGET_BYTES = 6000
 
 
 class UnknownReferenceError(ValueError):
@@ -110,9 +104,7 @@ class ReferenceExpander:
         expansion (or a dropped unknown name) leaves behind."""
         if "$" not in text:
             return text
-        expanded = REFERENCE_RE.sub(self._substitute, text)
-        expanded = re.sub(r"[ \t]*,(?:[ \t]*,)+", ",", expanded)
-        return re.sub(r"^[ \t]*,[ \t]*|[ \t]*,[ \t]*$", "", expanded, flags=re.MULTILINE)
+        return tidy_commas(REFERENCE_RE.sub(self._substitute, text))
 
     @property
     def negatives(self) -> str:
@@ -123,6 +115,14 @@ class ReferenceExpander:
         )
 
 
+def tidy_commas(text: str) -> str:
+    """Collapse the doubled commas, and drop the leading/trailing ones, that
+    removing something from the middle of a comma-separated prompt leaves
+    behind — shared with `lora_refs.extract_lora_tags`."""
+    text = re.sub(r"[ \t]*,(?:[ \t]*,)+", ",", text)
+    return re.sub(r"^[ \t]*,[ \t]*|[ \t]*,[ \t]*$", "", text, flags=re.MULTILINE)
+
+
 def has_references(text: str | None) -> bool:
     return bool(text) and REFERENCE_RE.search(text) is not None
 
@@ -130,35 +130,29 @@ def has_references(text: str | None) -> bool:
 def reference_suggestions(
     characters: list[dict[str, Any]],
     favorites: list[dict[str, Any]],
-    *,
-    budget: int = SUGGESTION_BUDGET_BYTES,
 ) -> list[dict[str, str]]:
     """What `$` can complete to in the "✏️ Detail Prompt" editor:
     `{"name", "kind": "character"|"favorite", "preview"}`, characters
     first. A favorite shadowed by a same-named character is left out, since
-    `$name` would insert the character. Keeps the JSON within `budget`
-    bytes (see `SUGGESTION_BUDGET_BYTES`): once previews no longer fit,
-    later entries go without one, and past that they're left out."""
+    `$name` would insert the character. Every saved name is listed: they
+    travel in the body of the relay's `POST /jobs`, which has no size
+    limit worth budgeting against (see `handlers._relay_create_job`)."""
     character_names = {c["name"].casefold() for c in characters}
     entries = [("character", c["name"], c["positive_prompt"]) for c in characters] + [
         ("favorite", f["name"], f["text"])
         for f in favorites
         if f["name"].casefold() not in character_names
     ]
-    suggestions: list[dict[str, str]] = []
-    used = 2  # the enclosing []
-    for kind, name, text in entries:
-        preview = " ".join(text.split())
-        if len(preview) > _SUGGESTION_PREVIEW_CHARS:
-            preview = preview[: _SUGGESTION_PREVIEW_CHARS - 1].rstrip() + "…"
-        suggestion = {"name": name, "kind": kind, "preview": preview}
-        size = len(json.dumps(suggestion)) + 2
-        if used + size > budget:
-            # Out of room for previews: a bare name still completes.
-            suggestion["preview"] = ""
-            size = len(json.dumps(suggestion)) + 2
-            if used + size > budget:
-                break
-        used += size
-        suggestions.append(suggestion)
-    return suggestions
+    return [
+        {"name": name, "kind": kind, "preview": shorten_preview(text, _SUGGESTION_PREVIEW_CHARS)}
+        for kind, name, text in entries
+    ]
+
+
+def shorten_preview(text: str, limit: int) -> str:
+    """`text` on one line, cut to `limit` characters with an ellipsis — a
+    menu entry's reminder of what a name inserts, not the full text."""
+    preview = " ".join(text.split())
+    if len(preview) > limit:
+        preview = preview[: limit - 1].rstrip() + "…"
+    return preview

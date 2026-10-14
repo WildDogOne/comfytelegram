@@ -20,6 +20,7 @@ import numpy as np
 from PIL import Image
 
 from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
+from comfytelegram.lora_refs import resolve_detail_loras
 from comfytelegram.params_serde import serialize_generation_params
 from comfytelegram.png_metadata import build_metadata, embed_metadata, extract_seed
 from comfytelegram.profiles import (
@@ -313,6 +314,61 @@ def _apply_detail_prompt(
         base,
         positive_prompt=base.positive_prompt if positive is None else positive,
         negative_prompt=base.negative_prompt if negative is None else negative,
+    )
+
+
+def _apply_detail_loras(
+    base: PostProcessBaseParams, profiles: list[ModelProfile] | None
+) -> PostProcessBaseParams:
+    """ "✏️ Detail Prompt"'s `<lora:…>` tags (see `lora_refs`), taken out of
+    `base`'s prompts — already the submitted detail prompt, after
+    `_apply_detail_prompt` — and resolved against the checkpoint's *live*
+    profile, like the editor's autocomplete. They add to the LoRAs the image
+    was generated with (a tag for one of those changes its strength, `:0`
+    removes it), unless `detailer_disable_lora` is set — by the editor's
+    checkbox or the profile — in which case they replace them: the inherited
+    LoRAs go, the typed ones still apply. A newly added LoRA's
+    `trigger_words` go in front of the prompt, unless already in it (the
+    editor pre-fills the image's own prompt, which carries the inherited
+    LoRAs' trigger words). A name the profile doesn't list is dropped — the
+    handler already warned about it when the editor submitted, and stored
+    the prompt without it for redo."""
+    profile = resolve_profile(base.checkpoint, profiles or [])
+    positive, positive_loras, unknown = resolve_detail_loras(base.positive_prompt, profile)
+    negative, negative_loras, unknown_negative = resolve_detail_loras(base.negative_prompt, profile)
+    if unknown or unknown_negative:
+        logger.warning("Dropping unknown detail-prompt LoRA tags: %s", unknown + unknown_negative)
+    typed = {lora.name: lora for lora in positive_loras + negative_loras}
+    if not typed:
+        return replace(base, positive_prompt=positive or "", negative_prompt=negative or "")
+
+    inherited = [] if base.detailer_disable_lora else base.loras
+    remaining = dict(typed)
+    loras = []
+    for lora in inherited:
+        override = remaining.pop(lora.name, None)
+        if override is None:
+            loras.append(lora)
+        elif override.default_enabled:
+            loras.append(override.to_spec())
+    loras += [lora.to_spec() for lora in remaining.values() if lora.default_enabled]
+
+    folded = (positive or "").casefold()
+    trigger_words = join_nonempty(
+        [
+            lora.trigger_words
+            for lora in typed.values()
+            if lora.default_enabled
+            and lora.trigger_words
+            and lora.trigger_words.casefold() not in folded
+        ]
+    )
+    return replace(
+        base,
+        positive_prompt=join_nonempty([trigger_words, positive or ""]),
+        negative_prompt=negative or "",
+        loras=loras,
+        detailer_disable_lora=False,
     )
 
 
@@ -1101,7 +1157,11 @@ async def post_process(
     but today only `"hand_drawn"` callers (`handlers.py`) ever supply a
     non-`None` value — "🩹 Fix Artifact" (`"fix_drawn"`) has no WebApp
     checkbox for it (see `handlers.py`'s `postprocess_callback`, which never
-    builds one for that job kind)."""
+    builds one for that job kind).
+
+    `<lora:…>` tags in `detail_prompt`/`detail_negative_prompt` add LoRAs
+    to this one pass, or replace the inherited ones when
+    `detailer_disable_lora` ends up set — see `_apply_detail_loras`."""
     base_params = _to_post_process_base(full_params)
     if kind in DETAIL_PROMPT_KINDS:
         base_params = _apply_detail_prompt(base_params, detail_prompt, detail_negative_prompt)
@@ -1113,6 +1173,8 @@ async def post_process(
         base_params = _refresh_detail_prompt_tile_controlnet(base_params, profiles)
     if detailer_disable_lora_override is not None:
         base_params = replace(base_params, detailer_disable_lora=detailer_disable_lora_override)
+    if kind in DETAIL_PROMPT_KINDS:
+        base_params = _apply_detail_loras(base_params, profiles)
     if kind == "upscale" and (
         upscale_denoise_override is not None or tile_controlnet_strength_override is not None
     ):

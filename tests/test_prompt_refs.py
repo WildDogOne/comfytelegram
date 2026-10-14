@@ -104,15 +104,14 @@ def test_suggestion_previews_are_shortened_to_one_line():
     assert suggestion["preview"].endswith("…")
 
 
-def test_suggestions_drop_previews_then_entries_to_stay_within_budget():
+def test_suggestions_list_every_saved_name_with_its_preview():
+    # No header-size budget any more: hundreds of favorites all come through.
     favorites = [{"name": f"fav{i:03}", "text": "x" * 80} for i in range(300)]
 
-    suggestions = reference_suggestions([], favorites, budget=3000)
+    suggestions = reference_suggestions([], favorites)
 
-    assert len(json.dumps(suggestions)) <= 3000
-    assert suggestions[0]["preview"]
-    assert suggestions[-1]["preview"] == ""
-    assert 0 < len(suggestions) < 300
+    assert len(suggestions) == 300
+    assert all(s["preview"] for s in suggestions)
 
 
 @pytest.mark.asyncio
@@ -194,7 +193,7 @@ async def test_generate_message_reports_an_unknown_name_without_generating(stora
 # --- "✏️ Detail Prompt" ---------------------------------------------------------
 
 
-async def _run_detail_job(storage: Storage, positive, negative, *, user_id=7):
+async def _run_detail_job(storage: Storage, positive, negative, *, user_id=7, profiles=()):
     result_id = "abc123"
     storage.store_pending_result(
         result_id=result_id,
@@ -206,6 +205,7 @@ async def _run_detail_job(storage: Storage, positive, negative, *, user_id=7):
     storage.save_character(42, "alice", "blonde hair, cat ears", "tail")
     storage.save_favorite(user_id, "wlop", "artist", "by wlop")
     application = MagicMock()
+    application.bot_data = {"profiles": list(profiles)}
     application.bot.send_message = AsyncMock(return_value=AsyncMock())
     application.bot.get_file = AsyncMock(
         return_value=MagicMock(download_as_bytearray=AsyncMock(return_value=bytearray(b"orig")))

@@ -1138,6 +1138,18 @@ def test_tagcheck_lines_marks_a_known_common_tag():
     assert lines == ["✅ 1girl — 500,000 posts (danbooru)"]
 
 
+def test_tagcheck_lines_skips_lora_tags():
+    tags_db = MagicMock()
+    tags_db.lookup_exact.return_value = _tag_result("1girl", 500_000)
+    settings = MagicMock(tag_rare_threshold=100)
+
+    lines = _tagcheck_lines(
+        "<lora:chars/alice_v2:0.8>, 1girl", [TagSource.DANBOORU], tags_db, settings
+    )
+
+    assert lines == ["✅ 1girl — 500,000 posts (danbooru)"]
+
+
 def test_tagcheck_lines_flags_a_rare_tag():
     tags_db = MagicMock()
     tags_db.lookup_exact.return_value = _tag_result("obscure_tag", 5)

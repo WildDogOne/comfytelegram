@@ -61,6 +61,15 @@ from comfytelegram.generation import (
 )
 from comfytelegram.lora_discovery import reload_profiles_and_discover
 from comfytelegram.lora_menu import handle_lora_custom_value_message
+from comfytelegram.lora_refs import (
+    UnknownLoraError,
+    apply_prompt_loras,
+    extract_lora_tags,
+    has_lora_tags,
+    lora_suggestions,
+    resolve_detail_loras,
+    strip_lora_tags,
+)
 from comfytelegram.message_text import message_text
 from comfytelegram.params_serde import (
     deserialize_generation_params,
@@ -1423,10 +1432,16 @@ async def _relay_create_job(
     `DETAIL_PROMPT_CALLBACK_KIND` branches) reports that back to the chat
     like any other post-processing error.
 
-    `meta`, when given, becomes the relay's `X-Job-Meta` header — base64'd
-    JSON rather than raw text, so it can't run into HTTP header encoding
-    rules (headers are meant to stay ASCII/latin-1). Omitted entirely for
-    "🩹 Fix Artifact" (the relay defaults an unset header to `mode="mask"`,
+    The request is multipart: an `image` part and, when `meta` is given, a
+    `meta` part holding it as JSON. `meta` used to ride in an `X-Job-Meta`
+    header (base64'd JSON) while the body stayed raw image bytes — fine
+    while it was a mode flag and two prompts, but it grew to carry the
+    `$name` and `<lora:…>` suggestion lists, and uvicorn rejects a header
+    block over 16KB. The size budgets that kept it under that silently
+    dropped entries (a profile's last-listed LoRAs went missing from the
+    editor's menu), so it moved into the body, where size doesn't matter.
+    `meta` is omitted entirely for
+    "🩹 Fix Artifact" (the relay defaults a missing part to `mode="mask"`,
     a canvas with no prompt fields, and there's no per-checkpoint toggle to
     show for it either); `DETAIL_PROMPT_CALLBACK_KIND` passes one carrying
     `mode="mask_prompt"` (the same canvas plus editable positive/negative/
@@ -1439,32 +1454,35 @@ async def _relay_create_job(
     detailer pass, not only "✏️ Detail Prompt"'s tile-ControlNet
     experiment). Any of the three also gets a `segmentation` entry when
     "✨ Smart" select is available (`_segmentation_meta`), which is the one
-    way "🩹 Fix Artifact" ends up sending a header at all.
+    way "🩹 Fix Artifact" ends up sending `meta` at all.
 
     The image is compressed here (`_to_display_jpeg`) rather than on the
     relay, which is where this used to happen: the relay re-encoded on
     arrival, so the full PNG crossed the internet only to be thrown away at
     the far end. Encoding first makes the upload ~8x smaller for the same
-    bytes served to the editor. `Content-Type` tells the relay what it
-    actually got, since it no longer re-encodes and has to serve this copy
-    back verbatim. The decode+encode itself runs off the event loop
+    bytes served to the editor. The image part's content type says which
+    of the two it is (the relay also sniffs the bytes, since it serves this
+    copy back verbatim). The decode+encode itself runs off the event loop
     (`asyncio.to_thread`) — a full-resolution JPEG re-encode is real CPU
     work, and `concurrent_updates(True)` only actually gets other updates
     running concurrently if nothing blocks the one event loop thread."""
     payload = await asyncio.to_thread(_to_display_jpeg, image_bytes)
-    content_type = "image/jpeg" if payload is not image_bytes else "image/png"
-    headers = {
-        "Authorization": f"Bearer {settings.inpaint_relay_shared_secret}",
-        "Content-Type": content_type,
-    }
+    is_jpeg = payload is not image_bytes
+    form = aiohttp.FormData()
+    form.add_field(
+        "image",
+        payload,
+        filename="source.jpg" if is_jpeg else "source.png",
+        content_type="image/jpeg" if is_jpeg else "image/png",
+    )
     if meta is not None:
-        headers["X-Job-Meta"] = base64.b64encode(json.dumps(meta).encode()).decode("ascii")
+        form.add_field("meta", json.dumps(meta), content_type="application/json")
     async with (
         aiohttp.ClientSession(timeout=_INPAINT_RELAY_UPLOAD_TIMEOUT) as session,
         session.post(
             f"{settings.inpaint_relay_url}/jobs",
-            data=payload,
-            headers=headers,
+            data=form,
+            headers={"Authorization": f"Bearer {settings.inpaint_relay_shared_secret}"},
         ) as resp,
     ):
         resp.raise_for_status()
@@ -1473,7 +1491,7 @@ async def _relay_create_job(
 
 
 def _segmentation_meta(settings: Settings, image_bytes: bytes) -> dict[str, Any] | None:
-    """The `X-Job-Meta` `segmentation` entry offering the editor's "✨ Smart"
+    """The job meta's `segmentation` entry offering the editor's "✨ Smart"
     select, or `None` when there's no encoder staged (the feature's off) or
     the image won't even open. Only reads the image header, so it's cheap
     enough to call inline; the actual encoding is `_relay_upload_embedding`'s
@@ -1930,6 +1948,7 @@ async def _process_one_inpaint_job(
         full_params,
         result.get("positive"),
         result.get("negative"),
+        application.bot_data["profiles"],
     )
     detail_denoise = result.get("denoise")
     tile_controlnet_choice = result.get("tile_controlnet")
@@ -2004,33 +2023,50 @@ async def _expand_detail_prompt_references(
     full_params: GenerationParams,
     positive: str | None,
     negative: str | None,
+    profiles: list[ModelProfile],
 ) -> tuple[str | None, str | None]:
     """Expand `$name`s (characters, then the submitter's favorites — see
     `prompt_refs`) in a "✏️ Detail Prompt" submission's fields. A
     referenced character's negative joins the negative, on top of the
     image's own when that field was left blank (blank means "keep the
     image's", which shouldn't silently turn into "only the character's").
-    Unlike a typed prompt, an unknown name is dropped with a warning
-    instead of rejecting the submission — that would also throw away the
-    mask that was just drawn. Redo stores the expanded text, so it replays
-    exactly what ran."""
-    if not (has_references(positive) or has_references(negative)):
-        return positive, negative
-    references = _reference_expander(storage, chat_id, user_id, strict=False)
-    if positive is not None:
-        positive = references.expand(positive)
-    if negative is not None:
-        negative = references.expand(negative)
-    if references.negatives:
-        base_negative = full_params.negative_prompt if negative is None else negative
-        negative = join_nonempty([base_negative, references.negatives])
-    if references.unknown:
-        names = ", ".join(f"${name}" for name in references.unknown)
-        await bot.send_message(
-            chat_id,
-            f"⚠️ Nothing saved under {names} — left it out of the detail prompt.",
-            message_thread_id=message_thread_id,
-        )
+    Then checks the `<lora:…>` tags (see `lora_refs`) against the
+    checkpoint's live profile — the tags themselves stay in the text, for
+    `post_process` to apply and for redo to replay. Unlike a typed prompt,
+    an unknown `$name` or LoRA is dropped with a warning instead of
+    rejecting the submission — that would also throw away the mask that was
+    just drawn. Redo stores the result, so it replays exactly what ran."""
+    if has_references(positive) or has_references(negative):
+        references = _reference_expander(storage, chat_id, user_id, strict=False)
+        if positive is not None:
+            positive = references.expand(positive)
+        if negative is not None:
+            negative = references.expand(negative)
+        if references.negatives:
+            base_negative = full_params.negative_prompt if negative is None else negative
+            negative = join_nonempty([base_negative, references.negatives])
+        if references.unknown:
+            names = ", ".join(f"${name}" for name in references.unknown)
+            await bot.send_message(
+                chat_id,
+                f"⚠️ Nothing saved under {names} — left it out of the detail prompt.",
+                message_thread_id=message_thread_id,
+            )
+
+    if has_lora_tags(positive) or has_lora_tags(negative):
+        profile = resolve_profile(full_params.checkpoint, profiles)
+        unknown = [
+            name for text in (positive, negative) for name in resolve_detail_loras(text, profile)[2]
+        ]
+        if unknown:
+            positive = strip_lora_tags(positive, unknown)
+            negative = strip_lora_tags(negative, unknown)
+            names = ", ".join(f"<lora:{name}>" for name in dict.fromkeys(unknown))
+            await bot.send_message(
+                chat_id,
+                f"⚠️ No LoRA called {names} for this checkpoint — left it out of the detail prompt.",
+                message_thread_id=message_thread_id,
+            )
     return positive, negative
 
 
@@ -2693,7 +2729,10 @@ def _resolve_profile_and_prompt(
     characters per region with `$name` instead, and folding one into the
     global prompt would put it on every character at once. `references`
     is passed through to `_resolve_effective_prompt` (`$name` expansion,
-    which can raise `UnknownReferenceError`)."""
+    which can raise `UnknownReferenceError`). `<lora:…>` tags are then
+    taken out of the prompt and layered onto the profile (see `lora_refs`),
+    raising `UnknownLoraError` — itself an `UnknownReferenceError` — for one
+    the profile doesn't list."""
     profile = resolve_profile(checkpoint, profiles)
     profile = apply_profile_override(profile, checkpoint, storage.get_override(chat_id, checkpoint))
     profile = apply_lora_overrides(profile, storage.get_lora_overrides(chat_id, checkpoint))
@@ -2710,6 +2749,12 @@ def _resolve_profile_and_prompt(
     effective_prompt, extra_negative, raw_positive, raw_negative = _resolve_effective_prompt(
         prompt_text, character, references
     )
+    # `<lora:…>` tags, read after `$name` expansion so a character or
+    # favorite can bring its own LoRA. `raw_*` keep them, so Show Prompt's
+    # copy and "as typed" still carry the tag.
+    effective_prompt, positive_tags = extract_lora_tags(effective_prompt)
+    extra_negative, negative_tags = extract_lora_tags(extra_negative)
+    profile = apply_prompt_loras(profile, positive_tags + negative_tags)
     return profile, effective_prompt, extra_negative, raw_positive, raw_negative
 
 
@@ -3771,6 +3816,20 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                             storage.list_characters(pending["chat_id"]),
                             storage.list_favorites(update.effective_user.id),
                         ),
+                        # `<lora:…>` autocomplete — the live profile's
+                        # LoRAs, the same list `post_process` resolves the
+                        # submitted tags against — plus what the image was
+                        # actually made with, shown read-only, since typed
+                        # tags add to those unless "Disable LoRAs" is on.
+                        "loras": lora_suggestions(live_profile),
+                        "active_loras": [
+                            {
+                                "name": lora.name,
+                                "strength_model": lora.strength_model,
+                                "strength_clip": lora.strength_clip,
+                            }
+                            for lora in full_params.loras
+                        ],
                     }
                 )
         # Uploading a large source image to a remote relay host can take a
@@ -4619,6 +4678,13 @@ async def _generate_regional(
         user_id = message.from_user.id if message.from_user else None
         references = _reference_expander(storage, chat_id, user_id)
         expanded = expand_references(parsed, references)
+        for region in expanded.regions:
+            if has_lora_tags(region.prompt):
+                raise RegionalPromptError(
+                    f"[{region.label}] has a <lora:…> tag — every region shares one model, "
+                    "so a LoRA can only go on the global lines, where it applies to the "
+                    "whole image."
+                )
     except RegionalPromptError as exc:
         if rearm_on_error:
             set_pending(context.chat_data, "awaiting_rp_prompt", message, True)
@@ -4638,11 +4704,20 @@ async def _generate_regional(
     negative_block = f"\n---\n{parsed.negative}" if parsed.negative else ""
     expanded_negative_block = f"\n---\n{expanded.negative}" if expanded.negative else ""
     global_text = expanded.global_prompt + expanded_negative_block
-    profile, effective_prompt, extra_negative, _raw_global, raw_negative = (
-        _resolve_profile_and_prompt(
-            chat_id, checkpoint, global_text, storage, profiles, use_active_character=False
+    try:
+        profile, effective_prompt, extra_negative, _raw_global, raw_negative = (
+            _resolve_profile_and_prompt(
+                chat_id, checkpoint, global_text, storage, profiles, use_active_character=False
+            )
         )
-    )
+    except UnknownLoraError as exc:
+        if rearm_on_error:
+            set_pending(context.chat_data, "awaiting_rp_prompt", message, True)
+        await message.reply_text(
+            f"⚠️ {exc}\n\nSend the corrected prompt.",
+            reply_markup=_rp_prompt_keyboard(cancel=rearm_on_error),
+        )
+        return
     # The unexpanded global prompt, put through the same split, for "as typed".
     raw_global, _ = _split_negative_prompt(parsed.global_prompt + negative_block)
 
@@ -5408,8 +5483,10 @@ def _tagcheck_lines(
     known tag at all (❌, with a "did you mean" hint when a close match
     turns up). Emphasis syntax (see `_strip_prompt_weight`) is stripped
     before lookup but the token is still displayed as the user wrote it.
-    Shared by `tagcheck_command` and `postprocess_callback`'s
+    `<lora:…>` tags aren't tags at all and are skipped. Shared by
+    `tagcheck_command` and `postprocess_callback`'s
     `SHOW_PROMPT_CALLBACK_KIND` branch."""
+    prompt_text, _ = extract_lora_tags(prompt_text)
     tokens = [token for token in (t.strip() for t in _TAG_SPLIT_RE.split(prompt_text)) if token]
     omitted = max(0, len(tokens) - TAGCHECK_TOKEN_LIMIT)
     tokens = tokens[:TAGCHECK_TOKEN_LIMIT]

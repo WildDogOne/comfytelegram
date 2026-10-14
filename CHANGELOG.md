@@ -8,6 +8,17 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **LoRAs in the prompt**: write `<lora:name>` (or `<lora:name:0.8>`, or
+  `<lora:name:0.8:0.5>` for model/clip strength) anywhere in a prompt to
+  switch on one of the checkpoint's LoRAs for that image, trigger words
+  included. Folders work (`<lora:chars/alice>`), `:0` switches off one
+  that's on by default, and a saved character or favorite can carry its
+  own tag. Only LoRAs listed under `/lora` for the checkpoint can be used.
+  In a regional prompt they go on the global lines, not in a region.
+- **LoRAs in ✏️ Detail Prompt**: type `<` in the editor's prompt fields to
+  pick a LoRA. It's added to the ones the image was made with for that one
+  detail pass (the editor now lists those); with "Disable LoRAs" checked,
+  the typed ones replace them instead. 🔁 Redo keeps the same LoRAs.
 - **Bring back an edited image**: edited one of the bot's images in another
   app? Send the edit as a reply to the original (or to its 📥 Download file
   copy) and it gets the original's settings and all its buttons back, even
@@ -47,6 +58,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **✏️ Detail Prompt's `$` menu lists all your characters and favorites**:
+  with a lot saved, the ones at the end of the list used to be left out
+  (and some lost their preview). The bot and the mask editor relay need
+  updating together for this.
 - Mask editor: the brush size is now measured on screen, so it's the same
   in Draw Mask, Fix Artifact and Detail Prompt and on every image. It used
   to depend on the image's resolution and on how much room the editor had

@@ -56,10 +56,40 @@ Still open:
   lines currently generates as one plain prompt, tags included.
 - [ ] **Weights in `/settings`**: `regional_base_weight`/
   `regional_region_weight` can only be set in profile JSON for now.
-- [ ] **Per-region LoRAs** with core hook nodes (`CreateHookLora`,
-  `PairConditioningSetProperties`). Probably doesn't combine with Attention
-  Couple; needs testing.
-
+- [ ] **Per-region LoRAs** — the original goal behind `<lora:…>` tags (and
+  everything built around them since). Why: with `/rp`, two characters each
+  need their *own* character LoRA (e.g. `[left]` marlow, `[right]` someone
+  else), but Attention Couple runs every region through one shared model,
+  so a LoRA can only apply to the whole image — it bleeds onto both
+  characters. Only a LoRA's CLIP half could be per-region; its UNet half,
+  usually the part that matters, can't.
+  Plan, in steps:
+  1. ✅ `<lora:name[:strength]>` in typed prompts (`lora_refs.py`). Inside a
+     `[region]` it's rejected for now.
+  2. ✅ `<lora:…>` in "✏️ Detail Prompt", with `<` autocomplete in the
+     editor (adds to the image's LoRAs, or replaces them with "Disable
+     LoRAs" checked). Side quest on the way: the editor's job meta moved
+     from an `X-Job-Meta` header into the `POST /jobs` body, after the
+     header's size budget cut LoRAs off the menu.
+  3. Test by hand (not done yet): `/rp` two characters, then "✏️ Detail
+     Prompt" over one of them with its `<lora:…>` and a fairly high
+     denoise. Main worry is visible seams where the inpainted region meets
+     the rest — the higher the denoise a LoRA needs to take hold, the
+     worse that gets.
+  4. If that holds up, automate it: generate without the region LoRAs,
+     then run one detailer pass per LoRA'd region (`MaskToSEGS` ->
+     `DetailerForEach`, like "✏️ Detail Prompt") with the LoRA loaded and
+     the region's prompt. To keep seams down, mask the subject's silhouette
+     inside the box (SAM at the box centre, or Impact Pack's person
+     detector) rather than the raw box, and optionally finish with a
+     Homogenize pass. Regions keep their LoRAs through `params_serde` so
+     "🔁 Generate Again" replays the whole pipeline.
+  Alternative if seams can't be tamed: core hook nodes (`CreateHookLora`,
+  `PairConditioningSetProperties`) with mask-based regions
+  (`ConditioningSetMask`) instead of Attention Couple — the LoRA's weights
+  apply only while sampling its region's conditioning, so no seams, but
+  roughly one model evaluation per region (slower) and coarser coherence
+  between regions.
 ## Mask editor
 
 - [ ] **Superpixel brush, alongside ✨ Smart select**: SAM picks whole

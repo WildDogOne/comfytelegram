@@ -6,7 +6,6 @@ and, at ~19MB after an upscale, routinely didn't finish inside the upload
 timeout. See `handlers._to_display_jpeg`.
 """
 
-import base64
 import io
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -61,16 +60,24 @@ def test_display_jpeg_passes_undecodable_bytes_through_untouched():
     assert _to_display_jpeg(junk) is junk
 
 
+def _parts(form) -> dict:
+    """`{name: (value, content_type, filename)}` for an `aiohttp.FormData`."""
+    return {
+        options["name"]: (value, headers.get("Content-Type"), options.get("filename"))
+        for options, headers, value in form._fields
+    }
+
+
 def _session_patch(captured: dict):
-    """Stand in for `aiohttp.ClientSession`, recording the POST's body and
-    headers and returning a token."""
+    """Stand in for `aiohttp.ClientSession`, recording the POST's multipart
+    parts and headers and returning a token."""
     response = AsyncMock()
     response.json.return_value = {"token": "tok123"}
     response.raise_for_status = MagicMock()
 
     def _post(url, *, data, headers):
         captured["url"] = url
-        captured["data"] = data
+        captured["parts"] = _parts(data)
         captured["headers"] = headers
         ctx = MagicMock()
         ctx.__aenter__ = AsyncMock(return_value=response)
@@ -88,7 +95,7 @@ def _session_patch(captured: dict):
 @pytest.mark.asyncio
 async def test_relay_upload_sends_the_compressed_copy_and_says_what_it_is():
     """The relay no longer re-encodes, so it serves these bytes back
-    verbatim and needs an accurate Content-Type to hand the browser."""
+    verbatim and needs to know what they are."""
     settings = MagicMock(inpaint_relay_url="https://relay.example", inpaint_relay_shared_secret="s")
     source = _noisy_png()
     captured: dict = {}
@@ -97,40 +104,44 @@ async def test_relay_upload_sends_the_compressed_copy_and_says_what_it_is():
         token = await _relay_create_job(settings, source)
 
     assert token == "tok123"
-    assert captured["headers"]["Content-Type"] == "image/jpeg"
-    assert captured["data"].startswith(b"\xff\xd8\xff")
-    assert len(captured["data"]) < len(source)
+    assert captured["headers"] == {"Authorization": "Bearer s"}
+    data, content_type, filename = captured["parts"]["image"]
+    assert (content_type, filename) == ("image/jpeg", "source.jpg")
+    assert data.startswith(b"\xff\xd8\xff")
+    assert len(data) < len(source)
 
 
 @pytest.mark.asyncio
-async def test_relay_upload_omits_the_meta_header_for_a_plain_mask_job():
+async def test_relay_upload_omits_the_meta_part_for_a_plain_mask_job():
     """The common case ("🖌️ Draw Mask"/"🩹 Fix Artifact") doesn't pass
-    `meta` at all — the relay defaults an unset header to `mode="mask"`."""
+    `meta` at all — the relay defaults a missing part to `mode="mask"`."""
     settings = MagicMock(inpaint_relay_url="https://relay.example", inpaint_relay_shared_secret="s")
-    source = _noisy_png()
     captured: dict = {}
 
     with patch("comfytelegram.handlers.aiohttp.ClientSession", _session_patch(captured)):
-        await _relay_create_job(settings, source)
+        await _relay_create_job(settings, _noisy_png())
 
-    assert "X-Job-Meta" not in captured["headers"]
+    assert set(captured["parts"]) == {"image"}
 
 
 @pytest.mark.asyncio
-async def test_relay_upload_sends_meta_as_base64_json_header():
-    """ "✏️ Detail Prompt" passes `meta` — base64'd JSON rather than a raw
-    header value, since a prompt can contain non-ASCII text that HTTP
-    headers aren't guaranteed to carry."""
+async def test_relay_upload_sends_meta_as_a_json_part_however_large():
+    """ "✏️ Detail Prompt" passes `meta` — in the body, not a header, so
+    long suggestion lists and non-ASCII prompts both just go through."""
     settings = MagicMock(inpaint_relay_url="https://relay.example", inpaint_relay_shared_secret="s")
-    source = _noisy_png()
     captured: dict = {}
-    meta = {"mode": "prompt", "positive": "五本指", "negative": None, "denoise": 0.42}
+    meta = {
+        "mode": "mask_prompt",
+        "positive": "五本指",
+        "loras": [{"name": f"folder/lora_{i}", "strength": "1", "preview": ""} for i in range(500)],
+    }
 
     with patch("comfytelegram.handlers.aiohttp.ClientSession", _session_patch(captured)):
-        await _relay_create_job(settings, source, meta=meta)
+        await _relay_create_job(settings, _noisy_png(), meta=meta)
 
-    decoded = json.loads(base64.b64decode(captured["headers"]["X-Job-Meta"]))
-    assert decoded == meta
+    value, content_type, _ = captured["parts"]["meta"]
+    assert content_type == "application/json"
+    assert json.loads(value) == meta
 
 
 @pytest.mark.asyncio
@@ -146,5 +157,8 @@ async def test_relay_upload_labels_a_pass_through_as_png():
     ):
         await _relay_create_job(settings, b"\x89PNG\r\n\x1a\n undecodable")
 
-    assert captured["headers"]["Content-Type"] == "image/png"
-    assert captured["data"] == b"\x89PNG\r\n\x1a\n undecodable"
+    assert captured["parts"]["image"] == (
+        b"\x89PNG\r\n\x1a\n undecodable",
+        "image/png",
+        "source.png",
+    )

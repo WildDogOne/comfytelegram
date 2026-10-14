@@ -180,7 +180,8 @@
     gap: 8px;
     box-sizing: border-box;
   }
-  #readonly-info {
+  #readonly-info,
+  #lora-info {
     font-size: 12px;
     line-height: 1.4;
     color: #9a9a9a;
@@ -362,6 +363,7 @@
   <div id="options-body">
   <div id="prompt-fields" style="display: none;">
     <div id="readonly-info"></div>
+    <div id="lora-info" style="display: none;"></div>
     <div>
       <div class="field-label">Positive <span class="field-hint" id="positive-hint">— $name inserts a character or favorite</span></div>
       <textarea
@@ -459,6 +461,7 @@
   // the markup regardless of which mode a given job turns out to be.
   var promptFieldsEl = document.getElementById("prompt-fields");
   var readonlyEl = document.getElementById("readonly-info");
+  var loraInfoEl = document.getElementById("lora-info");
   var positiveInput = document.getElementById("positive-input");
   var negativeInput = document.getElementById("negative-input");
   var denoiseOverride = document.getElementById("denoise-override");
@@ -2164,9 +2167,31 @@
     positiveInput.value = meta.positive || "";
     negativeInput.value = meta.negative || "";
     references = Array.isArray(meta.references) ? meta.references : [];
-    if (references.length) {
-      document.getElementById("positive-hint").textContent =
-        "— type $ for characters and favorites";
+    loraRefs = (Array.isArray(meta.loras) ? meta.loras : []).map(function (lora) {
+      return {
+        kind: "lora",
+        name: lora.name,
+        preview: lora.preview,
+        insert: "<lora:" + lora.name + ":" + lora.strength + ">",
+      };
+    });
+    var hints = [];
+    if (references.length) hints.push("$ for characters and favorites");
+    if (loraRefs.length) hints.push("< for LoRAs");
+    if (hints.length) {
+      document.getElementById("positive-hint").textContent = "— type " + hints.join(", ");
+    }
+    // Typed <lora:…> tags add to the LoRAs the image was made with, or
+    // replace them when "Disable LoRAs" is checked — say which ones those
+    // are, since nothing else on the page does.
+    var activeLoras = Array.isArray(meta.active_loras) ? meta.active_loras : [];
+    if (activeLoras.length || loraRefs.length) {
+      loraInfoEl.textContent = activeLoras.length
+        ? "LoRAs on this image: " +
+          activeLoras.map(formatActiveLora).join(", ") +
+          ". <lora:…> tags add to these (replace them with “Disable LoRAs” checked)."
+        : "No LoRAs on this image — <lora:…> tags add one for this pass.";
+      loraInfoEl.style.display = "block";
     }
     denoiseOverride.addEventListener("change", function () {
       denoiseInput.disabled = !denoiseOverride.checked;
@@ -2290,22 +2315,57 @@
   // comes back, so this only helps type a name that exists. Typing `$`
   // (or `$ab`) at the caret opens a menu of matching names, prefix matches
   // first; tapping one (or Enter/Tab) replaces the partial name.
+  //
+  // `<` (or `<lora:`, or `<ali`) does the same for `loraRefs` (from
+  // `meta.loras`, the checkpoint profile's LoRAs), inserting the whole
+  // `<lora:name:strength>` tag at the LoRA's configured strength.
+  // comfytelegram resolves those tags against the same profile when the
+  // submission comes back.
   var references = [];
+  var loraRefs = [];
   var refMenu = document.getElementById("ref-menu");
   var refState = null; // {input, start, end, items, index} while open
+
+  function formatActiveLora(lora) {
+    var name = lora.name.replace(/\\/g, "/").replace(/\.safetensors$/i, "");
+    var strength =
+      lora.strength_model === lora.strength_clip
+        ? String(lora.strength_model)
+        : lora.strength_model + "/" + lora.strength_clip;
+    return name + " (" + strength + ")";
+  }
 
   function refQueryAt(input) {
     if (input.selectionStart !== input.selectionEnd) return null;
     var caret = input.selectionStart;
-    var match = /(^|[^\w$])\$([A-Za-z0-9_-]*)$/.exec(input.value.slice(0, caret));
-    if (!match) return null;
-    return { start: caret - match[2].length - 1, end: caret, query: match[2].toLowerCase() };
+    var before = input.value.slice(0, caret);
+    var match = /(^|[^\w$])\$([A-Za-z0-9_-]*)$/.exec(before);
+    if (match) {
+      return {
+        start: caret - match[2].length - 1,
+        end: caret,
+        query: match[2].toLowerCase(),
+        pool: references,
+      };
+    }
+    // A LoRA path can hold folders (and dots), so anything up to a colon,
+    // angle bracket or whitespace is the query.
+    match = /<(lora:)?([^:<>\s]*)$/i.exec(before);
+    if (match) {
+      return {
+        start: caret - match[0].length,
+        end: caret,
+        query: match[2].toLowerCase(),
+        pool: loraRefs,
+      };
+    }
+    return null;
   }
 
-  function matchingReferences(query) {
+  function matchingReferences(query, pool) {
     var prefix = [];
     var inner = [];
-    references.forEach(function (ref) {
+    pool.forEach(function (ref) {
       var name = ref.name.toLowerCase();
       if (name.indexOf(query) === 0) prefix.push(ref);
       else if (query && name.indexOf(query) > 0) inner.push(ref);
@@ -2344,7 +2404,10 @@
       item.setAttribute("role", "option");
       var name = document.createElement("span");
       name.className = "ref-name";
-      name.textContent = (ref.kind === "character" ? "👤 $" : "⭐ $") + ref.name;
+      name.textContent =
+        ref.kind === "lora"
+          ? "🎛 " + ref.name
+          : (ref.kind === "character" ? "👤 $" : "⭐ $") + ref.name;
       var preview = document.createElement("span");
       preview.className = "ref-preview";
       preview.textContent = ref.preview || "";
@@ -2365,9 +2428,9 @@
   }
 
   function updateRefMenu(input) {
-    if (!references.length) return;
+    if (!references.length && !loraRefs.length) return;
     var query = refQueryAt(input);
-    var items = query ? matchingReferences(query.query) : [];
+    var items = query ? matchingReferences(query.query, query.pool) : [];
     if (!items.length) {
       closeRefMenu();
       return;
@@ -2378,7 +2441,8 @@
 
   function pickReference(i) {
     var input = refState.input;
-    var insert = "$" + refState.items[i].name;
+    var ref = refState.items[i];
+    var insert = ref.kind === "lora" ? ref.insert : "$" + ref.name;
     input.value = input.value.slice(0, refState.start) + insert + input.value.slice(refState.end);
     var caret = refState.start + insert.length;
     input.setSelectionRange(caret, caret);

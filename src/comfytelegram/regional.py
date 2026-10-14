@@ -81,6 +81,8 @@ REGIONAL_HELP = (
     "e.g. [left] $alice, waving. A character's negative prompt is added to "
     "the negatives. The active character isn't applied here — place "
     "characters with $name instead.\n"
+    "• <lora:name> tags go on the global lines and apply to the whole "
+    "image — every region shares one model.\n"
     "• Optional: a --- line, then negative tags.\n\n"
     "Regions don't move people: top/bottom only helps if the scene really "
     "stacks them, so for characters standing together use left/right with "
