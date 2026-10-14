@@ -19,6 +19,7 @@ from comfytelegram.params_serde import (
     deserialize_generation_params,
     serialize_generation_params,
 )
+from comfytelegram.png_metadata import extract_metadata
 from comfytelegram.profiles import resolve_generation_params
 from comfytelegram.profiles.schema import LoraDefault, ModelProfile, ProfileDefaults
 from comfytelegram.prompt_refs import ReferenceExpander
@@ -318,6 +319,22 @@ async def test_batch_images_record_their_noise_index_and_repeat_starts_over():
     assert [image.noise_index for image in fresh] == [3, 4]
     assert [image.noise_index for image in again] == [0, 1]
     assert again[0].full_params.batch_offset == 0
+
+
+@pytest.mark.asyncio
+async def test_each_batch_image_carries_its_noise_index_in_its_png():
+    def png() -> bytes:
+        out = io.BytesIO()
+        Image.new("RGB", (4, 4)).save(out, "PNG")
+        return out.getvalue()
+
+    raw = [(png(), "a.png"), (png(), "b.png")]
+    with patch("comfytelegram.generation._run_graph", new=AsyncMock(return_value=(raw, {}))):
+        images = await generate(
+            MagicMock(), "c", "scene", _profile(), overrides={"batch_offset": 1}
+        )
+
+    assert [extract_metadata(image.data)["noise_index"] for image in images] == [1, 2]
 
 
 def test_normalize_region_mask_resizes_to_the_latent_size_and_thresholds():

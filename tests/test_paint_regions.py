@@ -30,6 +30,7 @@ from comfytelegram.handlers import (
     _txt2img_seed,
     postprocess_callback,
 )
+from comfytelegram.png_metadata import build_metadata, embed_metadata
 from comfytelegram.profiles import LoraDefault, ModelProfile
 from comfytelegram.regional import painted_regions
 from comfytelegram.storage import Storage
@@ -158,12 +159,52 @@ async def test_seed_comes_from_a_txt2img_graph_only():
     }
     upscale = {"2": {"class_type": "KSampler", "inputs": {"seed": 99}}}
     client = MagicMock(get_image_bytes=AsyncMock(return_value=_png(pixels, graph=txt2img)))
+    pending = {"filename": "a.png", "file_id": "f"}
 
-    assert await _txt2img_seed(client, "a.png") == 1234
+    assert await _txt2img_seed(client, MagicMock(), pending) == 1234
     client.get_image_bytes.return_value = _png(pixels, graph=upscale)
-    assert await _txt2img_seed(client, "a.png") is None
+    assert await _txt2img_seed(client, MagicMock(), pending) is None
     client.get_image_bytes.side_effect = ComfyUIError("gone")
-    assert await _txt2img_seed(client, "a.png") is None
+    assert await _txt2img_seed(client, MagicMock(), pending) is None
+
+
+def _telegram_bot(data: bytes) -> MagicMock:
+    bot = MagicMock()
+    bot.get_file = AsyncMock(
+        return_value=MagicMock(download_as_bytearray=AsyncMock(return_value=bytearray(data)))
+    )
+    return bot
+
+
+@pytest.mark.asyncio
+async def test_an_imported_file_gives_its_seed_back_from_its_own_chunks():
+    """A re-imported "📥 Download file" PNG is Telegram-only: ComfyUI may not
+    have it, so the seed comes from the document itself."""
+    pixels = np.zeros((4, 4), dtype=np.uint8)
+    txt2img = {
+        "1": {"class_type": "EmptyLatentImage", "inputs": {}},
+        "2": {"class_type": "KSampler", "inputs": {"seed": 1234}},
+    }
+    client = MagicMock(get_image_bytes=AsyncMock(side_effect=AssertionError("not ComfyUI's")))
+    pending = {"filename": "tgonly_a.png", "file_id": "doc"}
+
+    bot = _telegram_bot(_png(pixels, graph=txt2img))
+    assert await _txt2img_seed(client, bot, pending) == 1234
+    bot.get_file.assert_awaited_once_with("doc")
+
+    # No ComfyUI graph left: our own chunk counts, if it says txt2img.
+    def own_chunk(kind):
+        params = _serialize_generation_params(_params())
+        return embed_metadata(
+            _png(pixels), build_metadata(params=params, kind=kind, filename="a.png", seed=55)
+        )
+
+    assert await _txt2img_seed(client, _telegram_bot(own_chunk("txt2img")), pending) == 55
+    assert await _txt2img_seed(client, _telegram_bot(own_chunk("upscale")), pending) is None
+    # A photo-type edit: re-encoded to JPEG, no chunks at all.
+    jpeg = io.BytesIO()
+    Image.new("RGB", (4, 4)).save(jpeg, "JPEG")
+    assert await _txt2img_seed(client, _telegram_bot(jpeg.getvalue()), pending) is None
 
 
 # --- the submission --------------------------------------------------------------

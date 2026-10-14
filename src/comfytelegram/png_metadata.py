@@ -183,6 +183,7 @@ def build_metadata(
     kind: str,
     filename: str,
     seed: int | None = None,
+    noise_index: int | None = None,
     checkpoint: str | None = None,
 ) -> dict[str, Any]:
     """Assemble the dict `embed_metadata` writes.
@@ -195,6 +196,13 @@ def build_metadata(
     `test_serialization_omits_seed_so_regenerate_gets_a_fresh_roll`), which
     is why `seed` rides *alongside* it as its own top-level key: recorded
     for the archive and displayable on import, without feeding regeneration.
+    `noise_index` rides beside it for the same reason: which draw of the
+    seed's noise the image was (`generation.GeneratedImage.noise_index` —
+    image k of a batch is draw k), the half of "reproduce this exact
+    noise" that ComfyUI's own graph chunk can't say, since a batch's graph
+    is the same for every image in it. An optional key on schema 1: a
+    reader that predates it ignores it, and one reading an older file gets
+    None.
     `kind` records which run produced the file ("txt2img", "repeat", or a
     `generation.post_process` kind), which no field of `params` implies.
     `checkpoint` is denormalised out of `params` purely so a human reading
@@ -206,6 +214,7 @@ def build_metadata(
         "kind": kind,
         "filename": filename,
         "seed": seed,
+        "noise_index": noise_index,
         "checkpoint": checkpoint if checkpoint is not None else params.get("checkpoint"),
         "params": params,
     }

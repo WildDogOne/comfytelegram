@@ -17,7 +17,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one image with the same checkpoint, size and noise as the image you
   painted over — even if it was the third image of a batch — so it tends
   to keep that layout; **🔁 Generate Again** then tries your usual batch
-  with new seeds, same painting. Paint a character *plus roughly their half* —
+  with new seeds, same painting. This also works on a "📥 Download file"
+  PNG sent back to the bot later: the file now records which image of its
+  batch it was, next to the seed. Paint a character *plus roughly their half* —
   the blue side covers everything you didn't paint, background included.
   `$names` and `<lora:…>` work as in `/rp`; a region's LoRA is applied
   afterwards like any region LoRA, and now follows the painted line

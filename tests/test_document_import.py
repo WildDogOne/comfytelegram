@@ -56,6 +56,7 @@ def _stamped_png(params: GenerationParams | None = None, **kwargs) -> bytes:
             kind=kwargs.pop("kind", "txt2img"),
             filename=kwargs.pop("filename", "comfytelegram_00042_.png"),
             seed=kwargs.pop("seed", 777),
+            noise_index=kwargs.pop("noise_index", None),
         ),
     )
 
@@ -260,6 +261,7 @@ async def test_archive_button_resends_the_original_png_with_metadata_embedded():
         "file_id": "tg-photo-id",
         "filename": "comfytelegram_00042_.png",
         "base_params": serialize_generation_params(params),
+        "noise_index": 3,
     }
     client = AsyncMock()
     # what ComfyUI still has on disk: no chunk of ours, but its own graph
@@ -280,7 +282,30 @@ async def test_archive_button_resends_the_original_png_with_metadata_embedded():
     metadata = extract_metadata(sent["document"].getvalue())
     assert metadata["params"] == serialize_generation_params(params)
     assert metadata["seed"] == 4242  # recovered from ComfyUI's own chunk
+    # which image of its batch it was — nothing in ComfyUI's graph says so
+    assert metadata["noise_index"] == 3
     # the copy carries the result's keyboard, so an edit of it can be sent
     # back as a reply to it
     callbacks = [b.callback_data for row in sent["reply_markup"].inline_keyboard for b in row]
     assert "pp:upscale:res1" in callbacks
+
+
+@pytest.mark.asyncio
+async def test_import_restores_which_noise_draw_the_image_was():
+    update, _message = _update()
+    context = _context(_stamped_png(noise_index=2))
+
+    await document_message(update, context)
+
+    store = context.bot_data["storage"].store_pending_result
+    assert store.call_args.kwargs["noise_index"] == 2
+
+
+@pytest.mark.asyncio
+async def test_import_of_a_file_from_before_noise_index_stores_none():
+    update, _message = _update()
+    context = _context(_stamped_png())
+
+    await document_message(update, context)
+
+    assert context.bot_data["storage"].store_pending_result.call_args.kwargs["noise_index"] is None

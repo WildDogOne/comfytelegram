@@ -788,6 +788,7 @@ def _tag_images(
     *,
     kind: str,
     graph: dict[str, Any],
+    first_noise_index: int | None = None,
 ) -> list[tuple[bytes, str]]:
     """Stamp each just-collected image with its own generation metadata.
 
@@ -803,6 +804,8 @@ def _tag_images(
     `graph` is the API-format graph that was actually submitted, read only
     for the seed — `params.seed` is normally None, since the builders roll
     the real value at build time (see `png_metadata.extract_seed`).
+    `first_noise_index` is the first image's `GeneratedImage.noise_index`
+    for a txt2img batch (the rest follow in order); None elsewhere.
     Embedding never raises; see `embed_metadata`.
     """
     seed = extract_seed(graph)
@@ -811,11 +814,17 @@ def _tag_images(
         (
             embed_metadata(
                 data,
-                build_metadata(params=serialized, kind=kind, filename=name, seed=seed),
+                build_metadata(
+                    params=serialized,
+                    kind=kind,
+                    filename=name,
+                    seed=seed,
+                    noise_index=None if first_noise_index is None else first_noise_index + i,
+                ),
             ),
             name,
         )
-        for data, name in raw
+        for i, (data, name) in enumerate(raw)
     ]
 
 
@@ -877,7 +886,9 @@ async def generate(
 
     await _upload_region_masks(client, params)
     raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
-    raw = _tag_images(raw, params, kind="txt2img", graph=prompt_graph)
+    raw = _tag_images(
+        raw, params, kind="txt2img", graph=prompt_graph, first_noise_index=params.batch_offset
+    )
     images = _batch_images(raw, params)
     if auto_region_loras:
         images = await _apply_region_loras_to_all(
@@ -1444,7 +1455,7 @@ async def repeat(
 
     await _upload_region_masks(client, fresh_params)
     raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
-    raw = _tag_images(raw, fresh_params, kind="repeat", graph=prompt_graph)
+    raw = _tag_images(raw, fresh_params, kind="repeat", graph=prompt_graph, first_noise_index=0)
     images = _batch_images(raw, fresh_params)
     if auto_region_loras:
         images = await _apply_region_loras_to_all(

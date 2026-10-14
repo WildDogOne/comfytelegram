@@ -47,9 +47,6 @@ Still open:
   - Images from before `pending_result.noise_index` existed have none, so
     painting over a later image of such a batch still gets image 1's
     noise. Self-healing: every new image records it.
-  - PNG metadata doesn't carry `noise_index` (nor does a re-imported
-    image have ComfyUI's graph for the seed), so an imported image gets a
-    fresh seed. Fine unless importing-then-painting becomes a habit.
   - Show Prompt's copy of a painted image gives its nearest box layout
     (`[left]`/`[right]`), not the painting — there's no text form for it.
 - [ ] **Region-aware detailers**: Face/Hand Detail on a regional image only

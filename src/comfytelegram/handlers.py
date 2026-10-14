@@ -2210,21 +2210,36 @@ def _paint_regions_initial_mask(source_bytes: bytes, first_region: RegionSpec | 
     return mask_to_png(mask)
 
 
-async def _txt2img_seed(client: ComfyClient, filename: str) -> int | None:
-    """The seed `filename` was sampled with, if it's a plain txt2img on
-    ComfyUI's disk — read off ComfyUI's own graph chunk, the only place it
-    exists (see `png_metadata.extract_seed`). None for an image ComfyUI
-    doesn't have, or one a post-processing graph made (no
-    `EmptyLatentImage`): that seed belongs to a detailer or upscaler pass and
-    says nothing about the picture's layout."""
-    if filename.startswith(TELEGRAM_ONLY_FILENAME_PREFIX):
-        return None
+#: Our own chunk's `kind`s whose seed is a txt2img seed — what
+#: `_txt2img_seed` trusts when a file has no ComfyUI graph to check.
+_TXT2IMG_KINDS = frozenset({"txt2img", "repeat"})
+
+
+async def _txt2img_seed(client: ComfyClient, bot: Bot, pending: dict[str, Any]) -> int | None:
+    """The seed `pending`'s image was sampled with, if it's a plain txt2img
+    — read off ComfyUI's own graph chunk (see `png_metadata.extract_seed`).
+    None for one a post-processing graph made (no `EmptyLatentImage`): that
+    seed belongs to a detailer or upscaler pass and says nothing about the
+    picture's layout. The file is ComfyUI's copy, or for a
+    `TELEGRAM_ONLY_FILENAME_PREFIX` row (an imported "📥 Download file"
+    PNG, an edit) the Telegram one — a document keeps its chunks, a photo
+    doesn't. Without a graph (an edit whose editor kept only our chunk),
+    our chunk's seed counts if its `kind` says txt2img."""
+    filename = pending["filename"]
     try:
-        graph = extract_comfy_graph(await client.get_image_bytes(filename, "", "output"))
+        if filename.startswith(TELEGRAM_ONLY_FILENAME_PREFIX):
+            data = await _download_telegram_file(bot, pending["file_id"])
+        else:
+            data = await client.get_image_bytes(filename, "", "output")
     except Exception:
         logger.warning("Couldn't fetch %s to recover its seed", filename, exc_info=True)
         return None
-    if not graph or not any(
+    graph = extract_comfy_graph(data)
+    if graph is None:
+        own = extract_metadata(data)
+        seed = own.get("seed") if own and own.get("kind") in _TXT2IMG_KINDS else None
+        return seed if isinstance(seed, int) else None
+    if not any(
         isinstance(node, dict) and node.get("class_type") == "EmptyLatentImage"
         for node in graph.values()
     ):
@@ -2338,7 +2353,7 @@ async def _run_paint_regions_job(
 
     overrides: dict[str, Any] = {"width": full_params.width, "height": full_params.height}
     normal_batch_size = resolve_generation_params(checkpoint, "", profile).batch_size
-    seed = await _txt2img_seed(client, pending["filename"])
+    seed = await _txt2img_seed(client, bot, pending)
     if seed is not None:
         # Image k of a batch is draw k of the seed's noise, not draw 0. A row
         # stored before `noise_index` was recorded has None; 0 is the best
@@ -3332,6 +3347,9 @@ async def _link_edit_to_result(
         file_id,
         f"{TELEGRAM_ONLY_FILENAME_PREFIX}edited_{result_id}.png",
         pending["base_params"],
+        # An edit of that picture — "🎨 Paint Regions" over it should start
+        # from the original's noise, like painting over the original would.
+        noise_index=pending.get("noise_index"),
     )
     params = _deserialize_generation_params(pending["base_params"])
     text = (
@@ -3548,6 +3566,7 @@ async def document_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         TELEGRAM_ONLY_FILENAME_PREFIX
         + (metadata.get("filename") or document.file_name or "imported.png"),
         metadata["params"],
+        noise_index=metadata.get("noise_index"),
     )
     await status_message.delete()
 
@@ -3696,6 +3715,9 @@ async def _send_archive_copy(
                 data = await asyncio.to_thread(_to_png, data)
             own = extract_metadata(data)
             seed = own.get("seed") if own else None
+            noise_index = pending.get("noise_index")
+            if noise_index is None and own:
+                noise_index = own.get("noise_index")
             filename = (
                 Path(filename.removeprefix(TELEGRAM_ONLY_FILENAME_PREFIX)).with_suffix(".png").name
             )
@@ -3703,6 +3725,7 @@ async def _send_archive_copy(
             data = await client.get_image_bytes(filename, "", "output")
             graph = extract_comfy_graph(data)
             seed = extract_seed(graph) if graph else None
+            noise_index = pending.get("noise_index")
         stamped = embed_metadata(
             data,
             build_metadata(
@@ -3710,6 +3733,7 @@ async def _send_archive_copy(
                 kind="archive",
                 filename=filename,
                 seed=seed,
+                noise_index=noise_index,
                 checkpoint=full_params.checkpoint,
             ),
         )
