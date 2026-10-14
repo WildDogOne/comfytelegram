@@ -402,10 +402,15 @@ async def mask_editor_page(token: str) -> FileResponse:
     """The page Telegram opens as a WebApp — a static file, not templated;
     its own JS reads `token` back out of `location.pathname`. 404s (rather
     than silently serving the editor) once the job has expired or been
-    consumed, since there'd be nothing left for it to load."""
+    consumed, since there'd be nothing left for it to load.
+
+    `no-cache` makes the webview revalidate (a cheap 304 via the ETag
+    `FileResponse` sets) instead of heuristically reusing a stale copy —
+    without it, Telegram's webview could keep running an old editor for a
+    while after the relay was redeployed with a new one."""
     _prune_expired_jobs()
     _get_job_or_404(token)
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/jobs/{token}/image")

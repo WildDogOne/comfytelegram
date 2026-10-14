@@ -2362,15 +2362,49 @@
     return null;
   }
 
+  // Fuzzy, so a LoRA's folder path doesn't have to be typed out:
+  // `marlow` finds `illustrious/marlowV3/marlowV3`, and so does `mlw3`.
+  // Best first — the file name (last path segment) starting with the
+  // query, then the query starting a word anywhere (after `/`, `_`, `-`,
+  // `.` or a space), then appearing anywhere, then its letters merely in
+  // order (scored up for consecutive letters and word starts). Ties keep
+  // the list's own order.
+  var WORD_BREAK = /[\/_\-. ]/;
+
+  function fuzzyScore(name, query) {
+    if (!query) return 0;
+    var lower = name.toLowerCase();
+    var base = lower.slice(lower.lastIndexOf("/") + 1);
+    if (base.indexOf(query) === 0) return 4000;
+    var at = lower.indexOf(query);
+    while (at > 0 && !WORD_BREAK.test(lower[at - 1])) {
+      at = lower.indexOf(query, at + 1);
+    }
+    if (at >= 0) return 3000 - at;
+    at = lower.indexOf(query);
+    if (at >= 0) return 2000 - at;
+    var score = 0;
+    var from = 0;
+    var previous = -2;
+    for (var i = 0; i < query.length; i++) {
+      var found = lower.indexOf(query[i], from);
+      if (found < 0) return -1;
+      if (found === previous + 1) score += 5;
+      else if (found === 0 || WORD_BREAK.test(lower[found - 1])) score += 3;
+      previous = found;
+      from = found + 1;
+    }
+    return 1000 + score - lower.length / 100;
+  }
+
   function matchingReferences(query, pool) {
-    var prefix = [];
-    var inner = [];
-    pool.forEach(function (ref) {
-      var name = ref.name.toLowerCase();
-      if (name.indexOf(query) === 0) prefix.push(ref);
-      else if (query && name.indexOf(query) > 0) inner.push(ref);
-    });
-    return prefix.concat(inner);
+    return pool
+      .map(function (ref, index) {
+        return { ref: ref, index: index, score: fuzzyScore(ref.name, query) };
+      })
+      .filter(function (entry) { return entry.score >= 0; })
+      .sort(function (a, b) { return b.score - a.score || a.index - b.index; })
+      .map(function (entry) { return entry.ref; });
   }
 
   function closeRefMenu() {

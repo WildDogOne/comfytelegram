@@ -16,7 +16,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   own tag. Only LoRAs listed under `/lora` for the checkpoint can be used.
   In a regional prompt they go on the global lines, not in a region.
 - **LoRAs in ✏️ Detail Prompt**: type `<` in the editor's prompt fields to
-  pick a LoRA. It's added to the ones the image was made with for that one
+  pick a LoRA — any part of its name finds it (`<marlow`, even `<mlw3`), no
+  need to type its folder. It's added to the ones the image was made with for that one
   detail pass (the editor now lists those); with "Disable LoRAs" checked,
   the typed ones replace them instead. 🔁 Redo keeps the same LoRAs.
 - **Bring back an edited image**: edited one of the bot's images in another
@@ -60,7 +61,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **✏️ Detail Prompt's `$` menu lists all your characters and favorites**:
   with a lot saved, the ones at the end of the list used to be left out
-  (and some lost their preview). The bot and the mask editor relay need
+  (and some lost their preview). Its search is looser too: letters typed in
+  order find a name even with gaps between them. The bot and the mask editor relay need
   updating together for this.
 - Mask editor: the brush size is now measured on screen, so it's the same
   in Draw Mask, Fix Artifact and Detail Prompt and on every image. It used
