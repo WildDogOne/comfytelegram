@@ -93,7 +93,7 @@ class RegionSpec:
     re-imported image still have it, whatever happened to ComfyUI's input
     folder since. A two-region mask is a few KB as a 1-bit PNG. The graph
     loads it as `region_mask_filename(mask_png)`, which
-    `generation._upload_region_masks` puts there before submitting.
+    `generation._upload_graph_inputs` puts there before submitting.
     `invert_mask` takes the unpainted part instead, so a two-region
     painting needs only one mask — the second region is the first one's
     inverse."""
@@ -107,6 +107,13 @@ class RegionSpec:
     loras: list[LoraSpec] = field(default_factory=list)
     mask_png: bytes | None = None
     invert_mask: bool = False
+
+
+def pose_image_filename(pose_png: bytes) -> str:
+    """ComfyUI input filename for a `/pose` skeleton, named after its content
+    like `region_mask_filename`, so re-uploading it per submission is an
+    idempotent overwrite."""
+    return f"pose-{hashlib.sha256(pose_png).hexdigest()[:16]}.png"
 
 
 def region_mask_filename(mask_png: bytes) -> str:
@@ -292,6 +299,23 @@ class GenerationParams:
     #: redraw the character, not touch it up. `None` means
     #: `generation.REGION_LORA_DEFAULT_DENOISE`.
     regional_lora_denoise: float | None = None
+    #: `/pose`: a rendered OpenPose skeleton PNG (see `pose.py`) that
+    #: `build_txt2img` conditions on through `pose_controlnet`. The bytes
+    #: themselves, like `RegionSpec.mask_png`, so storage, PNG metadata and
+    #: "🔁 Generate Again" all carry it; uploaded as
+    #: `pose_image_filename(pose_png)` by `generation._upload_graph_inputs`.
+    #: Only `build_txt2img` reads it — post-processing works from the image
+    #: itself, which already has the pose.
+    pose_png: bytes | None = None
+    #: A pose ControlNet trained for this checkpoint's architecture
+    #: (`ModelProfile.pose_controlnet`). Unset skips the branch even with a
+    #: `pose_png`, same as `tile_controlnet`.
+    pose_controlnet: str | None = None
+    pose_controlnet_strength: float = 0.8
+    #: `ControlNetApplyAdvanced`'s `end_percent` — when sampling stops
+    #: following the skeleton, leaving the rest of the steps to clean up
+    #: anatomy the skeleton gets wrong.
+    pose_controlnet_end: float = 0.8
 
     def resolved_seed(self) -> int:
         """This request's seed, or a freshly-rolled random one if unset."""
@@ -351,12 +375,17 @@ def build_txt2img(params: GenerationParams) -> tuple[dict[str, Any], str]:
     if params.regions:
         model_ref = _apply_attention_couple(g, params, model_ref, clip_ref, positive, latent)
 
+    positive_ref: NodeRef = (positive, 0)
+    negative_ref: NodeRef = (negative, 0)
+    if params.pose_png is not None and params.pose_controlnet:
+        positive_ref, negative_ref = _apply_pose_controlnet(g, params, positive_ref, negative_ref)
+
     sampler = g.add(
         "KSampler",
         {
             "model": list(model_ref),
-            "positive": [positive, 0],
-            "negative": [negative, 0],
+            "positive": list(positive_ref),
+            "negative": list(negative_ref),
             "latent_image": [latent, 0],
             "seed": params.resolved_seed(),
             "steps": params.steps,
@@ -377,6 +406,37 @@ def build_txt2img(params: GenerationParams) -> tuple[dict[str, Any], str]:
     )
 
     return g.as_prompt(), save
+
+
+def _apply_pose_controlnet(
+    g: PromptGraph, params: GenerationParams, positive: NodeRef, negative: NodeRef
+) -> tuple[NodeRef, NodeRef]:
+    """Condition the sampler's positive/negative on the `/pose` skeleton.
+    With `/rp` regions, `AttentionCouplePPM`'s `base_cond` keeps the plain
+    global prompt — the node only reads its conditioning tensors — and the
+    ControlNet sits on the sampler's own conditioning; verified live that
+    each region's character then lands on its own skeleton."""
+    assert params.pose_png is not None and params.pose_controlnet
+    pose_image = g.add(
+        "LoadImage", {"image": pose_image_filename(params.pose_png)}, title="Load Pose"
+    )
+    controlnet = g.add(
+        "ControlNetLoader", {"control_net_name": params.pose_controlnet}, title="Pose ControlNet"
+    )
+    apply = g.add(
+        "ControlNetApplyAdvanced",
+        {
+            "positive": list(positive),
+            "negative": list(negative),
+            "control_net": [controlnet, 0],
+            "image": [pose_image, 0],
+            "strength": params.pose_controlnet_strength,
+            "start_percent": 0.0,
+            "end_percent": params.pose_controlnet_end,
+        },
+        title="Apply Pose ControlNet",
+    )
+    return (apply, 0), (apply, 1)
 
 
 def _apply_attention_couple(

@@ -168,6 +168,7 @@
   "civitai_base_models": [
     "Illustrious"
   ],
+  "pose_controlnet": "illustriousXL_v10_openpose.safetensors",
   "tile_controlnet": "xinsir_tile_sdxl.safetensors",
   "tile_controlnet_strength": 0.5
 }

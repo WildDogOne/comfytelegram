@@ -93,6 +93,11 @@ CREATE TABLE IF NOT EXISTS chat_region_lora_auto (
     auto INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS chat_pose (
+    chat_id INTEGER PRIMARY KEY,
+    pose_png BLOB NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS profile_override (
     chat_id INTEGER NOT NULL,
     checkpoint TEXT NOT NULL,
@@ -308,6 +313,27 @@ class Storage:
                 "ON CONFLICT(chat_id) DO UPDATE SET auto = excluded.auto",
                 (chat_id, int(auto)),
             )
+
+    def get_pose(self, chat_id: int) -> bytes | None:
+        """This chat's active `/pose` skeleton PNG, or None. Per chat like
+        the active character, and kept until replaced or cleared — the
+        point of a pose is iterating on prompts against it."""
+        row = self._conn.execute(
+            "SELECT pose_png FROM chat_pose WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        return bytes(row[0]) if row else None
+
+    def set_pose(self, chat_id: int, pose_png: bytes) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO chat_pose (chat_id, pose_png) VALUES (?, ?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET pose_png = excluded.pose_png",
+                (chat_id, pose_png),
+            )
+
+    def clear_pose(self, chat_id: int) -> None:
+        with self._conn:
+            self._conn.execute("DELETE FROM chat_pose WHERE chat_id = ?", (chat_id,))
 
     def get_override(self, chat_id: int, checkpoint: str) -> dict[str, Any]:
         """The stored `/settings` override fields for (chat_id, checkpoint),

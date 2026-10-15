@@ -216,6 +216,33 @@ class ModelProfile(BaseModel):
         ),
     )
 
+    pose_controlnet: str | None = Field(
+        None,
+        description=(
+            "Filename of an OpenPose ControlNet (in ComfyUI's models/controlnet) "
+            "trained for this checkpoint's base architecture, used when the chat has "
+            "an active /pose. Unset (the default) means this checkpoint can't follow "
+            "a pose — the bot says so and generates without it. Verified: "
+            "illustriousXL_v10_openpose.safetensors on an Illustrious checkpoint."
+        ),
+    )
+    pose_controlnet_strength: float = Field(
+        0.8,
+        description=(
+            "pose_controlnet only: ControlNetApplyAdvanced's strength. 0.6 followed "
+            "the pose loosely (raised arms became 'holding a bar overhead'), 1.0 "
+            "most closely but started adding odd artifacts."
+        ),
+    )
+    pose_controlnet_end: float = Field(
+        0.8,
+        description=(
+            "pose_controlnet only: ControlNetApplyAdvanced's end_percent — when "
+            "sampling stops following the skeleton. 0.6-1.0 made next to no "
+            "difference in testing; the structure is settled well before that."
+        ),
+    )
+
     anima_lllite_inpaint_patch: str | None = Field(
         None,
         description=(

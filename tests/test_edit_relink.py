@@ -49,6 +49,7 @@ def _bot_result(result_id: str = "orig1", page: int = 1) -> MagicMock:
 
 def _context(pending: dict | None) -> MagicMock:
     context = MagicMock()
+    context.chat_data = {}
     storage = MagicMock()
     storage.get_pending_result.return_value = pending
     storage.get_checkpoint.return_value = "ponyxl.safetensors"
@@ -73,6 +74,7 @@ def _pending() -> dict:
 def _photo_update(reply_to) -> tuple[MagicMock, AsyncMock]:
     message = AsyncMock()
     message.photo = [MagicMock(file_id="small"), MagicMock(file_id="edited-photo")]
+    message.caption = None
     message.reply_to_message = reply_to
     update = MagicMock()
     update.effective_message = message
@@ -84,6 +86,7 @@ def _photo_update(reply_to) -> tuple[MagicMock, AsyncMock]:
 def _document_update(reply_to) -> tuple[MagicMock, AsyncMock]:
     message = AsyncMock()
     message.document = MagicMock(file_id="edited-doc", file_size=1000, file_name="edit.png")
+    message.caption = None
     message.reply_to_message = reply_to
     update = MagicMock()
     update.effective_message = message

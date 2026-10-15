@@ -27,6 +27,7 @@ from comfytelegram.handlers import (
     HAND_POINT_DENSITY_CALLBACK_PREFIX,
     KONTEXT_CANCEL_CALLBACK_DATA,
     LORA_SWITCH_TOGGLE_CALLBACK_PREFIX,
+    POSE_CALLBACK_PREFIX,
     REDO_TWEAK_CALLBACK_PREFIX,
     REGION_LORA_CALLBACK_PREFIX,
     RP_CANCEL_CALLBACK_DATA,
@@ -47,6 +48,8 @@ from comfytelegram.handlers import (
     model_command,
     photo_message,
     poll_inpaint_jobs,
+    pose_callback,
+    pose_command,
     postprocess_callback,
     redo_tweak_callback,
     region_lora_callback,
@@ -94,6 +97,7 @@ _COMMANDS = (
     ("stream", stream_command, "Generate images back-to-back until /stop"),
     ("stop", stop_command, "Stop a running /stream"),
     ("rp", rp_command, "How to write a regional prompt, with a template"),
+    ("pose", pose_command, "Set an OpenPose skeleton for images to follow (/pose off clears)"),
     ("tags", tags_command, "Search danbooru/e621 tags to build a prompt"),
     ("tagcheck", tagcheck_command, "Check a prompt's tags against the tag database"),
 )
@@ -388,6 +392,9 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CallbackQueryHandler(lora_callback, pattern=r"^lr:"))
     application.add_handler(CallbackQueryHandler(character_callback, pattern=r"^char:"))
     application.add_handler(CallbackQueryHandler(fav_callback, pattern=r"^fv:"))
+    application.add_handler(
+        CallbackQueryHandler(pose_callback, pattern=rf"^{POSE_CALLBACK_PREFIX}")
+    )
     application.add_handler(
         CallbackQueryHandler(stream_cancel_callback, pattern=rf"^{STREAM_CANCEL_CALLBACK_DATA}$")
     )

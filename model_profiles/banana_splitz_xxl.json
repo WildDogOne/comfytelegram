@@ -195,6 +195,7 @@
     "Illustrious"
   ],
   "vae_name": "sdxl_vae.safetensors",
+  "pose_controlnet": "illustriousXL_v10_openpose.safetensors",
   "tile_controlnet": "xinsir_tile_sdxl.safetensors",
   "tile_controlnet_strength": 0.4,
   "detail_prompt_tile_controlnet": false

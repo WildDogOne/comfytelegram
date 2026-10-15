@@ -79,6 +79,34 @@ Still open:
     roughly one model evaluation per region (slower) and coarser coherence
     between regions.
 
+## Poses (/pose)
+
+Step 1 (`/pose` upload, `pose_controlnet` profile fields, aspect from the
+pose, works with `/rp`) is done. Still open, in order:
+
+- [ ] **Test more checkpoints** with `scripts/smoke_test_pose.py`:
+  `xinsir_openpose` on autismmix/pony/sdxl_base (it may want
+  `--xinsir-sticks` thicker limbs), harder poses (overlapping limbs,
+  people touching), and whether `anima-lllite-any-test-like-v2` does
+  anything with a pose on Anima.
+- [ ] **🦴 Use pose button**: extract the pose from any image (page 2 of
+  the image keyboard, and uploaded photos) with comfyui_controlnet_aux's
+  `DWPreprocessor` and make it the chat's pose — "same pose, different
+  character".
+- [ ] **OpenPose JSON upload**: render the keypoints in Python. Gives exact
+  per-person keypoints for the next two items.
+- [ ] **Regions from the pose**: per-person boxes (left to right) instead of
+  fixed halves, so `[left]`/`[right]` mean "person 1/2" even when the
+  people don't split the canvas evenly.
+- [ ] **Region LoRA masks from the pose**: a per-person skeleton grown into
+  a mask separates touching characters, where `region_lora_mask` currently
+  cuts merged person detections with the box's straight line.
+- [ ] **Paint Regions over the pose**: open the editor with the skeleton as
+  its layout guide and person 1 pre-painted.
+- [ ] **Pose in the Region LoRA pass**: the high-denoise detailer redrawing
+  a character drifts from the pose; condition it on the cropped skeleton
+  (`ImpactControlNetApplySEGS`).
+
 ## Mask editor
 
 - [ ] **Superpixel brush, alongside ✨ Smart select**: SAM picks whole

@@ -8,6 +8,16 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **🦴 `/pose`**: send an OpenPose skeleton (coloured limbs on black) after
+  `/pose`, or as a photo captioned `/pose`, and every image in the chat
+  follows it until `/pose off`. Images take the pose's aspect ratio, the
+  progress message says "with pose 🦴" while one is active, and
+  **🔁 Generate Again** keeps the pose the image was made with. Works with
+  regional prompts: write `[left]`/`[right]` for the people in the pose
+  and each character lands on their own skeleton. Needs `pose_controlnet`
+  in the model profile — set for FurryToonMix and Banana Splitz
+  (`illustriousXL_v10_openpose`); other checkpoints say so and generate
+  without the pose.
 - **🎨 Paint Regions** (under "⋯ More"): paint the two regions of a
   regional prompt instead of splitting the picture into straight halves.
   Generate something like "2boys, cuddling", tap the button, and the mask

@@ -32,6 +32,8 @@ The bot talks to ComfyUI's HTTP + WebSocket API directly. It doesn't use the
 - **Regional prompts.** `[left]`/`[right]` lines give each side of the
   image its own prompt, so two characters keep their own hair, ears and
   outfits. `/rp` explains the format.
+- **Poses.** `/pose` sets an OpenPose skeleton that every image in the
+  chat follows, regional prompts included.
 - **Per-model defaults.** `/model` lists the checkpoints ComfyUI has
   installed. A matching [model profile](model_profiles/README.md) supplies
   cfg, steps, sampler, clip skip, prompt prefixes and default LoRAs.
@@ -78,6 +80,7 @@ The bot talks to ComfyUI's HTTP + WebSocket API directly. It doesn't use the
   | Hand Detail (auto) | `hand_yolov8s.pt` | `ultralytics/bbox/` |
   | Face / Hand Detail | `sam_vit_b_01ec64.pth` | `sams/` |
   | Upscale (optional, per profile) | `tile_controlnet`, e.g. `xinsir_tile_sdxl.safetensors` | `controlnet/` |
+  | `/pose` (optional, per profile) | `pose_controlnet`, e.g. `illustriousXL_v10_openpose.safetensors` | `controlnet/` |
   | 🪄 Kontext Edit (optional) | see `FLUX_KONTEXT_*` [below](#flux-kontext-edit) | `diffusion_models/`, `text_encoders/`, `vae/` |
 
 Optional:
@@ -182,6 +185,7 @@ docker compose up -d --build
 | `/stream [prompt]` | Generate single images back-to-back (max 100) until `/stop`. Asks for the prompt if you leave it out |
 | `/stop` | Stop a running stream |
 | `/rp` | Explain the regional prompt format, with a template to copy (see [Regional prompts](#regional-prompts)). Any prompt using the format is regional without it |
+| `/pose` | Set an OpenPose skeleton for images to follow (see [Poses](#poses)); `/pose off` clears it |
 | `/tags <query>` | Search the tag database. Prefix `danbooru:` / `e621:` to pick a source |
 | `/tagcheck <prompt>` | Flag unknown or rarely-used tags in a prompt |
 | `/start`, `/help` | Show help and install the command keyboard |
@@ -234,6 +238,22 @@ standing together still end up side by side, so use left/right with a
 landscape size for them. The global/region balance is set per model
 profile (see [model profiles](model_profiles/README.md)). Upscale and the
 detailers condition on the global prompt only.
+
+### Poses
+
+`/pose`, then send an OpenPose skeleton — coloured limbs on a black
+background, as exported by an OpenPose editor — as a photo or a file. (A
+photo captioned `/pose` does it in one step.) From then on every image in
+the chat follows that pose until `/pose off`, and takes its aspect ratio
+at your usual image size. `/pose` on its own shows the current one.
+
+It combines with regional prompts: for a two-person pose, `[left]` and
+`[right]` describe the person on each side, and each character stays on
+their own skeleton. "🔁 Generate Again" keeps the pose the image was made
+with; upscale and the detailers don't use it, since the image already has
+it. The checkpoint's [model profile](model_profiles/README.md) needs a
+`pose_controlnet` trained for its architecture — without one the bot says
+so and generates without the pose.
 
 ### Image buttons
 

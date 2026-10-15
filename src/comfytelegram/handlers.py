@@ -94,6 +94,7 @@ from comfytelegram.png_metadata import (
     is_png,
     summarize_graph,
 )
+from comfytelegram.pose import PoseImageError, normalize_pose_image, pose_size
 from comfytelegram.profiles import (
     LoraDefault,
     ModelProfile,
@@ -465,6 +466,9 @@ AGAIN_CALLBACK_PREFIX = "again:"
 GENERATE_FROM_PROMPT_CALLBACK_PREFIX = "genp:"
 STREAM_CANCEL_CALLBACK_DATA = "stream:cancel"
 RP_CANCEL_CALLBACK_DATA = "rp:cancel"
+POSE_CALLBACK_PREFIX = "pose:"
+POSE_CANCEL_CALLBACK_DATA = "pose:cancel"
+POSE_CLEAR_CALLBACK_DATA = "pose:clear"
 CHARACTER_EDIT_CANCEL_CALLBACK_DATA = "char:edit_cancel"
 CHARACTER_RENAME_CANCEL_CALLBACK_DATA = "char:rename_cancel"
 
@@ -529,7 +533,7 @@ HAND_POINT_PREVIEW_MAX_DIM = 1280
 #: run ends, so the chat always shows *either* this or `_STREAMING_KEYBOARD`,
 #: never both and never neither.
 _MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [["/model", "/settings"], ["/characters", "/favs"], ["/stream", "/rp"], ["/help"]],
+    [["/model", "/settings"], ["/characters", "/favs"], ["/stream", "/rp"], ["/pose", "/help"]],
     resize_keyboard=True,
 )
 
@@ -2397,6 +2401,9 @@ async def _run_paint_regions_job(
             regions=resolved_regions,
             overrides=overrides,
             on_progress=_make_progress_callback(status_message),
+            # The pose the painted-over image was made with, not the chat's
+            # current one — this re-run is about keeping that layout.
+            pose_png=full_params.pose_png,
             auto_region_loras=seed is None and storage.get_region_lora_auto(chat_id),
             on_stage=_make_stage_callback(status_message),
         ),
@@ -2718,6 +2725,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/stop — stop a running /stream\n"
         "/rp — how to write a regional prompt (a different prompt for each side "
         "of the image), with a template to copy\n"
+        "/pose — set an OpenPose skeleton for images to follow; /pose off to clear it\n"
         "/tags <query> — search danbooru/e621 tags to build a prompt\n"
         "/tagcheck <prompt> — check a prompt's tags against the tag database\n"
         "/help — show this message",
@@ -3287,7 +3295,9 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await message.reply_text(f"⚠️ {exc}")
         return
 
-    status_message = await message.reply_text("Generating… 0%", disable_notification=True)
+    pose_png = await _pose_for_generation(message, storage, chat_id, profile)
+    label = _pose_label("Generating", pose_png)
+    status_message = await message.reply_text(f"{label}… 0%", disable_notification=True)
 
     images = await _run_reporting_errors(
         status_message,
@@ -3301,7 +3311,8 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             extra_negative_prompt=extra_negative,
             raw_positive_prompt=raw_positive,
             raw_negative_prompt=raw_negative,
-            on_progress=_make_progress_callback(status_message),
+            on_progress=_make_progress_callback(status_message, label=label),
+            pose_png=pose_png,
         ),
     )
     if images is None:
@@ -3416,6 +3427,9 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     chat_id = update.effective_chat.id
     storage: Storage = context.bot_data["storage"]
     client: ComfyClient = context.bot_data["comfy_client"]
+
+    if await _consume_pose_upload(update, context, message.photo[-1].file_id):
+        return
 
     if await _link_edit_to_result(
         message, context, chat_id, message.photo[-1].file_id, from_photo=True
@@ -3556,6 +3570,9 @@ async def document_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "a bot download anything over 20MB, so I can't read it. (This is a Bot API "
             "limit, not a setting.)"
         )
+        return
+
+    if await _consume_pose_upload(update, context, document.file_id):
         return
 
     if await _link_edit_to_result(message, context, chat_id, document.file_id, from_photo=False):
@@ -5143,7 +5160,9 @@ async def generate_from_prompt_callback(update: Update, context: ContextTypes.DE
         profile, storage.get_lora_strength_overrides(chat_id, checkpoint)
     )
 
-    status_message = await query.message.reply_text("Generating… 0%", disable_notification=True)
+    pose_png = await _pose_for_generation(query.message, storage, chat_id, profile)
+    label = _pose_label("Generating", pose_png)
+    status_message = await query.message.reply_text(f"{label}… 0%", disable_notification=True)
     images = await _run_reporting_errors(
         status_message,
         "Generation",
@@ -5156,7 +5175,8 @@ async def generate_from_prompt_callback(update: Update, context: ContextTypes.DE
             extra_negative_prompt=stored["negative_prompt"],
             raw_positive_prompt=stored["prompt"],
             raw_negative_prompt=stored["negative_prompt"],
-            on_progress=_make_progress_callback(status_message),
+            on_progress=_make_progress_callback(status_message, label=label),
+            pose_png=pose_png,
         ),
     )
     if images is None:
@@ -5362,7 +5382,9 @@ async def _generate_regional(
     # The unexpanded global prompt, put through the same split, for "as typed".
     raw_global, _ = _split_negative_prompt(parsed.global_prompt + negative_block)
 
-    status_message = await message.reply_text("Generating… 0%", disable_notification=True)
+    pose_png = await _pose_for_generation(message, storage, chat_id, profile)
+    label = _pose_label("Generating", pose_png)
+    status_message = await message.reply_text(f"{label}… 0%", disable_notification=True)
 
     images = await _run_reporting_errors(
         status_message,
@@ -5377,9 +5399,10 @@ async def _generate_regional(
             raw_positive_prompt=format_regional_prompt(raw_global, parsed.regions),
             raw_negative_prompt=raw_negative,
             regions=regions,
-            on_progress=_make_progress_callback(status_message),
+            on_progress=_make_progress_callback(status_message, label=label),
             auto_region_loras=storage.get_region_lora_auto(chat_id),
             on_stage=_make_stage_callback(status_message),
+            pose_png=pose_png,
         ),
     )
     if images is None:
@@ -5789,6 +5812,161 @@ def _kontext_cancel_keyboard(copy_text: str | None = None) -> InlineKeyboardMark
     return InlineKeyboardMarkup([row])
 
 
+# --- /pose -------------------------------------------------------------------
+#
+# A chat's active OpenPose skeleton (`storage.chat_pose`, see `pose.py`), which
+# every fresh generation in the chat then follows through the checkpoint
+# profile's `pose_controlnet` until it's replaced or cleared. Sent as the next
+# photo/file after `/pose`, or as a photo captioned `/pose`. Post-processing
+# never uses it (the image already has the pose), and "🔁 Generate Again"
+# replays whatever pose the image was made with, not the chat's current one.
+
+_POSE_OFF_ARGS = {"off", "clear", "none", "reset"}
+
+
+def _pose_keyboard(*, has_pose: bool, waiting: bool) -> InlineKeyboardMarkup:
+    """Under `/pose`'s reply: clear the active pose, and/or stop waiting for
+    an upload."""
+    row = []
+    if has_pose:
+        row.append(InlineKeyboardButton("🗑 Clear pose", callback_data=POSE_CLEAR_CALLBACK_DATA))
+    if waiting:
+        row.append(InlineKeyboardButton("❌ Cancel", callback_data=POSE_CANCEL_CALLBACK_DATA))
+    return InlineKeyboardMarkup([row] if row else [])
+
+
+async def pose_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/pose` — wait for the next photo/file as this chat's pose (showing
+    the current one, if any); `/pose off` clears it."""
+    settings: Settings = context.bot_data["settings"]
+    if await reject_if_unauthorized(update, settings):
+        return
+
+    message = update.effective_message
+    chat_id = update.effective_chat.id
+    storage: Storage = context.bot_data["storage"]
+    parts = (message.text or "").split(maxsplit=1)
+    arg = parts[1].strip().lower() if len(parts) > 1 else ""
+
+    if arg in _POSE_OFF_ARGS:
+        pop_pending(context.chat_data, "awaiting_pose", message)
+        had_pose = storage.get_pose(chat_id) is not None
+        storage.clear_pose(chat_id)
+        await message.reply_text("🦴 Pose cleared." if had_pose else "No pose was set.")
+        return
+
+    set_pending(context.chat_data, "awaiting_pose", message, True)
+    current = storage.get_pose(chat_id)
+    instructions = (
+        "Send an OpenPose skeleton (coloured limbs on black) as your next photo or "
+        "file, and every image in this chat will follow it until you clear it with "
+        "/pose off. Works with regional prompts too: write [left]/[right] for the "
+        "people in the pose. Tip: send a photo with the caption /pose to set it in one go."
+    )
+    if current is None:
+        await message.reply_text(
+            instructions, reply_markup=_pose_keyboard(has_pose=False, waiting=True)
+        )
+        return
+    await message.reply_photo(
+        current,
+        caption=f"🦴 This is the current pose.\n\n{instructions}",
+        reply_markup=_pose_keyboard(has_pose=True, waiting=True),
+    )
+
+
+async def _consume_pose_upload(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str
+) -> bool:
+    """If this upload is meant as a pose — `/pose` is waiting for one in this
+    topic, or it's captioned `/pose` — store it as the chat's pose and
+    return True. Otherwise False, and `photo_message`/`document_message`
+    carry on as usual."""
+    message = update.effective_message
+    caption = (message.caption or "").strip().lower()
+    captioned = caption == "/pose" or caption.startswith(("/pose ", "/pose@"))
+    if not pop_pending(context.chat_data, "awaiting_pose", message) and not captioned:
+        return False
+
+    chat_id = update.effective_chat.id
+    storage: Storage = context.bot_data["storage"]
+    try:
+        pose_png = normalize_pose_image(await _download_telegram_file(context.bot, file_id))
+    except PoseImageError as exc:
+        set_pending(context.chat_data, "awaiting_pose", message, True)
+        await message.reply_text(
+            f"⚠️ {exc}", reply_markup=_pose_keyboard(has_pose=False, waiting=True)
+        )
+        return True
+
+    storage.set_pose(chat_id, pose_png)
+    width, height = pose_size(pose_png)
+    text = (
+        f"🦴 Pose set ({width}x{height}). Images in this chat now follow it and take its "
+        "aspect ratio, until /pose off."
+    )
+    checkpoint = storage.get_checkpoint(chat_id)
+    if checkpoint is not None:
+        profile = resolve_profile(checkpoint, context.bot_data["profiles"])
+        if profile is None or not profile.pose_controlnet:
+            text += f"\n\n{_pose_unsupported_note(checkpoint, profile)}"
+    await message.reply_text(text, reply_markup=_pose_keyboard(has_pose=True, waiting=False))
+    return True
+
+
+def _pose_unsupported_note(checkpoint: str, profile: ModelProfile | None) -> str:
+    name = profile.display_name if profile else checkpoint
+    return (
+        f"⚠️ {name} has no pose ControlNet set up (pose_controlnet in its model "
+        "profile), so it generates without the pose."
+    )
+
+
+async def _pose_for_generation(
+    message: Message, storage: Storage, chat_id: int, profile: ModelProfile | None
+) -> bytes | None:
+    """The chat's active pose, if the checkpoint about to generate can follow
+    it. Says so in the chat when there's a pose it can't."""
+    pose_png = storage.get_pose(chat_id)
+    if pose_png is None:
+        return None
+    if profile is None or not profile.pose_controlnet:
+        checkpoint = storage.get_checkpoint(chat_id) or ""
+        await message.reply_text(_pose_unsupported_note(checkpoint, profile))
+        return None
+    return pose_png
+
+
+def _pose_label(label: str, pose_png: bytes | None) -> str:
+    """The progress message's label, flagging a pose so a forgotten sticky
+    one doesn't go unnoticed."""
+    return f"{label} with pose 🦴" if pose_png is not None else label
+
+
+async def pose_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/pose`'s "🗑 Clear pose" and "❌ Cancel" buttons."""
+    query = update.callback_query
+    settings: Settings = context.bot_data["settings"]
+    user_id = update.effective_user.id if update.effective_user else None
+    if await reject_if_unauthorized_callback(query, user_id, settings):
+        return
+
+    pop_pending(context.chat_data, "awaiting_pose", query.message)
+    if query.data == POSE_CLEAR_CALLBACK_DATA:
+        storage: Storage = context.bot_data["storage"]
+        storage.clear_pose(query.message.chat.id)
+        await query.answer("Pose cleared.")
+        text = "🦴 Pose cleared."
+    else:
+        await query.answer("Cancelled.")
+        text = "Cancelled — no new pose."
+    try:
+        await query.edit_message_reply_markup(InlineKeyboardMarkup([]))
+    except BadRequest:
+        pass
+    await query.message.reply_text(text)
+
+
 def _make_cancel_callback(
     pending_key: str, cancelled_text: str
 ) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]:
@@ -5875,6 +6053,7 @@ async def _run_stream(
             await message.reply_text(f"⚠️ {exc}")
             return
 
+        pose_png = await _pose_for_generation(message, storage, chat_id, profile)
         status_message = await message.reply_text(
             f"🔁 Streaming started (up to {STREAM_HARD_LIMIT} images) — "
             "tap /stop below (or send it) to end early.",
@@ -5894,8 +6073,10 @@ async def _run_stream(
                 raw_negative_prompt=raw_negative,
                 overrides={"batch_size": 1},
                 on_progress=_make_progress_callback(
-                    status_message, label=f"Streaming {count}/{STREAM_HARD_LIMIT}"
+                    status_message,
+                    label=_pose_label(f"Streaming {count}/{STREAM_HARD_LIMIT}", pose_png),
                 ),
+                pose_png=pose_png,
             )
             await _send_and_store_result(message, chat_id, storage, images[0])
         await _finish_stream(

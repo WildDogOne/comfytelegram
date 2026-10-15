@@ -69,6 +69,14 @@ def serialize_generation_params(params: GenerationParams) -> dict[str, Any]:
         "regional_base_weight": params.regional_base_weight,
         "regional_region_weight": params.regional_region_weight,
         "regional_lora_denoise": params.regional_lora_denoise,
+        "pose_png": (
+            base64.b64encode(params.pose_png).decode("ascii")
+            if params.pose_png is not None
+            else None
+        ),
+        "pose_controlnet": params.pose_controlnet,
+        "pose_controlnet_strength": params.pose_controlnet_strength,
+        "pose_controlnet_end": params.pose_controlnet_end,
     }
 
 
@@ -112,6 +120,10 @@ def deserialize_generation_params(data: dict[str, Any]) -> GenerationParams:
         regional_base_weight=data.get("regional_base_weight", 0.1),
         regional_region_weight=data.get("regional_region_weight", 0.9),
         regional_lora_denoise=data.get("regional_lora_denoise"),
+        pose_png=base64.b64decode(data["pose_png"]) if data.get("pose_png") else None,
+        pose_controlnet=data.get("pose_controlnet"),
+        pose_controlnet_strength=data.get("pose_controlnet_strength", 0.8),
+        pose_controlnet_end=data.get("pose_controlnet_end", 0.8),
     )
 
 

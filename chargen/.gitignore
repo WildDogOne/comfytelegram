@@ -18,3 +18,4 @@ train_lora.sbatch
 sample_prompts_*.txt
 # Personal flow notes (cluster host/paths).
 README.md
+character_*.json

@@ -51,8 +51,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from PIL import Image
 
-from comfytelegram.comfy_client import ComfyClient
-from comfytelegram.generation import post_process
+from comfytelegram.comfy_client import ComfyClient, ComfyUIError
+from comfytelegram.generation import _run_graph, post_process
 from comfytelegram.params_serde import serialize_generation_params
 from comfytelegram.png_metadata import build_metadata, embed_metadata, extract_seed
 from comfytelegram.profiles import load_profiles, resolve_generation_params, resolve_profile
@@ -285,35 +285,27 @@ def load_profile(checkpoint: str) -> ModelProfile:
     )
 
 
-async def render(client: ComfyClient, params: GenerationParams, *, client_id: str) -> bytes | None:
-    """Run one txt2img graph; the PNG with comfytelegram metadata, or None."""
-    graph, save_node_id = build_txt2img(params)
-    async with client.connect_events(client_id=client_id) as events:
-        prompt_id = await client.queue_prompt(graph, client_id=client_id)
-        async for progress in events.watch(prompt_id):
-            if progress.done:
-                break
+async def render(client: ComfyClient, params: GenerationParams) -> bytes | None:
+    """Run one txt2img graph; the PNG with comfytelegram metadata, or None.
 
-    # /history is authoritative even if the socket missed the end event.
-    history = None
-    for _ in range(60):
-        history = await client.get_history(prompt_id)
-        if history and history.get("outputs", {}).get(save_node_id):
-            break
-        await asyncio.sleep(1)
-    images = (history or {}).get("outputs", {}).get(save_node_id, {}).get("images", [])
-    if not images:
-        print(f"render failed: {(history or {}).get('status')}")
+    Goes through the bot's own `_run_graph`, which gives every call its own
+    websocket client id — with several jobs in flight at once (see
+    `--pipeline`), a shared one would let each new socket replace the last
+    in ComfyUI's per-client table and strand the earlier job's events."""
+    graph, save_node_id = build_txt2img(params)
+    try:
+        images, _history = await _run_graph(client, graph, save_node_id, on_progress=None)
+    except ComfyUIError as exc:
+        print(f"render failed: {exc}")
         return None
 
-    img = images[0]
-    data = await client.get_image_bytes(img["filename"], img["subfolder"], img["type"])
+    data, filename = images[0]
     return embed_metadata(
         data,
         build_metadata(
             params=serialize_generation_params(params),
             kind="txt2img",
-            filename=img["filename"],
+            filename=filename,
             seed=extract_seed(graph),
         ),
     )
@@ -340,6 +332,58 @@ async def detail_face(
     return result.data, "applied"
 
 
+async def run_job(
+    client: ComfyClient,
+    job: dict,
+    args: argparse.Namespace,
+    profile: ModelProfile,
+    out_dir: Path,
+    manifest_path: Path,
+) -> bool:
+    """Render one job (plus its face detail pass) and write its PNG, caption
+    and manifest line. False if the render failed."""
+    dest = out_dir / f"{job['index']:04d}.png"
+    params = resolve_generation_params(
+        args.checkpoint,
+        job_prompt(job),
+        profile,
+        overrides={
+            "seed": job["seed"],
+            "width": job["width"],
+            "height": job["height"],
+            "batch_size": 1,
+            "filename_prefix": f"chargen_{args.run}",
+        },
+        extra_negative_prompt=EXTRA_NEGATIVE,
+        raw_positive_prompt=job_prompt(job),
+    )
+    data = await render(client, params)
+    if data is None:
+        print(f"{job['index']:04d} FAILED")
+        return False
+    face_detail = "off"
+    if not args.no_face_detail:
+        data, face_detail = await detail_face(client, data, dest, params)
+    dest.write_bytes(data)
+    # LoRA training caption, kohya-style (same stem, .txt): every tag
+    # the image was prompted with, minus the generic quality tags,
+    # which say nothing about this image in particular.
+    caption = job_prompt(job, escape=False)
+    dest.with_suffix(".txt").write_text(caption + "\n")
+    with manifest_path.open("a") as f:
+        record = {
+            **job,
+            "file": dest.name,
+            "caption": caption,
+            "face_detail": face_detail,
+            "loras": [{"name": l.name, "strength": l.strength_model} for l in LORAS],
+            "positive": params.positive_prompt,
+            "negative": params.negative_prompt,
+        }
+        f.write(json.dumps(record) + "\n")
+    return True
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -362,6 +406,13 @@ async def main() -> None:
         default=[],
         metavar="TAG",
         help="leave wildcard entries/artists containing this tag out of this run (repeatable)",
+    )
+    parser.add_argument(
+        "--pipeline",
+        type=int,
+        default=2,
+        metavar="N",
+        help="jobs in flight at once, so ComfyUI's queue never runs dry between images (1 = serial)",
     )
     parser.add_argument("--dry-run", action="store_true", help="print prompts, don't generate")
     args = parser.parse_args()
@@ -416,51 +467,32 @@ async def main() -> None:
         if missing:
             sys.exit(f"LoRA not installed on the ComfyUI server: {', '.join(missing)}")
 
-        for job in jobs:
-            dest = out_dir / f"{job['index']:04d}.png"
-            params = resolve_generation_params(
-                args.checkpoint,
-                job_prompt(job),
-                profile,
-                overrides={
-                    "seed": job["seed"],
-                    "width": job["width"],
-                    "height": job["height"],
-                    "batch_size": 1,
-                    "filename_prefix": f"chargen_{args.run}",
-                },
-                extra_negative_prompt=EXTRA_NEGATIVE,
-                raw_positive_prompt=job_prompt(job),
-            )
-            t0 = time.monotonic()
-            data = await render(client, params, client_id=f"chargen-{args.run}")
-            if data is None:
-                print(f"{job['index']:04d} FAILED")
-                continue
-            face_detail = "off"
-            if not args.no_face_detail:
-                data, face_detail = await detail_face(client, data, dest, params)
-            dest.write_bytes(data)
-            # LoRA training caption, kohya-style (same stem, .txt): every tag
-            # the image was prompted with, minus the generic quality tags,
-            # which say nothing about this image in particular.
-            caption = job_prompt(job, escape=False)
-            dest.with_suffix(".txt").write_text(caption + "\n")
-            with manifest_path.open("a") as f:
-                record = {
-                    **job,
-                    "file": dest.name,
-                    "caption": caption,
-                    "face_detail": face_detail,
-                    "loras": [{"name": l.name, "strength": l.strength_model} for l in LORAS],
-                    "positive": params.positive_prompt,
-                    "negative": params.negative_prompt,
-                }
-                f.write(json.dumps(record) + "\n")
-            print(
-                f"{job['index']:04d} {time.monotonic() - t0:5.1f}s  "
-                f"{', '.join(artist_tag(a) for a in job['artists'])} | {job['pose']} | {job['setting']}"
-            )
+        # ComfyUI runs its queue one prompt at a time, so a serial loop leaves
+        # the GPU idle whenever this script is between submissions —
+        # downloading a result, writing files, uploading it for face detail.
+        # Keeping a few jobs in flight means the next prompt is already
+        # queued by then. Images can therefore finish out of index order;
+        # nothing depends on manifest.jsonl being sorted.
+        pending = iter(jobs)
+        done = failed = 0
+        t0 = time.monotonic()
+
+        async def worker() -> None:
+            nonlocal done, failed
+            for job in pending:
+                if not await run_job(client, job, args, profile, out_dir, manifest_path):
+                    failed += 1
+                    continue
+                done += 1
+                rate = (time.monotonic() - t0) / done
+                print(
+                    f"{job['index']:04d} [{done}/{needed}, {rate:5.1f}s/img]  "
+                    f"{', '.join(artist_tag(a) for a in job['artists'])} | {job['pose']} | {job['setting']}"
+                )
+
+        await asyncio.gather(*(worker() for _ in range(max(1, args.pipeline))))
+        if failed:
+            print(f"{failed} job(s) failed")
 
 
 if __name__ == "__main__":

@@ -64,6 +64,7 @@ def _stamped_png(params: GenerationParams | None = None, **kwargs) -> bytes:
 def _update(*, file_size: int = 1000, file_name: str = "img.png"):
     message = AsyncMock()
     message.document = MagicMock(file_id="doc-1", file_size=file_size, file_name=file_name)
+    message.caption = None
     update = MagicMock()
     update.effective_message = message
     update.effective_chat.id = 42
@@ -73,6 +74,7 @@ def _update(*, file_size: int = 1000, file_name: str = "img.png"):
 
 def _context(data: bytes, *, checkpoints=("ponyxl.safetensors",)):
     context = MagicMock()
+    context.chat_data = {}
     storage = MagicMock()
     storage.get_checkpoint.return_value = "ponyxl.safetensors"
     client = AsyncMock()
@@ -255,6 +257,7 @@ async def test_archive_button_resends_the_original_png_with_metadata_embedded():
 
     params = _params()
     context = MagicMock()
+    context.chat_data = {}
     storage = MagicMock()
     storage.get_pending_result.return_value = {
         "chat_id": 42,

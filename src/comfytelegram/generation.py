@@ -23,6 +23,7 @@ from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
 from comfytelegram.lora_refs import resolve_detail_loras
 from comfytelegram.params_serde import serialize_generation_params
 from comfytelegram.png_metadata import build_metadata, embed_metadata, extract_seed
+from comfytelegram.pose import size_for_pose
 from comfytelegram.profiles import (
     ModelProfile,
     join_nonempty,
@@ -54,6 +55,7 @@ from comfytelegram.workflows import (
     build_txt2img,
     build_upscale,
     kontext_resolution,
+    pose_image_filename,
     region_mask_filename,
 )
 
@@ -846,6 +848,7 @@ async def generate(
     on_progress: ProgressCallback | None = None,
     auto_region_loras: bool = False,
     on_stage: StageCallback | None = None,
+    pose_png: bytes | None = None,
 ) -> list[GeneratedImage]:
     """Resolve profile defaults, build the base txt2img graph, run it.
 
@@ -868,6 +871,8 @@ async def generate(
     (`apply_region_loras`) — the "🎭 Region LoRAs: Automatic" chat setting;
     otherwise they wait for the image's "🎭 Region LoRAs" button.
     `on_stage` hears about each of those passes as it starts.
+    `pose_png` is the chat's `/pose` skeleton; unless `overrides` pins the
+    size, the image takes the pose's aspect ratio (`pose.size_for_pose`).
     """
     params = resolve_generation_params(
         checkpoint,
@@ -879,16 +884,19 @@ async def generate(
         raw_negative_prompt=raw_negative_prompt,
         regions=regions,
     )
+    if pose_png is not None:
+        params = _with_pose(params, pose_png, overrides or {})
     prompt_graph, save_node_id = build_txt2img(params)
     logger.info(
-        "Submitting txt2img: checkpoint=%s cfg=%s steps=%s regions=%s",
+        "Submitting txt2img: checkpoint=%s cfg=%s steps=%s regions=%s pose=%s",
         checkpoint,
         params.cfg,
         params.steps,
         len(params.regions),
+        params.pose_png is not None,
     )
 
-    await _upload_region_masks(client, params)
+    await _upload_graph_inputs(client, params)
     raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
     raw = _tag_images(raw, params, kind="txt2img", graph=prompt_graph, batch=True)
     images = _batch_images(raw, params)
@@ -899,6 +907,18 @@ async def generate(
     return images
 
 
+def _with_pose(
+    params: GenerationParams, pose_png: bytes, overrides: dict[str, Any]
+) -> GenerationParams:
+    """`params` with the `/pose` skeleton attached and, unless the caller
+    pinned a size (e.g. "🎨 Paint Regions" re-running an existing image),
+    the pose's aspect ratio at the resolved size's pixel count."""
+    if "width" in overrides or "height" in overrides:
+        return replace(params, pose_png=pose_png)
+    width, height = size_for_pose(pose_png, params.width, params.height)
+    return replace(params, pose_png=pose_png, width=width, height=height)
+
+
 def _batch_images(raw: list[tuple[bytes, str]], params: GenerationParams) -> list[GeneratedImage]:
     """A txt2img batch's images, each with its `noise_index`."""
     return [
@@ -907,12 +927,18 @@ def _batch_images(raw: list[tuple[bytes, str]], params: GenerationParams) -> lis
     ]
 
 
-async def _upload_region_masks(client: ComfyClient, params: GenerationParams) -> None:
-    """Put every painted region mask where `build_txt2img`'s `LoadImageMask`
-    looks for it (`region_mask_filename`). Done on every submission rather
-    than once when the mask was painted: the bytes travel with the params
-    (see `RegionSpec.mask_png`), ComfyUI's input folder doesn't have to
-    keep anything, and a content-named overwrite is idempotent."""
+async def _upload_graph_inputs(client: ComfyClient, params: GenerationParams) -> None:
+    """Put every painted region mask and the `/pose` skeleton where
+    `build_txt2img`'s loaders look for them (`region_mask_filename`,
+    `pose_image_filename`). Done on every submission rather than once when
+    the mask was painted or the pose sent: the bytes travel with the params
+    (see `RegionSpec.mask_png`, `GenerationParams.pose_png`), ComfyUI's
+    input folder doesn't have to keep anything, and a content-named
+    overwrite is idempotent."""
+    if params.pose_png is not None and params.pose_controlnet:
+        await client.upload_image(
+            params.pose_png, filename=pose_image_filename(params.pose_png), overwrite=True
+        )
     uploaded: set[str] = set()
     for region in params.regions:
         if region.mask_png is None:
@@ -1453,7 +1479,7 @@ async def repeat(
         fresh_params.steps,
     )
 
-    await _upload_region_masks(client, fresh_params)
+    await _upload_graph_inputs(client, fresh_params)
     raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
     raw = _tag_images(raw, fresh_params, kind="repeat", graph=prompt_graph, batch=True)
     images = _batch_images(raw, fresh_params)

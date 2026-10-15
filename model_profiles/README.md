@@ -55,6 +55,9 @@ Files starting with `_` are ignored (reserved for docs/schema files).
   "tile_controlnet": null,             // ControlNet Tile model filename for the upscale pass (omit/null to skip it) — see below
   "tile_controlnet_strength": 0.4,     // ControlNetApplyAdvanced's strength for tile_controlnet
   "detail_prompt_tile_controlnet": false, // "✏️ Detail Prompt" only: also condition its detailer on tile_controlnet — see below
+  "pose_controlnet": null,             // OpenPose ControlNet filename for /pose (omit/null: this checkpoint can't follow a pose) — see below
+  "pose_controlnet_strength": 0.8,     // ControlNetApplyAdvanced's strength for pose_controlnet
+  "pose_controlnet_end": 0.8,          // ControlNetApplyAdvanced's end_percent for pose_controlnet
   "anima_lllite_inpaint_patch": null,  // "split" (Anima) only: ETN_control_load weights filename for the "🩹 Fix Artifact" pass (omit/null to skip it) — see below
   "anima_lllite_inpaint_patch_strength": 1.0, // ETN_control_apply's strength for anima_lllite_inpaint_patch
   "fix_artifact_checkpoint": null      // exact filename "🩹 Fix Artifact" always uses instead of the image's own checkpoint (omit/null to keep using each image's own) — see below
@@ -314,6 +317,21 @@ default) got umbrella 3/3 and fan 2/3 there and 3/3 for both on Anima, with
 no bleeding between characters at any setting. The base weight must stay
 above 0 — the node rejects any pixel with no mask weight at all. Only set
 these on a profile whose model turns out to want a different balance.
+
+### `pose_controlnet` — following a `/pose` skeleton
+
+An OpenPose ControlNet trained for this checkpoint's architecture, which
+the txt2img pass conditions on whenever the chat has an active `/pose`.
+Unset means the checkpoint can't follow a pose: the bot says so and
+generates without it. Measured on FurryToonMix with
+`illustriousXL_v10_openpose.safetensors` (`scripts/smoke_test_pose.py`
+sweeps both settings at one seed and writes a contact sheet with the
+skeleton overlaid): the pose held at every strength from 0.6 to 1.0. At
+0.6 it followed loosely (raised arms became "holding a bar overhead"); at
+1.0 it was closest but started adding odd artifacts — hence the 0.8
+default. `pose_controlnet_end` from 0.6 to 1.0 made next to no difference.
+For SDXL/Pony checkpoints, `xinsir_openpose.safetensors` is the likely
+candidate but hasn't been tested yet; Anima has no pose ControlNet.
 
 ### `detail_prompt_tile_controlnet` — the same idea, tried on "✏️ Detail Prompt"
 

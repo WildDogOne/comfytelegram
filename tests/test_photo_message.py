@@ -12,6 +12,7 @@ def _settings_mock() -> MagicMock:
 def _photo_update_mock(*, chat_id: int = 1, user_id: int = 1) -> tuple[MagicMock, AsyncMock]:
     message = AsyncMock()
     message.photo = [MagicMock(file_id="small"), MagicMock(file_id="large")]
+    message.caption = None
     update = MagicMock()
     update.effective_message = message
     update.effective_chat.id = chat_id
@@ -21,6 +22,7 @@ def _photo_update_mock(*, chat_id: int = 1, user_id: int = 1) -> tuple[MagicMock
 
 def _context_mock(*, checkpoint: str | None = "ckpt.safetensors") -> MagicMock:
     context = MagicMock()
+    context.chat_data = {}
     storage = MagicMock()
     storage.get_checkpoint.return_value = checkpoint
     client = AsyncMock()

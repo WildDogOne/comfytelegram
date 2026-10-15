@@ -41,6 +41,7 @@ _CHECKPOINT_SWITCH_PRESERVED_FIELDS = {
     "filename_prefix",
     "loras",
     "regions",
+    "pose_png",
 }
 
 logger = logging.getLogger(__name__)
@@ -118,7 +119,7 @@ def apply_profile_override(
 def _architecture_fields(profile: ModelProfile) -> dict[str, Any]:
     """The `GenerationParams` fields that describe *how to load* `profile`'s
     checkpoint (loader/clip/vae/model-sampling-shift/tile-ControlNet/Anima
-    inpaint patch), as opposed to a tunable generation default — shared by
+    inpaint patch/pose ControlNet), as opposed to a tunable generation default — shared by
     `resolve_generation_params` (fresh generation) and
     `apply_checkpoint_switch` (switching an existing image's post-processing
     pipeline to a different checkpoint) so a new architecture-fact field
@@ -141,6 +142,9 @@ def _architecture_fields(profile: ModelProfile) -> dict[str, Any]:
         "detail_prompt_tile_controlnet": profile.detail_prompt_tile_controlnet,
         "anima_lllite_inpaint_patch": profile.anima_lllite_inpaint_patch,
         "anima_lllite_inpaint_patch_strength": profile.anima_lllite_inpaint_patch_strength,
+        "pose_controlnet": profile.pose_controlnet,
+        "pose_controlnet_strength": profile.pose_controlnet_strength,
+        "pose_controlnet_end": profile.pose_controlnet_end,
     }
 
 
