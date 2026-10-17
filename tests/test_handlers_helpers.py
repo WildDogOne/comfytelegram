@@ -13,6 +13,7 @@ from comfytelegram.handlers import (
     _MAIN_KEYBOARD,
     ANALYZE_PROMPT_CALLBACK_KIND,
     BACK_CALLBACK_KIND,
+    COPY_POSE_CALLBACK_KIND,
     DETAIL_PROMPT_CALLBACK_KIND,
     DRAWN_MASK_REDO4_COUNT,
     FIX_DRAW_CALLBACK_KIND,
@@ -220,7 +221,7 @@ def test_post_process_keyboard_page_two_holds_the_rest_and_a_way_back():
         for row in _post_process_keyboard("abc123", page=2).inline_keyboard
     ]
     assert rows == [
-        [f"pp:{PAINT_REGIONS_CALLBACK_KIND}:abc123"],
+        [f"pp:{PAINT_REGIONS_CALLBACK_KIND}:abc123", f"pp:{COPY_POSE_CALLBACK_KIND}:abc123"],
         ["pp:homogenize:abc123", "pp:analyze_only:abc123"],
         ["pp:deep_analyze:abc123", f"pp:{ANALYZE_PROMPT_CALLBACK_KIND}:abc123"],
         [f"pp:{SWITCH_MODEL_CALLBACK_KIND}:abc123", f"pp:{LORA_SWITCH_CALLBACK_KIND}:abc123"],

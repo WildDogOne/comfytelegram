@@ -28,6 +28,7 @@ from comfytelegram.handlers import (
     KONTEXT_CANCEL_CALLBACK_DATA,
     LORA_SWITCH_TOGGLE_CALLBACK_PREFIX,
     POSE_CALLBACK_PREFIX,
+    POSE_STRENGTH_CALLBACK_PREFIX,
     REDO_TWEAK_CALLBACK_PREFIX,
     REGION_LORA_CALLBACK_PREFIX,
     RP_CANCEL_CALLBACK_DATA,
@@ -50,6 +51,7 @@ from comfytelegram.handlers import (
     poll_inpaint_jobs,
     pose_callback,
     pose_command,
+    pose_strength_callback,
     postprocess_callback,
     redo_tweak_callback,
     region_lora_callback,
@@ -394,6 +396,9 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CallbackQueryHandler(fav_callback, pattern=r"^fv:"))
     application.add_handler(
         CallbackQueryHandler(pose_callback, pattern=rf"^{POSE_CALLBACK_PREFIX}")
+    )
+    application.add_handler(
+        CallbackQueryHandler(pose_strength_callback, pattern=rf"^{POSE_STRENGTH_CALLBACK_PREFIX}")
     )
     application.add_handler(
         CallbackQueryHandler(stream_cancel_callback, pattern=rf"^{STREAM_CANCEL_CALLBACK_DATA}$")

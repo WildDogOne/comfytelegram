@@ -95,7 +95,10 @@ CREATE TABLE IF NOT EXISTS chat_region_lora_auto (
 
 CREATE TABLE IF NOT EXISTS chat_pose (
     chat_id INTEGER PRIMARY KEY,
-    pose_png BLOB NOT NULL
+    pose_png BLOB NOT NULL,
+    pose_json TEXT,
+    background_file_id TEXT,
+    strength REAL
 );
 
 CREATE TABLE IF NOT EXISTS profile_override (
@@ -176,6 +179,7 @@ CREATE TABLE IF NOT EXISTS inpaint_job (
     message_thread_id INTEGER,
     kind TEXT NOT NULL DEFAULT 'hand',
     editor_message_id INTEGER,
+    background_file_id TEXT,
     created_at REAL NOT NULL
 );
 
@@ -242,11 +246,15 @@ class Storage:
         self._add_column_if_missing("inpaint_job", "message_thread_id", "INTEGER")
         self._add_column_if_missing("inpaint_job", "kind", "TEXT NOT NULL DEFAULT 'hand'")
         self._add_column_if_missing("inpaint_job", "editor_message_id", "INTEGER")
+        self._add_column_if_missing("inpaint_job", "background_file_id", "TEXT")
         self._add_column_if_missing("inpaint_redo", "detail_prompt", "TEXT")
         self._add_column_if_missing("inpaint_redo", "detail_negative_prompt", "TEXT")
         self._add_column_if_missing("inpaint_redo", "detail_denoise", "REAL")
         self._add_column_if_missing("inpaint_redo", "tile_controlnet", "INTEGER")
         self._add_column_if_missing("inpaint_redo", "detailer_disable_lora", "INTEGER")
+        self._add_column_if_missing("chat_pose", "pose_json", "TEXT")
+        self._add_column_if_missing("chat_pose", "background_file_id", "TEXT")
+        self._add_column_if_missing("chat_pose", "strength", "REAL")
         #: Last `_prune()` sweep time per table — see PRUNE_INTERVAL_SECONDS.
         self._last_prune: dict[str, float] = {}
 
@@ -323,13 +331,55 @@ class Storage:
         ).fetchone()
         return bytes(row[0]) if row else None
 
-    def set_pose(self, chat_id: int, pose_png: bytes) -> None:
+    def set_pose(
+        self,
+        chat_id: int,
+        pose_png: bytes,
+        *,
+        pose_json: str | None = None,
+        background_file_id: str | None = None,
+    ) -> None:
+        """Make `pose_png` this chat's pose. `pose_json` is its keypoints
+        (`pose.Pose.to_json`) when it was detected or drawn in the editor —
+        what "✏️ Edit pose" reopens — and None for an uploaded skeleton
+        image, which has no keypoints to edit. `background_file_id` is the
+        Telegram file the pose was taken from, if any, shown behind the
+        skeleton in the editor."""
         with self._conn:
             self._conn.execute(
-                "INSERT INTO chat_pose (chat_id, pose_png) VALUES (?, ?) "
-                "ON CONFLICT(chat_id) DO UPDATE SET pose_png = excluded.pose_png",
-                (chat_id, pose_png),
+                "INSERT INTO chat_pose (chat_id, pose_png, pose_json, background_file_id) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET "
+                "pose_png = excluded.pose_png, pose_json = excluded.pose_json, "
+                "background_file_id = excluded.background_file_id",
+                (chat_id, pose_png, pose_json, background_file_id),
             )
+
+    def get_pose_source(self, chat_id: int) -> tuple[str | None, str | None]:
+        """`(pose_json, background_file_id)` for this chat's pose (see
+        `set_pose`), both None without a pose."""
+        row = self._conn.execute(
+            "SELECT pose_json, background_file_id FROM chat_pose WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        return (row[0], row[1]) if row else (None, None)
+
+    def get_pose_strength(self, chat_id: int) -> float | None:
+        """The pose ControlNet strength this chat picked ("🦴 Pose
+        strength…"), overriding the profile's `pose_controlnet_strength` —
+        None for the profile's own. Lives on the pose row, so it outlasts a
+        new pose (`set_pose` leaves it alone) and goes with `/pose off`."""
+        row = self._conn.execute(
+            "SELECT strength FROM chat_pose WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def set_pose_strength(self, chat_id: int, strength: float | None) -> bool:
+        """Set (or with None, reset) this chat's pose strength. False when
+        the chat has no pose to set it on."""
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE chat_pose SET strength = ? WHERE chat_id = ?", (strength, chat_id)
+            )
+        return cursor.rowcount > 0
 
     def clear_pose(self, chat_id: int) -> None:
         with self._conn:
@@ -777,6 +827,7 @@ class Storage:
         message_thread_id: int | None = None,
         kind: str = "hand",
         editor_message_id: int | None = None,
+        background_file_id: str | None = None,
     ) -> None:
         """Record that `token` (an inpaint_relay job id — see
         `handlers.py`'s `hand_draw_callback`) is waiting on a freehand mask
@@ -797,13 +848,17 @@ class Storage:
         behavior. `editor_message_id` is the "Draw over the area…" message
         carrying the "🎨 Open mask editor" button, which the poller deletes
         once the mask comes back (None for rows written before this field
-        existed — nothing to delete then)."""
+        existed — nothing to delete then). `background_file_id` is only for
+        a "pose" job (`/pose`'s editor, which has no `result_id` — it's
+        stored as ""): the Telegram file shown behind the skeleton, kept
+        with the chat's pose once it's submitted so a later "✏️ Edit pose"
+        shows it again."""
         self._prune_inpaint_jobs()
         with self._conn:
             self._conn.execute(
                 "INSERT OR REPLACE INTO inpaint_job "
                 "(token, result_id, chat_id, message_thread_id, kind, editor_message_id, "
-                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "background_file_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     token,
                     result_id,
@@ -811,6 +866,7 @@ class Storage:
                     message_thread_id,
                     kind,
                     editor_message_id,
+                    background_file_id,
                     time.time(),
                 ),
             )
@@ -820,8 +876,8 @@ class Storage:
         check against the relay each tick."""
         self._prune_inpaint_jobs()
         rows = self._conn.execute(
-            "SELECT token, result_id, chat_id, message_thread_id, kind, editor_message_id "
-            "FROM inpaint_job"
+            "SELECT token, result_id, chat_id, message_thread_id, kind, editor_message_id, "
+            "background_file_id FROM inpaint_job"
         ).fetchall()
         return [
             {
@@ -831,8 +887,17 @@ class Storage:
                 "message_thread_id": message_thread_id,
                 "kind": kind,
                 "editor_message_id": editor_message_id,
+                "background_file_id": background_file_id,
             }
-            for token, result_id, chat_id, message_thread_id, kind, editor_message_id in rows
+            for (
+                token,
+                result_id,
+                chat_id,
+                message_thread_id,
+                kind,
+                editor_message_id,
+                background_file_id,
+            ) in rows
         ]
 
     def delete_inpaint_job(self, token: str) -> None:

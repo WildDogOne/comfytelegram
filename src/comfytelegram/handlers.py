@@ -94,7 +94,18 @@ from comfytelegram.png_metadata import (
     is_png,
     summarize_graph,
 )
-from comfytelegram.pose import PoseImageError, normalize_pose_image, pose_size
+from comfytelegram.pose import (
+    Pose,
+    PoseDataError,
+    PoseImageError,
+    canvas_size,
+    default_person,
+    normalize_pose_image,
+    parse_pose_json,
+    pose_size,
+    render_pose,
+)
+from comfytelegram.pose_detect import detect_poses
 from comfytelegram.profiles import (
     LoraDefault,
     ModelProfile,
@@ -284,6 +295,11 @@ REGION_LORA_ALL = "all"
 PAINT_REGIONS_CALLBACK_KIND = "paint_regions"
 PAINT_REGIONS_JOB_KIND = "regions"
 
+#: "🦴 Copy pose" (keyboard page 2) — detect everyone's pose in this image
+#: and make it the chat's `/pose`, for more pictures in the same pose
+#: (`_set_pose_from_image`).
+COPY_POSE_CALLBACK_KIND = "copy_pose"
+
 #: "🪄 Kontext Edit" — an instruction-driven FLUX.1 Kontext edit of the whole
 #: image (`generation.kontext_edit`). The tap only asks for the instruction;
 #: the follow-up text message is consumed by `_consume_awaiting_kontext`,
@@ -469,6 +485,33 @@ RP_CANCEL_CALLBACK_DATA = "rp:cancel"
 POSE_CALLBACK_PREFIX = "pose:"
 POSE_CANCEL_CALLBACK_DATA = "pose:cancel"
 POSE_CLEAR_CALLBACK_DATA = "pose:clear"
+#: `/pose`'s "✏️ Edit pose"/"🦴 Pose editor" — open the chat's current pose in
+#: inpaint_relay's skeleton editor (`_open_pose_editor_for_chat`).
+POSE_EDIT_CALLBACK_DATA = "pose:edit"
+#: `inpaint_job.kind` for a pose-editor job. It has no source image to
+#: post-process (`result_id` is ""), so `_process_one_inpaint_job` hands it
+#: to `_run_pose_job` before looking one up.
+POSE_JOB_KIND = "pose"
+#: "🦴 Pose strength…" — under every image generated with a pose
+#: (`_pose_strength_rows`): `pp:pose_strength:<result_id>` opens a picker
+#: of `POSE_STRENGTH_PRESETS`, whose buttons are `ps:<target>:<value>` (or
+#: `POSE_STRENGTH_CUSTOM`/`POSE_STRENGTH_CLOSE`). A `result_id` target
+#: re-renders that image at the picked strength on the same noise
+#: (`_run_pose_strength_redo`); `POSE_STRENGTH_CHAT_TARGET` (from `/pose`)
+#: only sets the chat's strength. Either way the pick becomes the chat's
+#: pose strength for new images (`storage.set_pose_strength`) — finding the
+#: right strength on one image and then having to pick it again for every
+#: next one would defeat the point.
+POSE_STRENGTH_CALLBACK_KIND = "pose_strength"
+POSE_STRENGTH_CALLBACK_PREFIX = "ps:"
+POSE_STRENGTH_CHAT_TARGET = "chat"
+POSE_STRENGTH_CUSTOM = "custom"
+POSE_STRENGTH_CLOSE = "close"
+POSE_STRENGTH_PRESETS = (0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
+POSE_STRENGTH_PRESETS_PER_ROW = 4
+#: Highest strength a typed value may be — ControlNet takes more than 1,
+#: but past this it only burns the skeleton into the picture.
+POSE_STRENGTH_MAX = 2.0
 CHARACTER_EDIT_CANCEL_CALLBACK_DATA = "char:edit_cancel"
 CHARACTER_RENAME_CANCEL_CALLBACK_DATA = "char:rename_cancel"
 
@@ -582,6 +625,7 @@ _REDO_CALLBACK_KINDS = frozenset(
         KONTEXT_REDO_CALLBACK_KIND,
         KONTEXT_REDO_NEW_CALLBACK_KIND,
         REGION_LORAS_CALLBACK_KIND,
+        POSE_STRENGTH_CALLBACK_KIND,
     }
 )
 
@@ -599,7 +643,8 @@ def _post_process_keyboard(result_id: str, page: int = 1) -> InlineKeyboardMarku
     action — draw a mask, describe it, run immediately — that belongs with
     the other two more than anywhere else on the keyboard), then
     📥 Download file and 🐛 Show Prompt. Page 2 holds the rest — 🎨 Paint
-    Regions (a new generation rather than work on this one), 🧵 Homogenize,
+    Regions and 🦴 Copy pose (both about a new generation rather than work
+    on this one), 🧵 Homogenize,
     the three analyzers, and 🔀 Switch Model / 🎛 LoRAs (see
     `SWITCH_MODEL_CALLBACK_KIND`/`LORA_SWITCH_CALLBACK_KIND` — deliberately
     page 2, not 1: switching a checkpoint mid-pipeline is a rare, deliberate
@@ -627,6 +672,10 @@ def _post_process_keyboard(result_id: str, page: int = 1) -> InlineKeyboardMarku
                     InlineKeyboardButton(
                         "🎨 Paint Regions",
                         callback_data=f"pp:{PAINT_REGIONS_CALLBACK_KIND}:{result_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "🦴 Copy pose",
+                        callback_data=f"pp:{COPY_POSE_CALLBACK_KIND}:{result_id}",
                     ),
                 ],
                 [
@@ -1359,6 +1408,24 @@ def _region_lora_rows(result_id: str, params: GenerationParams) -> list[list[Inl
     ]
 
 
+def _pose_strength_rows(result_id: str, img: GeneratedImage) -> list[list[InlineKeyboardButton]]:
+    """The "🦴 Pose strength…" row (`POSE_STRENGTH_CALLBACK_KIND`) for a
+    txt2img image made with a pose, else nothing. Only txt2img: an
+    upscale/detailer result carries the pose in its params too, but never
+    used it, and `noise_index` is what says an image is a batch slice
+    `_run_pose_strength_redo` can re-render."""
+    if img.full_params.pose_png is None or img.noise_index is None:
+        return []
+    return [
+        [
+            InlineKeyboardButton(
+                "🦴 Pose strength…",
+                callback_data=f"pp:{POSE_STRENGTH_CALLBACK_KIND}:{result_id}",
+            )
+        ]
+    ]
+
+
 def _short_lora_name(spec: LoraSpec) -> str:
     """A LoRA's file name without folder or extension, for a button."""
     name = spec.name.replace("\\", "/").rsplit("/", 1)[-1]
@@ -1450,7 +1517,10 @@ async def _send_and_store_result(
     in instead. Returns whichever id was actually used."""
     result_id = result_id or uuid.uuid4().hex[:12]
     reply_markup = _post_process_keyboard_with_extra_rows(
-        result_id, _region_lora_rows(result_id, img.full_params) + (extra_keyboard_rows or [])
+        result_id,
+        _region_lora_rows(result_id, img.full_params)
+        + _pose_strength_rows(result_id, img)
+        + (extra_keyboard_rows or []),
     )
     use_jpeg = storage.get_image_format(chat_id) != IMAGE_FORMAT_PNG
     sent = await _send_result_image(
@@ -1489,7 +1559,10 @@ async def _send_and_store_bot_result(
     `_send_and_store_result`'s — see there."""
     result_id = result_id or uuid.uuid4().hex[:12]
     reply_markup = _post_process_keyboard_with_extra_rows(
-        result_id, _region_lora_rows(result_id, img.full_params) + (extra_keyboard_rows or [])
+        result_id,
+        _region_lora_rows(result_id, img.full_params)
+        + _pose_strength_rows(result_id, img)
+        + (extra_keyboard_rows or []),
     )
     use_jpeg = storage.get_image_format(chat_id) != IMAGE_FORMAT_PNG
     sent = await _send_photo_or_document(
@@ -1707,8 +1780,11 @@ async def _relay_poll_result(settings: Settings, token: str) -> dict[str, Any] |
         payload = await resp.json()
     if payload.get("status") != "submitted":
         return None
+    mask_base64 = payload.get("mask_base64")
     return {
-        "mask": base64.b64decode(payload["mask_base64"]),
+        # None only for a pose job, which submits keypoints instead (`pose`).
+        "mask": base64.b64decode(mask_base64) if mask_base64 is not None else None,
+        "pose": payload.get("pose"),
         "positive": payload.get("positive"),
         "negative": payload.get("negative"),
         "denoise": payload.get("denoise"),
@@ -2064,6 +2140,10 @@ async def _process_one_inpaint_job(
         )
         return
 
+    if job["kind"] == POSE_JOB_KIND:
+        await _run_pose_job(application, storage, job, result)
+        return
+
     pending = storage.get_pending_result(job["result_id"])
     if pending is None:
         logger.warning(
@@ -2404,6 +2484,7 @@ async def _run_paint_regions_job(
             # The pose the painted-over image was made with, not the chat's
             # current one — this re-run is about keeping that layout.
             pose_png=full_params.pose_png,
+            pose_strength=full_params.pose_controlnet_strength,
             auto_region_loras=seed is None and storage.get_region_lora_auto(chat_id),
             on_stage=_make_stage_callback(status_message),
         ),
@@ -3258,6 +3339,9 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if await _consume_awaiting_redo_denoise(update, context):
         return
 
+    if await _consume_awaiting_pose_strength(update, context):
+        return
+
     if await _consume_awaiting_kontext(update, context):
         return
 
@@ -3313,6 +3397,7 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             raw_negative_prompt=raw_negative,
             on_progress=_make_progress_callback(status_message, label=label),
             pose_png=pose_png,
+            pose_strength=storage.get_pose_strength(chat_id),
         ),
     )
     if images is None:
@@ -4430,6 +4515,32 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    if kind == POSE_STRENGTH_CALLBACK_KIND:
+        current = full_params.pose_controlnet_strength
+        await query.message.reply_text(
+            f"🦴 Render this image again with another pose strength (now {current:g}) — "
+            "same seed, so only the pose's hold changes. The pick also becomes this "
+            "chat's pose strength for new images.",
+            reply_markup=_pose_strength_keyboard(result_id, current),
+        )
+        return
+
+    if kind == COPY_POSE_CALLBACK_KIND:
+        if not _pose_detection_available(settings):
+            await query.message.reply_text(_POSE_DETECTION_UNAVAILABLE)
+            return
+        source_bytes = await _fetch_source_image(
+            client,
+            context.bot,
+            pending["filename"],
+            pending["file_id"],
+            on_fallback=_source_fallback_notifier(query.message),
+        )
+        await _set_pose_from_image(
+            query.message, context, pending["chat_id"], source_bytes, pending["file_id"]
+        )
+        return
+
     if kind == PAINT_REGIONS_CALLBACK_KIND:
         if not settings.inpaint_relay_url:
             await query.message.reply_text("Mask drawing isn't configured on this bot.")
@@ -5177,6 +5288,7 @@ async def generate_from_prompt_callback(update: Update, context: ContextTypes.DE
             raw_negative_prompt=stored["negative_prompt"],
             on_progress=_make_progress_callback(status_message, label=label),
             pose_png=pose_png,
+            pose_strength=storage.get_pose_strength(chat_id),
         ),
     )
     if images is None:
@@ -5403,6 +5515,7 @@ async def _generate_regional(
             auto_region_loras=storage.get_region_lora_auto(chat_id),
             on_stage=_make_stage_callback(status_message),
             pose_png=pose_png,
+            pose_strength=storage.get_pose_strength(chat_id),
         ),
     )
     if images is None:
@@ -5823,16 +5936,60 @@ def _kontext_cancel_keyboard(copy_text: str | None = None) -> InlineKeyboardMark
 
 _POSE_OFF_ARGS = {"off", "clear", "none", "reset"}
 
+#: The canvas a pose drawn from scratch starts on, when there's no pose to
+#: take a size from — SDXL's usual portrait. The editor can change it.
+_DEFAULT_POSE_CANVAS = (832, 1216)
 
-def _pose_keyboard(*, has_pose: bool, waiting: bool) -> InlineKeyboardMarkup:
-    """Under `/pose`'s reply: clear the active pose, and/or stop waiting for
-    an upload."""
+_POSE_DETECTION_UNAVAILABLE = (
+    "Pose detection isn't set up on this bot (POSE_DETECTOR_PATH/POSE_ESTIMATOR_PATH — "
+    "see env.example)."
+)
+
+
+def _pose_detection_available(settings: Settings) -> bool:
+    """Whether both DWPose model files are staged (see `pose_detect.py`)."""
+    return settings.pose_detector_path.is_file() and settings.pose_estimator_path.is_file()
+
+
+def _pose_edit_label(settings: Settings, storage: Storage, chat_id: int) -> str | None:
+    """The editor button's label for this chat's pose: "✏️ Edit pose" when
+    it has keypoints to edit, "🦴 Pose editor" (start a new one — over the
+    current skeleton image, if there is one) otherwise. None when there's
+    no relay to host the editor."""
+    if not settings.inpaint_relay_url:
+        return None
+    pose_json, _ = storage.get_pose_source(chat_id)
+    return "✏️ Edit pose" if pose_json else "🦴 Pose editor"
+
+
+def _pose_keyboard(
+    *,
+    has_pose: bool,
+    waiting: bool,
+    edit_label: str | None = None,
+    strength: float | None = None,
+) -> InlineKeyboardMarkup:
+    """Under `/pose`'s replies: open the editor, set the strength (given
+    `strength`, the chat's current one), clear the active pose, and/or stop
+    waiting for an upload."""
     row = []
+    if edit_label is not None:
+        row.append(InlineKeyboardButton(edit_label, callback_data=POSE_EDIT_CALLBACK_DATA))
     if has_pose:
         row.append(InlineKeyboardButton("🗑 Clear pose", callback_data=POSE_CLEAR_CALLBACK_DATA))
     if waiting:
         row.append(InlineKeyboardButton("❌ Cancel", callback_data=POSE_CANCEL_CALLBACK_DATA))
-    return InlineKeyboardMarkup([row] if row else [])
+    rows = [row] if row else []
+    if has_pose and strength is not None:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"🎚 Strength {strength:g}",
+                    callback_data=f"{POSE_STRENGTH_CALLBACK_PREFIX}{POSE_STRENGTH_CHAT_TARGET}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 async def pose_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5857,21 +6014,34 @@ async def pose_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     set_pending(context.chat_data, "awaiting_pose", message, True)
     current = storage.get_pose(chat_id)
+    if _pose_detection_available(settings):
+        source = (
+            "Send a picture of people posing as your next photo or file — I'll find their "
+            "poses — or a ready-made OpenPose skeleton (coloured limbs on black)"
+        )
+    else:
+        source = "Send an OpenPose skeleton (coloured limbs on black) as your next photo or file"
     instructions = (
-        "Send an OpenPose skeleton (coloured limbs on black) as your next photo or "
-        "file, and every image in this chat will follow it until you clear it with "
+        f"{source}, and every image in this chat will follow it until you clear it with "
         "/pose off. Works with regional prompts too: write [left]/[right] for the "
         "people in the pose. Tip: send a photo with the caption /pose to set it in one go."
     )
+    edit_label = _pose_edit_label(settings, storage, chat_id)
+    if edit_label is not None:
+        instructions += f"\n\nOr tap {edit_label} to place the skeletons by hand."
     if current is None:
         await message.reply_text(
-            instructions, reply_markup=_pose_keyboard(has_pose=False, waiting=True)
+            instructions,
+            reply_markup=_pose_keyboard(has_pose=False, waiting=True, edit_label=edit_label),
         )
         return
+    strength = _chat_pose_strength(storage, context.bot_data["profiles"], chat_id)
     await message.reply_photo(
         current,
-        caption=f"🦴 This is the current pose.\n\n{instructions}",
-        reply_markup=_pose_keyboard(has_pose=True, waiting=True),
+        caption=f"🦴 This is the current pose (strength {strength:g}).\n\n{instructions}",
+        reply_markup=_pose_keyboard(
+            has_pose=True, waiting=True, edit_label=edit_label, strength=strength
+        ),
     )
 
 
@@ -5879,9 +6049,10 @@ async def _consume_pose_upload(
     update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str
 ) -> bool:
     """If this upload is meant as a pose — `/pose` is waiting for one in this
-    topic, or it's captioned `/pose` — store it as the chat's pose and
-    return True. Otherwise False, and `photo_message`/`document_message`
-    carry on as usual."""
+    topic, or it's captioned `/pose` — make it the chat's pose and return
+    True. Otherwise False, and `photo_message`/`document_message` carry on
+    as usual. A rendered skeleton is used as-is; anything else goes through
+    pose detection (`_set_pose_from_image`) when it's set up."""
     message = update.effective_message
     caption = (message.caption or "").strip().lower()
     captioned = caption == "/pose" or caption.startswith(("/pose ", "/pose@"))
@@ -5889,10 +6060,15 @@ async def _consume_pose_upload(
         return False
 
     chat_id = update.effective_chat.id
+    settings: Settings = context.bot_data["settings"]
     storage: Storage = context.bot_data["storage"]
+    data = await _download_telegram_file(context.bot, file_id)
     try:
-        pose_png = normalize_pose_image(await _download_telegram_file(context.bot, file_id))
+        pose_png = normalize_pose_image(data)
     except PoseImageError as exc:
+        if _pose_detection_available(settings):
+            await _set_pose_from_image(message, context, chat_id, data, file_id)
+            return True
         set_pending(context.chat_data, "awaiting_pose", message, True)
         await message.reply_text(
             f"⚠️ {exc}", reply_markup=_pose_keyboard(has_pose=False, waiting=True)
@@ -5901,17 +6077,267 @@ async def _consume_pose_upload(
 
     storage.set_pose(chat_id, pose_png)
     width, height = pose_size(pose_png)
-    text = (
+    text = _pose_set_text(
+        storage,
+        context.bot_data["profiles"],
+        chat_id,
         f"🦴 Pose set ({width}x{height}). Images in this chat now follow it and take its "
-        "aspect ratio, until /pose off."
+        "aspect ratio, until /pose off.",
     )
+    await message.reply_text(
+        text,
+        reply_markup=_pose_keyboard(
+            has_pose=True, waiting=False, edit_label=_pose_edit_label(settings, storage, chat_id)
+        ),
+    )
+    return True
+
+
+def _pose_set_text(storage: Storage, profiles: list[ModelProfile], chat_id: int, text: str) -> str:
+    """`text` announcing a new pose, plus a warning if the chat's checkpoint
+    can't follow one."""
     checkpoint = storage.get_checkpoint(chat_id)
     if checkpoint is not None:
-        profile = resolve_profile(checkpoint, context.bot_data["profiles"])
+        profile = resolve_profile(checkpoint, profiles)
         if profile is None or not profile.pose_controlnet:
             text += f"\n\n{_pose_unsupported_note(checkpoint, profile)}"
-    await message.reply_text(text, reply_markup=_pose_keyboard(has_pose=True, waiting=False))
-    return True
+    return text
+
+
+def _people_count(pose: Pose) -> str:
+    count = len(pose.people)
+    return "1 person" if count == 1 else f"{count} people"
+
+
+def _store_pose(
+    storage: Storage, chat_id: int, pose: Pose, background_file_id: str | None
+) -> bytes:
+    """Render `pose` and make it the chat's pose, keypoints and background
+    included (for "✏️ Edit pose"). Returns the rendered skeleton."""
+    pose_png = render_pose(pose)
+    storage.set_pose(
+        chat_id, pose_png, pose_json=pose.to_json(), background_file_id=background_file_id
+    )
+    return pose_png
+
+
+async def _set_pose_from_image(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    image_bytes: bytes,
+    file_id: str,
+) -> None:
+    """Detect everyone's pose in an image (an upload to `/pose`, or a
+    generated image's "🦴 Copy pose") and make it the chat's pose, replying
+    with the skeleton and an "✏️ Edit pose" button. `file_id` is the image
+    on Telegram, kept as the editor's background. When nobody is found the
+    editor opens straight away over the image with one default figure to
+    place by hand, since that's the only way forward (no relay: just say
+    so)."""
+    settings: Settings = context.bot_data["settings"]
+    storage: Storage = context.bot_data["storage"]
+    status = await message.reply_text("🦴 Finding poses…", disable_notification=True)
+    try:
+        pose = await asyncio.to_thread(
+            detect_poses, image_bytes, settings.pose_detector_path, settings.pose_estimator_path
+        )
+    except Exception:
+        logger.exception("Pose detection failed")
+        await status.edit_text("⚠️ Pose detection failed — see the bot's log.")
+        return
+
+    if not pose.people:
+        if not settings.inpaint_relay_url:
+            await status.edit_text("Couldn't find anyone in that image — the pose is unchanged.")
+            return
+        start = Pose(pose.width, pose.height, (default_person(pose.width, pose.height),))
+        await _open_pose_editor(
+            status,
+            context,
+            chat_id,
+            message.message_thread_id,
+            start,
+            background=image_bytes,
+            background_file_id=file_id,
+            prompt=(
+                "Couldn't find anyone in that image. Drag the skeleton over the person "
+                "yourself, then tap Done in the editor:"
+            ),
+        )
+        return
+
+    pose_png = _store_pose(storage, chat_id, pose, file_id)
+    await _delete_message_quietly(context.bot, chat_id, status.message_id)
+    await message.reply_photo(
+        pose_png,
+        caption=_pose_set_text(
+            storage,
+            context.bot_data["profiles"],
+            chat_id,
+            f"🦴 Pose found ({_people_count(pose)}). Images in this chat now follow it and "
+            "take its aspect ratio, until /pose off.",
+        ),
+        reply_markup=_pose_keyboard(
+            has_pose=True, waiting=False, edit_label=_pose_edit_label(settings, storage, chat_id)
+        ),
+    )
+
+
+def _blank_pose_background(width: int, height: int) -> bytes:
+    """A black image for the editor to draw a pose on when there's nothing
+    to trace over."""
+    out = io.BytesIO()
+    Image.new("RGB", (width, height), "black").save(out, format="PNG")
+    return out.getvalue()
+
+
+async def _open_pose_editor(
+    status_message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_thread_id: int | None,
+    pose: Pose,
+    *,
+    background: bytes | None,
+    background_file_id: str | None,
+    prompt: str = "Drag the joints into place, then tap Done in the editor:",
+) -> None:
+    """Upload `pose` (and the image to trace it over, if any) to inpaint_relay
+    as a `mode="pose"` job and turn `status_message` into the button opening
+    its skeleton editor (`static/pose.html`). The result comes back through
+    `poll_inpaint_jobs` -> `_run_pose_job`. The canvas starts at `pose`'s
+    size; the editor can change its shape, fitting the background inside
+    (black around it, never stretched), so a submitted pose's canvas needn't
+    match the background's aspect — the page re-fits it the same way when
+    the pose is reopened."""
+    settings: Settings = context.bot_data["settings"]
+    storage: Storage = context.bot_data["storage"]
+    meta = {
+        "mode": POSE_JOB_KIND,
+        "pose": json.loads(pose.to_json()),
+        "pose_has_background": background is not None,
+    }
+    image = (
+        background if background is not None else _blank_pose_background(pose.width, pose.height)
+    )
+    try:
+        token = await _relay_create_job(settings, image, meta=meta)
+    except Exception:
+        logger.exception("Failed to create inpaint_relay pose job")
+        await status_message.edit_text("Couldn't reach the editor server — try again later.")
+        return
+    storage.store_inpaint_job(
+        token,
+        "",
+        chat_id,
+        message_thread_id,
+        kind=POSE_JOB_KIND,
+        editor_message_id=status_message.message_id,
+        background_file_id=background_file_id,
+    )
+    await status_message.edit_text(
+        prompt,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🦴 Open pose editor",
+                        web_app=WebAppInfo(url=f"{settings.inpaint_relay_url}/jobs/{token}"),
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+async def _open_pose_editor_for_chat(message: Message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/pose`'s editor button: open the chat's current pose in the editor —
+    its keypoints over the image they were taken from, when it has them.
+    A pose uploaded as a skeleton image has no keypoints, so the editor
+    starts a default figure over that skeleton to trace; with no pose at
+    all, a default figure on black."""
+    settings: Settings = context.bot_data["settings"]
+    storage: Storage = context.bot_data["storage"]
+    chat_id = message.chat.id
+    if not settings.inpaint_relay_url:
+        await message.reply_text("The pose editor isn't configured on this bot.")
+        return
+
+    pose_json, background_file_id = storage.get_pose_source(chat_id)
+    pose: Pose | None = None
+    background: bytes | None = None
+    if pose_json:
+        try:
+            pose = parse_pose_json(pose_json)
+        except PoseDataError:
+            logger.warning("Stored pose for chat %s doesn't parse; starting over", chat_id)
+    if pose is not None and background_file_id:
+        try:
+            background = await _download_telegram_file(context.bot, background_file_id)
+        except Exception:
+            logger.warning("Couldn't fetch the pose's background image", exc_info=True)
+            background_file_id = None
+    if pose is None:
+        current_png = storage.get_pose(chat_id)
+        width, height = canvas_size(
+            *(pose_size(current_png) if current_png else _DEFAULT_POSE_CANVAS)
+        )
+        pose = Pose(width, height, (default_person(width, height),))
+        # Trace over an uploaded skeleton; it isn't a Telegram file of its
+        # own, so there's nothing to keep as the background afterwards.
+        background, background_file_id = current_png, None
+
+    status = await message.reply_text("Opening the pose editor…", disable_notification=True)
+    await _open_pose_editor(
+        status,
+        context,
+        chat_id,
+        message.message_thread_id,
+        pose,
+        background=background,
+        background_file_id=background_file_id,
+    )
+
+
+async def _run_pose_job(
+    application: Application, storage: Storage, job: dict[str, Any], result: dict[str, Any]
+) -> None:
+    """A submitted pose-editor job (`_process_one_inpaint_job`, after the
+    `initData` check): validate the keypoints, make them the chat's pose
+    and show the skeleton."""
+    chat_id = job["chat_id"]
+    message_thread_id = job["message_thread_id"]
+    try:
+        pose = parse_pose_json(result.get("pose") or "")
+    except PoseDataError as exc:
+        await application.bot.send_message(chat_id, f"⚠️ {exc}", message_thread_id=message_thread_id)
+        return
+    if not pose.people:
+        await application.bot.send_message(
+            chat_id,
+            "That pose has nobody in it — kept the previous one.",
+            message_thread_id=message_thread_id,
+        )
+        return
+
+    settings: Settings = application.bot_data["settings"]
+    pose_png = _store_pose(storage, chat_id, pose, job.get("background_file_id"))
+    await application.bot.send_photo(
+        chat_id,
+        pose_png,
+        caption=_pose_set_text(
+            storage,
+            application.bot_data["profiles"],
+            chat_id,
+            f"🦴 Pose set ({_people_count(pose)}, {pose.width}x{pose.height}). Images in this "
+            "chat now follow it and take its aspect ratio, until /pose off.",
+        ),
+        reply_markup=_pose_keyboard(
+            has_pose=True, waiting=False, edit_label=_pose_edit_label(settings, storage, chat_id)
+        ),
+        message_thread_id=message_thread_id,
+    )
 
 
 def _pose_unsupported_note(checkpoint: str, profile: ModelProfile | None) -> str:
@@ -5944,7 +6370,7 @@ def _pose_label(label: str, pose_png: bytes | None) -> str:
 
 
 async def pose_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/pose`'s "🗑 Clear pose" and "❌ Cancel" buttons."""
+    """`/pose`'s "✏️ Edit pose", "🗑 Clear pose" and "❌ Cancel" buttons."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
@@ -5952,6 +6378,10 @@ async def pose_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     pop_pending(context.chat_data, "awaiting_pose", query.message)
+    if query.data == POSE_EDIT_CALLBACK_DATA:
+        await query.answer()
+        await _open_pose_editor_for_chat(query.message, context)
+        return
     if query.data == POSE_CLEAR_CALLBACK_DATA:
         storage: Storage = context.bot_data["storage"]
         storage.clear_pose(query.message.chat.id)
@@ -5965,6 +6395,242 @@ async def pose_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except BadRequest:
         pass
     await query.message.reply_text(text)
+
+
+def _parse_pose_strength(raw: str) -> float | None:
+    """A pose strength typed or carried in callback data, or None unless
+    it's a number in (0, `POSE_STRENGTH_MAX`]."""
+    try:
+        value = float(raw.strip().replace(",", "."))
+    except ValueError:
+        return None
+    return value if 0 < value <= POSE_STRENGTH_MAX else None
+
+
+def _chat_pose_strength(storage: Storage, profiles: list[ModelProfile], chat_id: int) -> float:
+    """The strength this chat's next image would use: its own pick, else
+    the chat checkpoint's profile, else the profile field's default."""
+    strength = storage.get_pose_strength(chat_id)
+    if strength is not None:
+        return strength
+    checkpoint = storage.get_checkpoint(chat_id)
+    profile = resolve_profile(checkpoint, profiles) if checkpoint else None
+    if profile is not None:
+        return profile.pose_controlnet_strength
+    return ModelProfile.model_fields["pose_controlnet_strength"].default
+
+
+def _pose_strength_keyboard(target: str, current: float) -> InlineKeyboardMarkup:
+    """The "🦴 Pose strength…" picker: `POSE_STRENGTH_PRESETS` (the one
+    matching `current` marked), then "✏️ Custom…"/"✖ Close". `target` is a
+    `result_id` to re-render, or `POSE_STRENGTH_CHAT_TARGET`."""
+    prefix = f"{POSE_STRENGTH_CALLBACK_PREFIX}{target}:"
+    buttons = [
+        InlineKeyboardButton(
+            f"• {value:g}" if abs(value - current) < 1e-6 else f"{value:g}",
+            callback_data=f"{prefix}{value:g}",
+        )
+        for value in POSE_STRENGTH_PRESETS
+    ]
+    rows = [
+        buttons[i : i + POSE_STRENGTH_PRESETS_PER_ROW]
+        for i in range(0, len(buttons), POSE_STRENGTH_PRESETS_PER_ROW)
+    ]
+    rows.append(
+        [
+            InlineKeyboardButton("✏️ Custom…", callback_data=f"{prefix}{POSE_STRENGTH_CUSTOM}"),
+            InlineKeyboardButton("✖ Close", callback_data=f"{prefix}{POSE_STRENGTH_CLOSE}"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+async def pose_strength_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle a `ps:` tap (`POSE_STRENGTH_CALLBACK_PREFIX`): `ps:chat` (the
+    `/pose` reply's "🎚 Strength" button) opens the picker for the chat;
+    `ps:<target>:<value>` applies a pick (`_apply_pose_strength`), deleting
+    the picker first; `POSE_STRENGTH_CUSTOM` asks for a typed value
+    (`_consume_awaiting_pose_strength`); `POSE_STRENGTH_CLOSE` just deletes
+    the picker."""
+    query = update.callback_query
+    settings: Settings = context.bot_data["settings"]
+    user_id = update.effective_user.id if update.effective_user else None
+    if await reject_if_unauthorized_callback(query, user_id, settings):
+        return
+
+    storage: Storage = context.bot_data["storage"]
+    chat_id = query.message.chat_id
+    parts = query.data[len(POSE_STRENGTH_CALLBACK_PREFIX) :].split(":")
+    target = parts[0]
+    value = parts[1] if len(parts) > 1 else None
+
+    if value == POSE_STRENGTH_CLOSE:
+        await query.answer()
+        await _delete_messages(context.bot, chat_id, [query.message.message_id])
+        return
+    if value is None:
+        await query.answer()
+        if storage.get_pose(chat_id) is None:
+            await query.message.reply_text("No pose is set — send one with /pose first.")
+            return
+        current = _chat_pose_strength(storage, context.bot_data["profiles"], chat_id)
+        await query.message.reply_text(
+            f"🦴 Pose strength for new images in this chat (now {current:g}). Lower lets "
+            "the picture drift from the skeleton; higher holds it tighter.",
+            reply_markup=_pose_strength_keyboard(POSE_STRENGTH_CHAT_TARGET, current),
+        )
+        return
+    if value == POSE_STRENGTH_CUSTOM:
+        await query.answer()
+        prompt = await query.message.reply_text(
+            f"Send the pose strength, e.g. `0.65` (up to {POSE_STRENGTH_MAX:g})."
+        )
+        set_pending(
+            context.chat_data,
+            "awaiting_pose_strength",
+            query.message,
+            (target, [query.message.message_id, prompt.message_id]),
+        )
+        return
+
+    strength = _parse_pose_strength(value)
+    if strength is None:
+        await query.answer()
+        return
+    await query.answer(f"Pose strength {strength:g}")
+    await _apply_pose_strength(
+        _dialog_reply_anchor(query.message),
+        context,
+        chat_id,
+        target,
+        strength,
+        [query.message.message_id],
+    )
+
+
+async def _consume_awaiting_pose_strength(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """If this chat is mid-"✏️ Custom…" pose strength entry
+    (`pose_strength_callback`), consume the text as that strength and apply
+    it, returning True; otherwise False. An unparseable value asks again,
+    like `_consume_awaiting_redo_denoise`."""
+    message = update.effective_message
+    pending_entry = pop_pending(context.chat_data, "awaiting_pose_strength", message)
+    if pending_entry is None:
+        return False
+    target, dialog_message_ids = pending_entry
+
+    strength = _parse_pose_strength(message_text(message) or "")
+    if strength is None:
+        retry = await message.reply_text(
+            f"Couldn't read that — send a number above 0 and up to {POSE_STRENGTH_MAX:g}, "
+            "e.g. `0.65`."
+        )
+        set_pending(
+            context.chat_data,
+            "awaiting_pose_strength",
+            message,
+            (target, [*dialog_message_ids, retry.message_id]),
+        )
+        return True
+    await _apply_pose_strength(
+        message, context, message.chat_id, target, strength, dialog_message_ids
+    )
+    return True
+
+
+async def _apply_pose_strength(
+    anchor: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    target: str,
+    strength: float,
+    dialog_message_ids: list[int],
+) -> None:
+    """A picked pose strength: becomes the chat's for new images, and for a
+    `result_id` target also re-renders that image with it
+    (`_run_pose_strength_redo`). The picker dialog is deleted first."""
+    storage: Storage = context.bot_data["storage"]
+    await _delete_messages(context.bot, chat_id, dialog_message_ids)
+    if target == POSE_STRENGTH_CHAT_TARGET:
+        if storage.set_pose_strength(chat_id, strength):
+            await anchor.reply_text(
+                f"🦴 Pose strength {strength:g} for new images in this chat, until /pose off."
+            )
+        else:
+            await anchor.reply_text("No pose is set — send one with /pose first.")
+        return
+
+    pending = storage.get_pending_result(target)
+    if pending is None:
+        await anchor.reply_text("That image has expired — generate a new one.")
+        return
+    storage.set_pose_strength(chat_id, strength)
+    await _run_pose_strength_redo(
+        anchor, context, pending, _deserialize_generation_params(pending["base_params"]), strength
+    )
+
+
+async def _run_pose_strength_redo(
+    anchor: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    pending: dict[str, Any],
+    full_params: GenerationParams,
+    strength: float,
+) -> None:
+    """Render `pending`'s image again with pose strength `strength` on the
+    same noise, so the strength is the only thing that changed: its seed
+    (`_txt2img_seed`) and its whole batch re-run, keeping its slice
+    (`noise_index`) — the same reproduction "🎨 Paint Regions" uses, for
+    the same reason (ComfyUI draws a batch's noise all at once). Without a
+    recoverable seed it falls back to one image on a fresh seed, and says
+    so. Region LoRAs are never auto-applied here: this is a comparison."""
+    storage: Storage = context.bot_data["storage"]
+    client: ComfyClient = context.bot_data["comfy_client"]
+    chat_id = pending["chat_id"]
+    seed = await _txt2img_seed(client, context.bot, pending)
+    keep_index = pending.get("noise_index") or 0
+    params = replace(full_params, pose_controlnet_strength=strength)
+    if seed is not None:
+        params = replace(params, batch_size=max(full_params.batch_size, keep_index + 1))
+    else:
+        params = replace(params, batch_size=1)
+        keep_index = 0
+
+    label = f"Generating with pose strength {strength:g}"
+    status_message = await anchor.reply_text(f"{label}… 0%", disable_notification=True)
+    images = await _run_reporting_errors(
+        status_message,
+        "Generation",
+        "pose strength redo",
+        repeat(
+            client,
+            params,
+            seed=seed,
+            on_progress=_make_progress_callback(status_message, label=label),
+        ),
+    )
+    if images is None:
+        return
+    image = images[keep_index]
+    # Stored as the original's batch size, so this image's own "🦴 Pose
+    # strength…" reproduces it again (its slice of the same batch); a
+    # fresh-seed fallback was a batch of one, and stays one.
+    image = replace(
+        image,
+        full_params=replace(
+            image.full_params, batch_size=full_params.batch_size if seed is not None else 1
+        ),
+        noise_index=keep_index,
+    )
+    await _send_and_store_result(anchor, chat_id, storage, image)
+    await status_message.delete()
+    note = "" if seed is not None else " (new seed — couldn't recover this image's)"
+    await anchor.reply_text(
+        f"Done — pose strength {full_params.pose_controlnet_strength:g} → {strength:g}{note}. "
+        "New images in this chat use it too."
+    )
 
 
 def _make_cancel_callback(
@@ -6077,6 +6743,7 @@ async def _run_stream(
                     label=_pose_label(f"Streaming {count}/{STREAM_HARD_LIMIT}", pose_png),
                 ),
                 pose_png=pose_png,
+                pose_strength=storage.get_pose_strength(chat_id),
             )
             await _send_and_store_result(message, chat_id, storage, images[0])
         await _finish_stream(

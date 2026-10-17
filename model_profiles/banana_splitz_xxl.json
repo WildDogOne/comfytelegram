@@ -189,6 +189,13 @@
       "strength_clip": 1.0,
       "default_enabled": false,
       "trigger_words": "marlow"
+    },
+    {
+      "name": "illustrious/blueberryV1/blueberryV1.safetensors",
+      "strength_model": 1.0,
+      "strength_clip": 1.0,
+      "default_enabled": false,
+      "trigger_words": "blbs"
     }
   ],
   "civitai_base_models": [

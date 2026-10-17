@@ -269,7 +269,12 @@ def _context(tmp_path: Path, upload: bytes = b"", chat_data: dict | None = None)
     context = MagicMock()
     context.chat_data = {} if chat_data is None else chat_data
     context.bot_data = {
-        "settings": MagicMock(allowed_user_ids=None),
+        "settings": MagicMock(
+            allowed_user_ids=None,
+            inpaint_relay_url=None,
+            pose_detector_path=tmp_path / "no-detector.onnx",
+            pose_estimator_path=tmp_path / "no-estimator.onnx",
+        ),
         "storage": storage,
         "profiles": [_profile(pose_controlnet="openpose.safetensors")],
     }

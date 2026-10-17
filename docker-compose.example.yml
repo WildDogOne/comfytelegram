@@ -51,6 +51,9 @@ services:
       # select — staged by hand like the WD14 files (see env.example's
       # SAM_ENCODER_PATH). Without it the feature is simply off.
       - ./models/mobilesam:/app/models/mobilesam:ro
+      # DWPose's two ONNX files (~350MB) for /pose's detection from a photo —
+      # staged by hand too (see env.example's POSE_DETECTOR_PATH).
+      - ./models/dwpose:/app/models/dwpose:ro
       # Read-only access to ComfyUI's own models/loras directory, so the
       # "ℹ️ Info" button on /lora can hash a LoRA file locally and look up
       # its trigger words/base-model compatibility on CivitAI by that hash

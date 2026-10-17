@@ -1,0 +1,970 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Pose editor</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  /* Same fixed dark look as the mask editor (index.html): the skeleton's
+     colours only read properly on black, so there is no light theme. */
+  :root {
+    color-scheme: dark;
+    --bg: #111;
+    --panel: #1b1b1b;
+    --fg: #eee;
+    --muted: #9a9a9a;
+    --accent: #2ea6ff;
+    --danger: #ff5c5c;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overscroll-behavior: none;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    height: 100dvh;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  #status {
+    padding: 8px 14px;
+    min-height: 1.3em;
+    font-size: 14px;
+    text-align: center;
+  }
+  #canvas-wrap {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+    touch-action: none;
+  }
+  #view {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+  }
+  .toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 12px 0;
+  }
+  #main-bar {
+    padding-bottom: calc(10px + env(safe-area-inset-bottom));
+  }
+  #person-bar {
+    background: var(--panel);
+    padding: 8px 12px;
+    margin-top: 8px;
+  }
+  #person-label {
+    font-size: 13px;
+    color: var(--muted);
+    flex-basis: 100%;
+  }
+  button, select {
+    font-size: 15px;
+    padding: 9px 11px;
+    border: none;
+    border-radius: 8px;
+    background: #333;
+    color: var(--fg);
+  }
+  button:disabled {
+    opacity: 0.4;
+  }
+  #done-btn {
+    margin-left: auto;
+    background: var(--accent);
+    color: #fff;
+    font-weight: 600;
+  }
+  #delete-btn {
+    color: var(--danger);
+  }
+  /* Sized for "16:9", not its longest option, so the bar fits a phone. */
+  #aspect-select {
+    width: 82px;
+  }
+  #photo-btn[hidden] {
+    display: none;
+  }
+</style>
+</head>
+<body>
+  <div id="status">Loading…</div>
+  <div id="canvas-wrap"><canvas id="view"></canvas></div>
+  <!-- Always shown, buttons disabled with nobody selected: showing and
+       hiding it would resize the canvas under the user's finger. -->
+  <div id="person-bar" class="toolbar">
+    <span id="person-label">Tap a person to select them</span>
+    <button class="person-tool" id="mirror-btn" type="button" title="Mirror" disabled>⇋ Mirror</button>
+    <button class="person-tool" id="shrink-btn" type="button" title="Smaller" disabled>−</button>
+    <button class="person-tool" id="grow-btn" type="button" title="Bigger" disabled>+</button>
+    <button class="person-tool" id="rotl-btn" type="button" title="Rotate left" disabled>⟲</button>
+    <button class="person-tool" id="rotr-btn" type="button" title="Rotate right" disabled>⟳</button>
+    <button id="hide-btn" type="button" title="Hide this joint" disabled>Hide</button>
+    <button class="person-tool" id="delete-btn" type="button" title="Remove person" disabled>🗑</button>
+  </div>
+  <div id="main-bar" class="toolbar">
+    <button id="add-btn" type="button" disabled>+ Person</button>
+    <button id="undo-btn" type="button" title="Undo" disabled>↶</button>
+    <select id="aspect-select" aria-label="Canvas shape">
+      <option id="photo-aspect" value="" hidden>Photo</option>
+      <option value="0.5625">9:16</option>
+      <option value="0.6667">2:3</option>
+      <option value="0.75">3:4</option>
+      <option value="1">1:1</option>
+      <option value="1.3333">4:3</option>
+      <option value="1.5">3:2</option>
+      <option value="1.7778">16:9</option>
+    </select>
+    <button id="photo-btn" type="button" title="Dim or hide the photo" hidden>🖼</button>
+    <button id="done-btn" type="button" disabled>Done</button>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  // `/pose`'s skeleton editor — see comfytelegram's handlers.py
+  // (`_open_pose_editor`) for the bot side and server.py for the relay.
+  // The pose is OpenPose BODY_18 keypoints in pose-canvas pixels (the
+  // canvas is the background image's size, or a blank one), people drawn
+  // exactly as comfytelegram's `pose.render_pose` will draw the hint: the
+  // same colours for everyone — a colour says which limb it is, never
+  // whose — so what you see here is what ControlNet gets.
+  //
+  // Input: one finger drags a joint, or a body (anywhere in its outline)
+  // to move that whole person, or empty space to pan; two fingers pinch to
+  // zoom and pan. All of it through Pointer Events with the active
+  // pointers kept in a Map (`pointers`), which is all a pinch needs. A
+  // second finger landing a beat after the first — it always does —
+  // would otherwise have started a drag with the first, so starting a
+  // pinch rolls back whatever that drag changed (`cancelGesture`).
+
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) {
+    tg.ready();
+    tg.expand();
+    // Dragging a joint downwards would otherwise swipe the WebApp closed.
+    if (tg.disableVerticalSwipes) tg.disableVerticalSwipes();
+  }
+
+  var token = location.pathname.split("/").filter(Boolean).pop();
+
+  // OpenPose BODY_18, the order `pose_keypoints_2d` uses (pose.py's
+  // KEYPOINT_NAMES). "right" is the figure's own right.
+  var NAMES = [
+    "nose", "neck", "right shoulder", "right elbow", "right wrist",
+    "left shoulder", "left elbow", "left wrist", "right hip", "right knee",
+    "right ankle", "left hip", "left knee", "left ankle", "right eye",
+    "left eye", "right ear", "left ear"
+  ];
+  var N = NAMES.length;
+  // pose.py's LIMBS (limb i drawn in COLORS[i] at 60%) and KEYPOINT_COLORS.
+  var LIMBS = [
+    [1, 2], [1, 5], [2, 3], [3, 4], [5, 6], [6, 7], [1, 8], [8, 9], [9, 10],
+    [1, 11], [11, 12], [12, 13], [1, 0], [0, 14], [14, 16], [0, 15], [15, 17]
+  ];
+  var COLORS = [
+    [255, 0, 0], [255, 85, 0], [255, 170, 0], [255, 255, 0], [170, 255, 0],
+    [85, 255, 0], [0, 255, 0], [0, 255, 85], [0, 255, 170], [0, 255, 255],
+    [0, 170, 255], [0, 85, 255], [0, 0, 255], [85, 0, 255], [170, 0, 255],
+    [255, 0, 255], [255, 0, 170], [255, 0, 85]
+  ];
+  // Left/right keypoint pairs, swapped by "Mirror" so a flipped figure keeps
+  // its anatomy (its left arm is still drawn in the left arm's colours).
+  var MIRROR_PAIRS = [[2, 5], [3, 6], [4, 7], [8, 11], [9, 12], [10, 13], [14, 15], [16, 17]];
+  // A standing, front-facing figure: (x offset from centre, y) as fractions
+  // of its height — the same table as pose.py's `default_person`.
+  var DEFAULT_PERSON = [
+    [0, 0.10], [0, 0.20], [-0.09, 0.20], [-0.12, 0.35], [-0.13, 0.49],
+    [0.09, 0.20], [0.12, 0.35], [0.13, 0.49], [-0.06, 0.50], [-0.06, 0.70],
+    [-0.06, 0.90], [0.06, 0.50], [0.06, 0.70], [0.06, 0.90], [-0.02, 0.08],
+    [0.02, 0.08], [-0.04, 0.09], [0.04, 0.09]
+  ];
+  var MAX_PEOPLE = 12;           // pose.py's MAX_PEOPLE
+  var REFERENCE_SIDE = 512;      // pose.py's line-width reference
+  var HIT_RADIUS_PX = 24;        // finger-sized, in CSS pixels
+  var BODY_PADDING_PX = 18;      // how far outside a body still grabs it
+  var MIN_ZOOM = 0.5, MAX_ZOOM = 8;
+  var UNDO_LIMIT = 60;
+
+  var statusEl = document.getElementById("status");
+  var wrap = document.getElementById("canvas-wrap");
+  var canvas = document.getElementById("view");
+  var ctx = canvas.getContext("2d");
+  var personBar = document.getElementById("person-bar");
+  var personLabel = document.getElementById("person-label");
+  var hideBtn = document.getElementById("hide-btn");
+  var addBtn = document.getElementById("add-btn");
+  var undoBtn = document.getElementById("undo-btn");
+  var aspectSelect = document.getElementById("aspect-select");
+  var photoBtn = document.getElementById("photo-btn");
+  var doneBtn = document.getElementById("done-btn");
+
+  var W = 0, H = 0;              // pose canvas size
+  // people[i] = {pts: [[x, y] | null] * N, ghost: [[x, y]] * N}. `ghost`
+  // remembers where a hidden joint was (or a guess, for one the detector
+  // never placed), so it can be dragged back.
+  var people = [];
+  var selected = -1;             // person index
+  var selectedJoint = -1;        // keypoint index within `selected`
+  var undoStack = [];
+  var background = null;         // HTMLImageElement or null
+  // Where the photo sits on the canvas, in canvas pixels — the whole canvas
+  // until the canvas changes shape, then the photo fitted inside the new
+  // one, centred. Kept for blank canvases too (the original frame), since
+  // it's what every shape change is computed from: going back to a shape
+  // restores the pose exactly instead of shrinking it a little each time.
+  var content = { aspect: 1, x: 0, y: 0, w: 0, h: 0 };
+  // Pixel count every shape keeps — the canvas's at load, so rounding
+  // doesn't creep in over repeated changes.
+  var baseArea = 0;
+  var photoDim = 0.45;           // black over the photo; 1 hides it
+  var view = { scale: 1, tx: 0, ty: 0 };
+  var dpr = window.devicePixelRatio || 1;
+  var dirty = true;
+  var sending = false;
+
+  function setStatus(text) {
+    statusEl.textContent = text;
+  }
+
+  // --- model ---------------------------------------------------------------
+
+  function clonePeople(list) {
+    return list.map(function (p) {
+      return {
+        pts: p.pts.map(function (pt) { return pt ? [pt[0], pt[1]] : null; }),
+        ghost: p.ghost.map(function (pt) { return [pt[0], pt[1]]; })
+      };
+    });
+  }
+
+  function pushUndo() {
+    undoStack.push({
+      people: clonePeople(people), W: W, H: H, selected: selected, selectedJoint: selectedJoint,
+      content: { aspect: content.aspect, x: content.x, y: content.y, w: content.w, h: content.h }
+    });
+    if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+    undoBtn.disabled = false;
+  }
+
+  function undo() {
+    var state = undoStack.pop();
+    if (!state) return;
+    people = state.people;
+    W = state.W;
+    H = state.H;
+    content = state.content;
+    selected = state.selected < people.length ? state.selected : -1;
+    selectedJoint = -1;
+    undoBtn.disabled = undoStack.length === 0;
+    syncAspectSelect();
+    refresh();
+  }
+
+  function visiblePoints(p) {
+    return p.pts.filter(function (pt) { return pt; });
+  }
+
+  // Fill in `ghost` for joints that have no position: the default figure,
+  // fitted (uniform scale + shift, no rotation) to the joints that do.
+  function guessGhosts(p) {
+    var known = [];
+    for (var k = 0; k < N; k++) if (p.pts[k]) known.push(k);
+    var scale, ox, oy, dcx = 0, dcy = 0;
+    if (known.length === 0) {
+      return;
+    }
+    var vcx = 0, vcy = 0;
+    known.forEach(function (k) {
+      vcx += p.pts[k][0]; vcy += p.pts[k][1];
+      dcx += DEFAULT_PERSON[k][0]; dcy += DEFAULT_PERSON[k][1];
+    });
+    vcx /= known.length; vcy /= known.length; dcx /= known.length; dcy /= known.length;
+    var num = 0, den = 0;
+    known.forEach(function (k) {
+      num += Math.pow(p.pts[k][0] - vcx, 2) + Math.pow(p.pts[k][1] - vcy, 2);
+      den += Math.pow(DEFAULT_PERSON[k][0] - dcx, 2) + Math.pow(DEFAULT_PERSON[k][1] - dcy, 2);
+    });
+    scale = known.length >= 2 && den > 0 && num > 0 ? Math.sqrt(num / den) : H * 0.6;
+    ox = vcx - dcx * scale;
+    oy = vcy - dcy * scale;
+    for (var j = 0; j < N; j++) {
+      if (!p.pts[j]) p.ghost[j] = [ox + DEFAULT_PERSON[j][0] * scale, oy + DEFAULT_PERSON[j][1] * scale];
+    }
+  }
+
+  function makePerson(pts) {
+    var p = {
+      pts: pts,
+      ghost: pts.map(function (pt) { return pt ? [pt[0], pt[1]] : [0, 0]; })
+    };
+    guessGhosts(p);
+    return p;
+  }
+
+  function defaultPerson(centerX, figureHeight) {
+    var top = (H - figureHeight) / 2;
+    return makePerson(DEFAULT_PERSON.map(function (d) {
+      return [centerX + d[0] * figureHeight, top + d[1] * figureHeight];
+    }));
+  }
+
+  function personCenter(p) {
+    var pts = visiblePoints(p);
+    if (!pts.length) pts = p.ghost;
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    pts.forEach(function (pt) {
+      minX = Math.min(minX, pt[0]); maxX = Math.max(maxX, pt[0]);
+      minY = Math.min(minY, pt[1]); maxY = Math.max(maxY, pt[1]);
+    });
+    return { x: (minX + maxX) / 2, y: (minY + maxY) / 2, minX: minX, minY: minY, maxX: maxX, maxY: maxY };
+  }
+
+  // Apply fn([x, y]) -> [x, y] to every joint (and ghost) of person p.
+  function transformPerson(p, fn) {
+    p.pts = p.pts.map(function (pt) { return pt ? fn(pt) : null; });
+    p.ghost = p.ghost.map(fn);
+  }
+
+  function parsePose(json) {
+    W = json.canvas_width;
+    H = json.canvas_height;
+    people = (json.people || []).map(function (raw) {
+      var v = raw.pose_keypoints_2d || [];
+      var pts = [];
+      for (var k = 0; k < N; k++) {
+        pts.push(v[k * 3 + 2] > 0 ? [v[k * 3], v[k * 3 + 1]] : null);
+      }
+      return makePerson(pts);
+    }).filter(function (p) { return visiblePoints(p).length > 0; });
+  }
+
+  function poseJson() {
+    return JSON.stringify({
+      canvas_width: W,
+      canvas_height: H,
+      people: people.map(function (p) {
+        var v = [];
+        p.pts.forEach(function (pt) {
+          if (pt) v.push(Math.round(pt[0] * 100) / 100, Math.round(pt[1] * 100) / 100, 1);
+          else v.push(0, 0, 0);
+        });
+        return { pose_keypoints_2d: v };
+      }).filter(function (p) {
+        return p.pose_keypoints_2d.some(function (value, i) { return i % 3 === 2 && value > 0; });
+      })
+    });
+  }
+
+  // --- view ----------------------------------------------------------------
+
+  function toScreen(pt) {
+    return [view.tx + pt[0] * view.scale, view.ty + pt[1] * view.scale];
+  }
+
+  function toPose(x, y) {
+    return [(x - view.tx) / view.scale, (y - view.ty) / view.scale];
+  }
+
+  function fitView() {
+    var rect = wrap.getBoundingClientRect();
+    var scale = Math.min(rect.width / W, rect.height / H) * 0.94;
+    view.scale = scale;
+    view.tx = (rect.width - W * scale) / 2;
+    view.ty = (rect.height - H * scale) / 2;
+    dirty = true;
+  }
+
+  function resizeCanvas() {
+    var rect = wrap.getBoundingClientRect();
+    dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(rect.width * dpr));
+    canvas.height = Math.max(1, Math.round(rect.height * dpr));
+    dirty = true;
+  }
+
+  function color(c, factor) {
+    return "rgb(" + Math.round(c[0] * factor) + "," + Math.round(c[1] * factor) + "," + Math.round(c[2] * factor) + ")";
+  }
+
+  function render() {
+    var rect = wrap.getBoundingClientRect();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#262626";
+    ctx.fillRect(0, 0, rect.width, rect.height);
+
+    // The pose canvas itself: black, or the photo under a dimming veil.
+    ctx.save();
+    ctx.translate(view.tx, view.ty);
+    ctx.scale(view.scale, view.scale);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+    if (background && photoDim < 1) {
+      ctx.drawImage(background, content.x, content.y, content.w, content.h);
+      ctx.fillStyle = "rgba(0,0,0," + photoDim + ")";
+      ctx.fillRect(0, 0, W, H);
+    }
+
+    // Exactly `render_pose`'s geometry: limbs as ellipses as long as the
+    // joints are apart, all people's limb i before limb i+1, joints last.
+    var lineScale = Math.min(W, H) / REFERENCE_SIDE;
+    var halfWidth = Math.max(1, 4 * lineScale);
+    var radius = Math.max(1, 4 * lineScale);
+    LIMBS.forEach(function (limb, i) {
+      ctx.fillStyle = color(COLORS[i], 0.6);
+      people.forEach(function (p) {
+        var a = p.pts[limb[0]], b = p.pts[limb[1]];
+        if (!a || !b) return;
+        var len = Math.hypot(a[0] - b[0], a[1] - b[1]) / 2;
+        ctx.beginPath();
+        ctx.ellipse((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, Math.max(len, 0.01), halfWidth,
+          Math.atan2(a[1] - b[1], a[0] - b[0]), 0, Math.PI * 2);
+        ctx.fill();
+      });
+    });
+    // Joints get a finger-visible minimum size on screen; the hint itself
+    // uses `radius`.
+    var shownRadius = Math.max(radius, 5 / view.scale);
+    people.forEach(function (p) {
+      p.pts.forEach(function (pt, k) {
+        if (!pt) return;
+        ctx.fillStyle = color(COLORS[k], 1);
+        ctx.beginPath();
+        ctx.arc(pt[0], pt[1], shownRadius, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    });
+    ctx.restore();
+
+    // Editor overlay, in screen pixels: the selected person's outline,
+    // their hidden joints as rings, the grabbed joint highlighted.
+    if (selected >= 0 && people[selected]) {
+      var p = people[selected];
+      var c = personCenter(p);
+      var tl = toScreen([c.minX, c.minY]), br = toScreen([c.maxX, c.maxY]);
+      ctx.setLineDash([6, 5]);
+      ctx.strokeStyle = "rgba(255,255,255,0.75)";
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(tl[0] - BODY_PADDING_PX, tl[1] - BODY_PADDING_PX,
+        br[0] - tl[0] + 2 * BODY_PADDING_PX, br[1] - tl[1] + 2 * BODY_PADDING_PX);
+      ctx.setLineDash([3, 3]);
+      p.pts.forEach(function (pt, k) {
+        if (pt) return;
+        var s = toScreen(p.ghost[k]);
+        ctx.strokeStyle = color(COLORS[k], 1);
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(s[0], s[1], 7, 0, Math.PI * 2);
+        ctx.stroke();
+      });
+      ctx.setLineDash([]);
+      if (selectedJoint >= 0 && p.pts[selectedJoint]) {
+        var j = toScreen(p.pts[selectedJoint]);
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(j[0], j[1], 11, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+  }
+
+  function frame() {
+    if (dirty) {
+      dirty = false;
+      render();
+    }
+    requestAnimationFrame(frame);
+  }
+
+  function refresh() {
+    dirty = true;
+    var p = selected >= 0 ? people[selected] : null;
+    Array.prototype.forEach.call(personBar.querySelectorAll(".person-tool"), function (btn) {
+      btn.disabled = !p;
+    });
+    hideBtn.disabled = !(p && selectedJoint >= 0 && p.pts[selectedJoint]);
+    if (p) {
+      var label = "Person " + (selected + 1) + " of " + people.length;
+      if (selectedJoint >= 0) label += " · " + NAMES[selectedJoint];
+      personLabel.textContent = label;
+    } else {
+      personLabel.textContent = people.length
+        ? "Tap a person to select them"
+        : "Nobody here yet — add a person";
+    }
+    addBtn.disabled = people.length >= MAX_PEOPLE;
+  }
+
+  // --- hit testing ---------------------------------------------------------
+
+  // The joint under screen point (x, y): the selected person's (hidden
+  // ones' rings included) win, then whoever's is closest.
+  function jointAt(x, y) {
+    var best = null, bestDist = HIT_RADIUS_PX;
+    function consider(pi, k, pt, hidden) {
+      var s = toScreen(pt);
+      var d = Math.hypot(s[0] - x, s[1] - y);
+      if (d < bestDist) {
+        bestDist = d;
+        best = { person: pi, joint: k, hidden: hidden };
+      }
+    }
+    if (selected >= 0 && people[selected]) {
+      var sp = people[selected];
+      sp.pts.forEach(function (pt, k) { consider(selected, k, pt || sp.ghost[k], !pt); });
+      if (best) return best;
+    }
+    people.forEach(function (p, pi) {
+      p.pts.forEach(function (pt, k) { if (pt) consider(pi, k, pt, false); });
+    });
+    return best;
+  }
+
+  // The person whose (padded) outline contains (x, y) — the selected one
+  // first, else the smallest, so a person in front of a bigger one can
+  // still be grabbed.
+  function personAt(x, y) {
+    var hits = [];
+    people.forEach(function (p, pi) {
+      var c = personCenter(p);
+      var tl = toScreen([c.minX, c.minY]), br = toScreen([c.maxX, c.maxY]);
+      if (x >= tl[0] - BODY_PADDING_PX && x <= br[0] + BODY_PADDING_PX &&
+          y >= tl[1] - BODY_PADDING_PX && y <= br[1] + BODY_PADDING_PX) {
+        hits.push({ person: pi, area: (br[0] - tl[0]) * (br[1] - tl[1]) });
+      }
+    });
+    if (!hits.length) return -1;
+    for (var i = 0; i < hits.length; i++) if (hits[i].person === selected) return selected;
+    hits.sort(function (a, b) { return a.area - b.area; });
+    return hits[0].person;
+  }
+
+  // --- gestures --------------------------------------------------------------
+
+  var pointers = new Map();      // pointerId -> {x, y}, in wrap-relative CSS px
+  var gesture = null;            // {type: "joint"|"person"|"pan", ...} or {type: "pinch", ...}
+
+  function localPoint(evt) {
+    var rect = wrap.getBoundingClientRect();
+    return { x: evt.clientX - rect.left, y: evt.clientY - rect.top };
+  }
+
+  function startSingle(pt) {
+    var hit = jointAt(pt.x, pt.y);
+    if (hit) {
+      pushUndo();
+      selected = hit.person;
+      selectedJoint = hit.joint;
+      var p = people[selected];
+      if (hit.hidden) p.pts[hit.joint] = [p.ghost[hit.joint][0], p.ghost[hit.joint][1]];
+      gesture = {
+        type: "joint", start: pt, undoPushed: true,
+        origin: [p.pts[hit.joint][0], p.pts[hit.joint][1]]
+      };
+      refresh();
+      return;
+    }
+    var pi = personAt(pt.x, pt.y);
+    if (pi >= 0) {
+      pushUndo();
+      selected = pi;
+      selectedJoint = -1;
+      gesture = { type: "person", start: pt, undoPushed: true, snapshot: clonePeople([people[pi]])[0] };
+      refresh();
+      return;
+    }
+    gesture = {
+      type: "pan", start: pt, tx: view.tx, ty: view.ty,
+      selected: selected, selectedJoint: selectedJoint
+    };
+    if (selected >= 0) {
+      selected = -1;
+      selectedJoint = -1;
+      refresh();
+    }
+  }
+
+  function moveSingle(pt) {
+    var dx = (pt.x - gesture.start.x) / view.scale;
+    var dy = (pt.y - gesture.start.y) / view.scale;
+    if (gesture.type === "joint") {
+      var p = people[selected];
+      p.pts[selectedJoint] = [gesture.origin[0] + dx, gesture.origin[1] + dy];
+      p.ghost[selectedJoint] = [p.pts[selectedJoint][0], p.pts[selectedJoint][1]];
+      dirty = true;
+    } else if (gesture.type === "person") {
+      var snap = gesture.snapshot;
+      var person = people[selected];
+      person.pts = snap.pts.map(function (q) { return q ? [q[0] + dx, q[1] + dy] : null; });
+      person.ghost = snap.ghost.map(function (q) { return [q[0] + dx, q[1] + dy]; });
+      dirty = true;
+    } else if (gesture.type === "pan") {
+      view.tx = gesture.tx + (pt.x - gesture.start.x);
+      view.ty = gesture.ty + (pt.y - gesture.start.y);
+      dirty = true;
+    }
+  }
+
+  // Roll back a one-finger drag that turned out to be the start of a pinch.
+  function cancelGesture() {
+    if (gesture && gesture.undoPushed) {
+      var state = undoStack.pop();
+      if (state) {
+        people = state.people;
+        selected = state.selected;
+        selectedJoint = state.selectedJoint;
+        undoBtn.disabled = undoStack.length === 0;
+      }
+    } else if (gesture && gesture.type === "pan") {
+      view.tx = gesture.tx;
+      view.ty = gesture.ty;
+      selected = gesture.selected;
+      selectedJoint = gesture.selectedJoint;
+    }
+    gesture = null;
+    refresh();
+  }
+
+  function pinchState() {
+    var pts = Array.from(pointers.values());
+    return {
+      cx: (pts[0].x + pts[1].x) / 2,
+      cy: (pts[0].y + pts[1].y) / 2,
+      dist: Math.max(1, Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y))
+    };
+  }
+
+  function startPinch() {
+    var s = pinchState();
+    gesture = {
+      type: "pinch", dist: s.dist, scale: view.scale,
+      anchor: toPose(s.cx, s.cy)
+    };
+  }
+
+  function updatePinch() {
+    var s = pinchState();
+    var fit = Math.min(wrap.clientWidth / W, wrap.clientHeight / H);
+    var scale = gesture.scale * s.dist / gesture.dist;
+    view.scale = Math.min(Math.max(scale, fit * MIN_ZOOM), fit * MAX_ZOOM);
+    // Keep the pose point that was under the pinch's midpoint under it.
+    view.tx = s.cx - gesture.anchor[0] * view.scale;
+    view.ty = s.cy - gesture.anchor[1] * view.scale;
+    dirty = true;
+  }
+
+  canvas.addEventListener("pointerdown", function (evt) {
+    if (sending || !W) return;
+    evt.preventDefault();
+    canvas.setPointerCapture(evt.pointerId);
+    pointers.set(evt.pointerId, localPoint(evt));
+    if (pointers.size === 1) {
+      startSingle(localPoint(evt));
+    } else if (pointers.size === 2) {
+      cancelGesture();
+      startPinch();
+    }
+  });
+
+  canvas.addEventListener("pointermove", function (evt) {
+    if (!pointers.has(evt.pointerId)) return;
+    pointers.set(evt.pointerId, localPoint(evt));
+    if (!gesture) return;
+    if (gesture.type === "pinch") {
+      if (pointers.size >= 2) updatePinch();
+    } else {
+      moveSingle(localPoint(evt));
+    }
+  });
+
+  function endPointer(evt) {
+    if (!pointers.has(evt.pointerId)) return;
+    pointers.delete(evt.pointerId);
+    if (!gesture) return;
+    if (gesture.type === "pinch") {
+      // Lifting one finger of a pinch shouldn't turn the other into a drag.
+      if (pointers.size === 0) gesture = null;
+      return;
+    }
+    if (pointers.size === 0) gesture = null;
+  }
+  canvas.addEventListener("pointerup", endPointer);
+  canvas.addEventListener("pointercancel", endPointer);
+
+  // Mouse wheel / trackpad zoom, for Telegram Desktop.
+  canvas.addEventListener("wheel", function (evt) {
+    evt.preventDefault();
+    var pt = localPoint(evt);
+    var anchor = toPose(pt.x, pt.y);
+    var fit = Math.min(wrap.clientWidth / W, wrap.clientHeight / H);
+    var scale = view.scale * Math.exp(-evt.deltaY * 0.0015);
+    view.scale = Math.min(Math.max(scale, fit * MIN_ZOOM), fit * MAX_ZOOM);
+    view.tx = pt.x - anchor[0] * view.scale;
+    view.ty = pt.y - anchor[1] * view.scale;
+    dirty = true;
+  }, { passive: false });
+
+  // --- person tools ----------------------------------------------------------
+
+  function withSelected(fn) {
+    if (selected < 0 || !people[selected]) return;
+    pushUndo();
+    fn(people[selected]);
+    refresh();
+  }
+
+  document.getElementById("mirror-btn").addEventListener("click", function () {
+    withSelected(function (p) {
+      var cx = personCenter(p).x;
+      transformPerson(p, function (pt) { return [2 * cx - pt[0], pt[1]]; });
+      MIRROR_PAIRS.forEach(function (pair) {
+        var a = pair[0], b = pair[1];
+        var t = p.pts[a]; p.pts[a] = p.pts[b]; p.pts[b] = t;
+        var g = p.ghost[a]; p.ghost[a] = p.ghost[b]; p.ghost[b] = g;
+      });
+      if (selectedJoint >= 0) {
+        MIRROR_PAIRS.forEach(function (pair) {
+          if (selectedJoint === pair[0]) selectedJoint = pair[1];
+          else if (selectedJoint === pair[1]) selectedJoint = pair[0];
+        });
+      }
+    });
+  });
+
+  function scaleSelected(factor) {
+    withSelected(function (p) {
+      var c = personCenter(p);
+      transformPerson(p, function (pt) {
+        return [c.x + (pt[0] - c.x) * factor, c.y + (pt[1] - c.y) * factor];
+      });
+    });
+  }
+  document.getElementById("shrink-btn").addEventListener("click", function () { scaleSelected(1 / 1.1); });
+  document.getElementById("grow-btn").addEventListener("click", function () { scaleSelected(1.1); });
+
+  function rotateSelected(degrees) {
+    withSelected(function (p) {
+      var c = personCenter(p);
+      var a = degrees * Math.PI / 180, cos = Math.cos(a), sin = Math.sin(a);
+      transformPerson(p, function (pt) {
+        var x = pt[0] - c.x, y = pt[1] - c.y;
+        return [c.x + x * cos - y * sin, c.y + x * sin + y * cos];
+      });
+    });
+  }
+  document.getElementById("rotl-btn").addEventListener("click", function () { rotateSelected(-15); });
+  document.getElementById("rotr-btn").addEventListener("click", function () { rotateSelected(15); });
+
+  hideBtn.addEventListener("click", function () {
+    withSelected(function (p) {
+      if (selectedJoint < 0 || !p.pts[selectedJoint]) return;
+      p.ghost[selectedJoint] = p.pts[selectedJoint];
+      p.pts[selectedJoint] = null;
+      // A person needs at least one joint; hiding the last one removes them.
+      if (!visiblePoints(p).length) {
+        people.splice(selected, 1);
+        selected = -1;
+      }
+      selectedJoint = -1;
+    });
+  });
+
+  document.getElementById("delete-btn").addEventListener("click", function () {
+    withSelected(function () {
+      people.splice(selected, 1);
+      selected = -1;
+      selectedJoint = -1;
+    });
+  });
+
+  addBtn.addEventListener("click", function () {
+    if (people.length >= MAX_PEOPLE || !W) return;
+    pushUndo();
+    // Put the newcomer in whichever third of the frame is emptiest.
+    var centers = people.map(function (p) { return personCenter(p).x / W; });
+    var spots = [0.5, 0.25, 0.75, 0.375, 0.625];
+    var best = spots[0], bestGap = -1;
+    spots.forEach(function (s) {
+      var gap = centers.reduce(function (m, c) { return Math.min(m, Math.abs(c - s)); }, 1);
+      if (gap > bestGap + 1e-6) { bestGap = gap; best = s; }
+    });
+    people.push(defaultPerson(best * W, H * 0.8));
+    selected = people.length - 1;
+    selectedJoint = -1;
+    refresh();
+  });
+
+  undoBtn.addEventListener("click", undo);
+
+  photoBtn.addEventListener("click", function () {
+    // Dimmed -> faint -> hidden -> dimmed.
+    photoDim = photoDim < 0.5 ? 0.8 : photoDim < 1 ? 1 : 0.45;
+    dirty = true;
+  });
+
+  // --- canvas shape ------------------------------------------------------------
+  //
+  // The generated image takes the canvas's shape, so it has to be
+  // changeable even over a photo. The photo (or a blank canvas's original
+  // frame) is fitted inside the new shape, centred, and the people move
+  // with it, so the skeletons stay on the bodies they were traced from.
+  // Empty space around the photo is simply more picture to generate.
+
+  function fitRect(aspect, w, h) {
+    var rw = Math.min(w, h * aspect), rh = rw / aspect;
+    return { x: (w - rw) / 2, y: (h - rh) / 2, w: rw, h: rh };
+  }
+
+  function syncAspectSelect() {
+    var aspect = W / H, best = null, bestDiff = Infinity;
+    Array.prototype.forEach.call(aspectSelect.options, function (opt) {
+      if (opt.hidden || !opt.value) return;
+      var diff = Math.abs(Math.log(parseFloat(opt.value) / aspect));
+      if (diff < bestDiff - 1e-9) { bestDiff = diff; best = opt.value; }
+    });
+    aspectSelect.value = best;
+  }
+
+  aspectSelect.addEventListener("change", function () {
+    var aspect = parseFloat(aspectSelect.value);
+    // Same pixel count in every shape.
+    var newW = Math.round(Math.sqrt(baseArea * aspect));
+    var newH = Math.round(Math.sqrt(baseArea / aspect));
+    pushUndo();
+    var rect = fitRect(content.aspect, newW, newH);
+    var s = rect.w / content.w;
+    var ox = content.x, oy = content.y;
+    people.forEach(function (p) {
+      transformPerson(p, function (pt) {
+        return [rect.x + (pt[0] - ox) * s, rect.y + (pt[1] - oy) * s];
+      });
+    });
+    content = { aspect: content.aspect, x: rect.x, y: rect.y, w: rect.w, h: rect.h };
+    W = newW;
+    H = newH;
+    fitView();
+    refresh();
+  });
+
+  // --- submit ----------------------------------------------------------------
+
+  doneBtn.addEventListener("click", function () {
+    if (!people.length) {
+      setStatus("Add at least one person first.");
+      return;
+    }
+    sending = true;
+    doneBtn.disabled = true;
+    doneBtn.textContent = "Sending…";
+    var form = new FormData();
+    form.append("pose", poseJson());
+    form.append("init_data", tg ? tg.initData : "");
+    fetch("/jobs/" + encodeURIComponent(token) + "/mask", { method: "POST", body: form })
+      .then(function (resp) {
+        if (!resp.ok) throw new Error("Upload failed: " + resp.status);
+        setStatus("Sent — you can close this.");
+        if (tg) tg.close();
+      })
+      .catch(function (err) {
+        setStatus("Couldn't send the pose (" + err.message + ") — try again.");
+        sending = false;
+        doneBtn.disabled = false;
+        doneBtn.textContent = "Done";
+      });
+  });
+
+  // --- boot --------------------------------------------------------------------
+
+  function start(meta) {
+    parsePose(meta.pose);
+    if (!people.length) people.push(defaultPerson(W / 2, H * 0.8));
+    selected = people.length === 1 ? 0 : -1;
+    // A pose saved in another shape than its photo (changed here before)
+    // has the photo fitted inside, centred — where this page put it.
+    content.aspect = background ? background.naturalWidth / background.naturalHeight : W / H;
+    baseArea = W * H;
+    var rect = fitRect(content.aspect, W, H);
+    content.x = rect.x; content.y = rect.y; content.w = rect.w; content.h = rect.h;
+    if (background) {
+      var photoOption = document.getElementById("photo-aspect");
+      photoOption.value = String(content.aspect);
+      photoOption.hidden = false;
+    }
+    photoBtn.hidden = !meta.pose_has_background;
+    syncAspectSelect();
+    onResize();
+    fitView();
+    addBtn.disabled = false;
+    doneBtn.disabled = false;
+    setStatus("Drag a joint, or a body to move it · two fingers to zoom");
+    refresh();
+    requestAnimationFrame(frame);
+  }
+
+  // Keep the canvas's backing store matching its box whenever that
+  // changes (rotation, the Telegram viewport expanding, the keyboard), and
+  // keep what was in the middle in the middle.
+  var lastSize = null;
+  function onResize() {
+    var rect = wrap.getBoundingClientRect();
+    if (lastSize && W) {
+      view.tx += (rect.width - lastSize.width) / 2;
+      view.ty += (rect.height - lastSize.height) / 2;
+    }
+    lastSize = { width: rect.width, height: rect.height };
+    resizeCanvas();
+  }
+  if (window.ResizeObserver) {
+    new ResizeObserver(onResize).observe(wrap);
+  } else {
+    window.addEventListener("resize", onResize);
+  }
+
+  fetch("/jobs/" + encodeURIComponent(token) + "/meta")
+    .then(function (resp) {
+      if (!resp.ok) throw new Error(resp.status === 404 ? "This editor link has expired." : "HTTP " + resp.status);
+      return resp.json();
+    })
+    .then(function (meta) {
+      if (!meta.pose || !meta.pose.canvas_width || !meta.pose.canvas_height) {
+        throw new Error("This job has no pose to edit.");
+      }
+      if (!meta.pose_has_background) {
+        start(meta);
+        return;
+      }
+      var img = new Image();
+      img.onload = function () {
+        background = img;
+        start(meta);
+      };
+      img.onerror = function () {
+        // Still editable without the photo to trace over.
+        start(meta);
+        setStatus("Couldn't load the photo — editing on black.");
+      };
+      img.src = "/jobs/" + encodeURIComponent(token) + "/image";
+    })
+    .catch(function (err) {
+      setStatus(err.message);
+    });
+})();
+</script>
+</body>
+</html>

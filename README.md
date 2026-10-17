@@ -32,8 +32,9 @@ The bot talks to ComfyUI's HTTP + WebSocket API directly. It doesn't use the
 - **Regional prompts.** `[left]`/`[right]` lines give each side of the
   image its own prompt, so two characters keep their own hair, ears and
   outfits. `/rp` explains the format.
-- **Poses.** `/pose` sets an OpenPose skeleton that every image in the
-  chat follows, regional prompts included.
+- **Poses.** `/pose` takes a photo of people posing (or a ready skeleton),
+  finds their poses, and every image in the chat follows them — regional
+  prompts included. Fix or draw poses by hand in a touch skeleton editor.
 - **Per-model defaults.** `/model` lists the checkpoints ComfyUI has
   installed. A matching [model profile](model_profiles/README.md) supplies
   cfg, steps, sampler, clip skip, prompt prefixes and default LoRAs.
@@ -241,11 +242,46 @@ detailers condition on the global prompt only.
 
 ### Poses
 
-`/pose`, then send an OpenPose skeleton — coloured limbs on a black
-background, as exported by an OpenPose editor — as a photo or a file. (A
-photo captioned `/pose` does it in one step.) From then on every image in
-the chat follows that pose until `/pose off`, and takes its aspect ratio
-at your usual image size. `/pose` on its own shows the current one.
+`/pose`, then send a photo or a file: either a picture of people posing,
+whose poses the bot detects, or an OpenPose skeleton (coloured limbs on
+black) to use as-is. (A photo captioned `/pose` does it in one step, and
+"🦴 Copy pose" under an image's "⋯ More" detects the pose in that image.)
+From then on every image in the chat follows that pose until `/pose off`,
+and takes its aspect ratio at your usual image size. `/pose` on its own
+shows the current one.
+
+"✏️ Edit pose" opens a skeleton editor (hosted by the
+[mask editor relay](inpaint_relay/README.md)) over the photo the pose came
+from: drag a joint to move it, drag a body to move that whole person, and
+use the toolbar to add, remove, mirror, resize or rotate people or hide a
+joint that shouldn't show (a hidden joint stays as a dotted ring you can
+drag back). Two fingers zoom. Without a photo it starts from a standing
+figure on a blank canvas. The shape picker sets the canvas's (and so the
+generated image's) aspect ratio — it starts at the photo's, and a
+different shape fits the photo inside with black around it rather than
+stretching it, the skeletons moving along. If detection finds
+nobody — it misses some close-ups and stylized characters — the editor
+opens over the photo so you can place the skeleton yourself.
+
+How tightly images follow the pose is the ControlNet strength — the model
+profile's `pose_controlnet_strength`, 0.8 unless it says otherwise. Under
+every image made with a pose, "🦴 Pose strength…" renders that image again
+at a strength you pick, with the same seed, so you see exactly what the
+strength changes. The pick sticks for new images in the chat until
+`/pose off`; `/pose` shows the current value with a "🎚 Strength" button to
+change it directly. Lower lets the picture drift from the skeleton (looser,
+often more natural); higher holds it tighter.
+
+Every person is drawn in the same colours: in OpenPose the colour says
+which limb it is (red is always the neck to right shoulder), not whose, and
+that's what the ControlNets were trained on. People are told apart by where
+they are; who is who comes from the prompt.
+
+Detection runs DWPose locally on the CPU (about a second). It needs its two
+model files from [yzd-v/DWPose](https://huggingface.co/yzd-v/DWPose) —
+`yolox_l.onnx` and `dw-ll_ucoco_384.onnx` — in `models/dwpose/` (see
+`POSE_DETECTOR_PATH`/`POSE_ESTIMATOR_PATH` in `env.example`); without them
+`/pose` only takes skeleton images.
 
 It combines with regional prompts: for a two-person pose, `[left]` and
 `[right]` describe the person on each side, and each character stays on

@@ -849,6 +849,7 @@ async def generate(
     auto_region_loras: bool = False,
     on_stage: StageCallback | None = None,
     pose_png: bytes | None = None,
+    pose_strength: float | None = None,
 ) -> list[GeneratedImage]:
     """Resolve profile defaults, build the base txt2img graph, run it.
 
@@ -873,6 +874,8 @@ async def generate(
     `on_stage` hears about each of those passes as it starts.
     `pose_png` is the chat's `/pose` skeleton; unless `overrides` pins the
     size, the image takes the pose's aspect ratio (`pose.size_for_pose`).
+    `pose_strength` overrides the profile's `pose_controlnet_strength` for
+    it (the chat's own pick — `storage.get_pose_strength`).
     """
     params = resolve_generation_params(
         checkpoint,
@@ -886,6 +889,8 @@ async def generate(
     )
     if pose_png is not None:
         params = _with_pose(params, pose_png, overrides or {})
+        if pose_strength is not None:
+            params = replace(params, pose_controlnet_strength=pose_strength)
     prompt_graph, save_node_id = build_txt2img(params)
     logger.info(
         "Submitting txt2img: checkpoint=%s cfg=%s steps=%s regions=%s pose=%s",
@@ -1464,13 +1469,16 @@ async def repeat(
     auto_region_loras: bool = False,
     on_stage: StageCallback | None = None,
     profiles: list[ModelProfile] | None = None,
+    seed: int | None = None,
 ) -> list[GeneratedImage]:
     """Re-run an entire base txt2img request — all `batch_size` images — with
     the same resolved settings but a forced-fresh seed. Backs the chat-level
     "🔁 Generate Again" button, for quickly cranking out more variations of
     the same prompt without retyping it or picking a specific image.
-    `auto_region_loras`/`on_stage` as in `generate`."""
-    fresh_params = replace(full_params, seed=None)
+    `auto_region_loras`/`on_stage` as in `generate`. `seed` pins the seed
+    instead — "🦴 Pose strength…" re-running one image's batch to compare a
+    setting on the same noise."""
+    fresh_params = replace(full_params, seed=seed)
     prompt_graph, save_node_id = build_txt2img(fresh_params)
     logger.info(
         "Repeating: checkpoint=%s cfg=%s steps=%s",

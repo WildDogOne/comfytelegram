@@ -12,7 +12,9 @@ no public exposure) and a Telegram client opening this page as a WebApp
 "mask_prompt" or "regions") just picks which fields the editor page shows
 next to its canvas — every job submits a mask either way, through the same
 endpoint, and this relay never interprets any of it beyond that one
-rendering decision.
+rendering decision. The one exception is `mode="pose"` (`/pose`'s editor):
+a different page (`static/pose.html`) that submits OpenPose keypoint JSON
+instead of a mask — still opaque here, just carried back.
 
 Job state lives in memory only — a restart here just orphans whatever jobs
 were in flight; comfytelegram's own `inpaint_job` table times them out on
@@ -180,7 +182,19 @@ class Job:
     #: left blank. Always `None` for every other mode. `positive_prompt`/`negative_prompt` carry the
     #: whole-image prompt alongside them, same as for "mask_prompt".
     region_prompts: list[str | None] | None = None
+    #: A "pose" job's OpenPose JSON: what the editor opens with
+    #: (`meta["pose"]`, an object), then the submitted pose (a JSON string,
+    #: `submit_mask`). Opaque here either way — comfytelegram validates it.
+    #: `pose_has_background` says whether `image` is a photo to trace over
+    #: or just a blank canvas (where the page has no photo to dim or hide).
+    pose: Any = None
+    pose_has_background: bool = False
     init_data: str | None = None
+
+
+#: Largest pose JSON `submit_mask` accepts — a dozen people's 18 keypoints
+#: are about 6KB.
+MAX_POSE_BYTES = 64 * 1024
 
 
 #: Magic-byte prefixes for the image formats comfytelegram can upload,
@@ -415,6 +429,8 @@ async def create_job(request: Request) -> dict[str, str]:
         initial_mask=initial_mask or None,
         denoise_default=_parse_denoise_default(meta.get("denoise_default")),
         region_prompts=_parse_region_prompts(meta.get("regions")),
+        pose=meta.get("pose") if isinstance(meta.get("pose"), dict) else None,
+        pose_has_background=bool(meta.get("pose_has_background", False)),
     )
     return {"token": token}
 
@@ -456,8 +472,9 @@ async def mask_editor_page(token: str) -> FileResponse:
     without it, Telegram's webview could keep running an old editor for a
     while after the relay was redeployed with a new one."""
     _prune_expired_jobs()
-    _get_job_or_404(token)
-    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+    job = _get_job_or_404(token)
+    page = "pose.html" if job.mode == "pose" else "index.html"
+    return FileResponse(STATIC_DIR / page, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/jobs/{token}/image")
@@ -507,6 +524,8 @@ async def job_meta(token: str) -> JSONResponse:
             "has_initial_mask": job.initial_mask is not None,
             "denoise_default": job.denoise_default,
             "regions": job.region_prompts,
+            "pose": job.pose if job.status != "submitted" else None,
+            "pose_has_background": job.pose_has_background,
         }
     )
 
@@ -541,8 +560,20 @@ async def submit_mask(token: str, request: Request) -> dict[str, bool]:
     _prune_expired_jobs()
     job = _get_job_or_404(token)
     form = await request.form()
-    mask_file = form.get("mask")
     init_data = form.get("init_data")
+    if job.mode == "pose":
+        # `/pose`'s editor submits keypoints, not a mask: a `pose` text
+        # field (OpenPose JSON) plus `init_data`, nothing else.
+        pose = form.get("pose")
+        if not isinstance(pose, str) or not pose or init_data is None:
+            raise HTTPException(status_code=400, detail="Both 'pose' and 'init_data' are required")
+        if len(pose.encode()) > MAX_POSE_BYTES:
+            raise HTTPException(status_code=413, detail="Pose data too large")
+        job.pose = pose
+        job.init_data = str(init_data)
+        job.status = "submitted"
+        return {"ok": True}
+    mask_file = form.get("mask")
     if mask_file is None or init_data is None:
         raise HTTPException(status_code=400, detail="Both 'mask' and 'init_data' are required")
     job.mask = await mask_file.read()
@@ -585,7 +616,10 @@ async def job_result(token: str) -> JSONResponse:
     return JSONResponse(
         {
             "status": "submitted",
-            "mask_base64": base64.b64encode(job.mask).decode("ascii"),
+            "mask_base64": (
+                base64.b64encode(job.mask).decode("ascii") if job.mask is not None else None
+            ),
+            "pose": job.pose if job.mode == "pose" else None,
             "positive": job.positive_prompt,
             "negative": job.negative_prompt,
             "denoise": job.denoise,

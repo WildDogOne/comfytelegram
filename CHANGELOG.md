@@ -18,6 +18,27 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in the model profile — set for FurryToonMix and Banana Splitz
   (`illustriousXL_v10_openpose`); other checkpoints say so and generate
   without the pose.
+- **🦴 Pose detection and editor**: send `/pose` a photo of people posing
+  instead of a skeleton and it finds everyone's pose (DWPose, run locally —
+  stage its two model files, see `env.example`). **🦴 Copy pose** (under
+  "⋯ More") does the same for a generated image: same pose, new prompt.
+  **✏️ Edit pose** opens a touch skeleton editor in the mask-editor relay,
+  over the photo the pose came from: drag joints, drag a body to move that
+  person, add, remove, mirror, resize and rotate people, hide joints that
+  aren't visible, two fingers to zoom. Without a photo it starts from a
+  standing figure on a blank canvas. The canvas shape (and so the
+  generated image's) can be changed either way — over a photo, the photo
+  is fitted inside with black around it, never stretched. If nobody
+  is detected, the editor opens over the photo so you can place the
+  skeleton yourself. Every person is drawn in the same OpenPose colours on
+  purpose — the colour says which limb, the ControlNet tells people apart
+  by position.
+- **🦴 Pose strength…** under every image generated with a pose: pick a
+  strength (0.3–1.0, or type one up to 2) and that image is rendered again
+  with the same seed, so only the pose's hold changes. The pick also
+  becomes the chat's pose strength for new images until `/pose off`;
+  `/pose` shows it and has a **🎚 Strength** button to set it without a
+  re-render.
 - **🎨 Paint Regions** (under "⋯ More"): paint the two regions of a
   regional prompt instead of splitting the picture into straight halves.
   Generate something like "2boys, cuddling", tap the button, and the mask

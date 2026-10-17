@@ -89,12 +89,15 @@ pose, works with `/rp`) is done. Still open, in order:
   `--xinsir-sticks` thicker limbs), harder poses (overlapping limbs,
   people touching), and whether `anima-lllite-any-test-like-v2` does
   anything with a pose on Anima.
-- [ ] **🦴 Use pose button**: extract the pose from any image (page 2 of
-  the image keyboard, and uploaded photos) with comfyui_controlnet_aux's
-  `DWPreprocessor` and make it the chat's pose — "same pose, different
-  character".
-- [ ] **OpenPose JSON upload**: render the keypoints in Python. Gives exact
-  per-person keypoints for the next two items.
+- [x] ~~**🦴 Use pose button**~~ — shipped as "🦴 Copy pose" plus detection
+  on `/pose` uploads (DWPose run in-process, `pose_detect.py`), with a
+  body-only skeleton editor in the relay (`static/pose.html`). Keypoints
+  are stored per chat (`chat_pose.pose_json`), so the items below can use
+  them.
+- [ ] **OpenPose JSON upload**: accept a `.json` file from other editors
+  (`parse_pose_json` already reads that format).
+- [ ] **Hands and face in the editor**: body only for now. Hand keypoints
+  need the hand-trained ControlNets and are fiddly to place on a phone.
 - [ ] **Regions from the pose**: per-person boxes (left to right) instead of
   fixed halves, so `[left]`/`[right]` mean "person 1/2" even when the
   people don't split the canvas evenly.

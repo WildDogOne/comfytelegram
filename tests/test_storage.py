@@ -319,6 +319,7 @@ def test_inpaint_job_roundtrip_carries_message_thread_id(storage: Storage):
         "message_thread_id": 827915,
         "kind": "hand",
         "editor_message_id": None,
+        "background_file_id": None,
     }
 
 
@@ -380,6 +381,7 @@ def test_inpaint_job_message_thread_id_column_is_added_to_a_pre_existing_table(t
             "message_thread_id": 5,
             "kind": "hand",
             "editor_message_id": None,
+            "background_file_id": None,
         }
     ]
     s2.close()

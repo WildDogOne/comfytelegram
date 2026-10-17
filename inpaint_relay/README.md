@@ -22,7 +22,11 @@ the bot itself.
   the rest are two regions, tinted red and blue, each with its own prompt
   field next to the whole-image positive/negative; no denoise). One blob comes in from comfytelegram (the source image);
   one comes back from the browser (the mask, plus the prompt fields when
-  present).
+  present). The exception is "pose" (`/pose`'s skeleton editor): a
+  separate page, `static/pose.html`, that opens with OpenPose keypoint JSON
+  from the job's `meta` (over the uploaded image as a tracing guide, or a
+  blank canvas) and submits edited keypoint JSON in place of a mask —
+  still opaque here; comfytelegram validates and renders it.
 - Serves the editor page (`static/index.html` — its own JS reads
   `GET /jobs/{token}/meta`'s `mode` to decide whether to show the prompt
   fields, that's the only branch; a "mask_prompt" job's `references` —

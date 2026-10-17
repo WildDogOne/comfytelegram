@@ -199,6 +199,21 @@ class Settings(BaseSettings):
             "pinned to a commit so it can't drift from the encoder above."
         ),
     )
+    pose_detector_path: Path = Field(
+        default=PROJECT_ROOT / "models" / "dwpose" / "yolox_l.onnx",
+        description=(
+            "DWPose's YOLOX person detector (ONNX) behind /pose's detection from a photo "
+            "(see pose_detect.py). Staged manually — https://huggingface.co/yzd-v/DWPose's "
+            "yolox_l.onnx. Detection is off unless this and POSE_ESTIMATOR_PATH exist."
+        ),
+    )
+    pose_estimator_path: Path = Field(
+        default=PROJECT_ROOT / "models" / "dwpose" / "dw-ll_ucoco_384.onnx",
+        description=(
+            "DWPose's keypoint estimator (ONNX), the other half of POSE_DETECTOR_PATH — "
+            "https://huggingface.co/yzd-v/DWPose's dw-ll_ucoco_384.onnx."
+        ),
+    )
 
     @field_validator("inpaint_relay_url")
     @classmethod
