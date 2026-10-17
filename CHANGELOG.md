@@ -116,6 +116,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Mask editor info is folded away**: the detailer settings and LoRA note
+  above the prompt fields now sit in a collapsed "Info" dropdown, giving
+  the prompts and canvas more room. Needs a relay redeploy.
 - **✏️ Detail Prompt's `$` menu lists all your characters and favorites**:
   with a lot saved, the ones at the end of the list used to be left out
   (and some lost their preview). Its search is looser too: letters typed in

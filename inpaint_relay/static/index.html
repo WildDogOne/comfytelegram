@@ -185,11 +185,18 @@
     flex-direction: column;
     gap: 8px;
   }
-  #readonly-info,
-  #lora-info {
+  /* Detailer settings and the LoRA note — reference only, so folded away
+     by default to give the prompt fields (and the canvas) the room. */
+  #info-details {
     font-size: 12px;
     line-height: 1.4;
     color: #9a9a9a;
+  }
+  #info-details summary {
+    cursor: pointer;
+  }
+  #info-details[open] summary {
+    margin-bottom: 4px;
   }
   .field-label {
     font-size: 13px;
@@ -367,8 +374,11 @@
   </button>
   <div id="options-body">
   <div id="prompt-fields" style="display: none;">
-    <div id="readonly-info"></div>
-    <div id="lora-info" style="display: none;"></div>
+    <details id="info-details">
+      <summary>Info</summary>
+      <div id="readonly-info"></div>
+      <div id="lora-info" style="display: none;"></div>
+    </details>
     <div>
       <div class="field-label"><span id="positive-label">Positive</span> <span class="field-hint" id="positive-hint">— $name inserts a character or favorite</span></div>
       <textarea
@@ -2291,6 +2301,9 @@
           ". <lora:…> tags add to these (replace them with “Disable LoRAs” checked)."
         : "No LoRAs on this image — <lora:…> tags add one for this pass.";
       loraInfoEl.style.display = "block";
+    }
+    if (!readonlyEl.textContent && loraInfoEl.style.display === "none") {
+      document.getElementById("info-details").style.display = "none";
     }
     denoiseOverride.addEventListener("change", function () {
       denoiseInput.disabled = !denoiseOverride.checked;
