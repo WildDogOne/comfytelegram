@@ -2183,6 +2183,16 @@ async def _process_one_inpaint_job(
     detail_denoise = result.get("denoise")
     tile_controlnet_choice = result.get("tile_controlnet")
     detailer_disable_lora_choice = result.get("detailer_disable_lora")
+    if job["kind"] == "detail" and _detail_prefill_is_raw(full_params):
+        detail_prompt, detail_negative_prompt = _build_typed_detail_prompt(
+            storage,
+            chat_id,
+            full_params,
+            application.bot_data["profiles"],
+            detail_prompt,
+            detail_negative_prompt,
+            detailer_disable_lora_choice,
+        )
     source_bytes = await _fetch_source_image(
         client,
         application.bot,
@@ -2546,6 +2556,80 @@ def _init_data_user_id(init_data: dict[str, str]) -> int | None:
         return int(json.loads(init_data["user"])["id"])
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _detail_prefill_is_raw(full_params: GenerationParams) -> bool:
+    """Whether "✏️ Detail Prompt"'s editor pre-fills `full_params`' prompt
+    as typed (`raw_*`) rather than as built — checked both when the editor
+    opens and when its submission comes back, so the two always agree. Not
+    for a regional image, whose typed prompt is the whole `/rp` layout, nor
+    one with no typed prompt recorded."""
+    return not full_params.regions and bool(full_params.raw_positive_prompt)
+
+
+def _detail_prompt_prefill(full_params: GenerationParams) -> dict[str, str]:
+    """The `positive`/`negative` editor meta for "✏️ Detail Prompt": what was
+    typed for this image (see `_detail_prefill_is_raw`), so the profile
+    prefixes, the active character and the LoRAs' trigger words aren't
+    there to be pruned — `_build_typed_detail_prompt` adds the prefixes and
+    trigger words back on submission, like for a typed prompt."""
+    if _detail_prefill_is_raw(full_params):
+        return {
+            "positive": full_params.raw_positive_prompt,
+            "negative": full_params.raw_negative_prompt,
+        }
+    return {"positive": full_params.positive_prompt, "negative": full_params.negative_prompt}
+
+
+def _build_typed_detail_prompt(
+    storage: Storage,
+    chat_id: int,
+    full_params: GenerationParams,
+    profiles: list[ModelProfile],
+    positive: str | None,
+    negative: str | None,
+    disable_lora_choice: bool | None,
+) -> tuple[str | None, str | None]:
+    """A "✏️ Detail Prompt" submission pre-filled as typed (see
+    `_detail_prompt_prefill`), built up the way `resolve_generation_params`
+    builds a typed prompt: this chat's profile prefixes in front, and on the
+    positive side the trigger words of the image's own LoRAs that still
+    apply to this pass — none with "Disable LoRAs" on, none for one a
+    `<lora:…:0>` tag switches off. Typed `<lora:…>` tags stay in the text;
+    `generation._apply_detail_loras` adds their trigger words. A blank
+    field (None) is left alone — it means "keep the image's own", which is
+    built already. Redo stores the result, so it replays what ran."""
+    checkpoint = full_params.checkpoint
+    profile = resolve_profile(checkpoint, profiles)
+    profile = apply_profile_override(profile, checkpoint, storage.get_override(chat_id, checkpoint))
+    if profile is None:
+        return positive, negative
+    if positive is not None:
+        disable_lora = (
+            disable_lora_choice
+            if disable_lora_choice is not None
+            else profile.defaults.detailer_disable_lora
+        )
+        typed = {
+            lora.name: lora
+            for text in (positive, negative)
+            for lora in resolve_detail_loras(text, profile)[1]
+        }
+        by_name = {lora.name: lora for lora in profile.loras}
+        trigger_words = join_nonempty(
+            []
+            if disable_lora
+            else [
+                by_name[spec.name].trigger_words
+                for spec in full_params.loras
+                if spec.name in by_name
+                and (spec.name not in typed or typed[spec.name].default_enabled)
+            ]
+        )
+        positive = join_nonempty([profile.positive_prompt_prefix, trigger_words, positive])
+    if negative is not None:
+        negative = join_nonempty([profile.negative_prompt_prefix, negative])
+    return positive, negative
 
 
 async def _expand_detail_prompt_references(
@@ -3976,7 +4060,7 @@ async def _open_mask_editor(
     # detailer_disable_lora isn't live-refreshed for "fix_drawn" either
     # (see generation.py's `_DETAILER_TUNABLE_KINDS`) and there's no
     # tile-ControlNet checkbox for it. The prompt fields pre-fill with
-    # this image's own current prompt — the usual reason to open this is
+    # this image's prompt as typed (`_detail_prompt_prefill`) — the usual reason to open this is
     # to cut most of a scene-wide prompt down to what the marked region
     # actually needs, not type one from scratch — but nothing about them
     # is saved anywhere once the editor closes (see
@@ -3999,8 +4083,7 @@ async def _open_mask_editor(
             meta.update(
                 {
                     "mode": "mask_prompt",
-                    "positive": full_params.positive_prompt,
-                    "negative": full_params.negative_prompt,
+                    **_detail_prompt_prefill(full_params),
                     "readonly": _detail_prompt_readonly_info(live_profile),
                     "tile_controlnet_available": bool(
                         live_profile and live_profile.tile_controlnet

@@ -349,9 +349,8 @@ def _apply_detail_loras(
     removes it), unless `detailer_disable_lora` is set — by the editor's
     checkbox or the profile — in which case they replace them: the inherited
     LoRAs go, the typed ones still apply. A newly added LoRA's
-    `trigger_words` go in front of the prompt, unless already in it (the
-    editor pre-fills the image's own prompt, which carries the inherited
-    LoRAs' trigger words). A name the profile doesn't list is dropped — the
+    `trigger_words` go in front of the prompt, unless already in it (a
+    regional image's editor pre-fills the built prompt, which carries them). A name the profile doesn't list is dropped — the
     handler already warned about it when the editor submitted, and stored
     the prompt without it for redo.
 

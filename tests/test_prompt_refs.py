@@ -193,14 +193,16 @@ async def test_generate_message_reports_an_unknown_name_without_generating(stora
 # --- "✏️ Detail Prompt" ---------------------------------------------------------
 
 
-async def _run_detail_job(storage: Storage, positive, negative, *, user_id=7, profiles=()):
+async def _run_detail_job(
+    storage: Storage, positive, negative, *, user_id=7, profiles=(), params=None, disable_lora=None
+):
     result_id = "abc123"
     storage.store_pending_result(
         result_id=result_id,
         chat_id=42,
         file_id="presource123",
         filename="presource.png",
-        base_params=_serialize_generation_params(_params()),
+        base_params=_serialize_generation_params(params or _params()),
     )
     storage.save_character(42, "alice", "blonde hair, cat ears", "tail")
     storage.save_favorite(user_id, "wlop", "artist", "by wlop")
@@ -228,6 +230,7 @@ async def _run_detail_job(storage: Storage, positive, negative, *, user_id=7, pr
         "negative": negative,
         "denoise": None,
         "tile_controlnet": None,
+        "detailer_disable_lora": disable_lora,
         "init_data": "raw-init-data",
     }
     with (
@@ -267,3 +270,76 @@ async def test_detail_prompt_drops_an_unknown_name_with_a_warning(storage):
     assert kwargs["detail_prompt"] == "detailed eyes"
     warnings = [c.args[1] for c in send_message.await_args_list if "$nobody" in c.args[1]]
     assert warnings == ["⚠️ Nothing saved under $nobody — left it out of the detail prompt."]
+
+
+def _typed_params(**overrides):
+    from comfytelegram.workflows import LoraSpec
+
+    fields = {
+        "positive_prompt": "masterpiece, marlow, anthro, blonde hair, a fox",
+        "negative_prompt": "worst quality, tail",
+        "raw_positive_prompt": "$alice, a fox",
+        "raw_negative_prompt": "",
+        "loras": [LoraSpec("marlow.safetensors", 0.9, 0.9)],
+    }
+    fields.update(overrides)
+    return _params().__class__(checkpoint="ckpt.safetensors", **fields)
+
+
+def _typed_profile(**overrides):
+    from comfytelegram.profiles import LoraDefault, ModelProfile
+
+    return ModelProfile(
+        match=["ckpt*"],
+        display_name="Typed",
+        positive_prompt_prefix="masterpiece",
+        negative_prompt_prefix="worst quality",
+        loras=[
+            LoraDefault(
+                name="marlow.safetensors", default_enabled=True, trigger_words="marlow, anthro"
+            )
+        ],
+        **overrides,
+    )
+
+
+def test_detail_prompt_editor_prefills_the_prompt_as_typed():
+    from comfytelegram.handlers import _detail_prompt_prefill
+
+    assert _detail_prompt_prefill(_typed_params()) == {"positive": "$alice, a fox", "negative": ""}
+
+
+def test_detail_prompt_editor_prefills_the_built_prompt_without_a_typed_one():
+    from comfytelegram.handlers import _detail_prompt_prefill
+    from comfytelegram.workflows import RegionSpec
+
+    regional = _typed_params(regions=[RegionSpec("left", "a", 0.0, 0.0, 0.5, 1.0)])
+    for params in (_typed_params(raw_positive_prompt=""), regional):
+        assert _detail_prompt_prefill(params)["positive"] == params.positive_prompt
+
+
+@pytest.mark.asyncio
+async def test_typed_detail_prompt_gets_prefixes_and_inherited_trigger_words_back(storage):
+    kwargs, _ = await _run_detail_job(
+        storage, "detailed paws", "blurry", params=_typed_params(), profiles=[_typed_profile()]
+    )
+
+    assert kwargs["detail_prompt"] == "masterpiece, marlow, anthro, detailed paws"
+    assert kwargs["detail_negative_prompt"] == "worst quality, blurry"
+
+
+@pytest.mark.asyncio
+async def test_typed_detail_prompt_drops_trigger_words_of_loras_that_dont_apply(storage):
+    profiles = [_typed_profile()]
+    params = _typed_params()
+    disabled, _ = await _run_detail_job(
+        storage, "paws", None, params=params, profiles=profiles, disable_lora=True
+    )
+    switched_off, _ = await _run_detail_job(
+        storage, "paws, <lora:marlow:0>", None, params=params, profiles=profiles
+    )
+
+    assert disabled["detail_prompt"] == "masterpiece, paws"
+    assert switched_off["detail_prompt"] == "masterpiece, paws, <lora:marlow:0>"
+    # A blank field stays blank: post_process keeps the image's own, built already.
+    assert disabled["detail_negative_prompt"] is None

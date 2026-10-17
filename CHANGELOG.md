@@ -116,6 +116,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **✏️ Detail Prompt starts from the prompt as you typed it**: the editor
+  now pre-fills the image's prompt without the profile's quality tags, the
+  active character's prompt or LoRA trigger words, and the bot adds the
+  prefixes and trigger words back when you tap Done (only for LoRAs that
+  still run in that pass). They used to be in the text already and got
+  added a second time. Regional images still pre-fill the full prompt.
 - **Mask editor info is folded away**: the detailer settings and LoRA note
   above the prompt fields now sit in a collapsed "Info" dropdown, giving
   the prompts and canvas more room. Needs a relay redeploy.
