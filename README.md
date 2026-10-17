@@ -267,9 +267,9 @@ How tightly images follow the pose is the ControlNet strength — the model
 profile's `pose_controlnet_strength`, 0.8 unless it says otherwise. Under
 every image made with a pose, "🦴 Pose strength…" renders that image again
 at a strength you pick, with the same seed, so you see exactly what the
-strength changes. The pick sticks for new images in the chat until
-`/pose off`; `/pose` shows the current value with a "🎚 Strength" button to
-change it directly. Lower lets the picture drift from the skeleton (looser,
+strength changes. That only affects that image (and what's made from it);
+new images keep the chat's strength, which `/pose` shows with a
+"🎚 Strength" button to change it (until `/pose off`). Lower lets the picture drift from the skeleton (looser,
 often more natural); higher holds it tighter.
 
 Every person is drawn in the same colours: in OpenPose the colour says

@@ -35,10 +35,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   by position.
 - **🦴 Pose strength…** under every image generated with a pose: pick a
   strength (0.3–1.0, or type one up to 2) and that image is rendered again
-  with the same seed, so only the pose's hold changes. The pick also
-  becomes the chat's pose strength for new images until `/pose off`;
-  `/pose` shows it and has a **🎚 Strength** button to set it without a
-  re-render.
+  with the same seed, so only the pose's hold changes. The pick stays
+  with that image and what's made from it; new images use the chat's
+  pose strength, which `/pose` shows with a **🎚 Strength** button to set
+  it (until `/pose off`).
 - **🎨 Paint Regions** (under "⋯ More"): paint the two regions of a
   regional prompt instead of splitting the picture into straight halves.
   Generate something like "2boys, cuddling", tap the button, and the mask

@@ -497,11 +497,12 @@ POSE_JOB_KIND = "pose"
 #: of `POSE_STRENGTH_PRESETS`, whose buttons are `ps:<target>:<value>` (or
 #: `POSE_STRENGTH_CUSTOM`/`POSE_STRENGTH_CLOSE`). A `result_id` target
 #: re-renders that image at the picked strength on the same noise
-#: (`_run_pose_strength_redo`); `POSE_STRENGTH_CHAT_TARGET` (from `/pose`)
-#: only sets the chat's strength. Either way the pick becomes the chat's
-#: pose strength for new images (`storage.set_pose_strength`) — finding the
-#: right strength on one image and then having to pick it again for every
-#: next one would defeat the point.
+#: (`_run_pose_strength_redo`) and leaves the chat's setting alone — the
+#: strength belongs to that image (its `full_params`, so its own "🔁
+#: Generate Again"/next pick start from it), like "🎚️ Redo…"'s denoise.
+#: `POSE_STRENGTH_CHAT_TARGET` (the `/pose` reply's "🎚 Strength") is the
+#: one place that sets the chat's strength for new images
+#: (`storage.set_pose_strength`).
 POSE_STRENGTH_CALLBACK_KIND = "pose_strength"
 POSE_STRENGTH_CALLBACK_PREFIX = "ps:"
 POSE_STRENGTH_CHAT_TARGET = "chat"
@@ -4602,8 +4603,8 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         current = full_params.pose_controlnet_strength
         await query.message.reply_text(
             f"🦴 Render this image again with another pose strength (now {current:g}) — "
-            "same seed, so only the pose's hold changes. The pick also becomes this "
-            "chat's pose strength for new images.",
+            "same seed, so only the pose's hold changes. New images keep the chat's "
+            "strength — set that with /pose → 🎚 Strength.",
             reply_markup=_pose_strength_keyboard(result_id, current),
         )
         return
@@ -6631,9 +6632,10 @@ async def _apply_pose_strength(
     strength: float,
     dialog_message_ids: list[int],
 ) -> None:
-    """A picked pose strength: becomes the chat's for new images, and for a
-    `result_id` target also re-renders that image with it
-    (`_run_pose_strength_redo`). The picker dialog is deleted first."""
+    """A picked pose strength: for `POSE_STRENGTH_CHAT_TARGET` it becomes the
+    chat's for new images; for a `result_id` target it only re-renders that
+    image with it (`_run_pose_strength_redo`), leaving the chat's alone. The
+    picker dialog is deleted first."""
     storage: Storage = context.bot_data["storage"]
     await _delete_messages(context.bot, chat_id, dialog_message_ids)
     if target == POSE_STRENGTH_CHAT_TARGET:
@@ -6649,7 +6651,6 @@ async def _apply_pose_strength(
     if pending is None:
         await anchor.reply_text("That image has expired — generate a new one.")
         return
-    storage.set_pose_strength(chat_id, strength)
     await _run_pose_strength_redo(
         anchor, context, pending, _deserialize_generation_params(pending["base_params"]), strength
     )
@@ -6711,8 +6712,7 @@ async def _run_pose_strength_redo(
     await status_message.delete()
     note = "" if seed is not None else " (new seed — couldn't recover this image's)"
     await anchor.reply_text(
-        f"Done — pose strength {full_params.pose_controlnet_strength:g} → {strength:g}{note}. "
-        "New images in this chat use it too."
+        f"Done — pose strength {full_params.pose_controlnet_strength:g} → {strength:g}{note}."
     )
 
 
