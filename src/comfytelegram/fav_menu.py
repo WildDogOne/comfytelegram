@@ -35,7 +35,7 @@ from __future__ import annotations
 import re
 
 from telegram import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import InlineKeyboardButtonLimit
+from telegram.constants import InlineKeyboardButtonLimit, KeyboardButtonStyle
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
@@ -225,7 +225,11 @@ def _entry_keyboard(fav: dict) -> InlineKeyboardMarkup:
     if len(fav["text"]) <= InlineKeyboardButtonLimit.MAX_COPY_TEXT:
         action_row.append(InlineKeyboardButton("📋 Copy", copy_text=CopyTextButton(fav["text"])))
     action_row.append(InlineKeyboardButton("✏️ Edit", callback_data=f"fv:ed:{fav['name']}"))
-    action_row.append(InlineKeyboardButton("🗑 Delete", callback_data=f"fv:d:{fav['name']}"))
+    action_row.append(
+        InlineKeyboardButton(
+            "🗑 Delete", callback_data=f"fv:d:{fav['name']}", style=KeyboardButtonStyle.DANGER
+        )
+    )
     return InlineKeyboardMarkup(
         [
             action_row,
@@ -238,7 +242,11 @@ def _delete_confirm_keyboard(fav: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🗑 Yes, delete", callback_data=f"fv:dy:{fav['name']}"),
+                InlineKeyboardButton(
+                    "🗑 Yes, delete",
+                    callback_data=f"fv:dy:{fav['name']}",
+                    style=KeyboardButtonStyle.DANGER,
+                ),
                 InlineKeyboardButton("Cancel", callback_data=f"fv:e:{fav['name']}"),
             ]
         ]

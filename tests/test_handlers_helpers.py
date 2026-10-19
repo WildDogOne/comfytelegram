@@ -334,6 +334,19 @@ def test_characters_keyboard_marks_active_character():
     assert "char:clear" in labels.values()
 
 
+def test_characters_keyboard_colours_active_character_and_clear_button():
+    keyboard = _characters_keyboard([{"name": "fox"}, {"name": "wolf"}], active="fox")
+    styles = {b.text: b.style for row in keyboard.inline_keyboard for b in row}
+    assert styles["✅ fox"] == "primary"
+    assert styles["wolf"] is None
+    assert styles["❌ Clear active character"] == "danger"
+
+
+def test_again_keyboard_is_green():
+    button = _again_keyboard("snap123").inline_keyboard[0][0]
+    assert button.style == "success"
+
+
 def test_characters_keyboard_has_no_clear_button_when_none_active():
     keyboard = _characters_keyboard([{"name": "fox"}], active=None)
     callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]

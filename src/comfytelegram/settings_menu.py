@@ -26,6 +26,7 @@ from typing import Any
 
 from pydantic import ValidationError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import KeyboardButtonStyle
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
@@ -246,7 +247,15 @@ def _home_keyboard(
             )
         ]
     )
-    rows.append([InlineKeyboardButton("🔄 Reset all to model defaults", callback_data="st:ra")])
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🔄 Reset all to model defaults",
+                callback_data="st:ra",
+                style=KeyboardButtonStyle.DANGER,
+            )
+        ]
+    )
     rows.append([InlineKeyboardButton("✖ Close", callback_data="st:close")])
     return InlineKeyboardMarkup(rows)
 
@@ -289,6 +298,7 @@ def _enum_submenu_keyboard(
         InlineKeyboardButton(
             f"{'• ' if choice == current else ''}{choice}",
             callback_data=f"st:v:{meta.key}:{choice}",
+            style=KeyboardButtonStyle.PRIMARY if choice == current else None,
         )
         for choice in _curate(choices, meta.preferred)
     ]

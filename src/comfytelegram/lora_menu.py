@@ -56,6 +56,7 @@ import logging
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import KeyboardButtonStyle
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
@@ -185,7 +186,15 @@ def _home_keyboard(profile: ModelProfile, show_info: bool) -> InlineKeyboardMark
         if show_info:
             secondary_row.append(InlineKeyboardButton("ℹ️ Info", callback_data=f"lr:i:{index}"))
         rows.append(secondary_row)
-    rows.append([InlineKeyboardButton("🔄 Reset all to model defaults", callback_data="lr:ra")])
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🔄 Reset all to model defaults",
+                callback_data="lr:ra",
+                style=KeyboardButtonStyle.DANGER,
+            )
+        ]
+    )
     rows.append([InlineKeyboardButton("🔁 Reload profiles", callback_data="lr:reload")])
     rows.append([InlineKeyboardButton("✖ Close", callback_data="lr:close")])
     return InlineKeyboardMarkup(rows)

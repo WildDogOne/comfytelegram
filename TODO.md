@@ -145,11 +145,9 @@ Ideas from the Bot API changelog (8.0–10.3, reviewed 2026-10-19).
 
 PTB 22.8 supports Bot API 10.0.
 
-- [ ] **Coloured buttons** (`style`, Bot API 9.4): `"danger"` (red),
-  `"success"` (green), `"primary"` (blue) on inline and reply keyboard
-  buttons. E.g. red "❌ Cancel", green "🎨 Generate"/"🔁 Generate Again",
-  blue "⋯ More". `icon_custom_emoji_id` exists too but needs the bot owner
-  to have Premium.
+- [ ] **Custom emoji icons on buttons** (`icon_custom_emoji_id`, Bot API
+  9.4): needs the bot owner to have Premium (or bought Fragment
+  usernames). Button colours (`style`) shipped.
 - [ ] **Progress as a message draft** (`send_message_draft`, Bot API
   9.3/9.5): an animated, temporary preview meant for "still generating"
   output, instead of the throttled "Generating… 37%" edit loop. Private

@@ -30,12 +30,13 @@ from telegram import (
     CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
     Update,
     WebAppInfo,
 )
-from telegram.constants import InlineKeyboardButtonLimit
+from telegram.constants import InlineKeyboardButtonLimit, KeyboardButtonStyle
 from telegram.error import BadRequest
 from telegram.ext import Application, ContextTypes
 
@@ -589,7 +590,19 @@ _MAIN_KEYBOARD = ReplyKeyboardMarkup(
 #: it just sends the text "/stop" as an ordinary message, which
 #: `stop_command`'s existing CommandHandler picks up like any other typed
 #: "/stop".
-_STREAMING_KEYBOARD = ReplyKeyboardMarkup([["/stop"]], resize_keyboard=True)
+_STREAMING_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton("/stop", style=KeyboardButtonStyle.DANGER)]], resize_keyboard=True
+)
+
+
+# Button colours (Bot API 9.4 `style`) are kept sparse so they still mean
+# something: green (`SUCCESS`) for the button that starts or confirms the
+# work a message is about, red (`DANGER`) for deleting, clearing or
+# resetting, and blue (`PRIMARY`) for the current choice in a picker that
+# already marks it with "•"/"✅". Clients that predate `style` ignore it.
+def _current_style(is_current: bool) -> str | None:
+    """`style` for one option in a picker: blue for the current one."""
+    return KeyboardButtonStyle.PRIMARY if is_current else None
 
 
 #: `_post_process_keyboard`'s page-1 rows group like with like rather than
@@ -783,6 +796,7 @@ def _lora_switch_keyboard(
             InlineKeyboardButton(
                 "✅ Apply",
                 callback_data=f"{LORA_SWITCH_TOGGLE_CALLBACK_PREFIX}a:{result_id}:{mask:x}",
+                style=KeyboardButtonStyle.SUCCESS,
             ),
             InlineKeyboardButton(
                 "✖ Cancel", callback_data=f"{LORA_SWITCH_TOGGLE_CALLBACK_PREFIX}c:{result_id}"
@@ -803,7 +817,9 @@ def _again_keyboard(snapshot_id: str) -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
-                    "🔁 Generate Again", callback_data=f"{AGAIN_CALLBACK_PREFIX}{snapshot_id}"
+                    "🔁 Generate Again",
+                    callback_data=f"{AGAIN_CALLBACK_PREFIX}{snapshot_id}",
+                    style=KeyboardButtonStyle.SUCCESS,
                 )
             ]
         ]
@@ -822,6 +838,7 @@ def _upscale_confirm_keyboard(result_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     "✅ Upscale anyway",
                     callback_data=f"pp:{UPSCALE_CONFIRM_CALLBACK_KIND}:{result_id}",
+                    style=KeyboardButtonStyle.SUCCESS,
                 ),
                 InlineKeyboardButton(
                     "❌ Cancel", callback_data=f"pp:{UPSCALE_CANCEL_CALLBACK_KIND}:{result_id}"
@@ -842,6 +859,7 @@ def _upscale_mode_keyboard(result_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     "✅ Use Defaults",
                     callback_data=f"pp:{UPSCALE_DEFAULTS_CALLBACK_KIND}:{result_id}",
+                    style=KeyboardButtonStyle.SUCCESS,
                 ),
                 InlineKeyboardButton(
                     "⚙️ Customize",
@@ -915,6 +933,7 @@ def _redo_tweak_keyboard(result_id: str, mask_kind: str, current: float) -> Inli
         InlineKeyboardButton(
             f"• {value:g}" if abs(value - current) < 1e-6 else f"{value:g}",
             callback_data=f"{prefix}{value:g}",
+            style=_current_style(abs(value - current) < 1e-6),
         )
         for value in REDO_TWEAK_DENOISE_PRESETS
     ]
@@ -1089,7 +1108,9 @@ def _generate_from_prompt_keyboard(prompt_id: str, prompt: str) -> InlineKeyboar
     Generate" (through `derived_prompt`, no length limit)."""
     buttons = [
         InlineKeyboardButton(
-            "🎨 Generate", callback_data=f"{GENERATE_FROM_PROMPT_CALLBACK_PREFIX}{prompt_id}"
+            "🎨 Generate",
+            callback_data=f"{GENERATE_FROM_PROMPT_CALLBACK_PREFIX}{prompt_id}",
+            style=KeyboardButtonStyle.SUCCESS,
         )
     ]
     if len(prompt) <= InlineKeyboardButtonLimit.MAX_COPY_TEXT:
@@ -3059,13 +3080,25 @@ def _characters_keyboard(
         label = f"✅ {char['name']}" if char["name"] == active else char["name"]
         rows.append(
             [
-                InlineKeyboardButton(label, callback_data=f"char:activate:{char['name']}"),
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"char:activate:{char['name']}",
+                    style=_current_style(char["name"] == active),
+                ),
                 InlineKeyboardButton("✏️ Edit", callback_data=f"char:edit:{char['name']}"),
                 InlineKeyboardButton("🔤 Rename", callback_data=f"char:rename:{char['name']}"),
             ]
         )
     if active is not None:
-        rows.append([InlineKeyboardButton("❌ Clear active character", callback_data="char:clear")])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "❌ Clear active character",
+                    callback_data="char:clear",
+                    style=KeyboardButtonStyle.DANGER,
+                )
+            ]
+        )
     return InlineKeyboardMarkup(rows)
 
 
@@ -4220,6 +4253,7 @@ async def _open_mask_editor(
                         InlineKeyboardButton(
                             "🎨 Open mask editor",
                             web_app=WebAppInfo(url=f"{settings.inpaint_relay_url}/jobs/{token}"),
+                            style=KeyboardButtonStyle.SUCCESS,
                         )
                     ]
                 ]
@@ -6081,7 +6115,13 @@ def _pose_keyboard(
     if edit_label is not None:
         row.append(InlineKeyboardButton(edit_label, callback_data=POSE_EDIT_CALLBACK_DATA))
     if has_pose:
-        row.append(InlineKeyboardButton("🗑 Clear pose", callback_data=POSE_CLEAR_CALLBACK_DATA))
+        row.append(
+            InlineKeyboardButton(
+                "🗑 Clear pose",
+                callback_data=POSE_CLEAR_CALLBACK_DATA,
+                style=KeyboardButtonStyle.DANGER,
+            )
+        )
     if waiting:
         row.append(InlineKeyboardButton("❌ Cancel", callback_data=POSE_CANCEL_CALLBACK_DATA))
     rows = [row] if row else []
@@ -6349,6 +6389,7 @@ async def _open_pose_editor(
                     InlineKeyboardButton(
                         "🦴 Open pose editor",
                         web_app=WebAppInfo(url=f"{settings.inpaint_relay_url}/jobs/{token}"),
+                        style=KeyboardButtonStyle.SUCCESS,
                     )
                 ]
             ]
@@ -6534,6 +6575,7 @@ def _pose_strength_keyboard(target: str, current: float) -> InlineKeyboardMarkup
         InlineKeyboardButton(
             f"• {value:g}" if abs(value - current) < 1e-6 else f"{value:g}",
             callback_data=f"{prefix}{value:g}",
+            style=_current_style(abs(value - current) < 1e-6),
         )
         for value in POSE_STRENGTH_PRESETS
     ]

@@ -8,6 +8,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Coloured buttons**: green for the button that starts or confirms the
+  work (🔁 Generate Again, 🎨 Generate, ✅ Apply/Use Defaults/Upscale
+  anyway, the editor buttons), red for delete/clear/reset (and the
+  `/stop` key while streaming), blue for the current choice in a picker.
+  Older Telegram apps show them as before.
+
 - **🦴 `/pose`**: send an OpenPose skeleton (coloured limbs on black) after
   `/pose`, or as a photo captioned `/pose`, and every image in the chat
   follows it until `/pose off`. Images take the pose's aspect ratio, the
