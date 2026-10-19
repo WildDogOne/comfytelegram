@@ -13,6 +13,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    Defaults,
     MessageHandler,
     TypeHandler,
     filters,
@@ -351,6 +352,10 @@ def build_application(settings: Settings) -> Application:
         .concurrent_updates(True)
         .media_write_timeout(MEDIA_WRITE_TIMEOUT_SECONDS)
         .read_timeout(READ_TIMEOUT_SECONDS)
+        # Quiet unless a send says otherwise: menus, statuses and replies
+        # don't buzz, only finished images do (`handlers.
+        # _send_photo_or_document` opts back in).
+        .defaults(Defaults(disable_notification=True))
         .build()
     )
     application.bot_data["settings"] = settings

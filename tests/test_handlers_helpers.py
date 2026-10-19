@@ -7,7 +7,7 @@ from PIL import Image
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 
-from comfytelegram.comfy_client import ComfyUIError
+from comfytelegram.comfy_client import ComfyUIError, JobProgress
 from comfytelegram.generation import GeneratedImage
 from comfytelegram.handlers import (
     _MAIN_KEYBOARD,
@@ -16,6 +16,7 @@ from comfytelegram.handlers import (
     COPY_POSE_CALLBACK_KIND,
     DETAIL_PROMPT_CALLBACK_KIND,
     DRAWN_MASK_REDO4_COUNT,
+    DRAWN_MASK_REDO_IN_FLIGHT,
     FIX_DRAW_CALLBACK_KIND,
     FIX_REDO4_CALLBACK_KIND,
     FIX_REDO_CALLBACK_KIND,
@@ -2403,15 +2404,130 @@ async def test_redo4_stops_after_first_failure_instead_of_running_the_rest():
         ),
         unchanged=False,
     )
-    # succeeds once, then fails — the loop must not attempt a 3rd/4th run.
+    # Run 1 fails while run 2 (the other worker's) is still in flight: run 2
+    # still finishes and is sent, but no 3rd/4th run may start after the
+    # failure. Run 1 only fails once run 2 has started, and run 2 holds
+    # until run 1's failure has been recorded.
+    calls = 0
+    second_started = asyncio.Event()
+    first_failed = asyncio.Event()
+
+    async def fake_post_process(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await second_started.wait()
+            first_failed.set()
+            raise ComfyUIError("boom")
+        second_started.set()
+        await first_failed.wait()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        return redone
+
     with patch(
         "comfytelegram.handlers.post_process",
-        new=AsyncMock(side_effect=[redone, ComfyUIError("boom")]),
+        new=AsyncMock(side_effect=fake_post_process),
     ) as post_process_mock:
         await postprocess_callback(update, context)
 
     assert post_process_mock.await_count == 2
     assert query.message.reply_photo.await_count == 1
+    # The shared status keeps the error: not deleted by the run that
+    # succeeded after it.
+    status = query.message.reply_text.return_value
+    status.edit_text.assert_awaited_with("Refining hand failed: boom")
+    status.delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_redo4_moves_the_shared_draft_below_each_result():
+    # One status spans all four runs, so after each result goes out its
+    # draft needs a fresh id — else it keeps updating above the first image.
+    query = AsyncMock()
+    query.data = f"pp:{HAND_REDO4_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    storage.get_inpaint_redo.return_value = {
+        "source_file_id": "presource123",
+        "source_filename": "presource.png",
+        "mask_png": b"stored-mask-bytes",
+    }
+    context = _postprocess_context(storage, profile)
+    status = MagicMock(update=AsyncMock(), edit_text=AsyncMock(), delete=AsyncMock())
+
+    redone = GeneratedImage(
+        data=b"redone",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with (
+        patch("comfytelegram.handlers.start_reply_status", new=AsyncMock(return_value=status)),
+        patch("comfytelegram.handlers.post_process", new=AsyncMock(return_value=redone)),
+    ):
+        await postprocess_callback(update, context)
+
+    assert status.message_sent.call_count == DRAWN_MASK_REDO4_COUNT
+    status.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_redo4_keeps_two_runs_in_flight_at_most():
+    query = AsyncMock()
+    query.data = f"pp:{HAND_REDO4_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    storage.get_inpaint_redo.return_value = {
+        "source_file_id": "presource123",
+        "source_filename": "presource.png",
+        "mask_png": b"stored-mask-bytes",
+    }
+    context = _postprocess_context(storage, profile)
+
+    in_flight = peak = 0
+
+    async def fake_post_process(*args, **kwargs):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        in_flight -= 1
+        return GeneratedImage(
+            data=b"redone",
+            filename="out.png",
+            full_params=GenerationParams(
+                checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+            ),
+            unchanged=False,
+        )
+
+    with patch(
+        "comfytelegram.handlers.post_process",
+        new=AsyncMock(side_effect=fake_post_process),
+    ) as post_process_mock:
+        await postprocess_callback(update, context)
+
+    assert post_process_mock.await_count == DRAWN_MASK_REDO4_COUNT
+    assert peak == DRAWN_MASK_REDO_IN_FLIGHT
+    assert query.message.reply_photo.await_count == DRAWN_MASK_REDO4_COUNT
+    # One status for the whole tap, removed once every run is out.
+    status_replies = [
+        c for c in query.message.reply_text.await_args_list if "drawn mask" in c.args[0]
+    ]
+    assert len(status_replies) == 1
+    query.message.reply_text.return_value.delete.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -2530,6 +2646,10 @@ async def test_process_one_inpaint_job_stores_a_redoable_row_and_attaches_redo_b
         unchanged=False,
     )
 
+    async def report_progress_then_finish(*args, on_progress, **kwargs):
+        await on_progress(JobProgress(prompt_id="p", node_id="3", value=5, max=20))
+        return refined
+
     with (
         patch(
             "comfytelegram.handlers._relay_poll_result",
@@ -2539,9 +2659,15 @@ async def test_process_one_inpaint_job_stores_a_redoable_row_and_attaches_redo_b
             "comfytelegram.handlers.validate_webapp_init_data", return_value={"user": '{"id": 42}'}
         ),
         patch("comfytelegram.handlers._relay_delete_job", new=AsyncMock()),
-        patch("comfytelegram.handlers.post_process", new=AsyncMock(return_value=refined)),
+        patch(
+            "comfytelegram.handlers.post_process",
+            new=AsyncMock(side_effect=report_progress_then_finish),
+        ),
     ):
         await _process_one_inpaint_job(application, settings, storage, client, job)
+
+    # The first run reports sampling progress on its status, like a redo.
+    status_message.edit_text.assert_any_await("Refining hand… 25% (step 5/20)")
 
     application.bot.send_photo.assert_awaited_once()
     storage.store_inpaint_redo.assert_called_once()
@@ -3073,3 +3199,19 @@ async def test_kontext_redo_new_prompt_edits_the_original_source():
     args = run_mock.await_args.args
     assert args[3:5] == ("orig_file", "orig.png")
     assert args[6] == "make it snow"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [10, TELEGRAM_PHOTO_SIZE_LIMIT + 1])
+async def test_result_images_still_notify(size):
+    """The bot is quiet by default (`main.build_application`'s `Defaults`);
+    a finished image — photo or oversized document — opts back in."""
+    from comfytelegram.handlers import _send_photo_or_document
+
+    send_photo, send_document = AsyncMock(), AsyncMock()
+    await _send_photo_or_document(
+        send_photo, send_document, b"x" * size, "out.png", MagicMock(), use_jpeg=False
+    )
+
+    (sent,) = [m for m in (send_photo, send_document) if m.await_count]
+    assert sent.await_args.kwargs["disable_notification"] is False

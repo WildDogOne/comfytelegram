@@ -45,6 +45,12 @@ def test_read_timeout_survives_telegram_ingesting_a_large_upload(tmp_path):
     assert READ_TIMEOUT_SECONDS > 5
 
 
+def test_messages_are_quiet_by_default(tmp_path):
+    """Menus, statuses and replies shouldn't buzz the phone; only finished
+    images opt back in (see `test_result_images_still_notify`)."""
+    assert _application(tmp_path).bot.defaults.disable_notification is True
+
+
 def test_relay_upload_gets_its_own_generous_timeout():
     """`_relay_create_job` POSTs a full-resolution source PNG (~20MB after
     an upscale) to a relay on a public host, and aiohttp's `total` covers

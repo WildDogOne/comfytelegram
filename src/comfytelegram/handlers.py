@@ -365,6 +365,9 @@ _DRAWN_MASK_KINDS: dict[str, dict[str, Any]] = {
 }
 #: How many revisions "🔁 x4" produces in one tap.
 DRAWN_MASK_REDO4_COUNT = 4
+#: How many of those runs are in ComfyUI's queue at once — see
+#: `_run_drawn_mask_redos`.
+DRAWN_MASK_REDO_IN_FLIGHT = 2
 #: "🎚️ Redo…" — the third button on a drawn-mask result's redo row: the
 #: same "🔁 Redo (same mask)" re-run, but with a denoise picked first
 #: instead of replaying the stored one. Its own namespace rather than `pp:`
@@ -1285,17 +1288,24 @@ async def _send_photo_or_document(
     oversized-file caption live in one place. Returns the sent message —
     callers need it to read back the file_id Telegram assigned, for
     `_store_pending_result`."""
+    # The bot is quiet by default (`main.build_application`'s `Defaults`);
+    # a finished image is the one thing worth a notification.
     if use_jpeg:
         jpeg = await asyncio.to_thread(_to_display_jpeg, data, _DISPLAY_JPEG_QUALITY)
         if jpeg is not data and len(jpeg) <= TELEGRAM_PHOTO_SIZE_LIMIT:
-            return await send_photo(photo=io.BytesIO(jpeg), reply_markup=reply_markup)
+            return await send_photo(
+                photo=io.BytesIO(jpeg), reply_markup=reply_markup, disable_notification=False
+            )
     if len(data) <= TELEGRAM_PHOTO_SIZE_LIMIT:
-        return await send_photo(photo=io.BytesIO(data), reply_markup=reply_markup)
+        return await send_photo(
+            photo=io.BytesIO(data), reply_markup=reply_markup, disable_notification=False
+        )
     return await send_document(
         document=io.BytesIO(data),
         filename=filename,
         caption="Sent as a file — too large for Telegram's photo size limit (10MB).",
         reply_markup=reply_markup,
+        disable_notification=False,
     )
 
 
@@ -1843,6 +1853,8 @@ async def _run_drawn_mask_post_process(
     is_detail_prompt: bool = False,
     tile_controlnet_override: bool | None = None,
     detailer_disable_lora_override: bool | None = None,
+    on_progress: Callable[[JobProgress], Awaitable[None]] | None = None,
+    delete_status: bool = True,
 ) -> GeneratedImage | None:
     """Shared by `_process_one_inpaint_job` (a freshly submitted mask) and
     `postprocess_callback`'s `*_REDO_CALLBACK_KIND` branch (re-running a
@@ -1870,7 +1882,9 @@ async def _run_drawn_mask_post_process(
     detailer pass" checkbox — unlike `tile_controlnet_override`, it can be
     non-`None` for "hand" (plain "🖌️ Draw Mask") too, not just "detail" (see
     `postprocess_callback`'s `meta` construction); still always `None` for
-    "fix" ("🩹 Fix Artifact"), which has no such checkbox. Returns None on
+    "fix" ("🩹 Fix Artifact"), which has no such checkbox. `delete_status=
+    False` leaves `status_message` up on success, for a caller sharing it
+    across several runs (`_run_drawn_mask_redos`). Returns None on
     failure (already reported into `status_message` by
     `_run_reporting_errors`); callers should treat that as "stop here",
     same as `_run_reporting_errors` itself."""
@@ -1892,9 +1906,10 @@ async def _run_drawn_mask_post_process(
             tile_controlnet_override=tile_controlnet_override,
             detailer_disable_lora_override=detailer_disable_lora_override,
             profiles=profiles,
+            on_progress=on_progress,
         ),
     )
-    if generated is not None:
+    if generated is not None and delete_status:
         await status_message.delete()
     return generated
 
@@ -1977,10 +1992,11 @@ async def _run_one_drawn_mask_redo(
     source_bytes: bytes,
     denoise_override: float | None = None,
     *,
-    bot_data: dict[str, Any],
+    status_message: Status,
+    on_progress: Callable[[JobProgress], Awaitable[None]],
 ) -> bool:
-    """One "🔁 Redo (same mask)"/"🔁 x4"/"🎚️ Redo…" iteration: its own status message,
-    `post_process` call, and result send (with fresh redo buttons of its
+    """One "🔁 Redo (same mask)"/"🔁 x4"/"🎚️ Redo…" iteration: its
+    `post_process` call and result send (with fresh redo buttons of its
     own, so the chain keeps going indefinitely either way) — shared by
     `postprocess_callback`'s `*_REDO_CALLBACK_KIND`/`*_REDO4_CALLBACK_KIND`
     branch, which calls this once or `DRAWN_MASK_REDO4_COUNT` times
@@ -1994,10 +2010,12 @@ async def _run_one_drawn_mask_redo(
     they're simply absent for a "🖌️ Draw Mask"/"🩹 Fix Artifact" redo.
     `denoise_override` is a "🎚️ Redo…" pick, replacing the stored
     `detail_denoise` for this run *and* for the new result's own redo row.
-    Returns True on success, False on failure (already reported into that
-    iteration's own status message by `_run_reporting_errors`) — the
-    caller stops the loop on the first False rather than continuing to
-    burn ComfyUI time on a source/mask combination that just failed."""
+    `status_message` is the caller's, shared by every run of one tap, so it
+    is left up on success. Returns True on success, False on failure
+    (already reported into `status_message` by `_run_reporting_errors`) —
+    the caller stops starting new runs on the first False rather than
+    continuing to burn ComfyUI time on a source/mask combination that just
+    failed."""
     detail_prompt = redo.get("detail_prompt")
     detail_negative_prompt = redo.get("detail_negative_prompt")
     detail_denoise = (
@@ -2005,10 +2023,6 @@ async def _run_one_drawn_mask_redo(
     )
     tile_controlnet_choice = redo.get("tile_controlnet")
     detailer_disable_lora_choice = redo.get("detailer_disable_lora")
-    status_suffix = f", denoise {denoise_override:g}" if denoise_override is not None else ""
-    status_message = await start_reply_status(
-        bot_data, reply_message, f"{drawn_mask_kind['label']} (drawn mask{status_suffix})…"
-    )
     generated = await _run_drawn_mask_post_process(
         client,
         status_message,
@@ -2025,6 +2039,8 @@ async def _run_one_drawn_mask_redo(
         is_detail_prompt=drawn_mask_kind["is_detail_prompt"],
         tile_controlnet_override=tile_controlnet_choice,
         detailer_disable_lora_override=detailer_disable_lora_choice,
+        on_progress=on_progress,
+        delete_status=False,
     )
     if generated is None:
         return False
@@ -2044,6 +2060,9 @@ async def _run_one_drawn_mask_redo(
         tile_controlnet=tile_controlnet_choice,
         detailer_disable_lora=detailer_disable_lora_choice,
     )
+    # The shared status keeps going for the other runs: move its draft
+    # below this result, or it keeps updating out of sight above it.
+    status_message.message_sent()
     return True
 
 
@@ -2090,24 +2109,68 @@ async def _run_drawn_mask_redos(
     )
     # "🔁 x4" runs the same iteration DRAWN_MASK_REDO4_COUNT times instead
     # of once, reusing the one source download above across all of them.
-    # Stops at the first failure rather than continuing to spend ComfyUI
-    # time on a source/mask combination that just failed.
-    for _ in range(count):
-        ok = await _run_one_drawn_mask_redo(
-            reply_message,
-            client,
-            storage,
-            pending["chat_id"],
-            full_params,
-            redo,
-            _DRAWN_MASK_KINDS[mask_kind],
-            context.bot_data["profiles"],
-            source_bytes,
-            denoise_override=denoise_override,
-            bot_data=context.bot_data,
-        )
-        if not ok:
-            break
+    # DRAWN_MASK_REDO_IN_FLIGHT workers share the runs, so the next prompt
+    # is already in ComfyUI's queue while one result is still being
+    # downloaded and sent to Telegram — ComfyUI executes one prompt at a
+    # time anyway, so this only fills the GPU's idle gaps (same idea as
+    # chargen's `--pipeline`). Results are sent as they finish, not in tap
+    # order; each carries its own buttons. A failure stops new runs from
+    # starting rather than spending ComfyUI time on a source/mask
+    # combination that just failed; one already in flight still finishes.
+    #
+    # One status for the whole tap, not one per run: a queued run has no
+    # progress to show, so a second line would just repeat the first. Only
+    # the run ComfyUI is executing sends progress events, so whichever
+    # run's callback fires is the one actually rendering.
+    drawn_mask_kind = _DRAWN_MASK_KINDS[mask_kind]
+    label = drawn_mask_kind["label"]
+    status_suffix = f", denoise {denoise_override:g}" if denoise_override is not None else ""
+    status_message = await start_reply_status(
+        context.bot_data, reply_message, f"{label} (drawn mask{status_suffix})…"
+    )
+    started = 0
+    failed = False
+
+    def progress_for(run: int) -> Callable[[JobProgress], Awaitable[None]]:
+        run_label = f"{label} {run}/{count}" if count > 1 else label
+        report = _make_progress_callback(status_message, label=run_label)
+
+        async def on_progress(progress: JobProgress) -> None:
+            # After a failure the status holds the error; keep it there.
+            if not failed:
+                await report(progress)
+
+        return on_progress
+
+    async def worker() -> None:
+        nonlocal started, failed
+        while started < count and not failed:
+            started += 1
+            try:
+                ok = await _run_one_drawn_mask_redo(
+                    reply_message,
+                    client,
+                    storage,
+                    pending["chat_id"],
+                    full_params,
+                    redo,
+                    drawn_mask_kind,
+                    context.bot_data["profiles"],
+                    source_bytes,
+                    denoise_override=denoise_override,
+                    status_message=status_message,
+                    on_progress=progress_for(started),
+                )
+            except BaseException:
+                failed = True
+                await status_message.close()
+                raise
+            if not ok:
+                failed = True
+
+    await asyncio.gather(*(worker() for _ in range(min(count, DRAWN_MASK_REDO_IN_FLIGHT))))
+    if not failed:
+        await status_message.delete()
 
 
 async def _process_one_inpaint_job(
@@ -2258,6 +2321,7 @@ async def _process_one_inpaint_job(
         is_detail_prompt=drawn_mask_kind["is_detail_prompt"],
         tile_controlnet_override=tile_controlnet_choice,
         detailer_disable_lora_override=detailer_disable_lora_choice,
+        on_progress=_make_progress_callback(status_message, label=drawn_mask_kind["label"]),
     )
     if generated is None:
         return

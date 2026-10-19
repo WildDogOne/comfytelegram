@@ -122,6 +122,15 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Quiet messages**: the bot no longer buzzes your phone for menus,
+  status lines, prompts and other replies. Only finished images
+  (generations, post-processing results, `/stream` images) notify.
+- **"🔁 x4" keeps ComfyUI busy**: two redos are now queued at a time, so
+  the next one is already running while the previous result is still
+  being sent. Results arrive in the order they finish. One status line
+  covers the whole tap ("Detailing 2/4… 40%") instead of one per redo,
+  and drawn-mask jobs (Draw Mask, Fix Artifact, Detail Prompt and their
+  redos) now show a percentage.
 - **Detailers decode in tiles**: Face/Hand Detail, Draw Mask, Detail
   Prompt, Fix Artifact and the region LoRA pass now use tiled VAE
   encode/decode straight away. On a large (upscaled) image ComfyUI used to
