@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import time
 from urllib.parse import parse_qsl
 
 from telegram import CallbackQuery, Update
@@ -43,7 +44,14 @@ async def reject_if_unauthorized_callback(
     return True
 
 
-def validate_webapp_init_data(init_data: str, bot_token: str) -> dict[str, str] | None:
+#: How far in the future a WebApp `auth_date` may be, for clock drift
+#: between Telegram and this host.
+_INIT_DATA_CLOCK_SKEW_SECONDS = 60
+
+
+def validate_webapp_init_data(
+    init_data: str, bot_token: str, max_age_seconds: float | None = None
+) -> dict[str, str] | None:
     """Verify a Telegram WebApp's `Telegram.WebApp.initData` string per
     Telegram's documented algorithm
     (https://core.telegram.org/bots/webapps#validating-data-received-via-the-web-app),
@@ -55,7 +63,13 @@ def validate_webapp_init_data(init_data: str, bot_token: str) -> dict[str, str] 
     `poll_inpaint_jobs`) and running an arbitrary mask through ComfyUI: the
     relay itself never sees the bot token and can't check this, so
     comfytelegram must, after pulling a submitted mask back from the relay
-    and before acting on it."""
+    and before acting on it.
+
+    `max_age_seconds` also rejects a payload whose signed `auth_date` is
+    older than that (or missing, or in the future beyond a little clock
+    skew). The signature alone never expires, and every submission passes
+    through the relay, so without an age limit anyone who ever read one
+    off the relay could replay it indefinitely."""
     try:
         parsed = dict(parse_qsl(init_data, strict_parsing=True))
     except ValueError:
@@ -68,4 +82,11 @@ def validate_webapp_init_data(init_data: str, bot_token: str) -> dict[str, str] 
     expected_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected_hash, received_hash):
         return None
+    if max_age_seconds is not None:
+        try:
+            age = time.time() - int(parsed["auth_date"])
+        except (KeyError, ValueError):
+            return None
+        if not -_INIT_DATA_CLOCK_SKEW_SECONDS <= age <= max_age_seconds:
+            return None
     return parsed

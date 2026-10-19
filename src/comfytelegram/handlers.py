@@ -45,6 +45,7 @@ from comfytelegram.analysis import (
     analyze_tags,
 )
 from comfytelegram.auth import (
+    is_authorized,
     reject_if_unauthorized,
     reject_if_unauthorized_callback,
     validate_webapp_init_data,
@@ -136,7 +137,7 @@ from comfytelegram.regional import (
 from comfytelegram.segmentation import encode_image, sam_input_size
 from comfytelegram.settings import Settings
 from comfytelegram.settings_menu import _safe_edit_message, handle_custom_value_message
-from comfytelegram.storage import IMAGE_FORMAT_PNG, Storage
+from comfytelegram.storage import IMAGE_FORMAT_PNG, INPAINT_JOB_TTL_SECONDS, Storage
 from comfytelegram.tags import TagDatabase, TagResult, TagSource, category_label
 from comfytelegram.topics import pop_pending, set_pending
 from comfytelegram.workflows import (
@@ -2131,12 +2132,32 @@ async def _process_one_inpaint_job(
     if job.get("editor_message_id") is not None:
         await _delete_message_quietly(application.bot, chat_id, job["editor_message_id"])
 
-    verified = validate_webapp_init_data(result["init_data"], settings.telegram_bot_token)
+    verified = validate_webapp_init_data(
+        result["init_data"], settings.telegram_bot_token, max_age_seconds=INPAINT_JOB_TTL_SECONDS
+    )
     if verified is None:
-        logger.warning("Dropping inpaint_relay job %s: invalid initData signature", token)
+        logger.warning("Dropping inpaint_relay job %s: invalid or stale initData", token)
         await application.bot.send_message(
             chat_id,
             "⚠️ Couldn't verify the editor submission — please try again.",
+            message_thread_id=message_thread_id,
+        )
+        return
+    # A valid signature only proves *some* user of this bot opened *some*
+    # editor. The submitter must also be allowed to use the bot, and be the
+    # one this job was opened for: Telegram only shows Web App buttons in
+    # private chats, where the chat id is the user's own id.
+    submitter_id = _init_data_user_id(verified)
+    if not is_authorized(settings, submitter_id) or submitter_id != chat_id:
+        logger.warning(
+            "Dropping inpaint_relay job %s: submitted by user %s, not chat %s's owner",
+            token,
+            submitter_id,
+            chat_id,
+        )
+        await application.bot.send_message(
+            chat_id,
+            "⚠️ That editor submission didn't come from you — please try again.",
             message_thread_id=message_thread_id,
         )
         return
@@ -6710,10 +6731,13 @@ async def _run_pose_strength_redo(
     )
     await _send_and_store_result(anchor, chat_id, storage, image)
     await status_message.delete()
-    note = "" if seed is not None else " (new seed — couldn't recover this image's)"
-    await anchor.reply_text(
-        f"Done — pose strength {full_params.pose_controlnet_strength:g} → {strength:g}{note}."
-    )
+    # No "Done" message, like "🎚️ Redo…" — the image itself is the answer.
+    # Only the fallback needs saying: it isn't a like-for-like comparison.
+    if seed is None:
+        await anchor.reply_text(
+            "That one is on a new seed — couldn't recover the original image's, so "
+            "more than the pose strength changed."
+        )
 
 
 def _make_cancel_callback(

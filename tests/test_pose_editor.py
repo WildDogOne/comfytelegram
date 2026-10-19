@@ -462,7 +462,7 @@ def _poller(storage: Storage, pose_json: str | None):
     application.bot.send_photo = AsyncMock()
     application.bot.delete_message = AsyncMock()
     application.bot_data = {
-        "settings": MagicMock(inpaint_relay_url="https://relay.example"),
+        "settings": MagicMock(inpaint_relay_url="https://relay.example", allowed_user_ids=()),
         "profiles": [],
     }
     job = {
@@ -478,7 +478,9 @@ def _poller(storage: Storage, pose_json: str | None):
     patches = (
         patch("comfytelegram.handlers._relay_poll_result", new=AsyncMock(return_value=result)),
         patch("comfytelegram.handlers._relay_delete_job", new=AsyncMock()),
-        patch("comfytelegram.handlers.validate_webapp_init_data", return_value={"user": "{}"}),
+        patch(
+            "comfytelegram.handlers.validate_webapp_init_data", return_value={"user": '{"id": 1}'}
+        ),
     )
     return application, job, patches
 
@@ -490,7 +492,9 @@ async def test_a_submitted_pose_becomes_the_chats_pose(tmp_path):
     application, job, patches = _poller(storage, pose.to_json())
 
     with patches[0], patches[1], patches[2]:
-        await _process_one_inpaint_job(application, MagicMock(), storage, MagicMock(), job)
+        await _process_one_inpaint_job(
+            application, application.bot_data["settings"], storage, MagicMock(), job
+        )
 
     pose_json, background = storage.get_pose_source(1)
     assert parse_pose_json(pose_json) == parse_pose_json(pose.to_json())
@@ -508,7 +512,9 @@ async def test_a_bad_or_empty_submitted_pose_keeps_the_old_one(tmp_path):
     for pose_json in ("{nope", Pose(800, 800, ()).to_json()):
         application, job, patches = _poller(storage, pose_json)
         with patches[0], patches[1], patches[2]:
-            await _process_one_inpaint_job(application, MagicMock(), storage, MagicMock(), job)
+            await _process_one_inpaint_job(
+                application, application.bot_data["settings"], storage, MagicMock(), job
+            )
         application.bot.send_photo.assert_not_awaited()
         assert application.bot.send_message.await_args.kwargs["message_thread_id"] == 4
 
@@ -584,3 +590,31 @@ def test_no_shoulders_means_no_neck():
     scores[0] = 0.9
 
     assert pose_detect.to_openpose(keypoints, scores, factor=1.0)[1] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("submitter", "allowed"),
+    [
+        ('{"id": 2}', ()),  # someone else's signed initData
+        ('{"id": 1}', (5,)),  # the chat's own user, but no longer allowlisted
+        ("{}", ()),  # no user at all
+    ],
+)
+async def test_a_submission_from_anyone_but_the_chats_allowed_user_is_dropped(
+    tmp_path, submitter, allowed
+):
+    storage = Storage(tmp_path / "state.sqlite3")
+    storage.set_pose(1, b"old")
+    application, job, patches = _poller(storage, _two_people(64, 64).to_json())
+    settings = MagicMock(inpaint_relay_url="https://relay.example", allowed_user_ids=allowed)
+    with (
+        patches[0],
+        patches[1],
+        patch("comfytelegram.handlers.validate_webapp_init_data", return_value={"user": submitter}),
+    ):
+        await _process_one_inpaint_job(application, settings, storage, MagicMock(), job)
+
+    assert storage.get_pose(1) == b"old"
+    application.bot.send_photo.assert_not_awaited()
+    assert "didn't come from you" in application.bot.send_message.await_args.args[1]

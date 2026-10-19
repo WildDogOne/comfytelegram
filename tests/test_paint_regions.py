@@ -226,7 +226,7 @@ async def _submit(
     application = MagicMock()
     application.bot.send_message = AsyncMock(return_value=AsyncMock())
     application.bot_data = {"profiles": list(profiles)}
-    settings = MagicMock(inpaint_relay_url="https://r", telegram_bot_token="t")
+    settings = MagicMock(inpaint_relay_url="https://r", telegram_bot_token="t", allowed_user_ids=())
     job = {
         "token": "tok",
         "chat_id": 42,
@@ -250,7 +250,7 @@ async def _submit(
         ),
         patch(
             "comfytelegram.handlers.validate_webapp_init_data",
-            return_value={"user": json.dumps({"id": 7})},
+            return_value={"user": json.dumps({"id": 42})},
         ),
         patch("comfytelegram.handlers._relay_delete_job", new=AsyncMock()),
         patch("comfytelegram.handlers._txt2img_seed", new=AsyncMock(return_value=seed)),

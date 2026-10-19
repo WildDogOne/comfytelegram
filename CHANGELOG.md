@@ -140,6 +140,24 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tap Done in the editor" message (with its editor button) is now deleted
   once the drawn mask arrives and generation starts.
 
+### Security
+
+- Mask/pose editor submissions are only accepted from the user the editor
+  was opened for, if they're still on `ALLOWED_USER_IDS`, and only within
+  30 minutes of opening it. Before, any validly signed Telegram WebApp
+  data was accepted, and it never expired.
+- inpaint_relay: rejects malformed submissions (bad or out-of-range
+  denoise, oversized masks) with a 400/413 instead of a 500, accepts one
+  submission per job, no longer serves FastAPI's `/docs`, and sends
+  `Referrer-Policy: no-referrer`, `nosniff` and a Content-Security-Policy
+  on the editor pages.
+- inpaint_relay: the editor checks onnxruntime-web's files (script,
+  `.mjs`, `.wasm`) against pinned SHA-384 hashes before running them.
+- inpaint_relay: `docker-compose.example.yml` now actually attaches its
+  security-headers middleware to the router; it was defined but unused.
+  Add the same `traefik.http.routers.inpaint-relay.middlewares` label to
+  an existing deployment.
+
 ## 0.2.0 - 2026-10-06
 
 ### Added

@@ -1312,6 +1312,21 @@
   // since re-running the decoder during replay would be async.
   var ORT_VERSION = "1.29.0";
   var ORT_BASE = "https://cdn.jsdelivr.net/npm/onnxruntime-web@" + ORT_VERSION + "/dist/";
+  // SHA-384 of every onnxruntime-web file this page runs, so a tampered
+  // CDN copy is refused rather than run with access to the job token and
+  // initData. The script tag checks its own (SRI); the .mjs and .wasm it
+  // would otherwise fetch by itself are fetched and checked here instead,
+  // then handed over as a blob: URL and bytes (see initSmartSelect).
+  // Bumping ORT_VERSION means recomputing all three:
+  //   curl -sL <ORT_BASE><file> | openssl dgst -sha384 -binary | base64
+  // and updating the version in server.py's _EDITOR_CSP.
+  var ORT_INTEGRITY = {
+    "ort.wasm.min.js": "sha384-DfEnWLXuEOU4PRJhIXAuIsQhFvN453lwU7ictUMLLm3uyjMOvi5V87PJq21S1+MW",
+    "ort-wasm-simd-threaded.mjs":
+      "sha384-z5sGVARed0IX8pDHvBpO7K1OpdgqHdJvYEZsvBOUgb4Qesxi9Pc4WVSUmvDSlpNO",
+    "ort-wasm-simd-threaded.wasm":
+      "sha384-BgbOJ9Qymz3DQ6UBi4oQz+65TfnI1NbLk+hb2EsZqRyZPopUmGScxWWeUrmNmBR6",
+  };
   var SMART_MODEL_CACHE = "smart-select-models-v1";
   var EMBEDDING_FLOATS = 256 * 64 * 64;
   var EMBEDDING_POLL_MS = 1000;
@@ -1387,16 +1402,39 @@
     );
   });
 
-  function loadScript(src) {
+  function loadScript(src, integrity) {
     return new Promise(function (resolve, reject) {
       var el = document.createElement("script");
       el.src = src;
+      el.integrity = integrity;
+      el.crossOrigin = "anonymous";
       el.onload = resolve;
       el.onerror = function () {
         reject(new Error("couldn't load " + src));
       };
       document.head.appendChild(el);
     });
+  }
+
+  // An onnxruntime-web file's bytes, refused unless they match
+  // ORT_INTEGRITY.
+  function fetchOrtFile(name) {
+    return fetch(ORT_BASE + name)
+      .then(function (resp) {
+        if (!resp.ok) throw new Error("couldn't load " + name + ": " + resp.status);
+        return resp.arrayBuffer();
+      })
+      .then(function (buf) {
+        return crypto.subtle.digest("SHA-384", buf).then(function (digest) {
+          var bytes = new Uint8Array(digest);
+          var binary = "";
+          for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+          if ("sha384-" + btoa(binary) !== ORT_INTEGRITY[name]) {
+            throw new Error(name + " failed its integrity check");
+          }
+          return buf;
+        });
+      });
   }
 
   // The decoder is ~16MB, served through signed redirect URLs that change
@@ -1513,9 +1551,18 @@
       ", SAM frame " + seg.width + "x" + seg.height
     );
     var t0 = performance.now();
-    var sessionReady = loadScript(ORT_BASE + "ort.wasm.min.js").then(function () {
+    var sessionReady = Promise.all([
+      loadScript(ORT_BASE + "ort.wasm.min.js", ORT_INTEGRITY["ort.wasm.min.js"]),
+      fetchOrtFile("ort-wasm-simd-threaded.mjs"),
+      fetchOrtFile("ort-wasm-simd-threaded.wasm"),
+    ]).then(function (loaded) {
       smartLog("onnxruntime-web " + ORT_VERSION + " loaded, " + elapsed(t0));
-      ort.env.wasm.wasmPaths = ORT_BASE;
+      // Hand over the already-checked files, so onnxruntime never fetches
+      // either itself: the .mjs as a blob: URL to import, and the .wasm as
+      // bytes (with wasmBinary set it doesn't resolve a .wasm URL at all).
+      var mjs = new Blob([loaded[1]], { type: "text/javascript" });
+      ort.env.wasm.wasmPaths = { mjs: URL.createObjectURL(mjs) };
+      ort.env.wasm.wasmBinary = loaded[2];
       // Threads need SharedArrayBuffer, i.e. a cross-origin-isolated page,
       // which this one isn't (it loads telegram-web-app.js cross-origin).
       ort.env.wasm.numThreads = window.crossOriginIsolated
@@ -2177,7 +2224,9 @@
         body: form,
       })
         .then(function (resp) {
-          if (!resp.ok) throw new Error("Upload failed: " + resp.status);
+          // 409: an earlier tap already got through (its response was lost),
+          // and the relay takes one submission per job.
+          if (!resp.ok && resp.status !== 409) throw new Error("Upload failed: " + resp.status);
           setStatus("Sent — you can close this.");
           if (tg) {
             tg.close();

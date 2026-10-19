@@ -122,6 +122,79 @@ pose, works with `/rp`) is done. Still open, in order:
   works when no SAM encoder is staged. Undo can store touched region ids
   instead of bitmaps, since the regions never change. A coarse/fine choice
   for region size could go in the options panel.
+- [ ] **`disableVerticalSwipes()` in `index.html`**: `pose.html` already
+  calls it, the mask editor doesn't, so a downward paint stroke can
+  minimise or close the Mini App.
+- [ ] **Full-screen editors** (`requestFullscreen()`, Bot API 8.0): both
+  pages only `expand()`; full screen gives the canvas more room on a phone.
+  Mind the safe-area insets.
+- [ ] **`DeviceStorage`** (Bot API 9.0) instead of `localStorage` for the
+  options panel's folded state, since Telegram's webview can clear
+  `localStorage`.
+- [ ] **Check the Mini App domain lock** (Bot API 10.2, on since
+  2026-07-20): Mini App methods now only work from the Mini App's own
+  origin. The editors are served from the relay and only load
+  `telegram-web-app.js` from telegram.org, so they should be fine — try
+  both once to confirm.
+
+## Telegram Bot API features
+
+Ideas from the Bot API changelog (8.0–10.3, reviewed 2026-10-19).
+
+### Available in python-telegram-bot
+
+PTB 22.8 supports Bot API 10.0.
+
+- [ ] **Coloured buttons** (`style`, Bot API 9.4): `"danger"` (red),
+  `"success"` (green), `"primary"` (blue) on inline and reply keyboard
+  buttons. E.g. red "❌ Cancel", green "🎨 Generate"/"🔁 Generate Again",
+  blue "⋯ More". `icon_custom_emoji_id` exists too but needs the bot owner
+  to have Premium.
+- [ ] **Progress as a message draft** (`send_message_draft`, Bot API
+  9.3/9.5): an animated, temporary preview meant for "still generating"
+  output, instead of the throttled "Generating… 37%" edit loop. Private
+  chats only, so forum-topic groups keep the edit loop. A draft vanishes
+  ~30s after its last update, and the final result still has to be sent
+  as a normal message. Changes with the same `draft_id` animate.
+- [ ] **Topics in the private chat** (Bot API 9.3/9.4): the bot can enable
+  topics in its DM and `create_forum_topic` there, e.g. one thread per
+  character or project. `message_thread_id` is already passed everywhere,
+  so this should mostly just work.
+
+### Waiting for python-telegram-bot
+
+These need Bot API 10.1–10.3. Until PTB supports them, they're only
+reachable as raw `bot.do_api_request(...)` calls, without PTB models for
+the new update types. Check PTB's changelog for a release that supports
+Bot API 10.3.
+
+- [ ] **Stop button on drafts** (`can_stop`/`keep_on_stop` on
+  `sendMessageDraft`, `stopped_message_generation` update, Bot API 10.3):
+  a native "stop" on the progress draft above, which would interrupt the
+  ComfyUI job (`/interrupt`) or end a `/stream` — instead of
+  `_STREAMING_KEYBOARD`'s "/stop" button. Needs PTB to dispatch the new
+  update type.
+- [ ] **`force_reply` on inline keyboards** (Bot API 10.3): opens the reply
+  box as if the user had tapped "Reply". Fits every follow-up question
+  (`/stream` prompt, Kontext instruction, `/settings` custom value, `/fav`
+  edit, "🎚️ Redo…" custom denoise, `/rp`). The answer then arrives as a
+  reply to the question, so it could be matched by `reply_to_message`
+  instead of the `awaiting_*` flags in `chat_data`. Can't be changed by
+  editing the keyboard later.
+- [ ] **Disabled buttons** (`InlineKeyboardButton.disabled`/
+  `DisabledButton`, Bot API 10.3): grey out a tapped "🖌️ Draw Mask"/
+  upscale button while it runs, instead of `uploads_in_progress` plus a
+  "still uploading" reply. Also a greyed-out "📋 Copy" for prompts over
+  256 characters, rather than leaving the button out.
+- [ ] **Ephemeral messages** (Bot API 10.2/10.3): group messages only one
+  user sees. Fits `/settings`, `/lora`, `/favs` and error notes in a group;
+  `replace_callback_query_message` can show a menu in place of the message
+  that opened it. Only worth it if the bot is used in groups.
+- [ ] **Sending rich messages** (`sendRichMessage`, Bot API 10.1–10.3):
+  compact tables, collapsible quotes and button blocks — for
+  "🐛 Show Prompt", `/tagcheck`, LoRA info and the `/settings` summary.
+  Receiving them is already handled (`message_text.py`); once PTB models
+  `Message.rich_message`, that module's `api_kwargs` workaround can go too.
 
 ## Housekeeping
 

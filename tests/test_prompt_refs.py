@@ -194,7 +194,7 @@ async def test_generate_message_reports_an_unknown_name_without_generating(stora
 
 
 async def _run_detail_job(
-    storage: Storage, positive, negative, *, user_id=7, profiles=(), params=None, disable_lora=None
+    storage: Storage, positive, negative, *, user_id=42, profiles=(), params=None, disable_lora=None
 ):
     result_id = "abc123"
     storage.store_pending_result(
@@ -243,7 +243,11 @@ async def _run_detail_job(
         patch("comfytelegram.handlers.post_process", new=AsyncMock(return_value=generated)) as pp,
     ):
         await _process_one_inpaint_job(
-            application, MagicMock(inpaint_relay_url="https://x"), storage, client, job
+            application,
+            MagicMock(inpaint_relay_url="https://x", allowed_user_ids=()),
+            storage,
+            client,
+            job,
         )
     return pp.await_args.kwargs, application.bot.send_message
 

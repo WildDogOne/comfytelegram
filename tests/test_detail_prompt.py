@@ -518,7 +518,7 @@ async def test_process_one_inpaint_job_detail_kind_runs_the_one_shot_prompt():
         return_value=MagicMock(download_as_bytearray=AsyncMock(return_value=bytearray(b"orig")))
     )
     application.bot.send_photo = AsyncMock(return_value=MagicMock())
-    settings = MagicMock(inpaint_relay_url="https://inpaint.example.com")
+    settings = MagicMock(inpaint_relay_url="https://inpaint.example.com", allowed_user_ids=())
     client = MagicMock(get_image_bytes=AsyncMock(side_effect=ComfyUIError("no file")))
     job = {
         "token": "tok1",
@@ -544,7 +544,9 @@ async def test_process_one_inpaint_job_detail_kind_runs_the_one_shot_prompt():
                 }
             ),
         ),
-        patch("comfytelegram.handlers.validate_webapp_init_data", return_value={"user": "1"}),
+        patch(
+            "comfytelegram.handlers.validate_webapp_init_data", return_value={"user": '{"id": 42}'}
+        ),
         patch("comfytelegram.handlers._relay_delete_job", new=AsyncMock()),
         patch("comfytelegram.handlers.post_process", new=AsyncMock(return_value=generated)) as pp,
     ):
@@ -592,7 +594,7 @@ async def test_hand_draw_job_never_carries_a_prompt():
         return_value=MagicMock(download_as_bytearray=AsyncMock(return_value=bytearray(b"orig")))
     )
     application.bot.send_photo = AsyncMock(return_value=MagicMock())
-    settings = MagicMock(inpaint_relay_url="https://inpaint.example.com")
+    settings = MagicMock(inpaint_relay_url="https://inpaint.example.com", allowed_user_ids=())
     client = MagicMock(get_image_bytes=AsyncMock(side_effect=ComfyUIError("no file")))
     job = {
         "token": "tok1",
@@ -617,7 +619,9 @@ async def test_hand_draw_job_never_carries_a_prompt():
                 }
             ),
         ),
-        patch("comfytelegram.handlers.validate_webapp_init_data", return_value={"user": "1"}),
+        patch(
+            "comfytelegram.handlers.validate_webapp_init_data", return_value={"user": '{"id": 42}'}
+        ),
         patch("comfytelegram.handlers._relay_delete_job", new=AsyncMock()),
         patch("comfytelegram.handlers.post_process", new=AsyncMock(return_value=generated)) as pp,
     ):

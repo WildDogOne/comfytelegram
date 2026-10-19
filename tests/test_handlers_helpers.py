@@ -2522,7 +2522,9 @@ async def test_process_one_inpaint_job_stores_a_redoable_row_and_attaches_redo_b
             "comfytelegram.handlers._relay_poll_result",
             new=AsyncMock(return_value={"mask": b"drawn-mask-bytes", "init_data": "raw-init-data"}),
         ),
-        patch("comfytelegram.handlers.validate_webapp_init_data", return_value={"user": "1"}),
+        patch(
+            "comfytelegram.handlers.validate_webapp_init_data", return_value={"user": '{"id": 42}'}
+        ),
         patch("comfytelegram.handlers._relay_delete_job", new=AsyncMock()),
         patch("comfytelegram.handlers.post_process", new=AsyncMock(return_value=refined)),
     ):
@@ -2600,7 +2602,9 @@ async def test_process_one_inpaint_job_fix_kind_runs_fix_drawn_post_process():
             "comfytelegram.handlers._relay_poll_result",
             new=AsyncMock(return_value={"mask": b"drawn-mask-bytes", "init_data": "raw-init-data"}),
         ),
-        patch("comfytelegram.handlers.validate_webapp_init_data", return_value={"user": "1"}),
+        patch(
+            "comfytelegram.handlers.validate_webapp_init_data", return_value={"user": '{"id": 42}'}
+        ),
         patch("comfytelegram.handlers._relay_delete_job", new=AsyncMock()),
         patch("comfytelegram.handlers.post_process", new=AsyncMock(return_value=refined)) as mock,
     ):

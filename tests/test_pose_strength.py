@@ -272,8 +272,8 @@ async def test_a_pick_rerenders_that_image_on_the_same_noise(tmp_path):
     assert sent.noise_index == 2 and sent.full_params.batch_size == 3
     assert storage.get_pose_strength(1) is None  # the image's, not the chat's
     context.bot.delete_message.assert_awaited_once_with(chat_id=1, message_id=50)
-    done = query.message.reply_text.await_args_list[-1].args[0]
-    assert "0.8 → 0.6" in done
+    # Only the status message — no "Done" reply after the image.
+    assert query.message.reply_text.await_count == 1
 
 
 @pytest.mark.asyncio

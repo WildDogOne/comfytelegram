@@ -40,6 +40,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import os
 import secrets
 import time
@@ -196,6 +197,36 @@ class Job:
 #: are about 6KB.
 MAX_POSE_BYTES = 64 * 1024
 
+#: Largest mask `submit_mask` accepts. The editor exports a grayscale PNG
+#: at the source's size, a few MB at most even for a 4096px upscale.
+MAX_MASK_BYTES = 32 * 1024 * 1024
+
+#: Only the editor pages run scripts: their own inline code,
+#: `telegram-web-app.js`, and onnxruntime-web for "✨ Smart" select (pinned
+#: to the exact version `index.html` loads, and integrity-checked there
+#: too). `blob:` is how that page hands onnxruntime its hash-checked
+#: `.mjs`; `wasm-unsafe-eval` lets it compile the matching `.wasm`.
+#: `connect-src` stays open to https because the SAM decoder's URL is the
+#: bot's setting (`sam_decoder_url`), which this relay never sees.
+_EDITOR_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob: https://telegram.org/js/ "
+    "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' blob: data:; "
+    "connect-src 'self' https:; "
+    "worker-src 'self' blob:; "
+    "object-src 'none'; "
+    "base-uri 'none'; "
+    "form-action 'none'"
+)
+
+#: Sent with every response. The token is in every URL, so no Referer.
+_SECURITY_HEADERS = {
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+}
+
 
 #: Magic-byte prefixes for the image formats comfytelegram can upload,
 #: mapped to what `GET /jobs/{token}/image` should claim they are.
@@ -220,8 +251,17 @@ def _sniff_content_type(image: bytes) -> str:
     return "application/octet-stream"
 
 
-app = FastAPI(title="inpaint-relay")
+# No /docs, /redoc or /openapi.json: nothing here is meant to be explored.
+app = FastAPI(title="inpaint-relay", docs_url=None, redoc_url=None, openapi_url=None)
 _jobs: dict[str, Job] = {}
+
+
+@app.middleware("http")
+async def _add_security_headers(request: Request, call_next: Any) -> Response:
+    response = await call_next(request)
+    for name, value in _SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)
+    return response
 
 
 def _shared_secret() -> str:
@@ -474,7 +514,10 @@ async def mask_editor_page(token: str) -> FileResponse:
     _prune_expired_jobs()
     job = _get_job_or_404(token)
     page = "pose.html" if job.mode == "pose" else "index.html"
-    return FileResponse(STATIC_DIR / page, headers={"Cache-Control": "no-cache"})
+    return FileResponse(
+        STATIC_DIR / page,
+        headers={"Cache-Control": "no-cache", "Content-Security-Policy": _EDITOR_CSP},
+    )
 
 
 @app.get("/jobs/{token}/image")
@@ -530,6 +573,21 @@ async def job_meta(token: str) -> JSONResponse:
     )
 
 
+def _parse_denoise(value: Any) -> float | None:
+    """A submitted `denoise` field: blank means "no override" (`None`),
+    anything else must be a number in (0, 1] or the request is a 400."""
+    text = _none_if_blank(value)
+    if text is None:
+        return None
+    try:
+        denoise = float(text)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="'denoise' must be a number") from None
+    if not math.isfinite(denoise) or not 0 < denoise <= 1:
+        raise HTTPException(status_code=400, detail="'denoise' must be in (0, 1]")
+    return denoise
+
+
 def _none_if_blank(value: Any) -> str | None:
     """A submitted form field, blank-or-missing collapsed to `None` — "no
     override" rather than an empty-string override, matching how
@@ -559,8 +617,14 @@ async def submit_mask(token: str, request: Request) -> dict[str, bool]:
     detailer_disable_lora_available`'s own docstring for why."""
     _prune_expired_jobs()
     job = _get_job_or_404(token)
+    if job.status == "submitted":
+        # One submission per job: comfytelegram may already be acting on
+        # it, and a second POST shouldn't be able to swap it underneath.
+        raise HTTPException(status_code=409, detail="Already submitted")
     form = await request.form()
     init_data = form.get("init_data")
+    if init_data is not None and not isinstance(init_data, str):
+        raise HTTPException(status_code=400, detail="'init_data' must be a text field")
     if job.mode == "pose":
         # `/pose`'s editor submits keypoints, not a mask: a `pose` text
         # field (OpenPose JSON) plus `init_data`, nothing else.
@@ -574,9 +638,15 @@ async def submit_mask(token: str, request: Request) -> dict[str, bool]:
         job.status = "submitted"
         return {"ok": True}
     mask_file = form.get("mask")
-    if mask_file is None or init_data is None:
+    if mask_file is None or isinstance(mask_file, str) or init_data is None:
         raise HTTPException(status_code=400, detail="Both 'mask' and 'init_data' are required")
-    job.mask = await mask_file.read()
+    mask = await mask_file.read(MAX_MASK_BYTES + 1)
+    if len(mask) > MAX_MASK_BYTES:
+        raise HTTPException(status_code=413, detail="Mask too large")
+    # Parsed before anything is written, so a rejected request leaves the
+    # job untouched and the editor can retry.
+    denoise = _parse_denoise(form.get("denoise")) if job.mode == "mask_prompt" else None
+    job.mask = mask
     if job.detailer_disable_lora_available:
         job.detailer_disable_lora = (
             str(form.get("detailer_disable_lora", "")).strip().lower() == "true"
@@ -584,8 +654,7 @@ async def submit_mask(token: str, request: Request) -> dict[str, bool]:
     if job.mode == "mask_prompt":
         job.positive_prompt = _none_if_blank(form.get("positive"))
         job.negative_prompt = _none_if_blank(form.get("negative"))
-        denoise_raw = _none_if_blank(form.get("denoise"))
-        job.denoise = float(denoise_raw) if denoise_raw is not None else None
+        job.denoise = denoise
         job.tile_controlnet = str(form.get("tile_controlnet", "")).strip().lower() == "true"
     elif job.mode == "regions":
         job.positive_prompt = _none_if_blank(form.get("positive"))

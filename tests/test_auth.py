@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import time
 from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urlencode
 
@@ -115,3 +116,22 @@ def test_validate_webapp_init_data_rejects_missing_hash():
 
 def test_validate_webapp_init_data_rejects_malformed_input():
     assert validate_webapp_init_data("%zz", "test-token") is None
+
+
+def test_validate_webapp_init_data_max_age_accepts_a_fresh_payload():
+    init_data = _signed_init_data("test-token", auth_date=str(int(time.time()) - 60))
+    assert validate_webapp_init_data(init_data, "test-token", max_age_seconds=1800) is not None
+
+
+def test_validate_webapp_init_data_max_age_rejects_a_stale_payload():
+    """A correctly signed payload is replayable forever unless its age is
+    checked — the relay sees every one it forwards."""
+    init_data = _signed_init_data("test-token", auth_date=str(int(time.time()) - 3600))
+    assert validate_webapp_init_data(init_data, "test-token", max_age_seconds=1800) is None
+
+
+def test_validate_webapp_init_data_max_age_rejects_future_or_missing_auth_date():
+    future = _signed_init_data("test-token", auth_date=str(int(time.time()) + 3600))
+    assert validate_webapp_init_data(future, "test-token", max_age_seconds=1800) is None
+    missing = _signed_init_data("test-token", query_id="abc")
+    assert validate_webapp_init_data(missing, "test-token", max_age_seconds=1800) is None

@@ -877,7 +877,9 @@
     form.append("init_data", tg ? tg.initData : "");
     fetch("/jobs/" + encodeURIComponent(token) + "/mask", { method: "POST", body: form })
       .then(function (resp) {
-        if (!resp.ok) throw new Error("Upload failed: " + resp.status);
+        // 409: an earlier tap already got through (its response was lost),
+        // and the relay takes one submission per job.
+        if (!resp.ok && resp.status !== 409) throw new Error("Upload failed: " + resp.status);
         setStatus("Sent — you can close this.");
         if (tg) tg.close();
       })

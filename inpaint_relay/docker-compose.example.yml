@@ -24,6 +24,8 @@ services:
       - traefik.http.routers.inpaint-relay.entrypoints=web,websecure
       - traefik.http.routers.inpaint-relay.tls.certresolver=mytlschallenge
       - traefik.http.services.inpaint-relay.loadbalancer.server.port=8000
+      # Without this line the headers middleware below is defined but never applied.
+      - traefik.http.routers.inpaint-relay.middlewares=inpaint-relay@docker
 
 networks:
   default:
