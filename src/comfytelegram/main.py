@@ -71,6 +71,7 @@ from comfytelegram.lora_discovery import backfill_trigger_words, discover_new_lo
 from comfytelegram.lora_menu import lora_callback, lora_command
 from comfytelegram.message_text import TEXT_CONTENT, message_text
 from comfytelegram.profiles import load_profiles
+from comfytelegram.progress import DRAFT_BOARDS_KEY, DraftBoards
 from comfytelegram.settings import Settings, load_settings
 from comfytelegram.settings_menu import settings_callback, settings_command
 from comfytelegram.storage import Storage
@@ -286,6 +287,9 @@ async def _post_shutdown(application: Application) -> None:
     lora_discovery_task: asyncio.Task | None = application.bot_data.get("lora_discovery_task")
     if lora_discovery_task is not None:
         lora_discovery_task.cancel()
+    draft_boards: DraftBoards | None = application.bot_data.get(DRAFT_BOARDS_KEY)
+    if draft_boards is not None:
+        draft_boards.cancel_all()
     client: ComfyClient | None = application.bot_data.get("comfy_client")
     if client is not None:
         await client.__aexit__(None, None, None)
@@ -353,6 +357,8 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["profiles"] = load_profiles(settings.model_profiles_dir)
     application.bot_data["storage"] = Storage(settings.state_db_path)
     application.bot_data["tags_db"] = TagDatabase(settings.tags_db_path)
+    if settings.progress_drafts:
+        application.bot_data[DRAFT_BOARDS_KEY] = DraftBoards()
 
     for name, callback, _ in _COMMANDS:
         application.add_handler(CommandHandler(name, callback))

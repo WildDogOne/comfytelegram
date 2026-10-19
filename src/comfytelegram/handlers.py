@@ -119,6 +119,7 @@ from comfytelegram.profiles import (
     resolve_generation_params,
     resolve_profile,
 )
+from comfytelegram.progress import Status, start_chat_status, start_reply_status
 from comfytelegram.prompt_refs import (
     ReferenceExpander,
     UnknownReferenceError,
@@ -545,9 +546,10 @@ CHARACTER_HELP = (
     "prompt (also in regional prompts and ✏️ Detail Prompt) to insert it there."
 )
 
-# Minimum interval between progress-message edits, to stay well under
-# Telegram's per-chat edit rate limit — a 40-step job would otherwise fire
-# 40 edits in a few seconds.
+# Minimum interval between one job's progress updates (a draft in a private
+# chat, an edit of its status message elsewhere — see `progress.py`), to
+# stay well under Telegram's per-chat rate limits — a 40-step job would
+# otherwise fire 40 updates in a few seconds.
 PROGRESS_EDIT_INTERVAL = 2.0
 
 # Telegram's hard limit for sendPhoto is exactly 10485760 bytes (10 MiB) — a
@@ -1337,15 +1339,15 @@ _serialize_generation_params = serialize_generation_params
 _deserialize_generation_params = deserialize_generation_params
 
 
-def _make_progress_callback(status_message: Message, label: str = "Generating"):
-    """Shared throttled progress-edit closure for `generate_message` and
-    `again_callback` — see PROGRESS_EDIT_INTERVAL above. `label` lets
+def _make_progress_callback(status_message: Status, label: str = "Generating"):
+    """Shared throttled progress closure for every job that reports
+    sampling steps — see PROGRESS_EDIT_INTERVAL above. `label` lets
     `_run_stream` prefix each edit with its image count (e.g.
     "Streaming 3/100") instead of the generic "Generating"."""
     last_edit = {"t": 0.0}
 
     async def on_progress(progress: JobProgress) -> None:
-        """Edit `status_message` with the current step/percent, throttled
+        """Report the current step/percent on `status_message`, throttled
         to at most once per `PROGRESS_EDIT_INTERVAL`; silently skipped once
         `progress.done` or before the first real progress event arrives."""
         if progress.done or progress.value is None or progress.max is None:
@@ -1355,33 +1357,25 @@ def _make_progress_callback(status_message: Message, label: str = "Generating"):
             return
         last_edit["t"] = now
         pct = int(100 * progress.value / progress.max) if progress.max else 0
-        try:
-            await status_message.edit_text(
-                f"{label}… {pct}% (step {progress.value}/{progress.max})"
-            )
-        except Exception:
-            logger.debug("Progress edit skipped (rate-limited or unchanged)", exc_info=True)
+        await status_message.update(f"{label}… {pct}% (step {progress.value}/{progress.max})")
 
     return on_progress
 
 
-def _make_stage_callback(status_message: Message):
+def _make_stage_callback(status_message: Status):
     """`generation.StageCallback` that shows each extra stage of a run (a
     regional LoRA pass) on `status_message`, like `_make_progress_callback`
     does for sampling progress — no throttle, since stages are seconds
     apart at the least."""
 
     async def on_stage(stage: str) -> None:
-        try:
-            await status_message.edit_text(f"{stage}…")
-        except Exception:
-            logger.debug("Stage edit skipped", exc_info=True)
+        await status_message.update(f"{stage}…")
 
     return on_stage
 
 
 async def _run_reporting_errors(
-    status_message: Message, label: str, log_label: str, awaitable: Awaitable[T]
+    status_message: Status, label: str, log_label: str, awaitable: Awaitable[T]
 ) -> T | None:
     """Run `awaitable`, reporting a `ComfyUIError` or any other exception back
     into `status_message` instead of letting it propagate — shared by every
@@ -1834,7 +1828,7 @@ async def _relay_delete_job(settings: Settings, token: str) -> None:
 
 async def _run_drawn_mask_post_process(
     client: ComfyClient,
-    status_message: Message,
+    status_message: Status,
     source_bytes: bytes,
     source_filename: str,
     full_params: GenerationParams,
@@ -1982,6 +1976,8 @@ async def _run_one_drawn_mask_redo(
     profiles: list[ModelProfile],
     source_bytes: bytes,
     denoise_override: float | None = None,
+    *,
+    bot_data: dict[str, Any],
 ) -> bool:
     """One "🔁 Redo (same mask)"/"🔁 x4"/"🎚️ Redo…" iteration: its own status message,
     `post_process` call, and result send (with fresh redo buttons of its
@@ -2010,8 +2006,8 @@ async def _run_one_drawn_mask_redo(
     tile_controlnet_choice = redo.get("tile_controlnet")
     detailer_disable_lora_choice = redo.get("detailer_disable_lora")
     status_suffix = f", denoise {denoise_override:g}" if denoise_override is not None else ""
-    status_message = await reply_message.reply_text(
-        f"{drawn_mask_kind['label']} (drawn mask{status_suffix})…", disable_notification=True
+    status_message = await start_reply_status(
+        bot_data, reply_message, f"{drawn_mask_kind['label']} (drawn mask{status_suffix})…"
     )
     generated = await _run_drawn_mask_post_process(
         client,
@@ -2108,6 +2104,7 @@ async def _run_drawn_mask_redos(
             context.bot_data["profiles"],
             source_bytes,
             denoise_override=denoise_override,
+            bot_data=context.bot_data,
         )
         if not ok:
             break
@@ -2205,10 +2202,11 @@ async def _process_one_inpaint_job(
         )
         return
     drawn_mask_kind = _DRAWN_MASK_KINDS[job["kind"]]
-    status_message = await application.bot.send_message(
+    status_message = await start_chat_status(
+        application.bot_data,
+        application.bot,
         chat_id,
         f"{drawn_mask_kind['label']} (drawn mask)…",
-        disable_notification=True,
         message_thread_id=message_thread_id,
     )
     full_params = _deserialize_generation_params(pending["base_params"])
@@ -2507,10 +2505,11 @@ async def _run_paint_regions_job(
             scheduler=full_params.scheduler,
             clip_skip=full_params.clip_skip,
         )
-    status_message = await bot.send_message(
+    status_message = await start_chat_status(
+        application.bot_data,
+        bot,
         chat_id,
         "Generating regions… 0%",
-        disable_notification=True,
         message_thread_id=message_thread_id,
     )
     images = await _run_reporting_errors(
@@ -2749,7 +2748,12 @@ async def poll_inpaint_jobs(application: Application) -> None:
         client: ComfyClient = application.bot_data["comfy_client"]
         for job in storage.list_inpaint_jobs():
             try:
-                await _process_one_inpaint_job(application, settings, storage, client, job)
+                # Its own task, so a job that dies mid-way drops off its
+                # chat's progress draft (`progress.DraftBoard._prune` goes by
+                # task) instead of being kept alive by the poller's.
+                await asyncio.create_task(
+                    _process_one_inpaint_job(application, settings, storage, client, job)
+                )
             except Exception:
                 logger.exception("Error polling inpaint_relay job %s", job["token"])
 
@@ -2869,7 +2873,7 @@ async def _send_tag_and_caption_prompts(
 
 
 async def _deliver_generation_result(
-    status_message: Message,
+    status_message: Status,
     reply_target: Message,
     chat_id: int,
     storage: Storage,
@@ -3520,7 +3524,7 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     pose_png = await _pose_for_generation(message, storage, chat_id, profile)
     label = _pose_label("Generating", pose_png)
-    status_message = await message.reply_text(f"{label}… 0%", disable_notification=True)
+    status_message = await start_reply_status(context.bot_data, message, f"{label}… 0%")
 
     images = await _run_reporting_errors(
         status_message,
@@ -3664,7 +3668,7 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if checkpoint is None:
         return
 
-    status_message = await message.reply_text("Analyzing image…", disable_notification=True)
+    status_message = await start_reply_status(context.bot_data, message, "Analyzing image…")
 
     async def _download_and_analyze_both() -> tuple[str | None, tuple[str, str] | None]:
         source_bytes = await _download_telegram_file(context.bot, message.photo[-1].file_id)
@@ -4439,8 +4443,8 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if kind == ANALYZE_ONLY_CALLBACK_KIND:
-        status_message = await query.message.reply_text(
-            "Analyzing image…", disable_notification=True
+        status_message = await start_reply_status(
+            context.bot_data, query.message, "Analyzing image…"
         )
         checkpoint = full_params.checkpoint
         chat_id = pending["chat_id"]
@@ -4468,8 +4472,8 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if kind == DEEP_ANALYZE_CALLBACK_KIND:
-        status_message = await query.message.reply_text(
-            "Deep analyzing image…", disable_notification=True
+        status_message = await start_reply_status(
+            context.bot_data, query.message, "Deep analyzing image…"
         )
         checkpoint = full_params.checkpoint
         chat_id = pending["chat_id"]
@@ -4803,7 +4807,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         kind = "upscale"
 
     label = POSTPROCESS_STATUS_LABELS.get(kind, kind.title())
-    status_message = await anchor.reply_text(f"{label}…", disable_notification=True)
+    status_message = await start_reply_status(context.bot_data, anchor, f"{label}…")
 
     async def _download_and_post_process() -> GeneratedImage:
         """Bundle the file download and the post-process call into one
@@ -5046,8 +5050,8 @@ async def region_lora_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     profiles: list[ModelProfile] = context.bot_data["profiles"]
 
     if which == REGION_LORA_ALL:
-        status_message = await query.message.reply_text(
-            "Finding the characters…", disable_notification=True
+        status_message = await start_reply_status(
+            context.bot_data, query.message, "Finding the characters…"
         )
 
         async def _download_and_apply() -> GeneratedImage:
@@ -5136,7 +5140,7 @@ async def hand_point_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     box_size_frac = HAND_POINT_BOX_SIZE_FRAC_BASE / grid_size
 
-    status_message = await query.message.reply_text("Refining hand…", disable_notification=True)
+    status_message = await start_reply_status(context.bot_data, query.message, "Refining hand…")
 
     async def _download_and_post_process() -> GeneratedImage:
         data = await _fetch_source_image(
@@ -5355,7 +5359,7 @@ async def again_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     client: ComfyClient = context.bot_data["comfy_client"]
     full_params = _deserialize_generation_params(snapshot["params"])
 
-    status_message = await query.message.reply_text("Generating… 0%", disable_notification=True)
+    status_message = await start_reply_status(context.bot_data, query.message, "Generating… 0%")
     images = await _run_reporting_errors(
         status_message,
         "Generation",
@@ -5412,7 +5416,7 @@ async def generate_from_prompt_callback(update: Update, context: ContextTypes.DE
 
     pose_png = await _pose_for_generation(query.message, storage, chat_id, profile)
     label = _pose_label("Generating", pose_png)
-    status_message = await query.message.reply_text(f"{label}… 0%", disable_notification=True)
+    status_message = await start_reply_status(context.bot_data, query.message, f"{label}… 0%")
     images = await _run_reporting_errors(
         status_message,
         "Generation",
@@ -5635,7 +5639,7 @@ async def _generate_regional(
 
     pose_png = await _pose_for_generation(message, storage, chat_id, profile)
     label = _pose_label("Generating", pose_png)
-    status_message = await message.reply_text(f"{label}… 0%", disable_notification=True)
+    status_message = await start_reply_status(context.bot_data, message, f"{label}… 0%")
 
     images = await _run_reporting_errors(
         status_message,
@@ -5845,7 +5849,7 @@ async def _consume_awaiting_upscale_custom(
         return True
 
     label = POSTPROCESS_STATUS_LABELS["upscale"]
-    status_message = await message.reply_text(f"{label}…", disable_notification=True)
+    status_message = await start_reply_status(context.bot_data, message, f"{label}…")
 
     result = await _run_reporting_errors(
         status_message,
@@ -5986,7 +5990,7 @@ async def _run_kontext_and_send(
     storage: Storage = context.bot_data["storage"]
 
     label = "Kontext editing"
-    status_message = await message.reply_text(f"{label}…", disable_notification=True)
+    status_message = await start_reply_status(context.bot_data, message, f"{label}…")
 
     async def fetch_and_edit() -> GeneratedImage:
         # The source download runs inside `_run_reporting_errors` too, so a
@@ -6746,7 +6750,7 @@ async def _run_pose_strength_redo(
         keep_index = 0
 
     label = f"Generating with pose strength {strength:g}"
-    status_message = await anchor.reply_text(f"{label}… 0%", disable_notification=True)
+    status_message = await start_reply_status(context.bot_data, anchor, f"{label}… 0%")
     images = await _run_reporting_errors(
         status_message,
         "Generation",
@@ -6844,6 +6848,7 @@ async def _run_stream(
     profiles: list[ModelProfile] = context.bot_data["profiles"]
 
     status_message: Message | None = None
+    progress_status: Status | None = None
     count = 0
     try:
         checkpoint = await _resolve_checkpoint_or_default(
@@ -6875,9 +6880,16 @@ async def _run_stream(
             reply_markup=_STREAMING_KEYBOARD,
             disable_notification=True,
         )
+        # Progress goes to a draft below the newest image in a private chat;
+        # elsewhere it's edited into the "Streaming started" message.
+        progress_status = await start_reply_status(
+            context.bot_data, message, None, existing=status_message
+        )
 
         for i in range(STREAM_HARD_LIMIT):
             count = i + 1
+            label = _pose_label(f"Streaming {count}/{STREAM_HARD_LIMIT}", pose_png)
+            await progress_status.update(f"{label}…")
             images = await generate(
                 client,
                 checkpoint,
@@ -6887,14 +6899,12 @@ async def _run_stream(
                 raw_positive_prompt=raw_positive,
                 raw_negative_prompt=raw_negative,
                 overrides={"batch_size": 1},
-                on_progress=_make_progress_callback(
-                    status_message,
-                    label=_pose_label(f"Streaming {count}/{STREAM_HARD_LIMIT}", pose_png),
-                ),
+                on_progress=_make_progress_callback(progress_status, label=label),
                 pose_png=pose_png,
                 pose_strength=storage.get_pose_strength(chat_id),
             )
             await _send_and_store_result(message, chat_id, storage, images[0])
+            progress_status.message_sent()
         await _finish_stream(
             status_message, f"Stream finished — hit the {STREAM_HARD_LIMIT}-image limit."
         )
@@ -6911,6 +6921,8 @@ async def _run_stream(
             status_message, f"Stream stopped after {count} image(s) — unexpected error."
         )
     finally:
+        if progress_status is not None:
+            await progress_status.close()
         context.bot_data.get("active_streams", {}).pop(chat_id, None)
 
 

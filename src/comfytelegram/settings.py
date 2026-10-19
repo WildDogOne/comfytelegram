@@ -107,6 +107,14 @@ class Settings(BaseSettings):
             "first startup unless tag_db_auto_update is disabled — see that field."
         ),
     )
+    progress_drafts: bool = Field(
+        True,
+        description=(
+            "Show job progress in private chats as a Telegram message draft (an "
+            "animated preview that is never stored in the chat) instead of an edited "
+            "status message. Groups always use the status message."
+        ),
+    )
     tag_db_auto_update: bool = Field(
         True,
         description=(

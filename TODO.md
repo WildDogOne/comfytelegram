@@ -148,12 +148,6 @@ PTB 22.8 supports Bot API 10.0.
 - [ ] **Custom emoji icons on buttons** (`icon_custom_emoji_id`, Bot API
   9.4): needs the bot owner to have Premium (or bought Fragment
   usernames). Button colours (`style`) shipped.
-- [ ] **Progress as a message draft** (`send_message_draft`, Bot API
-  9.3/9.5): an animated, temporary preview meant for "still generating"
-  output, instead of the throttled "Generating… 37%" edit loop. Private
-  chats only, so forum-topic groups keep the edit loop. A draft vanishes
-  ~30s after its last update, and the final result still has to be sent
-  as a normal message. Changes with the same `draft_id` animate.
 - [ ] **Topics in the private chat** (Bot API 9.3/9.4): the bot can enable
   topics in its DM and `create_forum_topic` there, e.g. one thread per
   character or project. `message_thread_id` is already passed everywhere,
@@ -168,8 +162,8 @@ Bot API 10.3.
 
 - [ ] **Stop button on drafts** (`can_stop`/`keep_on_stop` on
   `sendMessageDraft`, `stopped_message_generation` update, Bot API 10.3):
-  a native "stop" on the progress draft above, which would interrupt the
-  ComfyUI job (`/interrupt`) or end a `/stream` — instead of
+  a native "stop" on the progress draft (`progress.py`), which would
+  interrupt the ComfyUI job (`/interrupt`) or end a `/stream` — instead of
   `_STREAMING_KEYBOARD`'s "/stop" button. Needs PTB to dispatch the new
   update type.
 - [ ] **`force_reply` on inline keyboards** (Bot API 10.3): opens the reply

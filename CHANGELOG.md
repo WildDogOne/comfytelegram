@@ -122,6 +122,14 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Progress as a live draft**: in a private chat, "Generating… 40%" (and
+  every other job's progress) is now Telegram's animated typing-style
+  preview instead of a status message that gets edited and deleted. It
+  never stays in the chat, shows below the newest image during `/stream`,
+  and lists every job at once when several run in parallel. Errors and
+  "No faces found"-style outcomes still arrive as normal messages. Groups
+  keep the old status message; `PROGRESS_DRAFTS=false` brings it back
+  everywhere.
 - **✏️ Detail Prompt starts from the prompt as you typed it**: the editor
   now pre-fills the image's prompt without the profile's quality tags, the
   active character's prompt or LoRA trigger words, and the bot adds the
