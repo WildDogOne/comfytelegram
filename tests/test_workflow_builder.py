@@ -1,3 +1,5 @@
+import pytest
+
 from comfytelegram.workflows.builder import (
     KONTEXT_RESOLUTIONS,
     DrawnMaskFixParams,
@@ -555,6 +557,45 @@ def test_build_hand_detailer_manual_clamps_the_box_at_image_edges():
     composite = next(n for n in prompt.values() if n["class_type"] == "MaskComposite")
     assert composite["inputs"]["x"] == 0
     assert composite["inputs"]["y"] == 0
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda base: build_face_detailer("src.png", base, FaceDetailerParams())[0],
+        lambda base: build_hand_detailer("src.png", base, HandDetailerParams())[0],
+        lambda base: build_hand_detailer_manual(
+            "src.png", base, ManualHandDetailerParams(), (0.5, 0.5), (4096, 4096)
+        )[0],
+        lambda base: build_hand_detailer_drawn_mask(
+            "src.png", "mask.png", base, DrawnMaskHandDetailerParams()
+        )[0],
+        lambda base: build_fix_drawn_mask(
+            "src.png",
+            "mask.png",
+            base,
+            DrawnMaskFixParams(),
+            image_size=(4096, 4096),
+            work_size=(1024, 1024),
+        )[0],
+    ],
+    ids=["face", "hand", "hand_manual", "hand_drawn", "fix_drawn"],
+)
+def test_detailers_use_tiled_vae(build):
+    base = PostProcessBaseParams(
+        checkpoint="furrytoonmix_xlIllustriousV2.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="low quality",
+    )
+    prompt = build(base)
+
+    detailers = [
+        n for n in prompt.values() if n["class_type"] in ("FaceDetailer", "DetailerForEach")
+    ]
+    assert detailers
+    for detailer in detailers:
+        assert detailer["inputs"]["tiled_encode"] is True
+        assert detailer["inputs"]["tiled_decode"] is True
 
 
 def test_build_hand_detailer_drawn_mask_loads_mask_via_load_image_mask():

@@ -122,6 +122,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Detailers decode in tiles**: Face/Hand Detail, Draw Mask, Detail
+  Prompt, Fix Artifact and the region LoRA pass now use tiled VAE
+  encode/decode straight away. On a large (upscaled) image ComfyUI used to
+  run out of memory on the full decode first and then retry tiled, which
+  cost time on every run.
 - **Progress as a live draft**: in a private chat, "Generating… 40%" (and
   every other job's progress) is now Telegram's animated typing-style
   preview instead of a status message that gets edited and deleted. It

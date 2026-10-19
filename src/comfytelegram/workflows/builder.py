@@ -947,8 +947,12 @@ def _build_detailer(
             "cycle": 1,
             "inpaint_model": False,
             "noise_mask_feather": 20,
-            "tiled_encode": False,
-            "tiled_decode": False,
+            # Tiled from the start: with force_inpaint a crop bigger than
+            # guide_size is sampled at native size, and on an upscaled
+            # image a full VAE decode can run out of memory: ComfyUI then tries,
+            # fails, frees memory and retries tiled anyway.
+            "tiled_encode": True,
+            "tiled_decode": True,
         },
         title=f"{label} Detailer",
     )
@@ -1085,6 +1089,9 @@ def _add_segs_detailer(
             "cycle": 1,
             "inpaint_model": False,
             "noise_mask_feather": 20,
+            # See `_build_detailer`'s FaceDetailer for why tiled.
+            "tiled_encode": True,
+            "tiled_decode": True,
         },
         title=detailer_title,
     )

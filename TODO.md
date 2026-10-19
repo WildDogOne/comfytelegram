@@ -131,11 +131,20 @@ pose, works with `/rp`) is done. Still open, in order:
 - [ ] **`DeviceStorage`** (Bot API 9.0) instead of `localStorage` for the
   options panel's folded state, since Telegram's webview can clear
   `localStorage`.
-- [ ] **Check the Mini App domain lock** (Bot API 10.2, on since
-  2026-07-20): Mini App methods now only work from the Mini App's own
-  origin. The editors are served from the relay and only load
-  `telegram-web-app.js` from telegram.org, so they should be fine — try
-  both once to confirm.
+
+## Progress
+
+- [ ] **Step progress for post-processing**: `post_process`,
+  `kontext_edit` and `apply_region_lora` already take `on_progress`, but
+  the handlers never pass it, so upscales, detailers, Fix Artifact and
+  Kontext only show a static "Upscaling…" with no percentage. Pass
+  `_make_progress_callback(status_message, label)` at those call sites
+  (`_run_drawn_mask_post_process`, `postprocess_callback`'s shared
+  upscale/face/hand block, `hand_point_callback`,
+  `_consume_awaiting_upscale_custom`, `_run_kontext_and_send`). An upscale
+  samples each UltimateSDUpscale tile separately, so its step count
+  probably restarts per tile; check what ComfyUI reports before choosing
+  the label.
 
 ## Telegram Bot API features
 
@@ -148,10 +157,27 @@ PTB 22.8 supports Bot API 10.0.
 - [ ] **Custom emoji icons on buttons** (`icon_custom_emoji_id`, Bot API
   9.4): needs the bot owner to have Premium (or bought Fragment
   usernames). Button colours (`style`) shipped.
-- [ ] **Topics in the private chat** (Bot API 9.3/9.4): the bot can enable
-  topics in its DM and `create_forum_topic` there, e.g. one thread per
-  character or project. `message_thread_id` is already passed everywhere,
-  so this should mostly just work.
+- [ ] **Per-topic state in the threaded DM** (threaded mode, Bot API
+  9.3/9.4, is already on): the checkpoint, `/settings` overrides, `/lora`
+  toggles, active character, active pose, image format and Region LoRAs
+  setting are all keyed by chat id in `storage.py`, so every topic shares
+  one setup. Keyed by topic too, a "Furry" topic could stay on
+  FurryToonMix while an "Anime" one uses Animagine, without `/model`
+  back and forth. Only follow-up prompts are per topic so far
+  (`topics.py`). Needs a fallback for existing rows (per-chat value when a
+  topic has none of its own) and a decision on which settings really
+  belong to a topic.
+- [ ] **`/stream` per topic**: `active_streams` is keyed by chat id, so the
+  whole DM can run one stream and `/stop` in any topic ends it. Same
+  per-chat-or-per-topic decision as above.
+- [ ] **Topics the bot creates** (`create_forum_topic` in private chats,
+  Bot API 9.4): e.g. `/stream` opening its own topic so a 100-image run
+  doesn't flood the current one, or a topic per saved character (pairs
+  with per-topic state).
+- [ ] **Drafts in topics**: `progress.py` keeps one `DraftBoard` per topic,
+  but whether Telegram shows a draft per topic or only one per chat (as
+  measured in a chat without topics) is untested. Check with jobs running
+  in two topics at once.
 
 ### Waiting for python-telegram-bot
 
@@ -165,7 +191,11 @@ Bot API 10.3.
   a native "stop" on the progress draft (`progress.py`), which would
   interrupt the ComfyUI job (`/interrupt`) or end a `/stream` — instead of
   `_STREAMING_KEYBOARD`'s "/stop" button. Needs PTB to dispatch the new
-  update type.
+  update type. One draft serves every job in the chat (`DraftBoard`), so
+  one stop button means "stop everything here" — or only offer it while a
+  single job is running. ComfyUI's `/interrupt` stops whatever is
+  executing right now, so a queued job behind it needs `/queue`'s delete
+  instead.
 - [ ] **`force_reply` on inline keyboards** (Bot API 10.3): opens the reply
   box as if the user had tapped "Reply". Fits every follow-up question
   (`/stream` prompt, Kontext instruction, `/settings` custom value, `/fav`
@@ -178,10 +208,6 @@ Bot API 10.3.
   upscale button while it runs, instead of `uploads_in_progress` plus a
   "still uploading" reply. Also a greyed-out "📋 Copy" for prompts over
   256 characters, rather than leaving the button out.
-- [ ] **Ephemeral messages** (Bot API 10.2/10.3): group messages only one
-  user sees. Fits `/settings`, `/lora`, `/favs` and error notes in a group;
-  `replace_callback_query_message` can show a menu in place of the message
-  that opened it. Only worth it if the bot is used in groups.
 - [ ] **Sending rich messages** (`sendRichMessage`, Bot API 10.1–10.3):
   compact tables, collapsible quotes and button blocks — for
   "🐛 Show Prompt", `/tagcheck`, LoRA info and the `/settings` summary.
