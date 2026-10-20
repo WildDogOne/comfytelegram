@@ -41,7 +41,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   by position.
 - **🦴 Pose strength…** under every image generated with a pose: pick a
   strength (0.3–1.0, or type one up to 2) and that image is rendered again
-  with the same seed, so only the pose's hold changes. The pick stays
+  with the same seed, so only the pose's hold changes. A "Done" message
+  follows it with **🔁 Generate Again** for a full new batch at that
+  strength. The pick stays
   with that image and what's made from it; new images use the chat's
   pose strength, which `/pose` shows with a **🎚 Strength** button to set
   it (until `/pose off`).

@@ -17,6 +17,7 @@ from comfytelegram.handlers import (
     POSE_STRENGTH_CHAT_TARGET,
     _chat_pose_strength,
     _consume_awaiting_pose_strength,
+    _deserialize_generation_params,
     _parse_pose_strength,
     _pose_keyboard,
     _pose_strength_keyboard,
@@ -272,8 +273,17 @@ async def test_a_pick_rerenders_that_image_on_the_same_noise(tmp_path):
     assert sent.noise_index == 2 and sent.full_params.batch_size == 3
     assert storage.get_pose_strength(1) is None  # the image's, not the chat's
     context.bot.delete_message.assert_awaited_once_with(chat_id=1, message_id=50)
-    # Only the status message — no "Done" reply after the image.
-    assert query.message.reply_text.await_count == 1
+    # A "Done" reply with "🔁 Generate Again" for a full batch at 0.6.
+    done = query.message.reply_text.await_args_list[-1]
+    assert "Generate Again tries 3" in done.args[0]
+    (snapshot_id,) = [
+        b.callback_data.split(":", 1)[1]
+        for row in done.kwargs["reply_markup"].inline_keyboard
+        for b in row
+    ]
+    snapshot = storage.get_generation_snapshot(snapshot_id)
+    again = _deserialize_generation_params(snapshot["params"])
+    assert again.pose_controlnet_strength == 0.6 and again.batch_size == 3
 
 
 @pytest.mark.asyncio

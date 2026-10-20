@@ -6839,15 +6839,25 @@ async def _run_pose_strength_redo(
         ),
         noise_index=keep_index,
     )
+    # "🔁 Generate Again" at the new strength, a full batch like the
+    # original's — the comparison is one image, but once a strength looks
+    # right the next step is usually more of them.
+    snapshot_id = uuid.uuid4().hex[:12]
+    storage.store_generation_snapshot(
+        snapshot_id,
+        chat_id,
+        _serialize_generation_params(replace(image.full_params, batch_size=full_params.batch_size)),
+    )
     await _send_and_store_result(anchor, chat_id, storage, image)
     await status_message.delete()
-    # No "Done" message, like "🎚️ Redo…" — the image itself is the answer.
-    # Only the fallback needs saying: it isn't a like-for-like comparison.
-    if seed is None:
-        await anchor.reply_text(
-            "That one is on a new seed — couldn't recover the original image's, so "
-            "more than the pose strength changed."
-        )
+    done_text = (
+        f"Done — pose strength {strength:g}, same seed. "
+        if seed is not None
+        # The fallback isn't a like-for-like comparison, so it says so.
+        else f"Done — pose strength {strength:g}, but on a new seed: couldn't recover "
+        "the original image's, so more than the pose strength changed. "
+    ) + f"🔁 Generate Again tries {full_params.batch_size} new one(s) at this strength."
+    await anchor.reply_text(done_text, reply_markup=_again_keyboard(snapshot_id))
 
 
 def _make_cancel_callback(
