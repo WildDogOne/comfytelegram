@@ -26,6 +26,8 @@ from typing import Any
 
 from PIL import Image, ImageDraw, UnidentifiedImageError
 
+from comfytelegram.aspect_refs import size_for_aspect
+
 #: A pose image bigger than this on its longer side is scaled down on the
 #: way in. ControlNet resizes the hint to the latent anyway, and the bytes
 #: ride along in every `pending_result` row and PNG metadata chunk.
@@ -36,8 +38,6 @@ POSE_MAX_SIDE = 1536
 #: as noise. Rendered skeletons sit around 95%+.
 _MIN_BLACK_SHARE = 0.6
 _BLACK_LEVEL = 40
-
-_SIZE_MULTIPLE = 64
 
 
 class PoseImageError(ValueError):
@@ -85,11 +85,7 @@ def size_for_pose(pose_png: bytes, width: int, height: int) -> tuple[int, int]:
     64. ControlNet fits its hint to the latent's size, so a pose on a
     canvas of another shape comes out cropped or squashed."""
     pose_w, pose_h = pose_size(pose_png)
-    scale = (width * height / (pose_w * pose_h)) ** 0.5
-    return (
-        max(_SIZE_MULTIPLE, round(pose_w * scale / _SIZE_MULTIPLE) * _SIZE_MULTIPLE),
-        max(_SIZE_MULTIPLE, round(pose_h * scale / _SIZE_MULTIPLE) * _SIZE_MULTIPLE),
-    )
+    return size_for_aspect(pose_w, pose_h, width, height)
 
 
 # --- keypoints ----------------------------------------------------------------

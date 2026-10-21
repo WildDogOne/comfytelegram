@@ -167,7 +167,7 @@ def test_resolve_profile_and_prompt_reads_tags_after_character_expansion(storage
 
     storage.save_character(1, "alice", "<lora:alice_v2:0.7>, blonde hair", "")
 
-    profile, effective, extra_negative, raw_positive, _ = _resolve_profile_and_prompt(
+    profile, effective, extra_negative, raw_positive, _, _ = _resolve_profile_and_prompt(
         1,
         "ckpt",
         "$alice, smile\n---\nlowres",

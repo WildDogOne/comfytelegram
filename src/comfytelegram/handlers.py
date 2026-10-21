@@ -45,6 +45,12 @@ from comfytelegram.analysis import (
     analyze_caption_deep,
     analyze_tags,
 )
+from comfytelegram.aspect_refs import (
+    AspectRatio,
+    extract_aspect_tag,
+    size_for_aspect,
+    strip_aspect_tags,
+)
 from comfytelegram.auth import (
     is_authorized,
     reject_if_unauthorized,
@@ -72,7 +78,6 @@ from comfytelegram.generation import (
 from comfytelegram.lora_discovery import reload_profiles_and_discover
 from comfytelegram.lora_menu import handle_lora_custom_value_message
 from comfytelegram.lora_refs import (
-    UnknownLoraError,
     apply_prompt_loras,
     extract_lora_tags,
     has_lora_tags,
@@ -2535,7 +2540,9 @@ async def _run_paint_regions_job(
             result["mask"], painted_text, rest_text, full_params.width, full_params.height
         )
         negative_block = f"\n---\n{negative_text}" if negative_text else ""
-        profile, effective_prompt, extra_negative, _raw_global, raw_negative = (
+        # An `<ar:…>` tag is dropped here: this re-run keeps the painted
+        # image's size.
+        profile, effective_prompt, extra_negative, _raw_global, raw_negative, _size = (
             _resolve_profile_and_prompt(
                 chat_id,
                 checkpoint,
@@ -2549,7 +2556,7 @@ async def _run_paint_regions_job(
         for region in regions:
             region_prompt, region_loras = resolve_region_loras(region.prompt, profile)
             resolved_regions.append(replace(region, prompt=region_prompt, loras=region_loras))
-    except (RegionalPromptError, UnknownLoraError) as exc:
+    except (RegionalPromptError, UnknownReferenceError) as exc:
         await bot.send_message(chat_id, f"⚠️ {exc}", message_thread_id=message_thread_id)
         return
 
@@ -2791,7 +2798,9 @@ async def _expand_detail_prompt_references(
                 f"⚠️ No LoRA called {names} for this checkpoint — left it out of the detail prompt.",
                 message_thread_id=message_thread_id,
             )
-    return positive, negative
+    # The image already has its size; an `<ar:…>` (e.g. kept in the
+    # prefill from the prompt as typed) would only reach CLIP as text.
+    return strip_aspect_tags(positive), strip_aspect_tags(negative)
 
 
 async def poll_inpaint_jobs(application: Application) -> None:
@@ -2986,7 +2995,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "photo and I'll analyze it into a prompt. Prefix any word with - to "
         'send it as a negative instead, e.g. "1girl, outdoors, -blurry, '
         '-watermark". Write $name to insert a saved character or favorite, e.g. '
-        '"$alice, $wlop, forest".\n\n'
+        '"$alice, $wlop, forest". Add <ar:2:3> (or 16:9, 3:2, …) to pick the '
+        "image's shape.\n\n"
         "/model — pick a checkpoint\n"
         "/settings — view or change generation defaults for the current model\n"
         "/lora — toggle which of the current model's LoRAs are applied\n"
@@ -3461,12 +3471,13 @@ def _resolve_profile_and_prompt(
     *,
     use_active_character: bool = True,
     references: ReferenceExpander | None = None,
-) -> tuple[ModelProfile, str, str, str | None, str | None]:
+) -> tuple[ModelProfile, str, str, str | None, str | None, dict[str, int]]:
     """This chat's profile (with its `/settings` and `/lora` overrides
     applied) plus the active character folded into `prompt_text` via
     `_resolve_effective_prompt` — the shared setup `generate_message` and
     `_run_stream` both need before calling `generate()`. Returns `(profile,
-    effective_prompt, extra_negative, raw_positive, raw_negative)`.
+    effective_prompt, extra_negative, raw_positive, raw_negative,
+    size_overrides)`.
     `use_active_character=False` skips the active character — `/rp` places
     characters per region with `$name` instead, and folding one into the
     global prompt would put it on every character at once. `references`
@@ -3474,7 +3485,11 @@ def _resolve_profile_and_prompt(
     which can raise `UnknownReferenceError`). `<lora:…>` tags are then
     taken out of the prompt and layered onto the profile (see `lora_refs`),
     raising `UnknownLoraError` — itself an `UnknownReferenceError` — for one
-    the profile doesn't list."""
+    the profile doesn't list. An `<ar:…>` tag (see `aspect_refs`) is taken
+    out too and becomes `size_overrides` — `width`/`height` for
+    `generate()`'s `overrides`, empty without one — which also keeps
+    `/pose` from reshaping it; a bad one raises `InvalidAspectRatioError`,
+    also an `UnknownReferenceError`."""
     profile = resolve_profile(checkpoint, profiles)
     profile = apply_profile_override(profile, checkpoint, storage.get_override(chat_id, checkpoint))
     profile = apply_lora_overrides(profile, storage.get_lora_overrides(chat_id, checkpoint))
@@ -3497,7 +3512,23 @@ def _resolve_profile_and_prompt(
     effective_prompt, positive_tags = extract_lora_tags(effective_prompt)
     extra_negative, negative_tags = extract_lora_tags(extra_negative)
     profile = apply_prompt_loras(profile, positive_tags + negative_tags)
-    return profile, effective_prompt, extra_negative, raw_positive, raw_negative
+    # `<ar:…>`, from either side; the positive's wins. Sized from the
+    # profile's resolved size, `/settings` included.
+    effective_prompt, aspect = extract_aspect_tag(effective_prompt)
+    extra_negative, negative_aspect = extract_aspect_tag(extra_negative)
+    aspect = aspect or negative_aspect
+    size_overrides = _aspect_size_overrides(checkpoint, profile, aspect) if aspect else {}
+    return profile, effective_prompt, extra_negative, raw_positive, raw_negative, size_overrides
+
+
+def _aspect_size_overrides(
+    checkpoint: str, profile: ModelProfile | None, aspect: AspectRatio
+) -> dict[str, int]:
+    """`generate()` `overrides` for an `<ar:…>` tag: its shape at the pixel
+    count of the size this chat would otherwise generate at."""
+    base = resolve_generation_params(checkpoint, "", profile)
+    width, height = size_for_aspect(aspect.width, aspect.height, base.width, base.height)
+    return {"width": width, "height": height}
 
 
 async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3572,7 +3603,7 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     user_id = update.effective_user.id if update.effective_user else None
     try:
-        profile, effective_prompt, extra_negative, raw_positive, raw_negative = (
+        profile, effective_prompt, extra_negative, raw_positive, raw_negative, size = (
             _resolve_profile_and_prompt(
                 chat_id,
                 checkpoint,
@@ -3586,7 +3617,7 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await message.reply_text(f"⚠️ {exc}")
         return
 
-    pose_png = await _pose_for_generation(message, storage, chat_id, profile)
+    pose_png = await _pose_for_generation(message, storage, chat_id, profile, size)
     label = _pose_label("Generating", pose_png)
     status_message = await start_reply_status(context.bot_data, message, f"{label}… 0%")
 
@@ -3602,6 +3633,7 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             extra_negative_prompt=extra_negative,
             raw_positive_prompt=raw_positive,
             raw_negative_prompt=raw_negative,
+            overrides=size or None,
             on_progress=_make_progress_callback(status_message, label=label),
             pose_png=pose_png,
             pose_strength=storage.get_pose_strength(chat_id),
@@ -5679,7 +5711,7 @@ async def _generate_regional(
     expanded_negative_block = f"\n---\n{expanded.negative}" if expanded.negative else ""
     global_text = expanded.global_prompt + expanded_negative_block
     try:
-        profile, effective_prompt, extra_negative, _raw_global, raw_negative = (
+        profile, effective_prompt, extra_negative, _raw_global, raw_negative, size = (
             _resolve_profile_and_prompt(
                 chat_id, checkpoint, global_text, storage, profiles, use_active_character=False
             )
@@ -5688,9 +5720,14 @@ async def _generate_regional(
         # detailer pass over that region (see `generation.apply_region_lora`).
         regions = []
         for region in expanded.regions:
-            region_prompt, region_loras = resolve_region_loras(region.prompt, profile)
+            # The size is the whole image's, so an `<ar:…>` written on a
+            # region line counts like one in the global part.
+            region_prompt, region_aspect = extract_aspect_tag(region.prompt)
+            if region_aspect is not None and not size:
+                size = _aspect_size_overrides(checkpoint, profile, region_aspect)
+            region_prompt, region_loras = resolve_region_loras(region_prompt, profile)
             regions.append(replace(region, prompt=region_prompt, loras=region_loras))
-    except UnknownLoraError as exc:
+    except UnknownReferenceError as exc:
         if rearm_on_error:
             set_pending(context.chat_data, "awaiting_rp_prompt", message, True)
         await message.reply_text(
@@ -5701,7 +5738,7 @@ async def _generate_regional(
     # The unexpanded global prompt, put through the same split, for "as typed".
     raw_global, _ = _split_negative_prompt(parsed.global_prompt + negative_block)
 
-    pose_png = await _pose_for_generation(message, storage, chat_id, profile)
+    pose_png = await _pose_for_generation(message, storage, chat_id, profile, size)
     label = _pose_label("Generating", pose_png)
     status_message = await start_reply_status(context.bot_data, message, f"{label}… 0%")
 
@@ -5718,6 +5755,7 @@ async def _generate_regional(
             raw_positive_prompt=format_regional_prompt(raw_global, parsed.regions),
             raw_negative_prompt=raw_negative,
             regions=regions,
+            overrides=size or None,
             on_progress=_make_progress_callback(status_message, label=label),
             auto_region_loras=storage.get_region_lora_auto(chat_id),
             on_stage=_make_stage_callback(status_message),
@@ -6562,11 +6600,23 @@ def _pose_unsupported_note(checkpoint: str, profile: ModelProfile | None) -> str
     )
 
 
+#: How far (as a width/height ratio) an `<ar:…>` size may be from the
+#: pose's own shape before `_pose_for_generation` warns about it — 64px
+#: snapping alone moves a matching shape by a few percent.
+_POSE_ASPECT_TOLERANCE = 0.05
+
+
 async def _pose_for_generation(
-    message: Message, storage: Storage, chat_id: int, profile: ModelProfile | None
+    message: Message,
+    storage: Storage,
+    chat_id: int,
+    profile: ModelProfile | None,
+    size_overrides: dict[str, int] | None = None,
 ) -> bytes | None:
     """The chat's active pose, if the checkpoint about to generate can follow
-    it. Says so in the chat when there's a pose it can't."""
+    it. Says so in the chat when there's a pose it can't — and, when an
+    `<ar:…>` tag's `size_overrides` (which win over the pose's shape) don't
+    match the pose's shape, that the skeleton will be squeezed to fit."""
     pose_png = storage.get_pose(chat_id)
     if pose_png is None:
         return None
@@ -6574,6 +6624,15 @@ async def _pose_for_generation(
         checkpoint = storage.get_checkpoint(chat_id) or ""
         await message.reply_text(_pose_unsupported_note(checkpoint, profile))
         return None
+    if size_overrides:
+        pose_w, pose_h = pose_size(pose_png)
+        ratio = (size_overrides["width"] / size_overrides["height"]) / (pose_w / pose_h)
+        if abs(ratio - 1) > _POSE_ASPECT_TOLERANCE:
+            await message.reply_text(
+                f"🦴 The aspect tag wins over the pose's shape — the image is "
+                f"{size_overrides['width']}x{size_overrides['height']}, so the skeleton "
+                "gets squeezed or cropped to fit and limbs may come out off."
+            )
     return pose_png
 
 
@@ -6933,7 +6992,7 @@ async def _run_stream(
 
         user_id = message.from_user.id if message.from_user else None
         try:
-            profile, effective_prompt, extra_negative, raw_positive, raw_negative = (
+            profile, effective_prompt, extra_negative, raw_positive, raw_negative, size = (
                 _resolve_profile_and_prompt(
                     chat_id,
                     checkpoint,
@@ -6947,7 +7006,7 @@ async def _run_stream(
             await message.reply_text(f"⚠️ {exc}")
             return
 
-        pose_png = await _pose_for_generation(message, storage, chat_id, profile)
+        pose_png = await _pose_for_generation(message, storage, chat_id, profile, size)
         status_message = await message.reply_text(
             f"🔁 Streaming started (up to {STREAM_HARD_LIMIT} images) — "
             "tap /stop below (or send it) to end early.",
@@ -6972,7 +7031,7 @@ async def _run_stream(
                 extra_negative_prompt=extra_negative,
                 raw_positive_prompt=raw_positive,
                 raw_negative_prompt=raw_negative,
-                overrides={"batch_size": 1},
+                overrides={**size, "batch_size": 1},
                 on_progress=_make_progress_callback(progress_status, label=label),
                 pose_png=pose_png,
                 pose_strength=storage.get_pose_strength(chat_id),

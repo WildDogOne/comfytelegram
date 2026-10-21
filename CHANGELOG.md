@@ -8,6 +8,14 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`<ar:2:3>` in a prompt** picks that image's aspect ratio (also
+  `<ar:16x9>`, `<ar:1.5>`, `<aspectratio:…>`). It keeps the model's usual
+  pixel count, so `<ar:2:3>` on a 1024×1024 model gives 832×1280. Works in
+  plain prompts, `/stream`, `/rp` (global part or any region line) and
+  inside a saved favorite; **🔁 Generate Again** keeps the size. It wins
+  over a `/pose` skeleton's shape, with a note when the two don't match.
+  Ratios past 4:1 are rejected.
+
 - **Coloured buttons**: green for the button that starts or confirms the
   work (🔁 Generate Again, 🎨 Generate, ✅ Apply/Use Defaults/Upscale
   anyway, the editor buttons), red for delete/clear/reset (and the
