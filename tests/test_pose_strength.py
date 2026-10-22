@@ -19,6 +19,7 @@ from comfytelegram.handlers import (
     _consume_awaiting_pose_strength,
     _deserialize_generation_params,
     _parse_pose_strength,
+    _parse_pose_strengths,
     _pose_keyboard,
     _pose_strength_keyboard,
     _pose_strength_rows,
@@ -126,12 +127,53 @@ def test_the_button_is_only_under_txt2img_images_made_with_a_pose():
 
 
 def test_picker_marks_the_current_strength():
-    keyboard = _pose_strength_keyboard("rid", 0.8)
+    keyboard = _pose_strength_keyboard(POSE_STRENGTH_CHAT_TARGET, 0.8)
     labels = [b.text for row in keyboard.inline_keyboard for b in row]
 
     assert "• 0.8" in labels and "0.6" in labels
-    assert keyboard.inline_keyboard[0][0].callback_data == f"{POSE_STRENGTH_CALLBACK_PREFIX}rid:0.3"
-    assert all(len(b.callback_data.encode()) <= 64 for row in keyboard.inline_keyboard for b in row)
+    assert keyboard.inline_keyboard[0][0].callback_data == (
+        f"{POSE_STRENGTH_CALLBACK_PREFIX}{POSE_STRENGTH_CHAT_TARGET}:0.3"
+    )
+    assert not any("Send" in label for label in labels)  # the chat has one strength
+
+
+def test_image_picker_is_multi_select():
+    empty = _pose_strength_keyboard("0123456789ab", 0.8)
+    # Each preset toggles its own bit; nothing ticked means nothing to send.
+    assert (
+        empty.inline_keyboard[0][0].callback_data
+        == f"{POSE_STRENGTH_CALLBACK_PREFIX}0123456789ab:t:1"
+    )
+    assert (
+        empty.inline_keyboard[0][1].callback_data
+        == f"{POSE_STRENGTH_CALLBACK_PREFIX}0123456789ab:t:2"
+    )
+    assert not any("Send" in b.text for row in empty.inline_keyboard for b in row)
+
+    keyboard = _pose_strength_keyboard("0123456789ab", 0.8, selected=0b101)  # 0.3 and 0.5
+    labels = [b.text for row in keyboard.inline_keyboard for b in row]
+    assert "✅ 0.3" in labels and "✅ 0.5" in labels and "0.4" in labels
+    assert keyboard.inline_keyboard[0][0].callback_data.endswith(":t:4")  # untick 0.3
+    (send,) = keyboard.inline_keyboard[-1]
+    assert send.text == "▶ Send (2)"
+    assert send.callback_data == f"{POSE_STRENGTH_CALLBACK_PREFIX}0123456789ab:go:5"
+    full = _pose_strength_keyboard("0123456789ab", 0.8, selected=255)
+    assert all(len(b.callback_data.encode()) <= 64 for row in full.inline_keyboard for b in row)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("0.65", [0.65]),
+        ("0.7 0.45", [0.45, 0.7]),
+        ("0.5, 0.7", [0.5, 0.7]),
+        ("0,5;0,6", [0.5, 0.6]),
+        ("0.5 x", None),
+        ("", None),
+    ],
+)
+def test_parse_several_pose_strengths(raw, expected):
+    assert _parse_pose_strengths(raw) == expected
 
 
 def test_pose_keyboard_offers_the_strength_only_with_a_pose():
@@ -357,3 +399,79 @@ async def test_custom_value_is_read_from_the_next_message(tmp_path):
     deleted = {call.kwargs["message_id"] for call in context.bot.delete_message.await_args_list}
     assert deleted == {50, 51, 52}
     assert await _consume_awaiting_pose_strength(typed, context) is False
+
+
+@pytest.mark.asyncio
+async def test_ticking_edits_the_picker_in_place(tmp_path):
+    storage = Storage(tmp_path / "state.sqlite3")
+    _store_posed_image(storage)
+    update, query = _query(f"{POSE_STRENGTH_CALLBACK_PREFIX}rid:t:6")
+
+    with patch("comfytelegram.handlers.repeat", new=AsyncMock()) as rerun:
+        await pose_strength_callback(update, _context(storage))
+
+    rerun.assert_not_awaited()
+    keyboard = query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+    labels = [b.text for row in keyboard.inline_keyboard for b in row]
+    assert "✅ 0.4" in labels and "✅ 0.5" in labels and "▶ Send (2)" in labels
+
+
+@pytest.mark.asyncio
+async def test_send_renders_every_ticked_strength(tmp_path):
+    storage = Storage(tmp_path / "state.sqlite3")
+    _store_posed_image(storage, noise_index=2)
+    update, _ = _query(f"{POSE_STRENGTH_CALLBACK_PREFIX}rid:go:{0b10000010}")  # 0.4, 1.0
+    context = _context(storage)
+
+    with (
+        patch("comfytelegram.handlers._txt2img_seed", new=AsyncMock(return_value=1234)),
+        patch("comfytelegram.handlers.repeat", new=AsyncMock(return_value=_batch(3))) as rerun,
+        patch(
+            "comfytelegram.handlers._send_and_store_result", new=AsyncMock(return_value="new")
+        ) as send,
+    ):
+        await pose_strength_callback(update, context)
+
+    assert [c.args[1].pose_controlnet_strength for c in rerun.await_args_list] == [0.4, 1.0]
+    assert all(c.kwargs["seed"] == 1234 for c in rerun.await_args_list)
+    assert send.await_count == 2
+    context.bot.delete_message.assert_awaited_once_with(chat_id=1, message_id=50)
+
+
+@pytest.mark.asyncio
+async def test_custom_values_add_to_the_ticked_ones(tmp_path):
+    storage = Storage(tmp_path / "state.sqlite3")
+    _store_posed_image(storage)
+    context = _context(storage)
+    update, query = _query(f"{POSE_STRENGTH_CALLBACK_PREFIX}rid:custom:1")  # 0.3 ticked
+    query.message.reply_text.return_value = MagicMock(message_id=51)
+    await pose_strength_callback(update, context)
+    assert "along with 0.3" in query.message.reply_text.await_args.args[0]
+
+    message = AsyncMock()
+    message.text = "0.65 0.3"
+    message.chat_id = 1
+    message.message_thread_id = None
+    with patch("comfytelegram.handlers._run_pose_strength_redo", new=AsyncMock()) as redo:
+        assert await _consume_awaiting_pose_strength(MagicMock(effective_message=message), context)
+
+    assert [c.args[4] for c in redo.await_args_list] == [0.3, 0.65]
+
+
+@pytest.mark.asyncio
+async def test_chat_custom_value_takes_only_one(tmp_path):
+    storage = Storage(tmp_path / "state.sqlite3")
+    storage.set_pose(1, b"pose")
+    context = _context(storage)
+    update, query = _query(f"{POSE_STRENGTH_CALLBACK_PREFIX}{POSE_STRENGTH_CHAT_TARGET}:custom")
+    query.message.reply_text.return_value = MagicMock(message_id=51)
+    await pose_strength_callback(update, context)
+
+    message = AsyncMock()
+    message.text = "0.5 0.6"
+    message.chat_id = 1
+    message.message_thread_id = None
+    message.reply_text.return_value = MagicMock(message_id=52)
+    assert await _consume_awaiting_pose_strength(MagicMock(effective_message=message), context)
+    assert storage.get_pose_strength(1) is None
+    assert "Couldn't read that" in message.reply_text.await_args.args[0]

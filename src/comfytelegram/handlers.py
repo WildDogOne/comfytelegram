@@ -519,6 +519,11 @@ POSE_STRENGTH_CALLBACK_PREFIX = "ps:"
 POSE_STRENGTH_CHAT_TARGET = "chat"
 POSE_STRENGTH_CUSTOM = "custom"
 POSE_STRENGTH_CLOSE = "close"
+#: An image's picker is multi-select (`_pose_strength_keyboard`):
+#: `ps:<result_id>:t:<mask>` re-ticks it, `ps:<result_id>:go:<mask>`
+#: renders every ticked strength.
+POSE_STRENGTH_TOGGLE = "t"
+POSE_STRENGTH_SEND = "go"
 POSE_STRENGTH_PRESETS = (0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
 POSE_STRENGTH_PRESETS_PER_ROW = 4
 #: Highest strength a typed value may be — ControlNet takes more than 1,
@@ -4757,8 +4762,9 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if kind == POSE_STRENGTH_CALLBACK_KIND:
         current = full_params.pose_controlnet_strength
         await query.message.reply_text(
-            f"🦴 Render this image again with another pose strength (now {current:g}) — "
-            "same seed, so only the pose's hold changes. New images keep the chat's "
+            f"🦴 Render this image again with other pose strengths (now {current:g}) — "
+            "same seed, so only the pose's hold changes. Tick one or more, then ▶ Send; "
+            "each becomes its own image. New images keep the chat's "
             "strength — set that with /pose → 🎚 Strength.",
             reply_markup=_pose_strength_keyboard(result_id, current),
         )
@@ -6680,6 +6686,22 @@ def _parse_pose_strength(raw: str) -> float | None:
     return value if 0 < value <= POSE_STRENGTH_MAX else None
 
 
+#: Separates several typed pose strengths: whitespace or ";", or a comma
+#: followed by whitespace — a bare comma is a decimal one ("0,5").
+_POSE_STRENGTHS_SEP_RE = re.compile(r"[\s;]+|,(?=\s)")
+
+
+def _parse_pose_strengths(raw: str) -> list[float] | None:
+    """One or more pose strengths typed in one message (`0.45 0.65`,
+    `0.45, 0.65`), deduplicated lowest first, or None unless every one
+    parses (`_parse_pose_strength`)."""
+    tokens = [t for t in _POSE_STRENGTHS_SEP_RE.split(raw) if t]
+    strengths = [_parse_pose_strength(t) for t in tokens]
+    if not strengths or None in strengths:
+        return None
+    return sorted(set(strengths))
+
+
 def _chat_pose_strength(storage: Storage, profiles: list[ModelProfile], chat_id: int) -> float:
     """The strength this chat's next image would use: its own pick, else
     the chat checkpoint's profile, else the profile field's default."""
@@ -6693,29 +6715,73 @@ def _chat_pose_strength(storage: Storage, profiles: list[ModelProfile], chat_id:
     return ModelProfile.model_fields["pose_controlnet_strength"].default
 
 
-def _pose_strength_keyboard(target: str, current: float) -> InlineKeyboardMarkup:
+def _selected_pose_strengths(selected: int) -> list[float]:
+    """The `POSE_STRENGTH_PRESETS` ticked in a picker's `selected` bitmask
+    (bit i = preset i), lowest first."""
+    return [value for i, value in enumerate(POSE_STRENGTH_PRESETS) if selected >> i & 1]
+
+
+def _parse_pose_strength_selection(raw: str) -> int | None:
+    """A `POSE_STRENGTH_TOGGLE`/`POSE_STRENGTH_SEND` bitmask from callback
+    data, or None if it isn't one."""
+    try:
+        selected = int(raw)
+    except ValueError:
+        return None
+    return selected if 0 <= selected < 1 << len(POSE_STRENGTH_PRESETS) else None
+
+
+def _pose_strength_keyboard(target: str, current: float, selected: int = 0) -> InlineKeyboardMarkup:
     """The "🦴 Pose strength…" picker: `POSE_STRENGTH_PRESETS` (the one
     matching `current` marked), then "✏️ Custom…"/"✖ Close". `target` is a
-    `result_id` to re-render, or `POSE_STRENGTH_CHAT_TARGET`."""
+    `result_id` to re-render, or `POSE_STRENGTH_CHAT_TARGET`.
+
+    The chat has one strength, so its presets apply on tap. An image's are
+    checkboxes instead — several strengths to compare side by side — whose
+    ticks (`selected`, a bitmask over the presets) ride in each button's
+    callback data, like `_post_process_keyboard`'s page: a preset carries
+    the mask it would toggle to (`POSE_STRENGTH_TOGGLE`), "▶ Send" the
+    current one (`POSE_STRENGTH_SEND`, shown once anything is ticked) and
+    "✏️ Custom…" too, so typed values add to the ticked ones."""
     prefix = f"{POSE_STRENGTH_CALLBACK_PREFIX}{target}:"
-    buttons = [
-        InlineKeyboardButton(
-            f"• {value:g}" if abs(value - current) < 1e-6 else f"{value:g}",
-            callback_data=f"{prefix}{value:g}",
-            style=_current_style(abs(value - current) < 1e-6),
+    multi = target != POSE_STRENGTH_CHAT_TARGET
+    buttons = []
+    for i, value in enumerate(POSE_STRENGTH_PRESETS):
+        is_current = abs(value - current) < 1e-6
+        label = f"• {value:g}" if is_current else f"{value:g}"
+        if not multi:
+            callback_data = f"{prefix}{value:g}"
+        else:
+            ticked = bool(selected >> i & 1)
+            label = f"✅ {label}" if ticked else label
+            callback_data = f"{prefix}{POSE_STRENGTH_TOGGLE}:{selected ^ 1 << i}"
+        buttons.append(
+            InlineKeyboardButton(
+                label, callback_data=callback_data, style=_current_style(is_current)
+            )
         )
-        for value in POSE_STRENGTH_PRESETS
-    ]
     rows = [
         buttons[i : i + POSE_STRENGTH_PRESETS_PER_ROW]
         for i in range(0, len(buttons), POSE_STRENGTH_PRESETS_PER_ROW)
     ]
+    custom_data = f"{prefix}{POSE_STRENGTH_CUSTOM}" + (f":{selected}" if multi else "")
     rows.append(
         [
-            InlineKeyboardButton("✏️ Custom…", callback_data=f"{prefix}{POSE_STRENGTH_CUSTOM}"),
+            InlineKeyboardButton("✏️ Custom…", callback_data=custom_data),
             InlineKeyboardButton("✖ Close", callback_data=f"{prefix}{POSE_STRENGTH_CLOSE}"),
         ]
     )
+    count = len(_selected_pose_strengths(selected))
+    if multi and count:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"▶ Send ({count})",
+                    callback_data=f"{prefix}{POSE_STRENGTH_SEND}:{selected}",
+                    style=KeyboardButtonStyle.SUCCESS,
+                )
+            ]
+        )
     return InlineKeyboardMarkup(rows)
 
 
@@ -6723,7 +6789,9 @@ async def pose_strength_callback(update: Update, context: ContextTypes.DEFAULT_T
     """Handle a `ps:` tap (`POSE_STRENGTH_CALLBACK_PREFIX`): `ps:chat` (the
     `/pose` reply's "🎚 Strength" button) opens the picker for the chat;
     `ps:<target>:<value>` applies a pick (`_apply_pose_strength`), deleting
-    the picker first; `POSE_STRENGTH_CUSTOM` asks for a typed value
+    the picker first; an image's multi-select picker instead re-ticks in
+    place on `POSE_STRENGTH_TOGGLE` and applies every ticked strength on
+    `POSE_STRENGTH_SEND`; `POSE_STRENGTH_CUSTOM` asks for typed value(s)
     (`_consume_awaiting_pose_strength`); `POSE_STRENGTH_CLOSE` just deletes
     the picker."""
     query = update.callback_query
@@ -6754,30 +6822,58 @@ async def pose_strength_callback(update: Update, context: ContextTypes.DEFAULT_T
             reply_markup=_pose_strength_keyboard(POSE_STRENGTH_CHAT_TARGET, current),
         )
         return
+    selected = _parse_pose_strength_selection(parts[2]) if len(parts) > 2 else None
+    if value == POSE_STRENGTH_TOGGLE and selected is not None:
+        await query.answer()
+        pending = storage.get_pending_result(target)
+        if pending is None:
+            await query.message.reply_text("That image has expired — generate a new one.")
+            return
+        current = _deserialize_generation_params(pending["base_params"]).pose_controlnet_strength
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=_pose_strength_keyboard(target, current, selected)
+            )
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+        return
     if value == POSE_STRENGTH_CUSTOM:
         await query.answer()
-        prompt = await query.message.reply_text(
-            f"Send the pose strength, e.g. `0.65` (up to {POSE_STRENGTH_MAX:g})."
-        )
+        ticked = _selected_pose_strengths(selected or 0)
+        if target == POSE_STRENGTH_CHAT_TARGET:
+            ask = f"Send the pose strength, e.g. `0.65` (up to {POSE_STRENGTH_MAX:g})."
+        else:
+            ask = (
+                f"Send the pose strength(s), e.g. `0.65` or `0.45 0.65` (up to "
+                f"{POSE_STRENGTH_MAX:g})."
+            )
+            if ticked:
+                ask += " They're rendered along with " + ", ".join(f"{v:g}" for v in ticked) + "."
+        prompt = await query.message.reply_text(ask)
         set_pending(
             context.chat_data,
             "awaiting_pose_strength",
             query.message,
-            (target, [query.message.message_id, prompt.message_id]),
+            (target, [query.message.message_id, prompt.message_id], ticked),
         )
         return
 
-    strength = _parse_pose_strength(value)
-    if strength is None:
+    if value == POSE_STRENGTH_SEND and selected is not None:
+        strengths = _selected_pose_strengths(selected)
+    else:
+        strength = _parse_pose_strength(value)
+        strengths = [strength] if strength is not None else []
+    if not strengths:
         await query.answer()
         return
-    await query.answer(f"Pose strength {strength:g}")
+    await query.answer("Pose strength " + ", ".join(f"{v:g}" for v in strengths))
     await _apply_pose_strength(
         _dialog_reply_anchor(query.message),
         context,
         chat_id,
         target,
-        strength,
+        strengths,
         [query.message.message_id],
     )
 
@@ -6786,17 +6882,18 @@ async def _consume_awaiting_pose_strength(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> bool:
     """If this chat is mid-"✏️ Custom…" pose strength entry
-    (`pose_strength_callback`), consume the text as that strength and apply
-    it, returning True; otherwise False. An unparseable value asks again,
-    like `_consume_awaiting_redo_denoise`."""
+    (`pose_strength_callback`), consume the text as that strength — for an
+    image, possibly several, added to the presets ticked before "✏️
+    Custom…" — and apply it, returning True; otherwise False. An
+    unparseable value asks again, like `_consume_awaiting_redo_denoise`."""
     message = update.effective_message
     pending_entry = pop_pending(context.chat_data, "awaiting_pose_strength", message)
     if pending_entry is None:
         return False
-    target, dialog_message_ids = pending_entry
+    target, dialog_message_ids, ticked = pending_entry
 
-    strength = _parse_pose_strength(message_text(message) or "")
-    if strength is None:
+    typed = _parse_pose_strengths(message_text(message) or "")
+    if typed is None or (target == POSE_STRENGTH_CHAT_TARGET and len(typed) != 1):
         retry = await message.reply_text(
             f"Couldn't read that — send a number above 0 and up to {POSE_STRENGTH_MAX:g}, "
             "e.g. `0.65`."
@@ -6805,11 +6902,12 @@ async def _consume_awaiting_pose_strength(
             context.chat_data,
             "awaiting_pose_strength",
             message,
-            (target, [*dialog_message_ids, retry.message_id]),
+            (target, [*dialog_message_ids, retry.message_id], ticked),
         )
         return True
+    strengths = sorted({*ticked, *typed})
     await _apply_pose_strength(
-        message, context, message.chat_id, target, strength, dialog_message_ids
+        message, context, message.chat_id, target, strengths, dialog_message_ids
     )
     return True
 
@@ -6819,16 +6917,18 @@ async def _apply_pose_strength(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
     target: str,
-    strength: float,
+    strengths: list[float],
     dialog_message_ids: list[int],
 ) -> None:
-    """A picked pose strength: for `POSE_STRENGTH_CHAT_TARGET` it becomes the
-    chat's for new images; for a `result_id` target it only re-renders that
-    image with it (`_run_pose_strength_redo`), leaving the chat's alone. The
-    picker dialog is deleted first."""
+    """Picked pose strength(s): for `POSE_STRENGTH_CHAT_TARGET` the one
+    pick becomes the chat's for new images; for a `result_id` target it
+    only re-renders that image once per strength, lowest first
+    (`_run_pose_strength_redo`), leaving the chat's alone. The picker
+    dialog is deleted first."""
     storage: Storage = context.bot_data["storage"]
     await _delete_messages(context.bot, chat_id, dialog_message_ids)
     if target == POSE_STRENGTH_CHAT_TARGET:
+        (strength,) = strengths
         if storage.set_pose_strength(chat_id, strength):
             await anchor.reply_text(
                 f"🦴 Pose strength {strength:g} for new images in this chat, until /pose off."
@@ -6841,9 +6941,9 @@ async def _apply_pose_strength(
     if pending is None:
         await anchor.reply_text("That image has expired — generate a new one.")
         return
-    await _run_pose_strength_redo(
-        anchor, context, pending, _deserialize_generation_params(pending["base_params"]), strength
-    )
+    full_params = _deserialize_generation_params(pending["base_params"])
+    for strength in strengths:
+        await _run_pose_strength_redo(anchor, context, pending, full_params, strength)
 
 
 async def _run_pose_strength_redo(

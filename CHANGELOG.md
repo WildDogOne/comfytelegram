@@ -16,6 +16,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   over a `/pose` skeleton's shape, with a note when the two don't match.
   Ratios past 4:1 are rejected.
 
+- **🦴 Pose strength…** can compare several strengths at once: tick any
+  number of presets (✅), then **▶ Send** to render the image once per
+  strength, lowest first. **✏️ Custom…** takes several values too
+  (`0.45 0.65`), added to the ticked ones. The chat-wide strength under
+  `/pose` → **🎚 Strength** still applies one value on tap.
+
 - **Coloured buttons**: green for the button that starts or confirms the
   work (🔁 Generate Again, 🎨 Generate, ✅ Apply/Use Defaults/Upscale
   anyway, the editor buttons), red for delete/clear/reset (and the
