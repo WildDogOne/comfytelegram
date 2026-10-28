@@ -1,5 +1,29 @@
 # TODO
 
+## Researched, parked
+
+- **Krea2 BBOX models** (Reddit, r/StableDiffusion, Oct 2026):
+  https://www.reddit.com/r/StableDiffusion/comments/1xh6gar/krea2_bbox_models_have_finished_training_and_been/
+  Findings (already looked this up — don't re-research):
+  - `jimmycarter/krea2-turbo-bbox` on HF: finetune of `krea/Krea-2-Raw`
+    plus a Turbo distillation delta (8 steps, no CFG), released in
+    diffusers *and* ComfyUI formats, with rank 64/128/256 LoRAs.
+  - "BBOX" here is a prompt-text grounding DSL — line-per-element layout
+    specs like `p[0,0,500,500] ...`, `ac:1[...] <character>`,
+    `t[...] "speech bubble"`. ~90% of training used it; prose still works.
+    **Unrelated to our detailer "bbox" YOLO detectors**
+    (`bbox/FacesV1.pt`, `bbox/hand_yolov8s.pt`) — the shared name is a
+    coincidence; it does nothing for hand-detailer auto-detect misses.
+  - Blocker if we ever want it: Krea-2 is a new architecture
+    (`diffusers:Krea2Pipeline`, not SDXL/Flux/SD3), so it needs a ComfyUI
+    build with Krea-2 support first; likely a `loader: "split"` profile
+    like Anima if it loads as separate UNET/CLIP/VAE files.
+  - The DSL itself needs *no* bot code once ComfyUI can run the
+    checkpoint — it's just prompt text through `CLIPTextEncode`; a model
+    profile's `positive_prompt_prefix` could carry DSL conventions.
+
+
+
 Ideas and follow-ups that were discussed but not built yet. When something
 here ships, move it to `CHANGELOG.md` under "Unreleased".
 
