@@ -300,7 +300,7 @@ between them on the same message.
 
 | Button | What it does |
 |---|---|
-| 🔍 Upscale 4x | Tiled 4x UltimateSDUpscale. Asks whether to use the profile's defaults or a custom denoise / tile-ControlNet strength, and asks for confirmation on images that are already large |
+| 🔍 Upscale 4x | Tiled 4x UltimateSDUpscale. Asks whether to use the profile's defaults, a custom denoise / tile-ControlNet strength (⚙️ Customize), or a prompt of your own (✏️ Prompt, which first shows the current one for copying, and expires after 10 minutes); asks for confirmation on images that are already large |
 | 🩹 Fix Artifact | Paint over anything unwanted (a stray object, a glitch, a watermark) and it is inpainted away. *Needs the relay* |
 | 🪄 Kontext Edit | Describe a change ("make it night", "remove the hat") and FLUX.1 Kontext edits the whole image. Upscale and detailer buttons on the result still use the original checkpoint |
 | ✨ Face Detail | Detects faces, then re-inpaints them at higher detail |

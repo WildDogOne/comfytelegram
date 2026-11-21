@@ -663,6 +663,96 @@ async def test_post_process_upscale_prefers_live_profile_over_stale_frozen_param
 
 
 @pytest.mark.asyncio
+async def test_post_process_upscale_prompt_override_replaces_the_conditioning():
+    """ "✏️ Prompt" replaces what the tiled upscale pass is conditioned on —
+    both sides if both were given — without touching the graph shape or the
+    result's own recorded prompt."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox, sitting",
+        negative_prompt="blurry",
+    )
+
+    result = await post_process(
+        client,
+        "upscale",
+        source,
+        "source.png",
+        params,
+        upscale_prompt_override="fine fur detail",
+        upscale_negative_prompt_override="lowres",
+    )
+
+    upscale_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "UltimateSDUpscale"
+    )
+
+    def _conditioning(ref) -> str:
+        """Follow the `positive`/`negative` wiring back to its CLIPTextEncode
+        — with no tile ControlNet on this checkpoint it's a direct link."""
+        return client.queued_graph[str(ref[0])]["inputs"]["text"]
+
+    assert _conditioning(upscale_node["inputs"]["positive"]) == "fine fur detail"
+    assert _conditioning(upscale_node["inputs"]["negative"]) == "lowres"
+    # The result still describes the generation it came from, same as the
+    # denoise/tile-strength overrides before it never rewrote metadata.
+    assert result.full_params.positive_prompt == "a fox, sitting"
+
+
+@pytest.mark.asyncio
+async def test_post_process_upscale_prompt_override_is_independent_per_side():
+    """Only the side that was actually replaced changes; the other keeps the
+    image's own prompt."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+    )
+
+    await post_process(
+        client, "upscale", source, "source.png", params, upscale_prompt_override="fine fur detail"
+    )
+
+    upscale_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "UltimateSDUpscale"
+    )
+    assert client.queued_graph[str(upscale_node["inputs"]["positive"][0])]["inputs"]["text"] == (
+        "fine fur detail"
+    )
+    assert client.queued_graph[str(upscale_node["inputs"]["negative"][0])]["inputs"]["text"] == (
+        "blurry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_process_homogenize_ignores_the_upscale_prompt_override():
+    """ "🧵 Homogenize" has no prompt entry of its own — the override is
+    `kind="upscale"`-only, so its conditioning stays the image's own."""
+    source = _solid_png(10, 10, (255, 0, 0))
+    client = _StubUploadingComfyClient(source)
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors",
+        positive_prompt="a fox",
+        negative_prompt="blurry",
+    )
+
+    await post_process(
+        client, "homogenize", source, "source.png", params, upscale_prompt_override="fine fur"
+    )
+
+    refine_node = next(
+        node for node in client.queued_graph.values() if node["class_type"] == "UltimateSDUpscale"
+    )
+    assert client.queued_graph[str(refine_node["inputs"]["positive"][0])]["inputs"]["text"] == (
+        "a fox"
+    )
+
+
+@pytest.mark.asyncio
 async def test_post_process_upscale_without_matching_profile_keeps_frozen_params():
     """No shipped profile matches this checkpoint any more (removed, or a
     foreign/imported image) — fall back to whatever was frozen into `params`

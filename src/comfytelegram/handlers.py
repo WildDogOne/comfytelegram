@@ -202,8 +202,22 @@ UPSCALE_CANCEL_CALLBACK_KIND = "upscale_cancelled"
 #: one-field flag (see `_consume_awaiting_upscale_custom`) and asks for the
 #: two values as a follow-up message — a one-shot override, never saved
 #: anywhere, unlike a profile's own JSON-file defaults.
+#: `UPSCALE_PROMPT_CALLBACK_KIND` sets the matching `awaiting_upscale_prompt`
+#: flag (see `_consume_awaiting_upscale_prompt`) and first replies with a
+#: copiable copy of the prompt that pass would otherwise be conditioned on —
+#: the image's own effective positive/negative — then takes the next message
+#: as a replacement for it. Same one-shot, never-saved rule as the two
+#: numbers above.
 UPSCALE_DEFAULTS_CALLBACK_KIND = "upscale_defaults"
 UPSCALE_CUSTOM_CALLBACK_KIND = "upscale_custom"
+UPSCALE_PROMPT_CALLBACK_KIND = "upscale_prompt"
+#: How long a "✏️ Prompt" entry stays armed. Every other text-entry flag here
+#: is short-lived by construction (two numbers, a rename), but this one invites
+#: a whole prompt, which is exactly what someone typing their *next* generation
+#: prompt is doing — so past this window the flag is dropped and the message is
+#: treated as the prompt it looks like, instead of silently becoming an upscale
+#: of whichever image the entry happened to point at.
+UPSCALE_PROMPT_ENTRY_TTL_SECONDS = 600
 #: "🖐️ Hand Detail" doesn't post-process immediately — it asks auto vs.
 #: manual first (see `_hand_mode_keyboard`), since the YOLO bbox detector
 #: `HAND_AUTO_CALLBACK_KIND` runs often can't find a hand at all.
@@ -881,9 +895,11 @@ def _upscale_confirm_keyboard(result_id: str) -> InlineKeyboardMarkup:
 
 def _upscale_mode_keyboard(result_id: str) -> InlineKeyboardMarkup:
     """Attached to "🔍 Upscale 4x"'s first reply — lets the user run with the
-    checkpoint's live profile defaults (`UPSCALE_DEFAULTS_CALLBACK_KIND`) or
+    checkpoint's live profile defaults (`UPSCALE_DEFAULTS_CALLBACK_KIND`),
     set a one-shot denoise/tile-ControlNet-strength for just this image
-    (`UPSCALE_CUSTOM_CALLBACK_KIND`). See `postprocess_callback`."""
+    (`UPSCALE_CUSTOM_CALLBACK_KIND`), or replace the prompt that pass is
+    conditioned on for just this image (`UPSCALE_PROMPT_CALLBACK_KIND`).
+    See `postprocess_callback`."""
     return InlineKeyboardMarkup(
         [
             [
@@ -896,7 +912,12 @@ def _upscale_mode_keyboard(result_id: str) -> InlineKeyboardMarkup:
                     "⚙️ Customize",
                     callback_data=f"pp:{UPSCALE_CUSTOM_CALLBACK_KIND}:{result_id}",
                 ),
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    "✏️ Prompt", callback_data=f"pp:{UPSCALE_PROMPT_CALLBACK_KIND}:{result_id}"
+                )
+            ],
         ]
     )
 
@@ -3589,7 +3610,8 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     a favorite being edited from `/favs` (`handle_fav_edit_message`),
     or an in-progress `/stream` or `/rp` prompt, character-edit/-rename entry, or
     "⚙️ Customize" upscale denoise/tile-strength entry
-    (`_consume_awaiting_upscale_custom`) takes priority over treating the
+    (`_consume_awaiting_upscale_custom`) or "✏️ Prompt" upscale prompt entry
+    (`_consume_awaiting_upscale_prompt`) takes priority over treating the
     text as a prompt. "✏️ Detail Prompt" has no entry here to take priority
     over — it's a webapp editor now, not a chat follow-up (see
     `DETAIL_PROMPT_CALLBACK_KIND`)."""
@@ -3619,6 +3641,9 @@ async def generate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if await _consume_awaiting_upscale_custom(update, context):
+        return
+
+    if await _consume_awaiting_upscale_prompt(update, context):
         return
 
     if await _consume_awaiting_redo_denoise(update, context):
@@ -4454,19 +4479,27 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     "<denoise> <tile strength>" follow-up message
     (`_consume_awaiting_upscale_custom`), which runs the upscale itself with
     those as a one-shot override — never saved, unlike a profile's own
-    defaults. The already-large-image gate applies either way: a fresh
+    defaults. `UPSCALE_PROMPT_CALLBACK_KIND` sits on its own keyboard row and
+    sets the matching `awaiting_upscale_prompt` flag instead: it first replies
+    with a copiable copy of the prompt this pass would be conditioned on (the
+    image's *effective* positive/negative, via `_raw_prompt_copy_text`, plus a
+    "📋 Copy" button where Telegram's `MAX_COPY_TEXT` cap allows), then
+    `_consume_awaiting_upscale_prompt` takes the next message as a
+    replacement for it — a whole prompt, split for a `---` negative block the
+    same way a generation prompt is, so the copy round-trips back in as-is.
+    `-` means "keep the original". The already-large-image gate applies either way: a fresh
     `"upscale"` tap (post-choice) on an image already at or beyond
     `UPSCALE_CONFIRM_THRESHOLD_PX` doesn't upscale immediately either — it
     downloads just far enough to measure the image, then replies with a
     "this is already large — continue?" prompt (`_upscale_confirm_keyboard`)
     instead, which comes back as either `UPSCALE_CONFIRM_CALLBACK_KIND`
     (proceed) or `UPSCALE_CANCEL_CALLBACK_KIND` (abort);
-    `_consume_awaiting_upscale_custom` runs the exact same check on its own
-    typed-override path, stashing the override in `chat_data`'s
+    `_run_upscale_with_overrides`, the shared tail of both typed-override
+    paths, runs the exact same check, stashing the overrides in `chat_data`'s
     `awaiting_upscale_custom_confirm` (keyed by result_id, since
-    `UPSCALE_CONFIRM_CALLBACK_KIND`'s callback_data has no room for two
-    floats) so a confirmed "✅ Upscale anyway" still applies it instead of
-    silently falling back to profile defaults — `"homogenize"` has
+    `UPSCALE_CONFIRM_CALLBACK_KIND`'s callback_data has no room for the id
+    plus four values) so a confirmed "✅ Upscale anyway" still applies them
+    instead of silently falling back to profile defaults — `"homogenize"` has
     no such gate, since it never changes the image's pixel dimensions (see
     `generation.post_process`'s `TiledRefineParams` branch). A `"face"`/`"hand"` result whose
     detector found nothing to refine (`GeneratedImage.unchanged`, see
@@ -4731,18 +4764,28 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if kind == "upscale":
-        # Clears any stale "⚙️ Customize" text-entry flag — reached either
-        # from a fresh tap (nothing pending, a harmless no-op), from that
-        # prompt's own "↩ Cancel" button (re-tapping this same result_id, so
-        # no notice needed), or from an "🔍 Upscale 4x" tap on a *different*
-        # image while another image's customize prompt was still pending —
-        # that last case gets an explicit heads-up, since dropping it with no
-        # notice could leave the user typing override numbers for an image
-        # that already stopped listening for them.
+        # Clears any stale "⚙️ Customize"/"✏️ Prompt" text-entry flag —
+        # reached either from a fresh tap (nothing pending, a harmless
+        # no-op), from those prompts' own "↩ Cancel" button (re-tapping this
+        # same result_id, so no notice needed), or from an "🔍 Upscale 4x"
+        # tap on a *different* image while another image's entry was still
+        # pending — that last case gets an explicit heads-up, since dropping
+        # it with no notice could leave the user typing an override for an
+        # image that already stopped listening for it. The half-finished
+        # "already large — continue?" stash is cleared by the same tap: an
+        # override typed for an abandoned confirmation must not resurface on
+        # a later, unrelated upscale of the same image.
+        pop_pending(context.chat_data, "awaiting_upscale_custom_confirm", query.message)
         stale_result_id = pop_pending(context.chat_data, "awaiting_upscale_custom", query.message)
-        if stale_result_id is not None and stale_result_id != result_id:
+        stale_prompt_entry = pop_pending(
+            context.chat_data, "awaiting_upscale_prompt", query.message
+        )
+        stale_prompt_id = stale_prompt_entry[0] if stale_prompt_entry else None
+        if (stale_result_id is not None and stale_result_id != result_id) or (
+            stale_prompt_id is not None and stale_prompt_id != result_id
+        ):
             await query.message.reply_text(
-                "Cancelled the pending “⚙️ Customize” request for the other image."
+                "Cancelled the pending “⚙️ Customize”/“✏️ Prompt” request for the other image."
             )
         profiles: list[ModelProfile] = context.bot_data["profiles"]
         tile_strength, denoise = resolve_live_upscale_defaults(full_params.checkpoint, profiles)
@@ -4754,6 +4797,12 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if kind == UPSCALE_CUSTOM_CALLBACK_KIND:
+        # Only one upscale override entry at a time — arming the numbers
+        # entry retires any "✏️ Prompt" entry, and any override left over from
+        # an abandoned "already large — continue?" confirmation, for the same
+        # or another image.
+        pop_pending(context.chat_data, "awaiting_upscale_prompt", query.message)
+        pop_pending(context.chat_data, "awaiting_upscale_custom_confirm", query.message)
         set_pending(context.chat_data, "awaiting_upscale_custom", query.message, result_id)
         anchor = _dialog_reply_anchor(query.message)
         await _delete_messages(context.bot, query.message.chat_id, [query.message.message_id])
@@ -4765,6 +4814,49 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 [[InlineKeyboardButton("↩ Cancel", callback_data=f"pp:upscale:{result_id}")]]
             ),
         )
+        return
+
+    if kind == UPSCALE_PROMPT_CALLBACK_KIND:
+        pop_pending(context.chat_data, "awaiting_upscale_custom", query.message)
+        pop_pending(context.chat_data, "awaiting_upscale_custom_confirm", query.message)
+        set_pending(
+            context.chat_data,
+            "awaiting_upscale_prompt",
+            query.message,
+            (result_id, time.time()),
+        )
+        anchor = _dialog_reply_anchor(query.message)
+        await _delete_messages(context.bot, query.message.chat_id, [query.message.message_id])
+        await anchor.reply_text(
+            "This upscale runs with the prompt the image was generated with. "
+            "Send a prompt to use instead, for this one image (`-` keeps the "
+            "original, a `---` line starts a negative). Here's the current "
+            "one — copy it, edit, send it back.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("↩ Cancel", callback_data=f"pp:upscale:{result_id}")]]
+            ),
+        )
+        # Second reply is the prompt alone, label-free, so grabbing the whole
+        # thing (via "📋 Copy" where Telegram's 256-char `copy_text` cap
+        # allows, or by selecting the message text) pastes straight back in
+        # as a replacement — same shape as "🐛 Show Prompt"'s "as typed"
+        # reply, but the *effective* prompt rather than what was typed,
+        # since that's what this pass is actually conditioned on. An image
+        # with no prompt at all (imported, or a hand-edited one) has nothing
+        # to copy, and Telegram rejects an empty message outright — say so
+        # instead, same guard "🐛 Show Prompt" has.
+        current = _raw_prompt_copy_text(full_params.positive_prompt, full_params.negative_prompt)
+        if not current:
+            await anchor.reply_text(
+                "This image has no prompt to show — send the prompt the upscale should use."
+            )
+            return
+        copy_keyboard = None
+        if len(current) <= InlineKeyboardButtonLimit.MAX_COPY_TEXT:
+            copy_keyboard = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("📋 Copy", copy_text=CopyTextButton(current))]]
+            )
+        await anchor.reply_text(current, reply_markup=copy_keyboard)
         return
 
     if kind in (KONTEXT_REDO_CALLBACK_KIND, KONTEXT_REDO_NEW_CALLBACK_KIND):
@@ -4957,6 +5049,10 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     # first, so replies go to what that dialog was replying to instead.
     anchor = query.message
     if kind == UPSCALE_DEFAULTS_CALLBACK_KIND:
+        # "Use Defaults" means exactly that: any override left sitting in the
+        # confirm stash from an earlier abandoned "already large — continue?"
+        # round trip is dropped rather than riding into this run.
+        pop_pending(context.chat_data, "awaiting_upscale_custom_confirm", query.message)
         anchor = _dialog_reply_anchor(query.message)
         await _delete_messages(context.bot, query.message.chat_id, [query.message.message_id])
         kind = "upscale"
@@ -4964,19 +5060,24 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     source_bytes: bytes | None = None
     upscale_denoise_override: float | None = None
     tile_controlnet_strength_override: float | None = None
+    upscale_prompt_override: str | None = None
+    upscale_negative_prompt_override: str | None = None
     if kind in ("upscale", UPSCALE_CONFIRM_CALLBACK_KIND):
         if kind == UPSCALE_CONFIRM_CALLBACK_KIND:
-            # A confirmed "⚙️ Customize" override (see
-            # `_consume_awaiting_upscale_custom`'s own already-large-image
-            # gate, which stashes it here rather than in callback_data — no
-            # room there for two floats alongside the result_id) rides along
-            # to this confirm tap so the customize path's chosen values
-            # survive the "already large — continue?" round trip too.
+            # A confirmed "⚙️ Customize"/"✏️ Prompt" override (see
+            # `_run_upscale_with_overrides`'s already-large-image gate, which
+            # stashes it here rather than in callback_data — no room there
+            # for the result_id plus every override value) rides along to
+            # this confirm tap so the typed values survive the "already
+            # large — continue?" round trip too.
             pending_custom = pop_pending(
                 context.chat_data, "awaiting_upscale_custom_confirm", query.message
             )
-            if pending_custom is not None and pending_custom[0] == result_id:
-                _, upscale_denoise_override, tile_controlnet_strength_override = pending_custom
+            if pending_custom is not None and pending_custom["result_id"] == result_id:
+                upscale_denoise_override = pending_custom["denoise"]
+                tile_controlnet_strength_override = pending_custom["tile_strength"]
+                upscale_prompt_override = pending_custom["prompt"]
+                upscale_negative_prompt_override = pending_custom["negative"]
             await _safe_edit_message(query, "Upscaling anyway…", InlineKeyboardMarkup([]))
         source_bytes = await _fetch_source_image(
             client,
@@ -5022,6 +5123,8 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             profiles=context.bot_data["profiles"],
             upscale_denoise_override=upscale_denoise_override,
             tile_controlnet_strength_override=tile_controlnet_strength_override,
+            upscale_prompt_override=upscale_prompt_override,
+            upscale_negative_prompt_override=upscale_negative_prompt_override,
         )
 
     result = await _run_reporting_errors(
@@ -5977,6 +6080,91 @@ def _parse_upscale_custom_input(
     return denoise, tile_strength
 
 
+async def _run_upscale_with_overrides(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    result_id: str,
+    *,
+    denoise: float | None,
+    tile_strength: float | None,
+    prompt: str | None,
+    negative: str | None,
+) -> bool:
+    """Shared tail of both "🔍 Upscale 4x" override flows — measures the
+    source, applies the `UPSCALE_CONFIRM_THRESHOLD_PX` already-large-image
+    gate `postprocess_callback`'s bare-tap path applies, and otherwise runs
+    the upscale with whatever one-shot overrides were collected
+    (`None` = keep the live profile default / the image's own prompt for
+    that one). Always returns True: the entry was consumed either way.
+    `postprocess_callback`'s `UPSCALE_CONFIRM_CALLBACK_KIND` branch picks the
+    overrides back up from `awaiting_upscale_custom_confirm` after a "✅ Upscale
+    anyway" tap — `callback_data` has no room for the result_id plus four
+    values, so they ride through `chat_data` instead."""
+    storage: Storage = context.bot_data["storage"]
+    pending = storage.get_pending_result(result_id)
+    if pending is None:
+        await message.reply_text("That image has expired — nothing to upscale.")
+        return True
+
+    full_params = _deserialize_generation_params(pending["base_params"])
+    profiles: list[ModelProfile] = context.bot_data["profiles"]
+    client: ComfyClient = context.bot_data["comfy_client"]
+    source_bytes = await _fetch_source_image(
+        client,
+        context.bot,
+        pending["filename"],
+        pending["file_id"],
+        on_fallback=_source_fallback_notifier(message),
+    )
+    width, height = Image.open(io.BytesIO(source_bytes)).size
+    if max(width, height) >= UPSCALE_CONFIRM_THRESHOLD_PX:
+        set_pending(
+            context.chat_data,
+            "awaiting_upscale_custom_confirm",
+            message,
+            {
+                "result_id": result_id,
+                "denoise": denoise,
+                "tile_strength": tile_strength,
+                "prompt": prompt,
+                "negative": negative,
+            },
+        )
+        await message.reply_text(
+            f"This image is already {width}×{height} — a 4x upscale would "
+            f"produce a {width * 4}×{height * 4} image. Upscale anyway?",
+            reply_markup=_upscale_confirm_keyboard(result_id),
+        )
+        return True
+
+    label = POSTPROCESS_STATUS_LABELS["upscale"]
+    status_message = await start_reply_status(context.bot_data, message, f"{label}…")
+
+    result = await _run_reporting_errors(
+        status_message,
+        label,
+        "post-processing",
+        post_process(
+            client,
+            "upscale",
+            source_bytes,
+            pending["filename"],
+            full_params,
+            profiles=profiles,
+            upscale_denoise_override=denoise,
+            tile_controlnet_strength_override=tile_strength,
+            upscale_prompt_override=prompt,
+            upscale_negative_prompt_override=negative,
+        ),
+    )
+    if result is None:
+        return True
+
+    await status_message.delete()
+    await _send_and_store_result(message, pending["chat_id"], storage, result)
+    return True
+
+
 async def _consume_awaiting_upscale_custom(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> bool:
@@ -5988,10 +6176,8 @@ async def _consume_awaiting_upscale_custom(
     `_consume_awaiting_stream_prompt`, but runs the post-processing pass
     itself rather than handing off to a shared starter — there's no other
     caller for "upscale with an explicit denoise/tile-strength override" to
-    share it with. Applies the same `UPSCALE_CONFIRM_THRESHOLD_PX`
-    already-large-image gate `postprocess_callback`'s bare-tap path does —
-    this used to skip it entirely, since it's a separate hand-rolled
-    pipeline rather than a route through that shared block."""
+    share it with. The already-large-image gate lives in
+    `_run_upscale_with_overrides`, shared with "✏️ Prompt"."""
     message = update.effective_message
     result_id = pop_pending(context.chat_data, "awaiting_upscale_custom", message)
     if result_id is None:
@@ -6017,57 +6203,146 @@ async def _consume_awaiting_upscale_custom(
         return True
     denoise, tile_strength = parsed
 
-    client: ComfyClient = context.bot_data["comfy_client"]
-    source_bytes = await _fetch_source_image(
-        client,
-        context.bot,
-        pending["filename"],
-        pending["file_id"],
-        on_fallback=_source_fallback_notifier(message),
+    return await _run_upscale_with_overrides(
+        message,
+        context,
+        result_id,
+        denoise=denoise,
+        tile_strength=tile_strength,
+        prompt=None,
+        negative=None,
     )
-    width, height = Image.open(io.BytesIO(source_bytes)).size
-    if max(width, height) >= UPSCALE_CONFIRM_THRESHOLD_PX:
-        # Stash the typed override so the "✅ Upscale anyway" tap — handled
-        # by `postprocess_callback`'s shared `UPSCALE_CONFIRM_CALLBACK_KIND`
-        # branch, not this function — can still apply it; callback_data has
-        # no room to carry two floats alongside the result_id itself.
-        set_pending(
-            context.chat_data,
-            "awaiting_upscale_custom_confirm",
-            message,
-            (result_id, denoise, tile_strength),
-        )
+
+
+async def _consume_awaiting_upscale_prompt(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """If this chat is mid-"send the replacement upscale prompt" entry (see
+    `postprocess_callback`'s `UPSCALE_PROMPT_CALLBACK_KIND` branch), consume
+    the incoming text as that one-shot prompt override and run the upscale,
+    returning True; otherwise return False so `generate_message` treats it as
+    a normal generation prompt. Unlike every other text-entry consumer here,
+    the incoming text is allowed to be a whole multi-line prompt, and gets the
+    same treatment a generation prompt gets before it reaches a CLIPTextEncode:
+    the "---" negative split (see `_split_negative_prompt`), `$name` reference
+    expansion, and `<ar:…>`/`<lora:…>` tags taken out — so the copiable
+    current-prompt reply that preceded it round-trips straight back in. The
+    entry only stays armed for `UPSCALE_PROMPT_ENTRY_TTL_SECONDS`; after that
+    the message is the generation prompt it looks like, not an upscale."""
+    message = update.effective_message
+    entry = pop_pending(context.chat_data, "awaiting_upscale_prompt", message)
+    if entry is None:
+        return False
+    result_id, armed_at = entry
+    if time.time() - armed_at > UPSCALE_PROMPT_ENTRY_TTL_SECONDS:
+        # Nobody meant "upscale this old image" when they typed a fresh
+        # prompt an hour after tapping "✏️ Prompt" — say the entry expired and
+        # let the caller generate from it like any other message.
         await message.reply_text(
-            f"This image is already {width}×{height} — a 4x upscale would "
-            f"produce a {width * 4}×{height * 4} image. Upscale anyway?",
-            reply_markup=_upscale_confirm_keyboard(result_id),
+            "That “✏️ Prompt” upscale request expired — using your message as a normal prompt."
         )
+        return False
+
+    storage: Storage = context.bot_data["storage"]
+    pending = storage.get_pending_result(result_id)
+    if pending is None:
+        await message.reply_text("That image has expired — nothing to upscale.")
         return True
+    full_params = _deserialize_generation_params(pending["base_params"])
 
-    label = POSTPROCESS_STATUS_LABELS["upscale"]
-    status_message = await start_reply_status(context.bot_data, message, f"{label}…")
+    raw = (message_text(message) or "").strip()
+    if not raw:
+        # A photo/sticker with no caption, or an empty message — nothing to
+        # replace the prompt with. Re-arm and ask again rather than run the
+        # upscale conditioned on nothing, which is never what was meant here.
+        set_pending(context.chat_data, "awaiting_upscale_prompt", message, (result_id, armed_at))
+        await message.reply_text("Send the prompt to upscale with (or `-` to keep the original).")
+        return True
+    # `<ar:…>` is meaningless for an upscale — the pixel dimensions are the
+    # source's times 4, whatever the tag says.
+    raw = strip_aspect_tags(raw) or ""
+    # `<lora:…>` tags are taken out rather than left in the text: this pass
+    # reuses the LoRAs the image was generated with (that's what makes the
+    # refinement match), and raw "<lora:foo>" sitting in a CLIPTextEncode
+    # conditions on nothing but noise. Say so, since the tag was typed on
+    # purpose — the copiable prompt shown before this reply never has tags,
+    # so this only catches one typed in by hand.
+    raw, lora_tags = extract_lora_tags(raw)
+    if lora_tags:
+        await message.reply_text(
+            "An upscale keeps the LoRAs the image was made with — ignored "
+            + ", ".join(f"<lora:{tag.name}>" for tag in lora_tags)
+            + "."
+        )
+    if not raw:
+        # Nothing but tags in the message: ask again rather than upscale with
+        # an empty prompt.
+        set_pending(context.chat_data, "awaiting_upscale_prompt", message, (result_id, armed_at))
+        await message.reply_text("Send the prompt to upscale with (or `-` to keep the original).")
+        return True
+    if raw == "-":
+        # Explicit "keep the original prompt" — same upscale the "✅ Use
+        # Defaults" tap runs.
+        return await _run_upscale_with_overrides(
+            message,
+            context,
+            result_id,
+            denoise=None,
+            tile_strength=None,
+            prompt=None,
+            negative=None,
+        )
 
-    result = await _run_reporting_errors(
-        status_message,
-        label,
-        "post-processing",
-        post_process(
-            client,
-            "upscale",
-            source_bytes,
-            pending["filename"],
-            full_params,
-            profiles=profiles,
-            upscale_denoise_override=denoise,
-            tile_controlnet_strength_override=tile_strength,
-        ),
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
+    positive, negative = _split_negative_prompt(raw)
+    try:
+        references = _reference_expander(storage, chat_id, user_id)
+        positive, negative = references.expand(positive), references.expand(negative)
+    except UnknownReferenceError as exc:
+        # Same "what is saved" listing a generation prompt gets; keep the
+        # entry armed so the name can be fixed and resent.
+        set_pending(context.chat_data, "awaiting_upscale_prompt", message, (result_id, armed_at))
+        await message.reply_text(str(exc))
+        return True
+    # A `---` block is a whole negative written out on purpose, so it replaces
+    # the image's own; bare "-tag" tokens are shorthand and are appended to it
+    # instead, exactly as they are when generating.
+    explicit_block = bool(_NEGATIVE_BLOCK_SEP_RE.search(raw))
+    if not positive and not negative:
+        # A bare "---" (or nothing readable left of it): treat as "keep the
+        # original prompts" rather than conditioning the pass on nothing.
+        prompt_override = negative_override = None
+    elif not positive:
+        if explicit_block:
+            # A leading `---` with nothing above it: replace just the
+            # negative, keep the image's own positive prompt.
+            negative_override = join_nonempty([negative, references.negatives]) or None
+            prompt_override = None
+        else:
+            # "-blurry" alone reads as a token-negative with nothing left
+            # over — taken literally instead of blanking the positive prompt.
+            prompt_override, negative_override = raw, None
+    else:
+        prompt_override = positive
+        if explicit_block:
+            negative_override = join_nonempty([negative, references.negatives]) or None
+        else:
+            negative_override = (
+                join_nonempty([full_params.negative_prompt, negative, references.negatives])
+                if negative or references.negatives
+                else None
+            )
+
+    return await _run_upscale_with_overrides(
+        message,
+        context,
+        result_id,
+        denoise=None,
+        tile_strength=None,
+        prompt=prompt_override,
+        negative=negative_override,
     )
-    if result is None:
-        return True
-
-    await status_message.delete()
-    await _send_and_store_result(message, pending["chat_id"], storage, result)
-    return True
 
 
 async def _consume_awaiting_kontext(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:

@@ -1,5 +1,6 @@
 import asyncio
 import io
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -40,6 +41,8 @@ from comfytelegram.handlers import (
     TELEGRAM_PHOTO_SIZE_LIMIT,
     UPSCALE_CUSTOM_CALLBACK_KIND,
     UPSCALE_DEFAULTS_CALLBACK_KIND,
+    UPSCALE_PROMPT_CALLBACK_KIND,
+    UPSCALE_PROMPT_ENTRY_TTL_SECONDS,
     _again_keyboard,
     _ask_kontext_painted_instruction,
     _characters_keyboard,
@@ -48,6 +51,7 @@ from comfytelegram.handlers import (
     _consume_awaiting_character_rename,
     _consume_awaiting_kontext,
     _consume_awaiting_upscale_custom,
+    _consume_awaiting_upscale_prompt,
     _deserialize_generation_params,
     _draw_hand_point_grid,
     _extract_file_id,
@@ -1769,11 +1773,13 @@ async def test_consume_awaiting_upscale_custom_gates_on_already_large_image():
     keyboard = last_call.kwargs["reply_markup"]
     callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
     assert "pp:upscale_confirmed:abc123" in callback_data
-    assert context.chat_data["awaiting_upscale_custom_confirm"][NO_TOPIC] == (
-        "abc123",
-        0.35,
-        0.3,
-    )
+    assert context.chat_data["awaiting_upscale_custom_confirm"][NO_TOPIC] == {
+        "result_id": "abc123",
+        "denoise": 0.35,
+        "tile_strength": 0.3,
+        "prompt": None,
+        "negative": None,
+    }
     # Consumed off the flag it was read from, same as the plain path.
     assert "awaiting_upscale_custom" not in context.chat_data
 
@@ -1793,7 +1799,17 @@ async def test_upscale_confirm_applies_a_stashed_custom_override():
     profile = ModelProfile(match=["*"], display_name="x")
     storage = _pending_result_mock(profile, "a fox")
     context = _postprocess_context(storage, profile)
-    context.chat_data = {"awaiting_upscale_custom_confirm": {NO_TOPIC: ("abc123", 0.35, 0.3)}}
+    context.chat_data = {
+        "awaiting_upscale_custom_confirm": {
+            NO_TOPIC: {
+                "result_id": "abc123",
+                "denoise": 0.35,
+                "tile_strength": 0.3,
+                "prompt": "highly detailed fur",
+                "negative": "blurry",
+            }
+        }
+    }
 
     changed_result = GeneratedImage(
         data=b"upscaled",
@@ -1811,7 +1827,607 @@ async def test_upscale_confirm_applies_a_stashed_custom_override():
     post_process_mock.assert_awaited_once()
     assert post_process_mock.await_args.kwargs["upscale_denoise_override"] == 0.35
     assert post_process_mock.await_args.kwargs["tile_controlnet_strength_override"] == 0.3
+    assert post_process_mock.await_args.kwargs["upscale_prompt_override"] == "highly detailed fur"
+    assert post_process_mock.await_args.kwargs["upscale_negative_prompt_override"] == "blurry"
     assert "awaiting_upscale_custom_confirm" not in context.chat_data
+
+
+@pytest.mark.asyncio
+async def test_upscale_prompt_tap_arms_the_entry_and_replies_with_the_current_prompt():
+    """ "✏️ Prompt" must show what the pass is conditioned on *now*, label-free
+    and copyable, so editing it means changing a few tags instead of typing
+    the whole thing out."""
+    query = AsyncMock()
+    query.data = f"pp:{UPSCALE_PROMPT_CALLBACK_KIND}:abc123"
+    query.message.message_thread_id = None
+    # The dialog this tap came from gets deleted before the replies go out;
+    # with nothing above it to quote, the deleted dialog is still the anchor.
+    query.message.reply_to_message = None
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "fox, blue_eyes", "blurry")
+    context = _postprocess_context(storage, profile)
+    context.bot.delete_message = AsyncMock()
+    context.chat_data = {}
+
+    await postprocess_callback(update, context)
+
+    assert context.chat_data["awaiting_upscale_prompt"][NO_TOPIC][0] == "abc123"
+    # First reply is the instruction + "↩ Cancel", second is the bare prompt.
+    prompt_reply = query.message.reply_text.await_args_list[-1]
+    assert prompt_reply.args[0] == "fox, blue_eyes\n---\nblurry"
+    copy_button = prompt_reply.kwargs["reply_markup"].inline_keyboard[0][0]
+    assert copy_button.copy_text.text == "fox, blue_eyes\n---\nblurry"
+
+
+@pytest.mark.asyncio
+async def test_upscale_prompt_tap_omits_the_copy_button_for_an_over_long_prompt():
+    """Telegram hard-caps `copy_text` at 256 chars with no partial fallback —
+    a truncated copy would be a wrong prompt, so the button is left off."""
+    query = AsyncMock()
+    query.data = f"pp:{UPSCALE_PROMPT_CALLBACK_KIND}:abc123"
+    query.message.message_thread_id = None
+    query.message.reply_to_message = None
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "long " * 100)
+    context = _postprocess_context(storage, profile)
+    context.bot.delete_message = AsyncMock()
+    context.chat_data = {}
+
+    await postprocess_callback(update, context)
+
+    prompt_reply = query.message.reply_text.await_args_list[-1]
+    assert prompt_reply.kwargs.get("reply_markup") is None
+
+
+def test_upscale_mode_keyboard_offers_a_prompt_override():
+    keyboard = _upscale_mode_keyboard("abc123")
+    callback_data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert f"pp:{UPSCALE_PROMPT_CALLBACK_KIND}:abc123" in callback_data
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_prompt_returns_false_when_not_pending():
+    update = MagicMock()
+    context = MagicMock()
+    context.chat_data = {}
+    context.bot_data = {"storage": MagicMock()}
+
+    assert await _consume_awaiting_upscale_prompt(update, context) is False
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_prompt_replaces_the_positive_prompt():
+    message = AsyncMock()
+    message.text = "highly detailed fur, sharp eyes"
+    message.message_thread_id = None
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox", "blurry")
+    context = _upscale_prompt_context(storage, profile)
+
+    changed_result = GeneratedImage(
+        data=b"upscaled",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch(
+        "comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)
+    ) as post_process_mock:
+        assert await _consume_awaiting_upscale_prompt(update, context) is True
+
+    assert "awaiting_upscale_prompt" not in context.chat_data
+    post_process_mock.assert_awaited_once()
+    assert post_process_mock.await_args.args[1] == "upscale"
+    assert post_process_mock.await_args.kwargs["upscale_prompt_override"] == (
+        "highly detailed fur, sharp eyes"
+    )
+    # No "---" in what was sent: the image's own negative stays as-is.
+    assert post_process_mock.await_args.kwargs["upscale_negative_prompt_override"] is None
+    message.reply_photo.assert_awaited_once()
+    storage.store_pending_result.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_prompt_splits_a_negative_block():
+    """The copiable reply round-trips: pasting "positive --- negative" back
+    in replaces both sides, same split a generation prompt gets."""
+    message = AsyncMock()
+    message.text = "detailed fur\n---\nlowres, blurry"
+    message.message_thread_id = None
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _upscale_prompt_context(storage, profile)
+
+    changed_result = GeneratedImage(
+        data=b"upscaled",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch(
+        "comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)
+    ) as post_process_mock:
+        assert await _consume_awaiting_upscale_prompt(update, context) is True
+
+    assert post_process_mock.await_args.kwargs["upscale_prompt_override"] == "detailed fur"
+    assert post_process_mock.await_args.kwargs["upscale_negative_prompt_override"] == (
+        "lowres, blurry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_prompt_dash_keeps_the_original_prompt():
+    message = AsyncMock()
+    message.text = "-"
+    message.message_thread_id = None
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _upscale_prompt_context(storage, profile)
+
+    changed_result = GeneratedImage(
+        data=b"upscaled",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch(
+        "comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)
+    ) as post_process_mock:
+        assert await _consume_awaiting_upscale_prompt(update, context) is True
+
+    post_process_mock.assert_awaited_once()
+    assert post_process_mock.await_args.kwargs["upscale_prompt_override"] is None
+    assert post_process_mock.await_args.kwargs["upscale_negative_prompt_override"] is None
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_prompt_rearms_on_a_captionless_message():
+    """A photo or sticker arrives as an empty message — running the upscale
+    conditioned on nothing would be silently wrong, so ask again instead."""
+    message = AsyncMock()
+    message.text = None
+    message.api_kwargs = {}
+    message.message_thread_id = None
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _upscale_prompt_context(storage, profile)
+
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock()) as post_process_mock:
+        assert await _consume_awaiting_upscale_prompt(update, context) is True
+
+    post_process_mock.assert_not_called()
+    assert context.chat_data["awaiting_upscale_prompt"][NO_TOPIC][0] == "abc123"
+    assert "Send the prompt" in message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_prompt_keeps_positive_for_a_negative_only_entry():
+    """A leading `---` means "only replace the negative" — the alternative
+    reading would blank the positive prompt entirely."""
+    message = AsyncMock()
+    message.text = "---\nlowres, blurry"
+    message.message_thread_id = None
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _upscale_prompt_context(storage, profile)
+
+    changed_result = GeneratedImage(
+        data=b"upscaled",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch(
+        "comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)
+    ) as post_process_mock:
+        assert await _consume_awaiting_upscale_prompt(update, context) is True
+
+    assert post_process_mock.await_args.kwargs["upscale_prompt_override"] is None
+    assert post_process_mock.await_args.kwargs["upscale_negative_prompt_override"] == (
+        "lowres, blurry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_prompt_drops_lora_tags_from_the_text():
+    """`<lora:…>` has no meaning for an upscale pass (it reuses the image's
+    own LoRAs) — the tag must not survive into the CLIPTextEncode as text."""
+    message = AsyncMock()
+    message.text = "fine fur <lora:detail:0.6>"
+    message.api_kwargs = {}
+    message.message_thread_id = None
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _upscale_prompt_context(storage, profile)
+
+    changed_result = GeneratedImage(
+        data=b"upscaled",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch(
+        "comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)
+    ) as post_process_mock:
+        assert await _consume_awaiting_upscale_prompt(update, context) is True
+
+    assert post_process_mock.await_args.kwargs["upscale_prompt_override"] == "fine fur"
+    notices = [call.args[0] for call in message.reply_text.await_args_list]
+    assert any("ignored" in notice and "<lora:detail>" in notice for notice in notices)
+
+
+@pytest.mark.asyncio
+async def test_upscale_prompt_entry_expires_and_lets_the_next_prompt_generate():
+    """A whole-prompt entry invites a long pause — but a prompt typed an hour
+    later is a generation prompt, not an upscale of whichever image the entry
+    happens to point at."""
+    message = AsyncMock()
+    message.text = "a fox sitting on a wall"
+    message.api_kwargs = {}
+    message.message_thread_id = None
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _upscale_prompt_context(
+        storage, profile, armed_at=time.time() - UPSCALE_PROMPT_ENTRY_TTL_SECONDS - 1
+    )
+
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock()) as post_process_mock:
+        assert await _consume_awaiting_upscale_prompt(update, context) is False
+
+    post_process_mock.assert_not_called()
+    assert "awaiting_upscale_prompt" not in context.chat_data
+    assert "expired" in message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_prompt_appends_dash_token_negatives():
+    """ "-tag" shorthand is appended to the image's own negative prompt, the
+    same way it is when generating — it must not throw the profile's and the
+    character's negatives away."""
+    message = AsyncMock()
+    message.text = "fine fur, -watermark"
+    message.api_kwargs = {}
+    message.message_thread_id = None
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox", "blurry, lowres")
+    context = _upscale_prompt_context(storage, profile)
+
+    changed_result = GeneratedImage(
+        data=b"upscaled",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch(
+        "comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)
+    ) as post_process_mock:
+        assert await _consume_awaiting_upscale_prompt(update, context) is True
+
+    assert post_process_mock.await_args.kwargs["upscale_prompt_override"] == "fine fur"
+    assert post_process_mock.await_args.kwargs["upscale_negative_prompt_override"] == (
+        "blurry, lowres, watermark"
+    )
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_prompt_strips_an_ar_tag_and_expands_references():
+    """`<ar:…>` decides generation size, which an upscale has already settled;
+    a saved `$name` means the same thing here as in a generation prompt."""
+    message = AsyncMock()
+    message.text = "<ar:16:9> $fox, sitting"
+    message.api_kwargs = {}
+    message.message_thread_id = None
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    storage.list_characters.return_value = [
+        {"name": "fox", "positive_prompt": "rusty, red fur", "negative_prompt": ""}
+    ]
+    storage.list_favorites.return_value = []
+    context = _upscale_prompt_context(storage, profile)
+
+    changed_result = GeneratedImage(
+        data=b"upscaled",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch(
+        "comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)
+    ) as post_process_mock:
+        assert await _consume_awaiting_upscale_prompt(update, context) is True
+
+    assert post_process_mock.await_args.kwargs["upscale_prompt_override"] == (
+        "rusty, red fur, sitting"
+    )
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_prompt_asks_again_for_an_unknown_reference():
+    message = AsyncMock()
+    message.text = "$notsaved, sitting"
+    message.api_kwargs = {}
+    message.message_thread_id = None
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    storage.list_characters.return_value = []
+    storage.list_favorites.return_value = []
+    context = _upscale_prompt_context(storage, profile)
+
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock()) as post_process_mock:
+        assert await _consume_awaiting_upscale_prompt(update, context) is True
+
+    post_process_mock.assert_not_called()
+    assert context.chat_data["awaiting_upscale_prompt"][NO_TOPIC][0] == "abc123"
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_prompt_asks_again_when_only_tags_were_sent():
+    """A message that is nothing but a `<lora:…>` tag leaves an empty prompt
+    once the tag is dropped — re-ask rather than upscale unconditioned."""
+    message = AsyncMock()
+    message.text = "<lora:detail:0.6>"
+    message.api_kwargs = {}
+    message.message_thread_id = None
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _upscale_prompt_context(storage, profile)
+
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock()) as post_process_mock:
+        assert await _consume_awaiting_upscale_prompt(update, context) is True
+
+    post_process_mock.assert_not_called()
+    assert context.chat_data["awaiting_upscale_prompt"][NO_TOPIC][0] == "abc123"
+
+
+@pytest.mark.asyncio
+async def test_upscale_prompt_tap_on_an_image_with_no_prompt_sends_no_empty_message():
+    """Telegram rejects an empty message, and the flag is already armed by
+    then — "🐛 Show Prompt"'s guard, same case."""
+    query = AsyncMock()
+    query.data = f"pp:{UPSCALE_PROMPT_CALLBACK_KIND}:abc123"
+    query.message.message_thread_id = None
+    query.message.reply_to_message = None
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "")
+    context = _postprocess_context(storage, profile)
+    context.bot.delete_message = AsyncMock()
+    context.chat_data = {}
+
+    await postprocess_callback(update, context)
+
+    replies = [call.args[0] for call in query.message.reply_text.await_args_list]
+    assert "" not in replies
+    assert any("no prompt" in reply for reply in replies)
+
+
+@pytest.mark.asyncio
+async def test_upscale_defaults_drops_a_stale_confirm_override():
+    """An override typed for an "already large — continue?" prompt that was
+    never confirmed must not ride into the next "✅ Use Defaults" upscale of
+    the same image."""
+    query = AsyncMock()
+    query.data = f"pp:{UPSCALE_DEFAULTS_CALLBACK_KIND}:abc123"
+    query.message.message_thread_id = None
+    query.message.reply_to_message = None
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _upscale_prompt_context(storage, profile)
+    context.bot.delete_message = AsyncMock()
+    context.chat_data = {
+        "awaiting_upscale_custom_confirm": {
+            NO_TOPIC: {
+                "result_id": "abc123",
+                "denoise": 0.9,
+                "tile_strength": 0.9,
+                "prompt": "forgotten override",
+                "negative": None,
+            }
+        }
+    }
+
+    changed_result = GeneratedImage(
+        data=b"upscaled",
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="fluffyfurry.safetensors", positive_prompt="a fox", negative_prompt=""
+        ),
+        unchanged=False,
+    )
+    with patch(
+        "comfytelegram.handlers.post_process", new=AsyncMock(return_value=changed_result)
+    ) as post_process_mock:
+        await postprocess_callback(update, context)
+
+    post_process_mock.assert_awaited_once()
+    assert post_process_mock.await_args.kwargs["upscale_prompt_override"] is None
+    assert post_process_mock.await_args.kwargs["upscale_denoise_override"] is None
+    assert "awaiting_upscale_custom_confirm" not in context.chat_data
+
+
+@pytest.mark.asyncio
+async def test_bare_upscale_tap_clears_a_stale_confirm_override():
+    query = AsyncMock()
+    query.data = "pp:upscale:abc123"
+    query.message.message_thread_id = None
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _upscale_prompt_context(storage, profile)
+    context.chat_data = {
+        "awaiting_upscale_custom_confirm": {
+            NO_TOPIC: {
+                "result_id": "abc123",
+                "denoise": 0.9,
+                "tile_strength": 0.9,
+                "prompt": "forgotten override",
+                "negative": None,
+            }
+        }
+    }
+
+    await postprocess_callback(update, context)
+
+    assert "awaiting_upscale_custom_confirm" not in context.chat_data
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_prompt_gates_on_an_already_large_image():
+    """The "✏️ Prompt" path shares `_run_upscale_with_overrides` with
+    ⚙️ Customize, so the same "already large — continue?" gate applies — and
+    the typed prompt has to survive that round trip."""
+    message = AsyncMock()
+    message.text = "fine fur detail"
+    message.api_kwargs = {}
+    message.message_thread_id = None
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _upscale_prompt_context(storage, profile)
+    large_png = io.BytesIO()
+    Image.new("RGB", (2048, 2048)).save(large_png, format="PNG")
+    context.bot.get_file = AsyncMock(
+        return_value=MagicMock(
+            download_as_bytearray=AsyncMock(return_value=bytearray(large_png.getvalue()))
+        )
+    )
+
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock()) as post_process_mock:
+        assert await _consume_awaiting_upscale_prompt(update, context) is True
+
+    post_process_mock.assert_not_called()
+    last = message.reply_text.await_args_list[-1]
+    assert "already" in last.args[0] and "Upscale anyway?" in last.args[0]
+    assert context.chat_data["awaiting_upscale_custom_confirm"][NO_TOPIC] == {
+        "result_id": "abc123",
+        "denoise": None,
+        "tile_strength": None,
+        "prompt": "fine fur detail",
+        "negative": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_consume_awaiting_upscale_prompt_is_topic_scoped():
+    """A forum topic's entry must not swallow a message typed in another
+    topic of the same chat (see `topics.py`)."""
+    message = AsyncMock()
+    message.text = "fine fur detail"
+    message.api_kwargs = {}
+    message.message_thread_id = 77
+    update = MagicMock()
+    update.effective_message = message
+    update.effective_chat.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _upscale_prompt_context(storage, profile)
+
+    with patch("comfytelegram.handlers.post_process", new=AsyncMock()) as post_process_mock:
+        assert await _consume_awaiting_upscale_prompt(update, context) is False
+
+    post_process_mock.assert_not_called()
+
+
+def _upscale_prompt_context(
+    storage: MagicMock, profile: ModelProfile, *, armed_at: float | None = None
+) -> MagicMock:
+    """Chat data pre-armed with a pending "✏️ Prompt" entry for `abc123`, plus
+    a small (gate-clearing) source image. `armed_at` lets a test age the entry
+    past `UPSCALE_PROMPT_ENTRY_TTL_SECONDS`."""
+    context = _postprocess_context(storage, profile)
+    context.chat_data = {
+        "awaiting_upscale_prompt": {
+            NO_TOPIC: ("abc123", time.time() if armed_at is None else armed_at)
+        }
+    }
+    source_png = io.BytesIO()
+    Image.new("RGB", (64, 64)).save(source_png, format="PNG")
+    context.bot.get_file = AsyncMock(
+        return_value=MagicMock(
+            download_as_bytearray=AsyncMock(return_value=bytearray(source_png.getvalue()))
+        )
+    )
+    return context
 
 
 @pytest.mark.asyncio

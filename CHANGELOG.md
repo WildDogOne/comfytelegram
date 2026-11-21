@@ -8,6 +8,18 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **"🔍 Upscale 4x" → ✏️ Prompt**: upscale with your own prompt instead of
+  the one the image was generated with. Tapping it first replies with a
+  copyable copy of the prompt that pass is currently conditioned on (📋 Copy
+  where it's short enough), so editing it means changing a few tags rather
+  than retyping everything. Send the replacement and the upscale runs — a
+  `---` line replaces the negative outright, `-tag` shorthand adds to it,
+  `$name` references expand as usual, and `-` keeps the original. The request
+  expires after 10 minutes, so a prompt typed later is still a prompt.
+  One-shot, like ⚙️ Customize's denoise/tile-strength values: nothing is
+  saved, and the result's own metadata still records the prompt the image
+  came from.
+
 - **🪄 Kontext Edit → 🎨 Paint a region**: draw over the part to change in
   the mask editor and write the change into its prompt field (the same
   editor as ✏️ Detail Prompt), then Done. Kontext only ever sees that

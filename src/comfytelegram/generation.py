@@ -1126,6 +1126,8 @@ async def post_process(
     extra_loras: list[LoraSpec] | None = None,
     upscale_denoise_override: float | None = None,
     tile_controlnet_strength_override: float | None = None,
+    upscale_prompt_override: str | None = None,
+    upscale_negative_prompt_override: str | None = None,
     on_progress: ProgressCallback | None = None,
     profiles: list[ModelProfile] | None = None,
 ) -> GeneratedImage:
@@ -1195,7 +1197,21 @@ async def post_process(
     single image where the live profile defaults aren't what's wanted
     without editing the profile's JSON file for every future image too.
     `None` (the default for each, independently) keeps whichever value
-    `profiles` resolved for that one. Ignored for every other `kind`,
+    `profiles` resolved for that one. `upscale_prompt_override`/
+    `upscale_negative_prompt_override` are the same one-shot idea for that
+    pass's *conditioning*: they replace the positive/negative prompt
+    `UltimateSDUpscale` is driven by, which otherwise reuses whatever the
+    image was generated with, so an upscale can push detail toward
+    something the original prompt never mentioned, or drop conditioning
+    that only fights the pass. Unlike the detailer kinds' `detail_prompt`
+    these *replace* rather than describe a region — a tiled whole-frame
+    pass has no region to describe — and each is independent, `None`
+    keeping the image's own prompt for that side. Also `kind="upscale"`-only,
+    and also never recorded in the result's `full_params`/PNG metadata,
+    which keeps describing the generation the image came from — ComfyUI's own
+    embedded graph chunk in that same PNG does carry the override text, which
+    is how its `/history` record works. Ignored for
+    every other `kind`,
     including `"homogenize"` — its `TiledRefineParams` denoise is a fixed
     low-denoise seam-blend pass by design, with no customize step of its
     own, though `tile_controlnet_strength_override` would need extending to
@@ -1284,7 +1300,10 @@ async def post_process(
     if kind in DETAIL_PROMPT_KINDS:
         base_params = _apply_detail_loras(base_params, profiles, extra_loras)
     if kind == "upscale" and (
-        upscale_denoise_override is not None or tile_controlnet_strength_override is not None
+        upscale_denoise_override is not None
+        or tile_controlnet_strength_override is not None
+        or upscale_prompt_override is not None
+        or upscale_negative_prompt_override is not None
     ):
         base_params = replace(
             base_params,
@@ -1297,6 +1316,16 @@ async def post_process(
                 tile_controlnet_strength_override
                 if tile_controlnet_strength_override is not None
                 else base_params.tile_controlnet_strength
+            ),
+            positive_prompt=(
+                upscale_prompt_override
+                if upscale_prompt_override is not None
+                else base_params.positive_prompt
+            ),
+            negative_prompt=(
+                upscale_negative_prompt_override
+                if upscale_negative_prompt_override is not None
+                else base_params.negative_prompt
             ),
         )
     upload = await client.upload_image(source_image, filename=source_filename)
