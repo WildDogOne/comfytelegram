@@ -7,6 +7,7 @@ import asyncio
 import logging
 
 from telegram import BotCommand, Update
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -18,6 +19,7 @@ from telegram.ext import (
     TypeHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from comfytelegram.comfy_client import ComfyClient
 from comfytelegram.fav_menu import fav_callback, fav_command, favs_command
@@ -339,6 +341,60 @@ MEDIA_WRITE_TIMEOUT_SECONDS = 600
 #: has to ingest and store the file before it answers.
 READ_TIMEOUT_SECONDS = 60
 
+#: How many extra times one outgoing Bot API request is re-sent when
+#: Telegram drops it with a transient failure — a 5xx, a closed connection,
+#: or a timeout (all surface as `telegram.error.NetworkError`, which
+#: `TimedOut` subclasses). Seen live: a finished 4-image batch died at
+#: `sendPhoto` with "NetworkError: Internal Server Error" while polling
+#: logged `Bad Gateway` from Telegram in the same window — the payload was
+#: a perfectly ordinary ~200 KB JPEG, so only Telegram's side was flaky.
+#: Without a retry the whole update fails and ~1 minute of finished GPU
+#: work is thrown away at the last step. PTB 22 removed its old
+#: `auto_retry` builder flag, so the retry lives here.
+TELEGRAM_REQUEST_RETRIES = 3
+
+#: First backoff step; doubles per attempt (0.5s, 1s, 2s).
+RETRY_BACKOFF_BASE_SECONDS = 0.5
+
+
+class RetryingRequest(HTTPXRequest):
+    """`HTTPXRequest` that re-sends requests Telegram dropped with a
+    transient network/5xx error instead of letting the exception bubble out
+    of the handler. Only transient failures are retried — bare
+    `NetworkError` (connection drops, Telegram's 5xx) and `TimedOut`;
+    deterministic ones (`BadRequest`, `Forbidden`, …) are the bot's own
+    mistake and repeating them just wastes time.
+    A retried `sendPhoto` can in theory duplicate an image Telegram
+    actually stored despite its 5xx; losing a finished generation to a
+    flaky upload is the worse failure, so we take that trade.
+    `get_updates` is unaffected: polling runs on its own request object and
+    PTB's updater already retries that loop."""
+
+    async def post(self, url: str, **kwargs: object) -> object:  # type: ignore[override]
+        for attempt in range(TELEGRAM_REQUEST_RETRIES + 1):
+            try:
+                return await super().post(url, **kwargs)
+            except NetworkError as exc:
+                # Only the transient corner of the `NetworkError` tree —
+                # bare `NetworkError` (connection drops, Telegram's 5xx)
+                # and `TimedOut`. `BadRequest` also subclasses it, but a
+                # 400 is deterministic; so is anything else PTB hangs off
+                # this class in future.
+                if not isinstance(exc, TimedOut) and type(exc) is not NetworkError:
+                    raise
+                if attempt == TELEGRAM_REQUEST_RETRIES:
+                    raise
+                delay = RETRY_BACKOFF_BASE_SECONDS * 2**attempt
+                logger.warning(
+                    "Telegram request failed (%s) — retrying in %.1fs (attempt %d/%d)",
+                    exc,
+                    delay,
+                    attempt + 1,
+                    TELEGRAM_REQUEST_RETRIES,
+                )
+                await asyncio.sleep(delay)
+        raise AssertionError("unreachable")
+
 
 def build_application(settings: Settings) -> Application:
     """Construct the python-telegram-bot `Application`: load profiles, open
@@ -350,8 +406,16 @@ def build_application(settings: Settings) -> Application:
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
         .concurrent_updates(True)
-        .media_write_timeout(MEDIA_WRITE_TIMEOUT_SECONDS)
-        .read_timeout(READ_TIMEOUT_SECONDS)
+        # A custom request object replaces the builder's own timeout
+        # shortcuts, so the two generous timeouts this app needs
+        # (`MEDIA_WRITE_TIMEOUT_SECONDS`, `READ_TIMEOUT_SECONDS`) are set
+        # on it directly.
+        .request(
+            RetryingRequest(
+                media_write_timeout=MEDIA_WRITE_TIMEOUT_SECONDS,
+                read_timeout=READ_TIMEOUT_SECONDS,
+            )
+        )
         # Quiet unless a send says otherwise: menus, statuses and replies
         # don't buzz, only finished images do (`handlers.
         # _send_photo_or_document` opts back in).

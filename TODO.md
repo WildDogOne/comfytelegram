@@ -238,6 +238,32 @@ Bot API 10.3.
   Receiving them is already handled (`message_text.py`); once PTB models
   `Message.rich_message`, that module's `api_kwargs` workaround can go too.
 
+## Telegram upload outage (live incident, Nov 2026)
+
+- Findings from the "$marlow <ar:3.2> images never arrive" debugging on
+  2026-11-20: generation and the new `RetryingRequest` both work, but
+  **every** file upload for this bot (1856×576 PNG *and* a 50-byte PNG,
+  `sendPhoto`/`sendDocument`/`uploadStickerFile`, httpx/curl, direct and
+  via proxy) gets a 500 or a read timeout from api.telegram.org, while
+  all non-upload calls (text, edits, polling, `sendPhoto` **by URL**)
+  return 200. Last successful upload in `pending_result` was 2026-11-18.
+  This matches the ongoing api.telegram.org incident — see
+  tdlib/telegram-bot-api issues #963/#975/#976/#1049/#1062/#1075; levlam
+  confirmed "all bots affected by Internal Server Errors at
+  api.telegram.org" on 2026-11-19. Not our bug; nothing to fix in code.
+- [ ] If it recurs, a **URL-based send fallback** would route around it:
+  `sendPhoto(photo=<https url>)` works during the outage (Telegram
+  fetches the file itself, verified live). Needs a publicly reachable
+  URL for the ComfyUI output — the inpaint_relay host is the natural
+  candidate: it already has a public URL + shared-secret auth, could
+  serve a short-lived signed `/image/<token>.png` proxying ComfyUI's
+  `/view`. Tradeoff: Telegram caches a copy of every image on its side,
+  and the relay becomes part of the delivery path.
+- [ ] Related idea: when delivery fails after retries, the finished
+  images currently exist only in ComfyUI's output dir. A "📦 Retrying
+  delivery…" status + re-deliver button (images are still in `/history`)
+  would save re-running the graph when Telegram recovers.
+
 ## Housekeeping
 
 - [ ] `scripts/smoke_test.py` and `scripts/smoke_test_postprocess.py` aren't

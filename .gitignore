@@ -225,6 +225,7 @@ __marimo__/
 sample.json
 .idea
 CLAUDE.md
+AGENTS.md
 
 inpaint_relay/docker-compose.yml
 docker-compose.yml
