@@ -41,6 +41,7 @@ from comfytelegram.handlers import (
     UPSCALE_CUSTOM_CALLBACK_KIND,
     UPSCALE_DEFAULTS_CALLBACK_KIND,
     _again_keyboard,
+    _ask_kontext_painted_instruction,
     _characters_keyboard,
     _checkpoint_labels,
     _consume_awaiting_character_edit,
@@ -3069,13 +3070,13 @@ async def test_consume_awaiting_kontext_blank_instruction_keeps_waiting():
     update.effective_message = message
     context = MagicMock()
     context.bot = AsyncMock()
-    context.chat_data = {"awaiting_kontext": {NO_TOPIC: ("abc123", 77, False)}}
+    context.chat_data = {"awaiting_kontext": {NO_TOPIC: ("abc123", 77, False, None)}}
     context.bot_data = {"storage": MagicMock()}
 
     assert await _consume_awaiting_kontext(update, context) is True
 
     # The re-prompt replaces the original prompt, and is what's tracked now.
-    assert context.chat_data["awaiting_kontext"] == {NO_TOPIC: ("abc123", 78, False)}
+    assert context.chat_data["awaiting_kontext"] == {NO_TOPIC: ("abc123", 78, False, None)}
     context.bot.delete_message.assert_awaited_once_with(1, 77)
     message.reply_text.assert_awaited_once()
 
@@ -3094,7 +3095,7 @@ async def test_consume_awaiting_kontext_reports_a_failed_source_fetch_on_its_sta
     profile = ModelProfile(match=["*"], display_name="x")
     context = MagicMock()
     context.bot = AsyncMock()
-    context.chat_data = {"awaiting_kontext": {NO_TOPIC: ("abc123", 77, False)}}
+    context.chat_data = {"awaiting_kontext": {NO_TOPIC: ("abc123", 77, False, None)}}
     context.bot_data = {
         "storage": _pending_result_mock(profile, "a fox"),
         "comfy_client": _comfy_client_mock(),
@@ -3128,6 +3129,7 @@ async def test_kontext_redo_reruns_the_original_source_and_chains():
         "source_file_id": "orig_file",
         "source_filename": "orig.png",
         "instruction": "make it night",
+        "mask_png": None,
     }
     status_message = AsyncMock()
     query = AsyncMock()
@@ -3153,7 +3155,7 @@ async def test_kontext_redo_reruns_the_original_source_and_chains():
     redo_button = send_mock.await_args.kwargs["extra_keyboard_rows"][0][0]
     assert redo_button.callback_data == f"pp:kontext_redo:{new_id}"
     storage.store_kontext_redo.assert_called_once_with(
-        new_id, "orig_file", "orig.png", "make it night"
+        new_id, "orig_file", "orig.png", "make it night", None
     )
     assert [b.callback_data for b in send_mock.await_args.kwargs["extra_keyboard_rows"][0]] == [
         f"pp:kontext_redo:{new_id}",
@@ -3172,6 +3174,7 @@ async def test_kontext_redo_new_prompt_edits_the_original_source():
         "source_file_id": "orig_file",
         "source_filename": "orig.png",
         "instruction": "make it night",
+        "mask_png": None,
     }
     query = AsyncMock()
     query.data = "pp:kontext_redo_new:abc123"
@@ -3183,7 +3186,7 @@ async def test_kontext_redo_new_prompt_edits_the_original_source():
 
     await postprocess_callback(update, context)
 
-    assert context.chat_data["awaiting_kontext"] == {NO_TOPIC: ("abc123", 77, True)}
+    assert context.chat_data["awaiting_kontext"] == {NO_TOPIC: ("abc123", 77, True, None)}
     assert "make it night" in query.message.reply_text.await_args.args[0]
 
     message = AsyncMock()
@@ -3199,6 +3202,222 @@ async def test_kontext_redo_new_prompt_edits_the_original_source():
     args = run_mock.await_args.args
     assert args[3:5] == ("orig_file", "orig.png")
     assert args[6] == "make it snow"
+
+
+@pytest.mark.asyncio
+async def test_kontext_tap_asks_whole_image_or_paint():
+    """With the relay configured, "🪄 Kontext Edit" now splits into the old
+    whole-image flow and the painted-region one."""
+    context = _page_toggle_context()
+    query = AsyncMock()
+    query.data = "pp:kontext:abc123"
+    query.message.reply_text = AsyncMock(return_value=MagicMock(message_id=77))
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    await postprocess_callback(update, context)
+
+    markup = query.message.reply_text.await_args.kwargs["reply_markup"]
+    assert [[b.callback_data for b in row] for row in markup.inline_keyboard] == [
+        ["pp:kontext_whole:abc123"],
+        ["pp:kontext_paint:abc123"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_kontext_whole_tap_asks_the_instruction_directly():
+    context = _page_toggle_context()
+    context.chat_data = {}
+    query = AsyncMock()
+    query.data = "pp:kontext_whole:abc123"
+    query.message.message_thread_id = None
+    query.message.reply_text = AsyncMock(return_value=MagicMock(message_id=77))
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    await postprocess_callback(update, context)
+
+    assert context.chat_data["awaiting_kontext"] == {NO_TOPIC: ("abc123", 77, False, None)}
+
+
+@pytest.mark.asyncio
+async def test_kontext_paint_tap_opens_the_mask_editor():
+    context = _page_toggle_context()
+    query = AsyncMock()
+    query.data = "pp:kontext_paint:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    with patch("comfytelegram.handlers._open_mask_editor", new=AsyncMock()) as editor_mock:
+        await postprocess_callback(update, context)
+
+    assert editor_mock.await_args.kwargs["job_kind"] == "kontext"
+    # The "✏️ Detail Prompt" editor reused as-is — no new inpaint_relay mode.
+    assert editor_mock.await_args.kwargs["meta_overrides"] == {"mode": "mask_prompt"}
+
+
+@pytest.mark.asyncio
+async def test_ask_kontext_painted_instruction_parks_the_mask():
+    """The poller has no `ContextTypes.DEFAULT_TYPE`, so the mask rides into
+    the same `awaiting_kontext` chat_data slot `_consume_awaiting_kontext`
+    pops — as its 4th item. `application.chat_data` is a MappingProxyType
+    over a defaultdict, mirrored here, and indexing through the proxy is
+    what triggers the factory — it has no `setdefault`."""
+    from collections import defaultdict
+
+    application = MagicMock()
+    application.chat_data = defaultdict(dict)
+    prompt_message = MagicMock(message_id=77, message_thread_id=None)
+    application.bot.send_message = AsyncMock(return_value=prompt_message)
+
+    await _ask_kontext_painted_instruction(application, 1, None, "abc123", b"maskbytes")
+
+    # PTB keys `chat_data` by chat id — the entry lands in chat 1's dict.
+    assert application.chat_data[1]["awaiting_kontext"] == {
+        NO_TOPIC: ("abc123", 77, False, b"maskbytes")
+    }
+
+
+@pytest.mark.asyncio
+async def test_painted_kontext_instruction_edits_with_the_parked_mask():
+    message = AsyncMock()
+    message.text = "red jacket"
+    message.message_thread_id = None
+    message.chat_id = 1
+    message.reply_text = AsyncMock(return_value=AsyncMock())
+    update = MagicMock()
+    update.effective_message = message
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    context = MagicMock()
+    context.bot = AsyncMock()
+    context.chat_data = {"awaiting_kontext": {NO_TOPIC: ("abc123", 77, False, b"maskbytes")}}
+    context.bot_data = {
+        "storage": _pending_result_mock(profile, "a fox"),
+        "comfy_client": _comfy_client_mock(),
+        "settings": MagicMock(),
+    }
+
+    edited = GeneratedImage(data=b"png", filename="out.png", full_params=MagicMock())
+    with (
+        patch("comfytelegram.handlers._fetch_source_image", new=AsyncMock(return_value=b"src")),
+        patch("comfytelegram.handlers.kontext_edit", new=AsyncMock(return_value=edited)) as edit,
+        patch("comfytelegram.handlers._send_and_store_result", new=AsyncMock()) as send_mock,
+    ):
+        assert await _consume_awaiting_kontext(update, context) is True
+
+    assert edit.await_args.kwargs["mask_png"] == b"maskbytes"
+    # The stitched result is stored under a TELEGRAM_ONLY name: ComfyUI's
+    # output dir only holds the ~1MP crop, so a later `_fetch_source_image`
+    # must go straight to Telegram's full-image copy.
+    sent_image = send_mock.await_args.args[3]
+    assert sent_image.filename.startswith("tgonly_")
+    # The mask is stored on the redo row too, so both redo buttons replay
+    # the same region without redrawing it.
+    storage = context.bot_data["storage"]
+    assert storage.store_kontext_redo.call_args.args[4] == b"maskbytes"
+    new_id = send_mock.await_args.kwargs["result_id"]
+    assert [b.callback_data for b in send_mock.await_args.kwargs["extra_keyboard_rows"][0]] == [
+        f"pp:kontext_redo:{new_id}",
+        f"pp:kontext_redo_new:{new_id}",
+    ]
+
+
+def _kontext_poller_mocks():
+    """Storage/application mocks for a `_process_one_inpaint_job` kontext
+    tick, shaped like the drawn-mask poller tests above."""
+    storage = MagicMock()
+    storage.get_pending_result.return_value = {
+        "chat_id": 42,
+        "file_id": "presource123",
+        "filename": "presource.png",
+        "base_params": _serialize_generation_params(
+            GenerationParams(checkpoint="ckpt", positive_prompt="a fox", negative_prompt="")
+        ),
+    }
+    application = MagicMock()
+    application.bot.send_message = AsyncMock(return_value=AsyncMock())
+    application.bot.delete_message = AsyncMock()
+    settings = _settings(
+        inpaint_relay_url="https://inpaint.example.com", inpaint_relay_shared_secret="shh"
+    )
+    return storage, application, settings
+
+
+@pytest.mark.asyncio
+async def test_process_one_inpaint_job_kontext_kind_runs_the_edit_from_the_editor_prompt():
+    """The reused "✏️ Detail Prompt" editor submits mask + instruction in
+    one tap — the poller runs the edit straight away, no chat follow-up."""
+    from comfytelegram.handlers import _process_one_inpaint_job
+
+    storage, application, settings = _kontext_poller_mocks()
+    job = {
+        "token": "tok1",
+        "chat_id": 42,
+        "message_thread_id": None,
+        "result_id": "abc123",
+        "kind": "kontext",
+    }
+
+    with (
+        patch(
+            "comfytelegram.handlers._relay_poll_result",
+            new=AsyncMock(
+                return_value={
+                    "mask": b"drawn-mask-bytes",
+                    "positive": "red jacket",
+                    "init_data": "raw-init-data",
+                }
+            ),
+        ),
+        patch(
+            "comfytelegram.handlers.validate_webapp_init_data", return_value={"user": '{"id": 42}'}
+        ),
+        patch("comfytelegram.handlers._relay_delete_job", new=AsyncMock()),
+        patch("comfytelegram.handlers._run_kontext_and_send_bot", new=AsyncMock()) as run_mock,
+        patch("comfytelegram.handlers._ask_kontext_painted_instruction", new=AsyncMock()) as ask,
+    ):
+        await _process_one_inpaint_job(application, settings, storage, MagicMock(), job)
+
+    ask.assert_not_awaited()
+    args = run_mock.await_args.args
+    assert args[1:4] == (42, None, "presource123")
+    assert args[6] == "red jacket"
+    assert args[7] == b"drawn-mask-bytes"
+
+
+@pytest.mark.asyncio
+async def test_process_one_inpaint_job_kontext_kind_blank_prompt_falls_back_to_chat():
+    from comfytelegram.handlers import _process_one_inpaint_job
+
+    storage, application, settings = _kontext_poller_mocks()
+    job = {
+        "token": "tok1",
+        "chat_id": 42,
+        "message_thread_id": None,
+        "result_id": "abc123",
+        "kind": "kontext",
+    }
+
+    with (
+        patch(
+            "comfytelegram.handlers._relay_poll_result",
+            new=AsyncMock(return_value={"mask": b"m", "positive": "   ", "init_data": "raw"}),
+        ),
+        patch(
+            "comfytelegram.handlers.validate_webapp_init_data", return_value={"user": '{"id": 42}'}
+        ),
+        patch("comfytelegram.handlers._relay_delete_job", new=AsyncMock()),
+        patch("comfytelegram.handlers._run_kontext_and_send_bot", new=AsyncMock()) as run_mock,
+        patch("comfytelegram.handlers._ask_kontext_painted_instruction", new=AsyncMock()) as ask,
+    ):
+        await _process_one_inpaint_job(application, settings, storage, MagicMock(), job)
+
+    run_mock.assert_not_awaited()
+    assert ask.await_args.args[3:] == ("abc123", b"m")
 
 
 @pytest.mark.asyncio

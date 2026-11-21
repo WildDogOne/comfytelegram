@@ -321,6 +321,22 @@ KONTEXT_CANCEL_CALLBACK_DATA = "kontext:cancel"
 #: (consumed by `_consume_awaiting_kontext`, same as a fresh edit).
 KONTEXT_REDO_CALLBACK_KIND = "kontext_redo"
 KONTEXT_REDO_NEW_CALLBACK_KIND = "kontext_redo_new"
+#: The two answers to "🪄 Kontext Edit"'s follow-up question (see
+#: `_kontext_mode_keyboard`): "🖼️ Whole image" is the old one-field flow —
+#: `_ask_kontext_instruction` right away — and "🎨 Paint a region" opens the
+#: inpaint relay's mask editor over the image (`_open_mask_editor`, job kind
+#: `KONTEXT_JOB_KIND`, handled outside `_DRAWN_MASK_KINDS` in
+#: `_process_one_inpaint_job` like `PAINT_REGIONS_JOB_KIND` is). The painted
+#: flow reuses the "✏️ Detail Prompt" editor (`mode="mask_prompt"`) rather
+#: than adding a relay mode of its own: its positive field is the Kontext
+#: instruction, submitted with the mask in one Done tap, and the edit runs
+#: crop-and-stitch on just that region (`generation.kontext_edit`'s
+#: `mask_png`) — chat only asks for the instruction if that field was left
+#: blank (`_ask_kontext_painted_instruction`).
+KONTEXT_WHOLE_CALLBACK_KIND = "kontext_whole"
+KONTEXT_PAINT_CALLBACK_KIND = "kontext_paint"
+#: `inpaint_job.kind` for a "🎨 Paint a region" Kontext job.
+KONTEXT_JOB_KIND = "kontext"
 
 #: What `storage.py`'s `inpaint_job.kind`/a drawn-mask redo tap actually
 #: means in terms of `generation.post_process`'s API — looked up by
@@ -2274,6 +2290,32 @@ async def _process_one_inpaint_job(
             application, storage, client, job, pending, result, _init_data_user_id(verified)
         )
         return
+
+    if job["kind"] == KONTEXT_JOB_KIND:
+        # The instruction rides along in the reused "✏️ Detail Prompt"
+        # editor's positive field (`mode="mask_prompt"` — see
+        # `postprocess_callback`'s `KONTEXT_PAINT_CALLBACK_KIND` branch),
+        # so mask and instruction arrive together in one submission and the
+        # edit runs right away. Left blank, fall back to asking in chat
+        # like the flow did before it borrowed that editor.
+        instruction = (result.get("positive") or "").strip()
+        if not instruction:
+            await _ask_kontext_painted_instruction(
+                application, chat_id, message_thread_id, job["result_id"], result["mask"]
+            )
+            return
+        await _run_kontext_and_send_bot(
+            application,
+            chat_id,
+            message_thread_id,
+            pending["file_id"],
+            pending["filename"],
+            _deserialize_generation_params(pending["base_params"]),
+            instruction,
+            result["mask"],
+        )
+        return
+
     drawn_mask_kind = _DRAWN_MASK_KINDS[job["kind"]]
     status_message = await start_chat_status(
         application.bot_data,
@@ -4206,7 +4248,11 @@ async def _open_mask_editor(
     source image's bytes, the mask the editor should open with already
     drawn (`_relay_create_job`'s `initial_mask`). "🎨 Paint Regions" uses
     both too, with `job_kind=PAINT_REGIONS_JOB_KIND`: its whole meta comes
-    from `meta_overrides` (`_paint_regions_meta`)."""
+    from `meta_overrides` (`_paint_regions_meta`). "🎨 Paint a region"
+    Kontext (`job_kind=KONTEXT_JOB_KIND`) passes `meta_overrides=
+    {"mode": "mask_prompt"}` — the "✏️ Detail Prompt" editor reused as-is,
+    its positive field carrying the edit instruction alongside the mask
+    (`_process_one_inpaint_job`); the negative/denoise fields go unused."""
     settings: Settings = context.bot_data["settings"]
     storage: Storage = context.bot_data["storage"]
     client: ComfyClient = context.bot_data["comfy_client"]
@@ -4347,6 +4393,11 @@ async def _open_mask_editor(
             editor_prompt = (
                 "Draw over the region to detail, describe what should be there, then "
                 "tap Done in the editor:"
+            )
+        elif job_kind == KONTEXT_JOB_KIND:
+            editor_prompt = (
+                "Paint the area to change, write the change in the editor's "
+                '"Positive" field, then tap Done:'
             )
         else:
             editor_prompt = "Draw over the area to fix, then tap Done in the editor:"
@@ -4725,7 +4776,12 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         if kind == KONTEXT_REDO_NEW_CALLBACK_KIND:
             await _ask_kontext_instruction(
-                query.message, context, result_id, from_original=True, previous=redo["instruction"]
+                query.message,
+                context,
+                result_id,
+                from_original=True,
+                previous=redo["instruction"],
+                mask_png=redo.get("mask_png"),
             )
             return
         await _run_kontext_and_send(
@@ -4736,11 +4792,43 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             redo["source_filename"],
             full_params,
             redo["instruction"],
+            mask_png=redo.get("mask_png"),
         )
         return
 
     if kind == KONTEXT_CALLBACK_KIND:
+        await query.message.reply_text(
+            "🪄 Kontext Edit — change the whole image, or only a painted area?",
+            reply_markup=_kontext_mode_keyboard(
+                result_id, allow_painted=bool(settings.inpaint_relay_url)
+            ),
+        )
+        return
+
+    if kind == KONTEXT_WHOLE_CALLBACK_KIND:
         await _ask_kontext_instruction(query.message, context, result_id, from_original=False)
+        return
+
+    if kind == KONTEXT_PAINT_CALLBACK_KIND:
+        if not settings.inpaint_relay_url:
+            await query.message.reply_text("Mask drawing isn't configured on this bot.")
+            return
+        await _open_mask_editor(
+            query,
+            context,
+            pending=pending,
+            full_params=full_params,
+            result_id=result_id,
+            job_kind=KONTEXT_JOB_KIND,
+            user_id=user_id,
+            # Reuse the "✏️ Detail Prompt" editor as-is (`Job.mode=
+            # "mask_prompt"`, see inpaint_relay/server.py) — its positive
+            # field is the Kontext instruction, submitted with the mask in
+            # one Done tap; the negative/denoise fields ride along unused
+            # (`_process_one_inpaint_job` reads only `positive`), which is
+            # the trade for not forking a new editor mode.
+            meta_overrides={"mode": "mask_prompt"},
+        )
         return
 
     if kind == HAND_MANUAL_CALLBACK_KIND:
@@ -5991,7 +6079,11 @@ async def _consume_awaiting_kontext(update: Update, context: ContextTypes.DEFAUL
     pending_entry = pop_pending(context.chat_data, "awaiting_kontext", message)
     if pending_entry is None:
         return False
-    result_id, prompt_message_id, from_original = pending_entry
+    # `mask_png` (the 4th slot) is the painted region from the "🎨 Paint a
+    # region" flow — see `_ask_kontext_painted_instruction`; `*rest` keeps
+    # entries written before that slot existed readable across a restart.
+    result_id, prompt_message_id, from_original, *rest = pending_entry
+    mask_png = rest[0] if rest else None
 
     instruction = (message_text(message) or "").strip()
     if not instruction:
@@ -6008,7 +6100,7 @@ async def _consume_awaiting_kontext(update: Update, context: ContextTypes.DEFAUL
             context.chat_data,
             "awaiting_kontext",
             message,
-            (result_id, reprompt.message_id, from_original),
+            (result_id, reprompt.message_id, from_original, mask_png),
         )
         return True
 
@@ -6036,6 +6128,7 @@ async def _consume_awaiting_kontext(update: Update, context: ContextTypes.DEFAUL
         source_filename,
         _deserialize_generation_params(pending["base_params"]),
         instruction,
+        mask_png=mask_png,
     )
     return True
 
@@ -6047,13 +6140,31 @@ async def _ask_kontext_instruction(
     *,
     from_original: bool,
     previous: str | None = None,
+    mask_png: bytes | None = None,
 ) -> None:
     """Ask for a Kontext instruction as a follow-up message. `from_original`
     (the "✏️ New prompt" redo) makes `_consume_awaiting_kontext` edit the
     `kontext_redo` row's pre-edit source instead of `result_id`'s own image;
     `previous` is that row's instruction, shown (and copyable, when it fits
-    Telegram's cap) so it can be tweaked rather than retyped."""
-    if previous is None:
+    Telegram's cap) so it can be tweaked rather than retyped. `mask_png` is
+    a "🎨 Paint a region" edit's already-drawn mask — carried in the pending
+    entry so `_consume_awaiting_kontext` runs the crop-and-stitch edit on
+    it, and only changes the wording here."""
+    if mask_png is not None:
+        if previous is None:
+            text = (
+                "🪄 Kontext Edit — area painted. Now describe the change to make "
+                'there, e.g. "change the jacket to red leather". Only the painted '
+                "area will change, and the result comes back at this image's "
+                "full size."
+            )
+        else:
+            text = (
+                "✏️ Redo with a new prompt — describe the change to make in the "
+                "painted area of the original image instead.\n\n"
+                f"Previous prompt:\n{previous}"
+            )
+    elif previous is None:
         text = (
             "🪄 Kontext Edit — describe the change in plain English. Be specific "
             'and say what to keep, e.g. "Change the jacket to red leather while '
@@ -6075,7 +6186,45 @@ async def _ask_kontext_instruction(
         context.chat_data,
         "awaiting_kontext",
         message,
-        (result_id, prompt_message.message_id, from_original),
+        (result_id, prompt_message.message_id, from_original, mask_png),
+    )
+
+
+async def _ask_kontext_painted_instruction(
+    application: Application,
+    chat_id: int,
+    message_thread_id: int | None,
+    result_id: str,
+    mask_png: bytes,
+) -> None:
+    """Fallback for a "🎨 Paint a region" Kontext job whose borrowed
+    "✏️ Detail Prompt" editor came back with the positive field blank
+    (`_process_one_inpaint_job`) — the mask is in hand but the instruction
+    isn't, so ask for it in chat and park the mask in the same
+    `awaiting_kontext` pending entry the whole-image flow uses, as its 4th
+    slot. `chat_data` comes from `application.chat_data` because the poller
+    has no `ContextTypes.DEFAULT_TYPE` of its own; it's the same dict
+    `generate_message`'s `_consume_awaiting_kontext` pops, and like every
+    other pending entry a restart drops it (the mask with it — by then the
+    relay's job row is gone too, so redrawing is the only way back either
+    way)."""
+    prompt_message = await application.bot.send_message(
+        chat_id,
+        "🪄 Kontext Edit — area painted. Now describe the change to make there, "
+        'e.g. "change the jacket to red leather". Only the painted area will '
+        "change, and the result comes back at this image's full size.",
+        reply_markup=_kontext_cancel_keyboard(),
+        message_thread_id=message_thread_id,
+    )
+    # `Application.chat_data` is a `MappingProxyType` over a `defaultdict` —
+    # no `setdefault` on the proxy, but plain `[chat_id]` indexing goes
+    # through the defaultdict factory and creates the per-chat dict.
+    chat_data: dict[str, Any] = application.chat_data[chat_id]
+    set_pending(
+        chat_data,
+        "awaiting_kontext",
+        prompt_message,
+        (result_id, prompt_message.message_id, False, mask_png),
     )
 
 
@@ -6087,12 +6236,17 @@ async def _run_kontext_and_send(
     source_filename: str,
     full_params: GenerationParams,
     instruction: str,
+    *,
+    mask_png: bytes | None = None,
 ) -> None:
     """Run `instruction` as a Kontext edit on the source image and reply
     with the result plus the "🔁 Same prompt"/"✏️ New prompt" redo row — shared by the first
     edit (`_consume_awaiting_kontext`) and every redo, which always pass
     the original pre-edit source so a redo retries the edit rather than
-    stacking a second one on top of it."""
+    stacking a second one on top of it. `mask_png` is a "🎨 Paint a region"
+    edit's mask: it selects `generation.kontext_edit`'s crop-and-stitch path
+    and is stored on the redo row, so both redo buttons replay the same
+    region."""
     settings: Settings = context.bot_data["settings"]
     client: ComfyClient = context.bot_data["comfy_client"]
     storage: Storage = context.bot_data["storage"]
@@ -6121,6 +6275,7 @@ async def _run_kontext_and_send(
             params=KontextParams(
                 steps=settings.flux_kontext_steps, guidance=settings.flux_kontext_guidance
             ),
+            mask_png=mask_png,
             on_progress=_make_progress_callback(status_message, label),
         )
 
@@ -6132,7 +6287,37 @@ async def _run_kontext_and_send(
 
     await status_message.delete()
     result_id = uuid.uuid4().hex[:12]
-    redo_row = [
+    if mask_png is not None:
+        result = _kontext_painted_result(result, result_id)
+    await _send_and_store_result(
+        message,
+        chat_id,
+        storage,
+        result,
+        result_id=result_id,
+        extra_keyboard_rows=[_kontext_redo_row(result_id)],
+    )
+    storage.store_kontext_redo(result_id, source_file_id, source_filename, instruction, mask_png)
+
+
+def _kontext_painted_result(result: GeneratedImage, result_id: str) -> GeneratedImage:
+    """Rename a painted-region Kontext result to a
+    `TELEGRAM_ONLY_FILENAME_PREFIX` name. The bytes sent to Telegram are the
+    full stitched image, but the `filename` it would otherwise carry is
+    ComfyUI's output name for the ~1MP *crop* Kontext ran on — and
+    `_fetch_source_image` prefers ComfyUI's `/view` copy, so every later
+    post-process / Kontext / mask-editor / download tap on the stitched
+    result would silently work on the crop instead. (Uploading the stitched
+    PNG wouldn't help either: that lookup only checks ComfyUI's `output`
+    folder, never `input` — the Telegram copy is the only complete one.)"""
+    return replace(result, filename=f"{TELEGRAM_ONLY_FILENAME_PREFIX}kontext_{result_id}.png")
+
+
+def _kontext_redo_row(result_id: str) -> list[InlineKeyboardButton]:
+    """The "🔁 Same prompt"/"✏️ New prompt" row under every Kontext result —
+    shared by the `Message`-based flow and the poller's
+    `_run_kontext_and_send_bot`."""
+    return [
         InlineKeyboardButton(
             "🔁 Same prompt", callback_data=f"pp:{KONTEXT_REDO_CALLBACK_KIND}:{result_id}"
         ),
@@ -6140,10 +6325,80 @@ async def _run_kontext_and_send(
             "✏️ New prompt", callback_data=f"pp:{KONTEXT_REDO_NEW_CALLBACK_KIND}:{result_id}"
         ),
     ]
-    await _send_and_store_result(
-        message, chat_id, storage, result, result_id=result_id, extra_keyboard_rows=[redo_row]
+
+
+async def _run_kontext_and_send_bot(
+    application: Application,
+    chat_id: int,
+    message_thread_id: int | None,
+    source_file_id: str,
+    source_filename: str,
+    full_params: GenerationParams,
+    instruction: str,
+    mask_png: bytes,
+) -> None:
+    """`_run_kontext_and_send`'s counterpart for the inpaint poller: a
+    "🎨 Paint a region" job that came back with its instruction already in
+    the reused "✏️ Detail Prompt" editor's positive field, so this runs
+    unattended — no `Message`, no `ContextTypes.DEFAULT_TYPE`, status
+    and result sent at `chat_id` directly (with `message_thread_id`
+    threaded through, same as `_send_and_store_bot_result` requires). The
+    mask is always set here — it came with the submission — and goes onto
+    the redo row, so both redo buttons replay the same painted region."""
+    settings: Settings = application.bot_data["settings"]
+    client: ComfyClient = application.bot_data["comfy_client"]
+    storage: Storage = application.bot_data["storage"]
+
+    label = "Kontext editing"
+    status_message = await start_chat_status(
+        application.bot_data,
+        application.bot,
+        chat_id,
+        f"{label} (painted region)…",
+        message_thread_id=message_thread_id,
     )
-    storage.store_kontext_redo(result_id, source_file_id, source_filename, instruction)
+
+    async def fetch_and_edit() -> GeneratedImage:
+        source_bytes = await _fetch_source_image(
+            client,
+            application.bot,
+            source_filename,
+            source_file_id,
+            on_fallback=_source_fallback_notifier_bot(application.bot, chat_id, message_thread_id),
+        )
+        return await kontext_edit(
+            client,
+            source_bytes,
+            source_filename,
+            full_params,
+            instruction,
+            files=_kontext_model_files(settings),
+            params=KontextParams(
+                steps=settings.flux_kontext_steps, guidance=settings.flux_kontext_guidance
+            ),
+            mask_png=mask_png,
+            on_progress=_make_progress_callback(status_message, label),
+        )
+
+    result = await _run_reporting_errors(
+        status_message, "Kontext edit", "Kontext edit", fetch_and_edit()
+    )
+    if result is None:
+        return
+
+    await status_message.delete()
+    result_id = uuid.uuid4().hex[:12]
+    result = _kontext_painted_result(result, result_id)
+    await _send_and_store_bot_result(
+        application.bot,
+        chat_id,
+        storage,
+        result,
+        message_thread_id=message_thread_id,
+        result_id=result_id,
+        extra_keyboard_rows=[_kontext_redo_row(result_id)],
+    )
+    storage.store_kontext_redo(result_id, source_file_id, source_filename, instruction, mask_png)
 
 
 async def _delete_message_quietly(bot: Bot, chat_id: int, message_id: int) -> None:
@@ -6164,6 +6419,30 @@ def _kontext_model_files(settings: Settings) -> KontextModelFiles:
         t5xxl=settings.flux_kontext_t5xxl,
         vae=settings.flux_kontext_vae,
     )
+
+
+def _kontext_mode_keyboard(result_id: str, *, allow_painted: bool) -> InlineKeyboardMarkup:
+    """The follow-up to a "🪄 Kontext Edit" tap: whole-image edit or paint a
+    region first. `allow_painted` is False when `Settings.inpaint_relay_url`
+    isn't configured — unlike `_post_process_keyboard`, this one is built at
+    tap time, where `Settings` is right there."""
+    rows = [
+        [
+            InlineKeyboardButton(
+                "🖼️ Whole image", callback_data=f"pp:{KONTEXT_WHOLE_CALLBACK_KIND}:{result_id}"
+            )
+        ]
+    ]
+    if allow_painted:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🎨 Paint a region",
+                    callback_data=f"pp:{KONTEXT_PAINT_CALLBACK_KIND}:{result_id}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 def _kontext_cancel_keyboard(copy_text: str | None = None) -> InlineKeyboardMarkup:

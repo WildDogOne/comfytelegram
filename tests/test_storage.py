@@ -394,7 +394,10 @@ def test_kontext_redo_roundtrip(storage: Storage):
         "source_file_id": "file123",
         "source_filename": "source.png",
         "instruction": "make it night",
+        "mask_png": None,
     }
+    storage.store_kontext_redo("result2", "file456", "source.png", "red jacket", b"\x89PNGmask")
+    assert storage.get_kontext_redo("result2")["mask_png"] == b"\x89PNGmask"
 
 
 def test_inpaint_redo_roundtrip(storage: Storage):

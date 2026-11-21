@@ -1854,3 +1854,156 @@ async def test_kontext_edit_downscales_large_source_to_a_1mp_bucket():
     assert (latent["inputs"]["width"], latent["inputs"]["height"]) == (1248, 832)
     assert result.full_params is params
     assert extract_metadata(result.data)["kind"] == "kontext"
+
+
+def test_kontext_crop_box_grows_a_small_mark_to_a_native_resolution_neighborhood():
+    """Kontext only matches what it can see, so a crop smaller than ~1024
+    source px must be grown to that floor instead of being upscaled to the
+    bucket — real context at real pixels beats a zoomed, blurred window on
+    a sliver of the object."""
+    box = generation._kontext_crop_box((1800, 1900, 2001, 2101), (4096, 4096))
+    assert box[2] - box[0] >= 1024
+    assert box[3] - box[1] >= 1024
+    # The mark itself (and its padding) stays inside, and the box stays
+    # centered on it rather than sliding to an image corner.
+    assert box[0] <= 1730 and box[1] <= 1830 and box[2] >= 2071 and box[3] >= 2171
+    assert box[0] >= 0 and box[2] <= 4096 and box[1] >= 0 and box[3] <= 4096
+
+
+def test_kontext_crop_box_takes_the_whole_axis_when_the_image_is_smaller():
+    assert generation._kontext_crop_box((100, 100, 200, 200), (800, 700)) == (0, 0, 800, 700)
+
+
+def test_kontext_crop_box_anchors_a_corner_mark_flush_with_the_edges():
+    # Mark painted into the corner: the grown box must still cover the
+    # corner itself, not just be a 1024 square somewhere near it.
+    box = generation._kontext_crop_box((0, 0, 150, 150), (4096, 4096))
+    assert box[0] == 0 and box[1] == 0
+    assert box[2] - box[0] >= 1024 and box[3] - box[1] >= 1024
+
+
+def test_kontext_mask_at_source_size_resamples_a_mismatched_mask():
+    """A mask that came back at the display copy's dimensions while the
+    source was re-fetched at full size (or vice versa) must be resampled
+    into the source's coordinate space before the bbox/stitch math runs."""
+    mask = _rect_mask_png(1000, 750, (700, 150, 800, 250))
+    normalized = generation._kontext_mask_at_source_size(_solid_png(2000, 1500, (0, 0, 0)), mask)
+    assert Image.open(io.BytesIO(normalized)).size == (2000, 1500)
+    # The mark lands where the same painting on a full-size canvas would
+    # (within the resample's edge blend).
+    normalized_bbox = generation._mask_bbox(normalized)
+    reference_bbox = generation._mask_bbox(_rect_mask_png(2000, 1500, (1400, 300, 1600, 500)))
+    assert all(abs(a - b) <= 2 for a, b in zip(normalized_bbox, reference_bbox))
+    # An already-matching mask passes through untouched.
+    same = _rect_mask_png(2000, 1500, (1400, 300, 1600, 500))
+    assert generation._kontext_mask_at_source_size(_solid_png(2000, 1500, (0, 0, 0)), same) is same
+
+
+@pytest.mark.asyncio
+async def test_kontext_edit_painted_with_a_half_res_mask_still_edits_the_right_spot():
+    source = _solid_png(2000, 1500, (255, 0, 0))
+    mask = _rect_mask_png(1000, 750, (700, 150, 800, 250))
+    client = _StubUploadingComfyClient(_solid_png(1024, 1024, (0, 255, 0)))
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    result = await generation.kontext_edit(
+        client,
+        source,
+        "source.png",
+        params,
+        "make it red leather",
+        files=generation.KontextModelFiles(unet="k.st", clip_l="l.st", t5xxl="t5.st", vae="ae.st"),
+        params=generation.KontextParams(steps=20, guidance=2.5),
+        mask_png=mask,
+    )
+
+    image = Image.open(io.BytesIO(result.data))
+    assert image.size == (2000, 1500)
+    assert image.getpixel((1500, 400)) == (0, 255, 0)  # the mark, in source coords
+    assert image.getpixel((100, 100)) == (255, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_kontext_edit_painted_crops_to_the_mask_and_stitches_it_back():
+    """A painted-region edit must ship only the mask's padded crop (at the
+    bucket size that crop's own aspect ratio picks) and come back at the
+    source's full size — the painted area showing the edit, everything
+    outside it pixel-identical. That's the whole point of crop-and-stitch:
+    a small mark on a big source gets the model's full ~1MP budget instead
+    of a thumbnail's share of it."""
+    source = _solid_png(2000, 1500, (255, 0, 0))
+    mask = _rect_mask_png(2000, 1500, (1400, 300, 1600, 500))
+    client = _StubUploadingComfyClient(_solid_png(1024, 1024, (0, 255, 0)))
+    uploaded: list[bytes] = []
+    original_upload = client.upload_image
+
+    async def capture(data, **kwargs):
+        uploaded.append(data)
+        return await original_upload(data, **kwargs)
+
+    client.upload_image = capture
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    result = await generation.kontext_edit(
+        client,
+        source,
+        "source.png",
+        params,
+        "make it red leather",
+        files=generation.KontextModelFiles(unet="k.st", clip_l="l.st", t5xxl="t5.st", vae="ae.st"),
+        params=generation.KontextParams(steps=20, guidance=2.5),
+        mask_png=mask,
+    )
+
+    # bbox 201x201 + 0.35 padding → 341x341, grown to the 1024px native
+    # minimum (clamped at the right edge) → the square 1024x1024 bucket.
+    (sent,) = uploaded
+    assert Image.open(io.BytesIO(sent)).size == (1024, 1024)
+    latent = next(
+        n for n in client.queued_graph.values() if n["class_type"] == "EmptySD3LatentImage"
+    )
+    assert (latent["inputs"]["width"], latent["inputs"]["height"]) == (1024, 1024)
+
+    image = Image.open(io.BytesIO(result.data))
+    assert image.size == (2000, 1500)
+    assert image.getpixel((1500, 400)) == (0, 255, 0)  # inside the painted area: edited
+    assert image.getpixel((1560, 460)) == (0, 255, 0)  # grown past the mask edge: still edited
+    assert image.getpixel((100, 100)) == (255, 0, 0)  # outside the crop: untouched
+    assert extract_metadata(result.data)["kind"] == "kontext"
+
+
+@pytest.mark.asyncio
+async def test_kontext_edit_painted_with_an_empty_mask_falls_back_to_the_whole_image():
+    source = _solid_png(1200, 900, (255, 0, 0))
+    mask = _solid_mask_png(1200, 900, 0)
+    client = _StubUploadingComfyClient(_solid_png(8, 8, (0, 0, 255)))
+    uploaded: list[bytes] = []
+    original_upload = client.upload_image
+
+    async def capture(data, **kwargs):
+        uploaded.append(data)
+        return await original_upload(data, **kwargs)
+
+    client.upload_image = capture
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    await generation.kontext_edit(
+        client,
+        source,
+        "source.png",
+        params,
+        "make it night",
+        files=generation.KontextModelFiles(unet="k.st", clip_l="l.st", t5xxl="t5.st", vae="ae.st"),
+        params=generation.KontextParams(steps=20, guidance=2.5),
+        mask_png=mask,
+    )
+
+    # The whole-image path, not a crop: the full frame scaled to its bucket.
+    (sent,) = uploaded
+    assert Image.open(io.BytesIO(sent)).size == (1184, 880)

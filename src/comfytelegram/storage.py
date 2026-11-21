@@ -201,7 +201,8 @@ CREATE TABLE IF NOT EXISTS kontext_redo (
     source_file_id TEXT NOT NULL,
     source_filename TEXT NOT NULL,
     instruction TEXT NOT NULL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    mask_png BLOB
 );
 
 CREATE TABLE IF NOT EXISTS favorite (
@@ -255,6 +256,7 @@ class Storage:
         self._add_column_if_missing("chat_pose", "pose_json", "TEXT")
         self._add_column_if_missing("chat_pose", "background_file_id", "TEXT")
         self._add_column_if_missing("chat_pose", "strength", "REAL")
+        self._add_column_if_missing("kontext_redo", "mask_png", "BLOB")
         #: Last `_prune()` sweep time per table — see PRUNE_INTERVAL_SECONDS.
         self._last_prune: dict[str, float] = {}
 
@@ -1015,37 +1017,47 @@ class Storage:
         }
 
     def store_kontext_redo(
-        self, result_id: str, source_file_id: str, source_filename: str, instruction: str
+        self,
+        result_id: str,
+        source_file_id: str,
+        source_filename: str,
+        instruction: str,
+        mask_png: bytes | None = None,
     ) -> None:
         """Record what "🔁 Redo Kontext" (`handlers.py`'s
         `KONTEXT_REDO_CALLBACK_KIND`) needs to re-run a Kontext edit for a
         fresh seed: the *pre-edit* source image (redoing against the edited
         result would compound the edit instead of retrying it) and the
-        instruction. Keyed by the edited result's `result_id`, same as
-        `inpaint_redo`, and TTL'd the same way so the two expire together."""
+        instruction. `mask_png` is the painted region a "🎨 Paint a region"
+        edit drew (`generation.kontext_edit`'s crop-and-stitch mask), kept so
+        "🔁 Same prompt" and "✏️ New prompt" replay the same region without
+        redrawing it — None for a whole-image edit. Keyed by the edited
+        result's `result_id`, same as `inpaint_redo`, and TTL'd the same way
+        so the two expire together."""
         self._prune("kontext_redo")
         with self._conn:
             self._conn.execute(
                 "INSERT OR REPLACE INTO kontext_redo "
-                "(result_id, source_file_id, source_filename, instruction, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (result_id, source_file_id, source_filename, instruction, time.time()),
+                "(result_id, source_file_id, source_filename, instruction, mask_png, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (result_id, source_file_id, source_filename, instruction, mask_png, time.time()),
             )
 
     def get_kontext_redo(self, result_id: str) -> dict[str, Any] | None:
         """The row `store_kontext_redo` wrote for `result_id`, or None."""
         row = self._conn.execute(
-            "SELECT source_file_id, source_filename, instruction FROM kontext_redo "
+            "SELECT source_file_id, source_filename, instruction, mask_png FROM kontext_redo "
             "WHERE result_id = ?",
             (result_id,),
         ).fetchone()
         if row is None:
             return None
-        source_file_id, source_filename, instruction = row
+        source_file_id, source_filename, instruction, mask_png = row
         return {
             "source_file_id": source_file_id,
             "source_filename": source_filename,
             "instruction": instruction,
+            "mask_png": bytes(mask_png) if mask_png is not None else None,
         }
 
     def save_favorite(

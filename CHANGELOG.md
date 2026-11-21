@@ -8,6 +8,18 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **🪄 Kontext Edit → 🎨 Paint a region**: draw over the part to change in
+  the mask editor and write the change into its prompt field (the same
+  editor as ✏️ Detail Prompt), then Done. Kontext only ever sees that
+  region — its padded crop, never smaller than a 1024px neighborhood so
+  the model keeps real context around the mark — scaled to a ~1MP bucket,
+  and the result is blended back through the feathered mask, so only the
+  painted area changes and the picture comes back at the source's full
+  size instead of ~1MP.
+  🔁 Same prompt / ✏️ New prompt replay the same region without redrawing;
+  if the prompt field is left blank, the bot asks in chat instead.
+  🖼️ Whole image is the old flow, unchanged.
+
 - **`<ar:2:3>` in a prompt** picks that image's aspect ratio (also
   `<ar:16x9>`, `<ar:1.5>`, `<aspectratio:…>`). It keeps the model's usual
   pixel count, so `<ar:2:3>` on a 1024×1024 model gives 832×1280. Works in
@@ -183,6 +195,17 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Draw Mask, Fix Artifact and Detail Prompt: the "Draw over the area…, then
   tap Done in the editor" message (with its editor button) is now deleted
   once the drawn mask arrives and generation starts.
+
+### Fixed
+
+- Finished images no longer vanish when Telegram has a bad minute: every
+  Bot API request is now retried up to 3 times with backoff when Telegram
+  answers with a 5xx or the connection drops. Live failure: a completed
+  4-image batch died at `sendPhoto` with "Internal Server Error" and the
+  chat only got "Something went wrong handling that — check the bot's
+  logs." — the generation itself had succeeded, and ~1 minute of GPU work
+  was thrown away at the last step. (`python-telegram-bot` 22 removed its
+  `auto_retry` option, so the retry is built in now.)
 
 ### Security
 

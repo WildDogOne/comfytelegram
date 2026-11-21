@@ -1424,6 +1424,148 @@ def _scale_for_kontext(source_image: bytes) -> tuple[bytes, tuple[int, int]]:
     return buf.getvalue(), (target_w, target_h)
 
 
+#: How much context around the painted region's bounding box the Kontext
+#: crop adds, as a share of the bbox's longer side. Kontext only "sees" what
+#: is inside its `ReferenceLatent`, and a crop barely bigger than the mark
+#: itself gives it nothing to blend the change into — the live failure that
+#: set this was a painted jacket patch whose edit stopped at a hard rectangle
+#: because the model never saw the rest of the jacket.
+_KONTEXT_CROP_PADDING = 0.35
+
+#: How far the painted mask is grown, and how wide its edge feathered, when
+#: stitching the edited crop back in — as shares of the source's shorter
+#: side, so the falloff scales with the image the way the detailers'
+#: grow/blur params do (`_fix_drawn_geometry`), capped because
+#: `ImageFilter.MaxFilter` is a square-kernel filter whose cost grows with
+#: the kernel area — an uncapped 20px grow on a 4096px source means a
+#: 41px-wide kernel over the whole crop, seconds for what is a rounding
+#: error in the falloff. Growing past the painted edge matters because
+#: Kontext regenerates the *whole* crop: a stroke drawn just inside a hard
+#: outline would leave an unedited sliver of the old content between
+#: outline and stitch edge.
+_KONTEXT_MASK_GROW_RATIO = 0.005
+_KONTEXT_MASK_GROW_MAX = 10
+_KONTEXT_MASK_FEATHER_RATIO = 0.012
+_KONTEXT_MASK_FEATHER_MAX = 24
+
+
+def _kontext_mask_at_source_size(source_image: bytes, mask_png: bytes) -> bytes:
+    """The painted mask resized to the source's pixel dimensions if it
+    isn't already — normally it is (the relay canvas sizes itself to the
+    full-dimension reference copy, see `_to_display_jpeg`), but when
+    `_fetch_source_image` falls back to Telegram's copy of a big image the
+    two can disagree, and both the crop-box bbox and the stitch composite
+    need mask and source in one coordinate space. Done once up front so
+    neither has to re-derive it."""
+    size = Image.open(io.BytesIO(source_image)).size
+    mask = Image.open(io.BytesIO(mask_png))
+    if mask.size == size:
+        return mask_png
+    logger.info(
+        "Kontext paint mask is %s against a %s source; resampling it to match",
+        mask.size,
+        size,
+    )
+    buf = io.BytesIO()
+    # BILINEAR, not LANCZOS: masks are binary-ish, and Lanczos' undershoot
+    # rings faint nonzero halos a few px past the mark — enough to shift
+    # the bbox that `_kontext_crop_box` keys off.
+    mask.convert("L").resize(size, Image.Resampling.BILINEAR).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+#: The smallest crop side Kontext gets, in *source* pixels. Kontext
+#: regenerates its whole canvas from the reference tokens alone, so
+#: everything the edit should match — the rest of the painted object, the
+#: lighting, the line style — has to be inside the crop. A padded crop
+#: smaller than this would be upscaled to the bucket instead, which costs
+#: twice: the model edits a Lanczos-blurred reference (and re-synthesizes
+#: its own grain, which then fights the source's native detail at the
+#: stitch edge), and a 300px window on a 4096px image can't even show the
+#: object being edited. Growing the box to ~1024 source pixels costs no
+#: compute at all — the bucket is always ~1MP — it just spends the fixed
+#: budget on context instead of zoom, which is the right trade for a
+#: semantic instruction edit (pixel-level detailing is the detailers' job).
+_KONTEXT_MIN_CROP_SIDE = 1024
+
+
+def _kontext_crop_box(
+    mask_bbox: tuple[int, int, int, int], image_size: tuple[int, int]
+) -> tuple[int, int, int, int]:
+    """The crop Kontext gets for a painted-region edit: the mask's bounding
+    box plus `_KONTEXT_CROP_PADDING` of its longer side on every edge, then
+    grown to a `_KONTEXT_MIN_CROP_SIDE` square around that box's center (via
+    the detailer path's `_expand_axis`) — both clamped to the image."""
+    width, height = image_size
+    left, top, right, bottom = mask_bbox
+    pad = round(_KONTEXT_CROP_PADDING * max(right - left, bottom - top))
+    left, top = max(0, left - pad), max(0, top - pad)
+    right, bottom = min(width, right + pad), min(height, bottom + pad)
+    left, right = _expand_axis(left, right, _KONTEXT_MIN_CROP_SIDE, width)
+    top, bottom = _expand_axis(top, bottom, _KONTEXT_MIN_CROP_SIDE, height)
+    return (left, top, right, bottom)
+
+
+def _crop_for_kontext(
+    source_image: bytes, mask_png: bytes
+) -> tuple[bytes, tuple[int, int, int, int], tuple[int, int]]:
+    """The painted region's padded crop, scaled to a `KONTEXT_RESOLUTIONS`
+    entry for its own aspect ratio, plus the crop box (in source pixels) and
+    that size. Unlike `_scale_for_kontext` this is a plain resize, not a
+    scale+centre-crop: the crop box already carries the geometry, and any
+    aspect mismatch against the bucket cancels in `_kontext_stitch`'s resize
+    back to the crop box.
+
+    This is the whole point of the crop: a 300px mark on a 4MP source gets
+    ~1MP of model compute instead of being downscaled to a thumbnail of
+    itself alongside the rest of the frame."""
+    image = Image.open(io.BytesIO(source_image)).convert("RGB")
+    crop_box = _kontext_crop_box(_mask_bbox(mask_png), image.size)
+    crop = image.crop(crop_box)
+    size = kontext_resolution(crop.size)
+    buf = io.BytesIO()
+    crop.resize(size, Image.Resampling.LANCZOS).save(buf, format="PNG")
+    return buf.getvalue(), crop_box, size
+
+
+def _kontext_stitch(
+    source_image: bytes,
+    edited_crop: bytes,
+    mask_png: bytes,
+    crop_box: tuple[int, int, int, int],
+) -> bytes:
+    """Composite the ~1MP crop Kontext returned back into the full-size
+    source: resize the crop back onto its box and blend it in through the
+    painted mask (grown by `_KONTEXT_MASK_GROW_RATIO`, feathered by
+    `_KONTEXT_MASK_FEATHER_RATIO`), so everything outside the painted region
+    stays pixel-identical to the source and the result keeps the source's
+    full resolution. No `SetLatentNoiseMask` in the graph is needed for
+    that preservation — the composite does it, which is why
+    `build_kontext_edit` stays untouched."""
+    image = Image.open(io.BytesIO(source_image)).convert("RGB")
+    left, top, right, bottom = crop_box
+    crop_w, crop_h = right - left, bottom - top
+    edited = (
+        Image.open(io.BytesIO(edited_crop))
+        .convert("RGB")
+        .resize((crop_w, crop_h), Image.Resampling.LANCZOS)
+    )
+    mask = Image.open(io.BytesIO(mask_png)).convert("L")
+    mask = mask.crop(crop_box)
+    short_side = min(image.size)
+    grow = min(_KONTEXT_MASK_GROW_MAX, max(1, round(_KONTEXT_MASK_GROW_RATIO * short_side)))
+    feather = min(
+        _KONTEXT_MASK_FEATHER_MAX, max(4, round(_KONTEXT_MASK_FEATHER_RATIO * short_side))
+    )
+    mask = mask.filter(ImageFilter.MaxFilter(2 * grow + 1)).filter(
+        ImageFilter.GaussianBlur(feather)
+    )
+    image.paste(edited, (left, top), mask)
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 async def kontext_edit(
     client: ComfyClient,
     source_image: bytes,
@@ -1433,6 +1575,7 @@ async def kontext_edit(
     *,
     files: KontextModelFiles,
     params: KontextParams,
+    mask_png: bytes | None = None,
     on_progress: ProgressCallback | None = None,
 ) -> GeneratedImage:
     """Edit a previously generated image with FLUX.1 Kontext, following a
@@ -1446,9 +1589,49 @@ async def kontext_edit(
     source's `full_params` though, so its own post-processing buttons
     (upscale, detailers) keep working against the original checkpoint.
 
-    The output is always ~1MP (see `KONTEXT_RESOLUTIONS`), however large
-    the source was — a 4x upscale comes back at roughly a quarter of its
-    side length, to be upscaled again afterwards if wanted."""
+    `mask_png` (a painted mask at the source's pixel dimensions, from the
+    inpaint relay's "🎨 Paint a region" flow) switches to the crop-and-stitch
+    path: Kontext only ever runs on the mask's padded crop scaled to a
+    ~1MP bucket, and the result is blended back into the full-size source
+    through the feathered mask — so only the painted area changes, the
+    region gets the model's full ~1MP budget instead of a share of it, and
+    the output comes back at the source's own resolution. An empty mask
+    (nothing painted) silently falls back to the whole-image path.
+
+    Without a mask the output is always ~1MP (see `KONTEXT_RESOLUTIONS`),
+    however large the source was — a 4x upscale comes back at roughly a
+    quarter of its side length, to be upscaled again afterwards if
+    wanted."""
+    if mask_png is not None:
+        mask_png = await asyncio.to_thread(_kontext_mask_at_source_size, source_image, mask_png)
+    if mask_png is not None and _mask_bbox(mask_png) is None:
+        logger.info("Kontext paint job has an empty mask; editing the whole image")
+        mask_png = None
+
+    if mask_png is not None:
+        crop, crop_box, size = await asyncio.to_thread(_crop_for_kontext, source_image, mask_png)
+        upload = await client.upload_image(crop, filename=f"kontext_{source_filename}")
+        prompt_graph, save_node_id = build_kontext_edit(
+            upload["name"], instruction, size, files, params
+        )
+        logger.info(
+            "Submitting painted Kontext edit on %s at %dx%d (crop box %s)",
+            upload["name"],
+            *size,
+            crop_box,
+        )
+        raw, _history = await _run_graph(
+            client, prompt_graph, save_node_id, on_progress=on_progress
+        )
+        edited_crop, raw_filename = raw[0]
+        stitched = await asyncio.to_thread(
+            _kontext_stitch, source_image, edited_crop, mask_png, crop_box
+        )
+        data, filename = _tag_images(
+            [(stitched, raw_filename)], full_params, kind="kontext", graph=prompt_graph
+        )[0]
+        return GeneratedImage(data=data, filename=filename, full_params=full_params)
+
     scaled, size = await asyncio.to_thread(_scale_for_kontext, source_image)
     upload = await client.upload_image(scaled, filename=f"kontext_{source_filename}")
     prompt_graph, save_node_id = build_kontext_edit(
