@@ -908,15 +908,15 @@ def _upscale_mode_keyboard(result_id: str) -> InlineKeyboardMarkup:
                     callback_data=f"pp:{UPSCALE_DEFAULTS_CALLBACK_KIND}:{result_id}",
                     style=KeyboardButtonStyle.SUCCESS,
                 ),
+            ],
+            [
                 InlineKeyboardButton(
                     "⚙️ Customize",
                     callback_data=f"pp:{UPSCALE_CUSTOM_CALLBACK_KIND}:{result_id}",
                 ),
-            ],
-            [
                 InlineKeyboardButton(
                     "✏️ Prompt", callback_data=f"pp:{UPSCALE_PROMPT_CALLBACK_KIND}:{result_id}"
-                )
+                ),
             ],
         ]
     )

@@ -162,6 +162,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Upscale keyboard layout**: "✅ Use Defaults" now sits alone on its own
+  row so it is the widest button, with "⚙️ Customize" and "✏️ Prompt" sharing
+  the row below it.
 - **Quiet messages**: the bot no longer buzzes your phone for menus,
   status lines, prompts and other replies. Only finished images
   (generations, post-processing results, `/stream` images) notify.
