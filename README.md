@@ -23,6 +23,7 @@ The bot talks to ComfyUI's HTTP + WebSocket API directly. It doesn't use the
 - [Optional features](#optional-features)
 - [Development](#development)
 - [Architecture](#architecture)
+- [License](#license)
 
 ## Features
 
@@ -214,6 +215,15 @@ This works in plain prompts, `/stream`, regional prompts and the
 warning instead, so the drawn mask isn't lost; typing `$` there opens a
 menu of your characters and favorites. "🐛 Show Prompt" shows the
 prompt as typed, with the `$name`s.
+
+`<ar:2:3>` picks that image's aspect ratio without going through
+`/settings` — `<ar:16x9>` and `<ar:1.5>` work too, as do `<aspect:…>` and
+`<aspectratio:…>`. The tag only sets the shape: the size keeps your
+model's usual pixel count, so `<ar:2:3>` on a 1024×1024 profile gives
+832×1280. It works in plain prompts, `/stream`, regional prompts (global
+part or any region line) and inside a saved favorite, and **🔁 Generate
+Again** keeps the size. It wins over a `/pose` skeleton's shape, with a
+note when the two disagree.
 
 ### Regional prompts
 
@@ -514,3 +524,7 @@ by [cg-use-everywhere](https://github.com/chrisgoringe/cg-use-everywhere)
 broadcast nodes. `builder.py` wires all of them explicitly, so the bot
 depends only on node packs that add real generation capability, not
 UI-convenience ones.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
