@@ -6899,6 +6899,11 @@ async def _send_cutout_pair(
     right under the thumb. That order is safe because the sticker send is
     fully wrapped in a try/except: a failing sticker send must never take
     the PNG or its `pending_result` row down with it, order be damned.
+    (The converse is deliberately not handled: if the PNG send itself
+    fails, the already-sent sticker is orphaned — same send-then-store
+    shape as every other result here, since the row needs the sent
+    message's `file_id` and a failed send surfaces through the caller's
+    error handler like everywhere else.)
 
     The PNG deliberately goes through `_send_and_store_result` with
     `force_document=True` — `sendPhoto` would JPEG-flatten the alpha away,

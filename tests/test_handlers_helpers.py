@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from PIL import Image
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 
 from comfytelegram.comfy_client import ComfyUIError, JobProgress
 from comfytelegram.generation import GeneratedImage
@@ -4325,3 +4325,68 @@ async def test_send_photo_or_document_force_document_skips_the_photo_path():
     )
     send_photo.assert_not_awaited()
     assert send_document.await_args.kwargs["filename"] == "sticker.png"
+
+
+@pytest.mark.asyncio
+async def test_send_cutout_pair_sends_sticker_before_png_document():
+    """The UX order the user asked for: sticker preview first, then the
+    full-res transparent PNG document (with its keyboard) — and the
+    pending_result row still lands."""
+    from comfytelegram.handlers import _send_cutout_pair
+
+    order: list[str] = []
+    anchor = MagicMock()
+    anchor.reply_sticker = AsyncMock(side_effect=lambda **_: order.append("sticker"))
+    anchor.reply_text = AsyncMock(side_effect=lambda **_: order.append("text"))
+    anchor.reply_document = AsyncMock(
+        side_effect=lambda **_: (
+            order.append("document") or MagicMock(document=MagicMock(file_id="f"))
+        )
+    )
+    anchor.reply_photo = AsyncMock(side_effect=lambda **_: order.append("photo"))
+    storage = MagicMock()
+    storage.get_image_format.return_value = "png"
+    png = io.BytesIO()
+    Image.new("RGBA", (8, 8), (255, 0, 0, 0)).save(png, format="PNG")
+    result = GeneratedImage(
+        data=png.getvalue(),
+        filename="cut.png",
+        full_params=GenerationParams(
+            checkpoint="c.safetensors", positive_prompt="p", negative_prompt=""
+        ),
+    )
+
+    await _send_cutout_pair(anchor, {"chat_id": 7}, storage, result)
+
+    assert order == ["sticker", "document"]
+    storage.store_pending_result.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_send_cutout_pair_sticker_failure_still_delivers_png():
+    """A Telegram-rejected sticker (100KB cap, invalid file, flood) is a
+    note, not a failure: the PNG document and its `pending_result` row go
+    out regardless."""
+    from comfytelegram.handlers import _send_cutout_pair
+
+    anchor = MagicMock()
+    anchor.reply_sticker = AsyncMock(side_effect=TelegramError("sticker too big"))
+    anchor.reply_text = AsyncMock()
+    anchor.reply_document = AsyncMock(return_value=MagicMock(document=MagicMock(file_id="f")))
+    storage = MagicMock()
+    storage.get_image_format.return_value = "png"
+    png = io.BytesIO()
+    Image.new("RGBA", (8, 8), (255, 0, 0, 0)).save(png, format="PNG")
+    result = GeneratedImage(
+        data=png.getvalue(),
+        filename="cut.png",
+        full_params=GenerationParams(
+            checkpoint="c.safetensors", positive_prompt="p", negative_prompt=""
+        ),
+    )
+
+    await _send_cutout_pair(anchor, {"chat_id": 7}, storage, result)
+
+    anchor.reply_text.assert_awaited_once()
+    anchor.reply_document.assert_awaited_once()
+    storage.store_pending_result.assert_called_once()
