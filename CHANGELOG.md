@@ -12,8 +12,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sticker workflow as two separate buttons. ✂️ Remove BG cuts the subject
   out to a transparent PNG (BiRefNet, ComfyUI core nodes — no custom node
   pack); ⭕ Outline draws a white die-cut border around the transparency
-  (Thin/Medium/Thick, scaled with the image, hard-edged and contour-
-  faithful like a Photoshop outer glow at 100% spread), and works on any already transparent result —
+  (Thin/Medium/Thick, scaled with the image; tight contour-hugging with
+  a slight rounding of the sharpest points, hard edge), and works on any already transparent result —
   including ✂️ Remove BG's own output, which it reads from the PNG's
   alpha channel without re-segmenting. Each comes back twice: a real
   Telegram sticker (512px WebP, transparency intact, the quick way to

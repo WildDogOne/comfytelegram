@@ -1476,7 +1476,7 @@ def build_sticker_outline(
     `LoadImage` is a classic trap: it sees the 3-channel tensor, reports
     "fully opaque", and the outline ends up whiting out the whole canvas.)
     That MASK follows the LoadImage polarity (white = transparent), hence
-    the `InvertMask`: `GrowMask` and `ImageCompositeMasked` (white = show
+    the `InvertMask`: the growth and `ImageCompositeMasked` (white = show
     source) want the foreground mask. `JoinImageWithAlpha`'s alpha input
     wants the transparent polarity back, hence the second invert on the
     grown mask — same convention dance as `build_bg_removal`. Runs on the
@@ -1484,33 +1484,66 @@ def build_sticker_outline(
     `postprocess_callback` checks for alpha before offering it.
 
     `outline_px` is the white border's width in source-image pixels
-    (`GrowMask`'s `expand`); the handlers scale it off the image's shorter
-    side and cap it for cost.
+    (`GrowMask`'s `expand`); the handlers scale it off the image's
+    shorter side and cap it for cost.
 
-    Shape (this is Photoshop's outer glow at 100% spread): the alpha is
-    thresholded at 0.5 *before* dilating, so the border traces the
-    subject's crisp 50%-alpha contour exactly and grows outward from
-    there — the same "spread first, no blur" geometry. No `FeatherMask`/
-    gaussian anywhere: any blur-then-rethreshold on the grown mask is a
-    morphological *closing*, which bridges concave bays (arm-to-torso,
-    between legs) and cuts a straight line across them, and blur without
-    rethresholding just gives a fuzzy edge instead of a die-cut one. The
-    one thing `GrowMask`'s max-filter staircasing does need is a clean
-    input, which is what the threshold supplies — dilating BiRefNet's
-    raw soft alpha instead inherits every 1px notch of the segmentation
-    fringe. The subject is composited through the *un-thresholded* soft
-    mask, so hair/fur edges keep their softness even though the border
-    behind them is hard-edged."""
+    Shape: Photoshop's outer glow at 100% spread — a hard threshold on
+    the alpha first (the border traces the subject's crisp 50%-alpha
+    contour, not BiRefNet's soft fringe), plain `GrowMask` dilation
+    (tight, exact width), and hard binary thresholds throughout (zero
+    partial-alpha pixels). The one concession: a *small disk opening*
+    (erode→dilate, radius σ_o ≈ an eighth of the border) blunts needle
+    tips and rounds the sharpest corners only — opening can only remove
+    area, so concave bays are never bridged, and straight edges and
+    obtuse corners lose at most ~1.5σ_o px. Never blur+rethreshold on
+    top of a finished growth (that's a morphological closing and bridges
+    bays); the opening here is erode-then-dilate, blur strictly before
+    each threshold. The subject is composited through the
+    *un-thresholded* soft mask, so hair/fur edges keep their softness
+    even though the border behind them is hard-edged."""
     g = PromptGraph()
     load = g.add("LoadImage", {"image": source_filename}, title="Source Image")
     subject_mask = g.add("InvertMask", {"mask": [load, 1]}, title="Subject Mask")
     crisp_subject = g.add(
         "ThresholdMask", {"mask": [subject_mask, 0], "value": 0.5}, title="Crisp Subject Edge"
     )
+    # Growth itself is plain `GrowMask` — diamond kernel, hugs the
+    # contour at exactly `outline_px`, and that tightness is the look.
     outline_mask = g.add(
         "GrowMask",
         {"mask": [crisp_subject, 0], "expand": outline_px, "tapered_corners": True},
         title="Outline Silhouette",
+    )
+    # The one concession at extreme points: a *small disk opening*
+    # (erode→dilate by radius σ_o) shaves needle tips and rounds the
+    # sharpest corners and nothing else. Morphological opening can only
+    # remove area, so concave bays are never bridged, and straight
+    # edges/obtuse corners lose at most ~1.5σ_o px. Disk-shaped because
+    # every mask-dilation *node* here (`GrowMask`, `Mask Dilate Region`,
+    # `ImpactDilateMask`) is a cross kernel — a diamond opening would
+    # leave diamond-capped tips untouched; the `Morphology` node (real
+    # morphology) errors out on this ComfyUI. So the opening is done the
+    # gaussian way, calibrated against this ComfyUI: blur σ + threshold
+    # 0.84 erodes by ~σ, blur σ + threshold 0.16 dilates by ~σ (the
+    # level set sits ~0.99σ off the edge). σ_o ≈ an eighth of the border
+    # (2..6px): a 20° spike loses ~5σ_o of tip, a 90° corner ~1.5σ_o px.
+    # Blur strictly before each threshold; both thresholds binary, so
+    # the outline edge stays a hard die-cut.
+    sigma_o = max(2, min(6, round(outline_px / 8)))
+    kernel = min(100, 3 * sigma_o | 1)
+    softened = g.add(
+        "ImpactGaussianBlurMask",
+        {"mask": [outline_mask, 0], "kernel_size": kernel, "sigma": float(sigma_o)},
+        title="Soften for Opening",
+    )
+    eroded = g.add("ThresholdMask", {"mask": [softened, 0], "value": 0.84}, title="Erode (Disk σ)")
+    softened = g.add(
+        "ImpactGaussianBlurMask",
+        {"mask": [eroded, 0], "kernel_size": kernel, "sigma": float(sigma_o)},
+        title="Regrow after Opening",
+    )
+    outline_mask = g.add(
+        "ThresholdMask", {"mask": [softened, 0], "value": 0.16}, title="Regrow Level (Hard Edge)"
     )
     white = g.add("MaskToImage", {"mask": [outline_mask, 0]}, title="White Outline")
     composited = g.add(

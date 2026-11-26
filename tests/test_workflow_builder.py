@@ -1276,21 +1276,54 @@ def test_build_sticker_outline_reads_alpha_no_segmentation():
         for nid, n in graph.items()
         if n["class_type"] == "InvertMask" and n["inputs"]["mask"] == [load_id, 1]
     )
-    grow_id, grow = by_type["GrowMask"]
-    assert grow["inputs"]["expand"] == 24
 
     # Photoshop outer glow at 100% spread: hard threshold on the subject
-    # edge *before* dilating, and no blur anywhere — a blur+threshold on
-    # the grown mask is a morphological closing that bridges concave bays,
-    # and blur alone gives a fuzzy edge instead of a die-cut one.
+    # edge *before* dilating, hard thresholds throughout (die-cut edge,
+    # no fuzzy alpha).
     assert "FeatherMask" not in by_type and "Mask Gaussian Region" not in by_type
-    crisp_id, crisp = by_type["ThresholdMask"]
-    assert crisp["inputs"]["mask"] == [subject_invert_id, 0]
+    crisp_id, crisp = next(
+        (nid, n)
+        for nid, n in graph.items()
+        if n["class_type"] == "ThresholdMask" and n["inputs"]["mask"] == [subject_invert_id, 0]
+    )
     assert crisp["inputs"]["value"] == 0.5
+
+    # growth is plain `GrowMask` at full resolution (tight, exact width),
+    # followed by a small *disk opening* (blur+threshold 0.84 = erode ~σ,
+    # blur+threshold 0.16 = dilate ~σ, calibrated on this ComfyUI) that
+    # blunts needle tips only. Diamond-kernel dilation nodes (`GrowMask`
+    # etc.) can't open away their own diamond caps, hence the gaussian
+    # pair; the `Morphology` node errors out on this ComfyUI.
+    grow_id, grow = by_type["GrowMask"]
     assert grow["inputs"]["mask"] == [crisp_id, 0]
+    assert grow["inputs"]["expand"] == 24
+    assert "ImageScale" not in by_type
+    blurs = [(nid, n) for nid, n in graph.items() if n["class_type"] == "ImpactGaussianBlurMask"]
+    assert len(blurs) == 2
+    open_sigma = 3.0  # 24 / 8, clamped 2..6
+    for _, blur in blurs:
+        assert blur["inputs"]["sigma"] == open_sigma
+        assert blur["inputs"]["kernel_size"] == 9  # 3σ, odd
+    erode_id, erode = next(
+        (nid, n)
+        for nid, n in graph.items()
+        if n["class_type"] == "ThresholdMask"
+        and n["inputs"]["mask"]
+        == [next(nid for nid, b in blurs if b["inputs"]["mask"] == [grow_id, 0]), 0]
+    )
+    assert erode["inputs"]["value"] == 0.84  # erode by ~σ
+    regrow_id, regrow = next(
+        (nid, n)
+        for nid, n in graph.items()
+        if n["class_type"] == "ThresholdMask"
+        and n["inputs"]["mask"]
+        == [next(nid for nid, b in blurs if b["inputs"]["mask"] == [erode_id, 0]), 0]
+    )
+    assert regrow["inputs"]["value"] == 0.16  # dilate by ~σ; binary → stays hard-edged
+    hard_id = regrow_id
 
     white_id, white = by_type["MaskToImage"]
-    assert white["inputs"]["mask"] == [grow_id, 0]
+    assert white["inputs"]["mask"] == [hard_id, 0]
     comp_id, comp = by_type["ImageCompositeMasked"]
     assert comp["inputs"]["destination"] == [white_id, 0]
     assert comp["inputs"]["source"] == [load_id, 0]
@@ -1303,7 +1336,7 @@ def test_build_sticker_outline_reads_alpha_no_segmentation():
     alpha_invert_id = next(
         nid
         for nid, n in graph.items()
-        if n["class_type"] == "InvertMask" and n["inputs"]["mask"] == [grow_id, 0]
+        if n["class_type"] == "InvertMask" and n["inputs"]["mask"] == [hard_id, 0]
     )
     join_id, join = by_type["JoinImageWithAlpha"]
     assert join["inputs"]["image"] == [comp_id, 0]
@@ -1316,13 +1349,33 @@ def test_build_sticker_outline_reads_alpha_no_segmentation():
                 assert value[0] in graph
 
 
-def test_build_sticker_outline_has_no_blur_nodes():
-    """The 100%-spread look is structural: exactly one `ThresholdMask`
-    (on the subject, before `GrowMask`) and zero blur nodes — no
-    `Mask Gaussian Region`/`FeatherMask` on either side of the dilation,
-    which is what made earlier attempts either close bays or fuzz the
-    edge."""
+def test_build_sticker_outline_opening_not_closing():
+    """The opening discipline: blur only ever feeds a threshold, and the
+    order is erode-then-dilate (0.84 before 0.16). Dilate-then-erode on
+    a grown mask is a morphological *closing* and bridges concave bays —
+    the regression this pins out. No half-res plumbing, no fake-disk
+    nodes (`Mask Dilate Region`, Essentials `Mask Gaussian Region`,
+    `FeatherMask`) either."""
     graph, _ = build_sticker_outline("src.png", 24)
     types = [n["class_type"] for n in graph.values()]
-    assert types.count("ThresholdMask") == 1
-    assert "Mask Gaussian Region" not in types and "FeatherMask" not in types
+    assert types.count("ThresholdMask") == 3  # crisp subject, erode, regrow
+    assert types.count("ImpactGaussianBlurMask") == 2
+    assert "ImageScale" not in types and "GrowMask" in types
+    assert "Mask Gaussian Region" not in types and "Mask Dilate Region" not in types
+    assert "FeatherMask" not in types
+    for n in graph.values():
+        if n["class_type"] == "ImpactGaussianBlurMask":
+            # blurs sit directly on the grown mask or on the erode
+            # threshold — never on a 0.16-level (already dilated) mask
+            src = graph[n["inputs"]["mask"][0]]
+            assert src["class_type"] in {"GrowMask", "ThresholdMask"}
+            if src["class_type"] == "ThresholdMask":
+                assert src["inputs"]["value"] == 0.84
+    values = sorted(
+        n["inputs"]["value"]
+        for n in graph.values()
+        if n["class_type"] == "ThresholdMask"
+        and n["inputs"]["mask"][0]
+        and (graph[n["inputs"]["mask"][0]]["class_type"] == "ImpactGaussianBlurMask")
+    )
+    assert values == [0.16, 0.84]  # erode before regrow, both hard
