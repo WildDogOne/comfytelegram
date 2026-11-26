@@ -341,9 +341,9 @@ BG_REMOVE_CALLBACK_KIND = "remove_bg"
 OUTLINE_CALLBACK_KIND = "outline"
 #: kind -> (outline as a fraction of the shorter image side, button label).
 OUTLINE_WIDTH_CALLBACK_KINDS = {
-    "outline_thin": (0.015, "Thin"),
-    "outline_medium": (0.03, "Medium"),
-    "outline_thick": (0.05, "Thick"),
+    "outline_thin": (0.0075, "Thin"),
+    "outline_medium": (0.015, "Medium"),
+    "outline_thick": (0.03, "Thick"),
 }
 #: Telegram's hard cap on sticker files (docs: "WebP, up to 100KB"). The
 #: 512x512/quality ladder in `_to_telegram_sticker` aims under it; over
