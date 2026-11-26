@@ -1703,6 +1703,29 @@ async def remove_background(
     return GeneratedImage(data=data, filename=filename, full_params=full_params)
 
 
+def _pad_transparent(png: bytes, pad_px: int) -> bytes:
+    """Grow a transparent PNG's canvas by `pad_px` on every side (the new
+    margin is transparent). The outline pass needs it: `GrowMask` cannot
+    grow past the canvas edge, so a subject that touches an edge (a
+    portrait cropped at the bottom) would come back with no border along
+    that edge and a flat-cut border next to it. The padding is done here
+    rather than in the graph because there is no mask-padding node — and
+    it also means the outline never clips, whatever its width.
+    Mask-less `paste` deliberately: pasting with the image as its own mask
+    blends *through* the alpha for RGB and alpha alike, which premultiplies
+    the colour and squares the alpha (the sticker halo bug, see
+    `handlers._to_telegram_sticker`)."""
+    with Image.open(io.BytesIO(png)) as im:
+        source = im.convert("RGBA")
+        canvas = Image.new(
+            "RGBA", (source.width + 2 * pad_px, source.height + 2 * pad_px), (0, 0, 0, 0)
+        )
+        canvas.paste(source, (pad_px, pad_px))
+    buf = io.BytesIO()
+    canvas.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 async def add_sticker_outline(
     client: ComfyClient,
     source_image: bytes,
@@ -1716,8 +1739,18 @@ async def add_sticker_outline(
     (see `build_sticker_outline`) — the "⭕ Outline" button. Runs on the
     source's own alpha, no segmentation model, so `source_image` needs one:
     the handlers check before offering the button (`_has_alpha`). Same
-    carry-forward rules as `remove_background`."""
-    upload = await client.upload_image(source_image, filename=f"sticker_{source_filename}")
+    carry-forward rules as `remove_background`.
+    The source is uploaded with `outline_px` of transparent margin on every
+    side (see `_pad_transparent`), so the border has somewhere to grow at
+    the image edges — the result canvas is therefore the source plus twice
+    that margin, which is also what a die-cut sticker wants."""
+    upload = await client.upload_image(
+        # PNG decode + re-encode of a 4x upscale is a second of zlib, and
+        # every handler shares one event-loop thread — same reason
+        # `_to_telegram_sticker` goes through `to_thread`
+        await asyncio.to_thread(_pad_transparent, source_image, outline_px),
+        filename=f"sticker_{source_filename}",
+    )
     prompt_graph, save_node_id = build_sticker_outline(upload["name"], outline_px)
     logger.info("Submitting sticker outline on %s (outline %dpx)", upload["name"], outline_px)
     raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)

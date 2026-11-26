@@ -22,6 +22,14 @@ class ComfyUIError(RuntimeError):
     """Raised when ComfyUI rejects a prompt or a job fails during execution."""
 
 
+class NodeNotInstalledError(ComfyUIError):
+    """`GET /object_info/<class_type>` answered 200 with an empty envelope:
+    that node type isn't in this ComfyUI at all (an older core version, or
+    a missing custom pack). Subclasses `ComfyUIError`, so callers that only
+    care about "couldn't ask" keep working; callers that want to tell the
+    user "your ComfyUI is too old" can catch this one first."""
+
+
 @dataclass
 class JobProgress:
     """One event from `JobEvents.watch()`: either a step update
@@ -82,11 +90,25 @@ class ComfyClient:
 
     async def get_node_info(self, class_type: str) -> dict[str, Any]:
         """`GET /object_info/<class_type>` — one node type's info, unwrapped
-        from the `{class_type: {...}}` envelope the endpoint returns."""
+        from the `{class_type: {...}}` envelope the endpoint returns. An
+        unknown class answers 200 with `{}`, so the unwrapping raises
+        `NodeNotInstalledError` instead of a `KeyError` — callers already
+        handle the `ComfyUIError` branch, and a node class not existing is
+        a ComfyUI problem, not a parsing bug."""
         async with self.session.get(f"{self.http_base}/object_info/{class_type}") as resp:
             resp.raise_for_status()
             data = await resp.json()
-            return data[class_type]
+        if class_type not in data:
+            raise NodeNotInstalledError(f"ComfyUI doesn't know the node type {class_type!r}")
+        return data[class_type]
+
+    async def list_background_removal_models(self) -> list[str]:
+        """The `LoadBackgroundRemovalModel` combo — the background-removal
+        weights staged in ComfyUI's `models/background_removal/`, since
+        that folder is what builds the list. Raises `NodeNotInstalledError`
+        on a ComfyUI without core background removal."""
+        info = await self.get_node_info("LoadBackgroundRemovalModel")
+        return _enum_choices(info, "bg_removal_name")
 
     async def list_checkpoints(self) -> list[str]:
         """Checkpoint filenames ComfyUI has installed: single-file
@@ -243,11 +265,22 @@ class JobEvents:
 
 def _enum_choices(node_info: dict[str, Any], input_name: str) -> list[str]:
     """Pull the enum choice list for one required input out of a
-    `/object_info` node entry — ComfyUI represents an enum input as
-    `[[choice, ...], {...}]`, so this is `[0]` of that pair. Returns `[]`
-    if `input_name` isn't a required input or isn't enum-shaped."""
-    required = node_info.get("input", {}).get("required", {})
+    `/object_info` node entry. ComfyUI has shipped an enum input in two
+    shapes: the older `[[choice, ...], {...}]` pair (the choices *are*
+    `[0]`, the dict is only a tooltip) and the newer
+    `["COMBO", {"options": [...]}]` (the choices live in the dict). Both
+    must be read: which one a node uses depends on the ComfyUI version
+    *and* on the node, and taking the dict unconditionally would report
+    the old shape's choices as empty. Returns `[]` if `input_name` isn't
+    a required input or isn't enum-shaped."""
+    required = (node_info.get("input") or {}).get("required") or {}
     spec = required.get(input_name)
-    if not spec or not isinstance(spec[0], list):
+    if not isinstance(spec, (list, tuple)) or not spec:
         return []
-    return list(spec[0])
+    if isinstance(spec[0], list):
+        return [str(choice) for choice in spec[0]]
+    if len(spec) > 1 and isinstance(spec[1], dict):
+        options = spec[1].get("options")
+        if isinstance(options, list):
+            return [str(choice) for choice in options]
+    return []

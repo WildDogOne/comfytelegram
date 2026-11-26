@@ -11,18 +11,23 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **✂️ Remove BG and ⭕ Outline** (post-processing keyboard, page 2): the
   sticker workflow as two separate buttons. ✂️ Remove BG cuts the subject
   out to a transparent PNG (BiRefNet, ComfyUI core nodes — no custom node
-  pack); ⭕ Outline draws a white die-cut border around the transparency
-  (Thin/Medium/Thick, scaled with the image; tight contour-hugging with
-  a slight rounding of the sharpest points, hard edge), and works on any already transparent result —
-  including ✂️ Remove BG's own output, which it reads from the PNG's
-  alpha channel without re-segmenting. Each comes back twice: a real
-  Telegram sticker (512px WebP, transparency intact, the quick way to
-  check a cutout worked) and the full-resolution transparent PNG as a
-  document with the usual post-processing keyboard, so upscale/📥
-  Download/the other pass all keep working on the result. Two separate
-  buttons on purpose: judge the cutout before outlining it. One one-time
-  model to stage: `birefnet.safetensors` from
-  huggingface.co/Comfy-Org/BiRefNet into `ComfyUI/models/background_removal/`.
+  pack); ⭕ Outline draws a white die-cut border around that transparency
+  (Thin/Medium/Thick, scaled with the image; tight contour-hugging with a
+  slight rounding of the sharpest points, hard edge, and it never cuts
+  into the subject itself). Outline works on any already transparent
+  result, including ✂️ Remove BG's own output, which it reads from the
+  PNG's alpha channel without re-segmenting; the canvas gets a margin
+  first, so a subject cropped at an image edge still gets a border there.
+  Each comes back twice: a real Telegram sticker (512px WebP, transparency
+  intact, the quick way to check a cutout worked) and the full-resolution
+  transparent PNG as a document with the usual post-processing keyboard,
+  so 📥 Download and the other pass keep working on the result — with one
+  caveat: image passes like upscale work on the RGB *under* the alpha, so
+  upscaling a bare cutout brings the original background back (in the
+  outlined version there's white there instead). Two separate buttons on
+  purpose: judge the cutout before outlining it. One one-time model to
+  stage: `birefnet.safetensors` from huggingface.co/Comfy-Org/BiRefNet
+  into `ComfyUI/models/background_removal/`.
 
 - **"🔍 Upscale 4x" → ✏️ Prompt**: upscale with your own prompt instead of
   the one the image was generated with. Tapping it first replies with a

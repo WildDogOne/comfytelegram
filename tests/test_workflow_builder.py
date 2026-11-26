@@ -1320,7 +1320,16 @@ def test_build_sticker_outline_reads_alpha_no_segmentation():
         == [next(nid for nid, b in blurs if b["inputs"]["mask"] == [erode_id, 0]), 0]
     )
     assert regrow["inputs"]["value"] == 0.16  # dilate by ~σ; binary → stays hard-edged
-    hard_id = regrow_id
+
+    # ...and the opening's removal is confined to the border: union with the
+    # crisp subject, so a strand thinner than the opening disk can't be
+    # erased out of the artwork and come back transparent
+    union_id, union = by_type["MaskComposite"]
+    assert union["inputs"]["destination"] == [regrow_id, 0]
+    assert union["inputs"]["source"] == [crisp_id, 0]
+    assert union["inputs"]["operation"] == "add"
+    assert (union["inputs"]["x"], union["inputs"]["y"]) == (0, 0)
+    hard_id = union_id
 
     white_id, white = by_type["MaskToImage"]
     assert white["inputs"]["mask"] == [hard_id, 0]

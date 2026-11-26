@@ -4,14 +4,19 @@ import random
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
 from PIL import Image
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest, TelegramError
 
-from comfytelegram.comfy_client import ComfyUIError, JobProgress
+from comfytelegram.comfy_client import ComfyUIError, JobProgress, NodeNotInstalledError
 from comfytelegram.generation import GeneratedImage
 from comfytelegram.handlers import (
+    _BG_REMOVAL_NODE_MISSING,
+    _BG_REMOVAL_STAGED,
+    _BG_REMOVAL_UNKNOWN,
+    _BG_REMOVAL_UNSTAGED,
     _MAIN_KEYBOARD,
     ANALYZE_PROMPT_CALLBACK_KIND,
     BACK_CALLBACK_KIND,
@@ -36,6 +41,7 @@ from comfytelegram.handlers import (
     LORA_SWITCH_TOGGLE_CALLBACK_PREFIX,
     MORE_CALLBACK_KIND,
     OUTLINE_CALLBACK_KIND,
+    OUTLINE_WIDTH_CALLBACK_KINDS,
     PAINT_REGIONS_CALLBACK_KIND,
     SHOW_PROMPT_CALLBACK_KIND,
     SWITCH_MODEL_CALLBACK_KIND,
@@ -4256,45 +4262,92 @@ def test_to_telegram_sticker_returns_none_on_undecodable_bytes():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "spec, staged",
+    "options, state",
     [
-        (["COMBO", {"options": ["birefnet.safetensors"]}], True),
-        (["COMBO", {"options": []}], False),
-        (["COMBO", {"options": ["something_else.safetensors"]}], False),
+        (["birefnet.safetensors"], _BG_REMOVAL_STAGED),
+        ([], _BG_REMOVAL_UNSTAGED),
+        (["something_else.safetensors"], _BG_REMOVAL_UNSTAGED),
     ],
 )
-async def test_bg_removal_model_gate_reads_the_combo_options(spec, staged):
+async def test_bg_removal_model_gate_reads_the_combo_options(options, state):
     """ "✂️ Remove BG" is gated on `LoadBackgroundRemovalModel` actually
-    offering the BiRefNet weights — an empty combo means unstaged."""
-    from comfytelegram.handlers import _bg_removal_model_staged
+    offering the BiRefNet weights — the combo is built from
+    `models/background_removal/`, so an empty/foreign list means unstaged.
+    (The combo *format* parsing lives with `ComfyClient`, see
+    `tests/test_comfy_client.py`.)"""
+    from comfytelegram.handlers import _bg_removal_model_state
 
     client = MagicMock()
-    client.get_node_info = AsyncMock(
-        return_value={"input": {"required": {"bg_removal_name": spec}}}
-    )
-    assert await _bg_removal_model_staged(client) is staged
+    client.list_background_removal_models = AsyncMock(return_value=options)
+    assert await _bg_removal_model_state(client) == state
 
 
 @pytest.mark.asyncio
-async def test_bg_removal_model_gate_treats_query_failure_as_staged():
+async def test_bg_removal_model_gate_treats_query_failure_as_unknown():
     """Can't tell ≠ unstaged: a /object_info hiccup shouldn't block the
     feature — ComfyUI's own queue-time validation reports the real thing."""
-    from comfytelegram.handlers import _bg_removal_model_staged
+    from comfytelegram.handlers import _bg_removal_model_state
 
     client = MagicMock()
-    client.get_node_info = AsyncMock(side_effect=ComfyUIError("offline"))
-    assert await _bg_removal_model_staged(client) is True
+    client.list_background_removal_models = AsyncMock(side_effect=ComfyUIError("offline"))
+    assert await _bg_removal_model_state(client) == _BG_REMOVAL_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_bg_removal_model_gate_separates_a_missing_node():
+    """A ComfyUI without the node type at all is *not* "unstaged": staging
+    a file won't help, so the tap needs its own hint instead of queueing a
+    graph ComfyUI will reject with a raw validation error."""
+    from comfytelegram.handlers import _bg_removal_model_state
+
+    client = MagicMock()
+    client.list_background_removal_models = AsyncMock(side_effect=NodeNotInstalledError("nope"))
+    assert await _bg_removal_model_state(client) == _BG_REMOVAL_NODE_MISSING
+
+
+@pytest.mark.asyncio
+async def test_remove_bg_tap_hints_about_an_outdated_comfyui():
+    """The missing-node state reaches the user as the ComfyUI-update hint,
+    not the staging hint, and nothing is queued."""
+    query = AsyncMock()
+    query.data = f"pp:{BG_REMOVE_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    context.bot_data["comfy_client"].list_background_removal_models = AsyncMock(
+        side_effect=NodeNotInstalledError("no such node")
+    )
+
+    with patch("comfytelegram.handlers.remove_background", new=AsyncMock()) as remove_mock:
+        await postprocess_callback(update, context)
+
+    remove_mock.assert_not_awaited()
+    hint = query.message.reply_text.await_args_list[-1].args[0]
+    assert "updating ComfyUI" in hint and "models/background_removal" not in hint
 
 
 @pytest.mark.parametrize(
-    "mode, expected",
-    [("RGBA", True), ("LA", True), ("RGB", False), ("P", False)],
+    "mode, transparent, expected",
+    [
+        ("RGBA", True, True),
+        ("LA", True, True),
+        ("RGB", False, False),
+        ("P", False, False),
+        # an uploaded screenshot is RGBA and perfectly opaque: an alpha
+        # channel alone must not be enough to offer Outline
+        ("RGBA", False, False),
+    ],
 )
-def test_has_alpha(mode, expected):
+def test_has_alpha(mode, transparent, expected):
     from comfytelegram.handlers import _has_alpha
 
     buf = io.BytesIO()
-    Image.new("RGBA" if mode == "RGBA" else "RGB", (8, 8)).convert(mode).save(buf, format="PNG")
+    alpha = 0 if transparent else 255
+    Image.new("RGBA", (8, 8), (255, 0, 0, alpha)).convert(mode).save(buf, format="PNG")
     assert _has_alpha(buf.getvalue()) is expected
 
 
@@ -4390,3 +4443,170 @@ async def test_send_cutout_pair_sticker_failure_still_delivers_png():
     anchor.reply_text.assert_awaited_once()
     anchor.reply_document.assert_awaited_once()
     storage.store_pending_result.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_cutout_pair_failed_sticker_note_never_eats_the_png():
+    """The failure note itself can hit Telegram trouble (FloodWait right
+    after the rejected sticker is the classic case) — even then the PNG
+    document and its `pending_result` row must go out."""
+    from comfytelegram.handlers import _send_cutout_pair
+
+    anchor = MagicMock()
+    anchor.reply_sticker = AsyncMock(side_effect=TelegramError("sticker too big"))
+    anchor.reply_text = AsyncMock(side_effect=TelegramError("flood"))
+    anchor.reply_document = AsyncMock(return_value=MagicMock(document=MagicMock(file_id="f")))
+    storage = MagicMock()
+    storage.get_image_format.return_value = "png"
+    png = io.BytesIO()
+    Image.new("RGBA", (8, 8), (255, 0, 0, 0)).save(png, format="PNG")
+    result = GeneratedImage(
+        data=png.getvalue(),
+        filename="cut.png",
+        full_params=GenerationParams(
+            checkpoint="c.safetensors", positive_prompt="p", negative_prompt=""
+        ),
+    )
+
+    await _send_cutout_pair(anchor, {"chat_id": 7}, storage, result)
+
+    anchor.reply_document.assert_awaited_once()
+    storage.store_pending_result.assert_called_once()
+
+
+def _png_bytes(width: int, height: int) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGBA", (width, height), (255, 0, 0, 128)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_to_telegram_sticker_keeps_semi_transparent_pixels_intact():
+    """A cutout's soft edge must survive the sticker conversion. The
+    centring `paste` used to pass the image as its own mask, which blends
+    *through* the alpha for RGB and alpha alike: `(200,120,40,128)` came
+    out `(100,60,20,64)` — RGB premultiplied (the dark halo around the
+    sticker) and alpha squared (the soft edge halved twice). The paste is
+    mask-less now, and `resize` needs no manual premultiply because
+    Pillow resizes RGBA through `RGBa` internally — measured: the block
+    below comes back at ~(201,120,40,128)."""
+    from comfytelegram.handlers import _to_telegram_sticker
+
+    # 512x512 source: the resize is an identity, so the only thing that can
+    # move these values is the paste (WebP q90 perturbs a solid block by ~1)
+    block = Image.fromarray(np.full((160, 160, 4), [200, 120, 40, 128], np.uint8), "RGBA")
+    im = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+    im.paste(block, (176, 176))
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+
+    sticker = Image.open(io.BytesIO(_to_telegram_sticker(buf.getvalue()))).convert("RGBA")
+    centre = np.asarray(sticker)[200:310, 200:310].reshape(-1, 4).mean(axis=0)
+    assert abs(centre[0] - 200) < 25 and abs(centre[1] - 120) < 25 and abs(centre[2] - 40) < 25
+    assert abs(centre[3] - 128) < 20  # the squared-alpha bug lands at 64
+
+
+@pytest.mark.asyncio
+async def test_outline_width_scales_off_the_shorter_side():
+    """The handler-side width math: `outline_fraction` × the shorter image
+    side, rounded — the builder just receives the pixel count, so this is
+    where the Thin/Medium/Thick fractions actually become geometry."""
+    query = AsyncMock()
+    query.data = "pp:outline_medium:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    # 1000x800 source: shorter side 800 * 0.015 (Medium) = 12px
+    context.bot.get_file = AsyncMock(
+        return_value=MagicMock(
+            download_as_bytearray=AsyncMock(return_value=bytearray(_png_bytes(1000, 800)))
+        )
+    )
+
+    outline_result = GeneratedImage(
+        data=_png_bytes(1000, 800),
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="c.safetensors", positive_prompt="p", negative_prompt=""
+        ),
+    )
+    with patch(
+        "comfytelegram.handlers.add_sticker_outline", new=AsyncMock(return_value=outline_result)
+    ) as outline_mock:
+        await postprocess_callback(update, context)
+
+    assert outline_mock.await_args.args[4] == 12
+    fraction = OUTLINE_WIDTH_CALLBACK_KINDS["outline_medium"][0]
+    assert round(fraction * 800) == 12  # the table and the math agree
+
+
+@pytest.mark.asyncio
+async def test_outline_width_caps_at_the_max():
+    """Huge upscales: the fraction would ask for hundreds of GrowMask
+    iterations, so the width is capped at `_OUTLINE_MAX_PX`."""
+    from comfytelegram.handlers import _OUTLINE_MAX_PX
+
+    query = AsyncMock()
+    query.data = "pp:outline_thick:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    context.bot.get_file = AsyncMock(
+        return_value=MagicMock(
+            # 4400px: just past the point where Thick (0.03) exceeds the cap,
+            # so the cap is what's under test — a 9000px image would spend
+            # most of the test decoding pixels
+            download_as_bytearray=AsyncMock(return_value=bytearray(_png_bytes(4400, 4400)))
+        )
+    )
+
+    outline_result = GeneratedImage(
+        data=_png_bytes(64, 64),
+        filename="out.png",
+        full_params=GenerationParams(
+            checkpoint="c.safetensors", positive_prompt="p", negative_prompt=""
+        ),
+    )
+    with patch(
+        "comfytelegram.handlers.add_sticker_outline", new=AsyncMock(return_value=outline_result)
+    ) as outline_mock:
+        await postprocess_callback(update, context)
+
+    assert outline_mock.await_args.args[4] == _OUTLINE_MAX_PX
+
+
+@pytest.mark.asyncio
+async def test_outline_tap_on_an_opaque_image_hints_instead_of_queuing():
+    """No alpha → the alpha gate explains (Remove BG first) and never
+    reaches the width keyboard — outlining an opaque source would white
+    out the whole canvas."""
+    query = AsyncMock()
+    query.data = f"pp:{OUTLINE_CALLBACK_KIND}:abc123"
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 1
+
+    profile = ModelProfile(match=["*"], display_name="x")
+    storage = _pending_result_mock(profile, "a fox")
+    context = _postprocess_context(storage, profile)
+    jpeg = io.BytesIO()
+    Image.new("RGB", (64, 64)).save(jpeg, format="JPEG")
+    context.bot.get_file = AsyncMock(
+        return_value=MagicMock(
+            download_as_bytearray=AsyncMock(return_value=bytearray(jpeg.getvalue()))
+        )
+    )
+
+    await postprocess_callback(update, context)
+
+    hint = query.message.reply_text.await_args_list[-1].args[0]
+    assert "Remove BG" in hint
+    for call in query.message.reply_text.await_args_list:
+        assert "reply_markup" not in call.kwargs  # no width keyboard shown

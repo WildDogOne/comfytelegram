@@ -1909,6 +1909,64 @@ async def test_post_process_fix_drawn_falls_back_to_generation_prefixes():
 
 
 @pytest.mark.asyncio
+async def test_add_sticker_outline_uploads_a_padded_canvas_and_keeps_alpha_exact():
+    """`GrowMask` cannot grow past the canvas, so the outline pass uploads
+    the source with `outline_px` of transparent margin: a subject cropped
+    at an image edge gets a real border there instead of a flat cut, and
+    the outline can never clip. The paste must stay mask-less — pasting
+    through the alpha would premultiply the RGB and square the alpha (the
+    sticker halo bug)."""
+    buf = io.BytesIO()
+    Image.new("RGBA", (200, 120), (200, 120, 40, 128)).save(buf, format="PNG")
+    source = buf.getvalue()
+
+    out = io.BytesIO()
+    Image.new("RGBA", (220, 140), (255, 255, 255, 255)).save(out, format="PNG")
+    client = _StubUploadingComfyClient(out.getvalue())
+    uploaded: list[bytes] = []
+    original_upload = client.upload_image
+
+    async def capture(data, **kwargs):
+        uploaded.append(data)
+        return await original_upload(data, **kwargs)
+
+    client.upload_image = capture
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    result = await generation.add_sticker_outline(client, source, "source.png", params, 10)
+
+    (sent,) = uploaded
+    padded = Image.open(io.BytesIO(sent))
+    assert padded.size == (220, 140)  # 200x120 + 10px margin on each side
+    assert padded.getpixel((0, 0)) == (0, 0, 0, 0)  # the margin is transparent
+    assert padded.getpixel((110, 60)) == (200, 120, 40, 128)  # not (100,60,20,64)
+    load = next(n for n in client.queued_graph.values() if n["class_type"] == "LoadImage")
+    assert load["inputs"]["image"] == "sticker_source.png"
+    assert result.full_params is params
+    assert extract_metadata(result.data)["kind"] == "outline"
+
+
+@pytest.mark.asyncio
+async def test_remove_background_carries_the_source_params_and_tags_the_result():
+    """The cutout result keeps the source's `full_params` so its own
+    keyboard (upscale, download, the outline pass) still works."""
+    client = _StubUploadingComfyClient(_solid_png(8, 8, (0, 0, 255)))
+    params = GenerationParams(
+        checkpoint="ckpt.safetensors", positive_prompt="a fox", negative_prompt=""
+    )
+
+    result = await generation.remove_background(
+        client, _solid_png(8, 8, (0, 0, 0)), "s.png", params
+    )
+
+    assert result.full_params is params
+    assert extract_metadata(result.data)["kind"] == "cutout"
+    assert "RemoveBackground" in {n["class_type"] for n in client.queued_graph.values()}
+
+
+@pytest.mark.asyncio
 async def test_kontext_edit_downscales_large_source_to_a_1mp_bucket():
     """A 4x-upscaled source must reach ComfyUI at ~1MP — past that Kontext
     tiles the scene into repeated copies instead of editing it."""

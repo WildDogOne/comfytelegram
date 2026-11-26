@@ -1485,7 +1485,12 @@ def build_sticker_outline(
 
     `outline_px` is the white border's width in source-image pixels
     (`GrowMask`'s `expand`); the handlers scale it off the image's
-    shorter side and cap it for cost.
+    shorter side and cap it for cost. `generation.add_sticker_outline`
+    uploads the source with `outline_px` of transparent margin around it,
+    which this graph needs: `GrowMask` cannot grow past the canvas, so
+    without padding a subject touching an image edge (a portrait cropped
+    at the bottom) would come back with no border along that edge and a
+    flat-cut border next to it.
 
     Shape: Photoshop's outer glow at 100% spread — a hard threshold on
     the alpha first (the border traces the subject's crisp 50%-alpha
@@ -1498,7 +1503,11 @@ def build_sticker_outline(
     obtuse corners lose at most ~1.5σ_o px. Never blur+rethreshold on
     top of a finished growth (that's a morphological closing and bridges
     bays); the opening here is erode-then-dilate, blur strictly before
-    each threshold. The subject is composited through the
+    each threshold. That opening is then unioned back with the crisp
+    subject (`MaskComposite` "add"): it can only remove, and on a thin
+    border its 2px floor erases anything narrower than that — a hair
+    strand or a claw would come back transparent, so the removal has to
+    be confined to the border. The subject is composited through the
     *un-thresholded* soft mask, so hair/fur edges keep their softness
     even though the border behind them is hard-edged."""
     g = PromptGraph()
@@ -1544,6 +1553,29 @@ def build_sticker_outline(
     )
     outline_mask = g.add(
         "ThresholdMask", {"mask": [softened, 0], "value": 0.16}, title="Regrow Level (Hard Edge)"
+    )
+    # An opening only ever *removes* — and on a thin border it can remove
+    # from the subject itself, not just the border: σ_o never drops below
+    # 2px, so a 3px hair strand or a claw thinner than 2σ_o is erased
+    # outright and the re-dilation can't bring it back (the subject would
+    # come back transparent there). Union with the crisp subject, so the
+    # opening shapes the border only and never cuts the artwork.
+    # `MaskComposite` "add" is a clamped sum = union for binary masks.
+    # Side effect worth knowing: where the subject is thinner than 2σ_o the
+    # *border* really is gone (the union restores the subject, not the ring
+    # around it), so a whisker keeps its pixels but has no white hugging its
+    # tip — the right look for a die-cut, and the answer if someone reports
+    # "the outline skips the whiskers".
+    outline_mask = g.add(
+        "MaskComposite",
+        {
+            "destination": [outline_mask, 0],
+            "source": [crisp_subject, 0],
+            "x": 0,
+            "y": 0,
+            "operation": "add",
+        },
+        title="Keep the Subject Whole",
     )
     white = g.add("MaskToImage", {"mask": [outline_mask, 0]}, title="White Outline")
     composited = g.add(

@@ -57,7 +57,12 @@ from comfytelegram.auth import (
     reject_if_unauthorized_callback,
     validate_webapp_init_data,
 )
-from comfytelegram.comfy_client import ComfyClient, ComfyUIError, JobProgress
+from comfytelegram.comfy_client import (
+    ComfyClient,
+    ComfyUIError,
+    JobProgress,
+    NodeNotInstalledError,
+)
 from comfytelegram.fav_menu import handle_fav_edit_message
 from comfytelegram.generation import (
     REGION_LORA_DEFAULT_DENOISE,
@@ -351,11 +356,13 @@ OUTLINE_WIDTH_CALLBACK_KINDS = {
 TELEGRAM_STICKER_SIZE_LIMIT = 100_000
 #: Ceiling on the white outline in source pixels. The width kinds scale it
 #: off the image, but core `GrowMask` runs scipy `grey_dilation` once *per
-#: expand pixel* over the full-size mask — "Thick" on a 4x upscale (205px
-#: on a 4096px image, 410 on an 8192px one) runs for minutes, and neither
-#: BiRefNet nor GrowMask emits progress events, so the status message
-#: would just sit frozen. 128px is still ~3% of a 4096px side, so the
-#: three widths stay distinguishable at the top of the range.
+#: expand pixel* over the full-size mask — a 4096px image at 0.03 is
+#: already 123px of expand, and an 8192px one would be 246 — running for
+#: minutes, and neither BiRefNet nor GrowMask emits progress events, so
+#: the status message would just sit frozen. The cap only binds above
+#: ~4267px (Thick = 0.03 of the shorter side), and 128px is still ~3% of
+#: a 4096px side, so the three widths stay distinguishable at the top of
+#: the range.
 _OUTLINE_MAX_PX = 128
 
 #: "🪄 Kontext Edit" — an instruction-driven FLUX.1 Kontext edit of the whole
@@ -1369,7 +1376,8 @@ async def _send_photo_or_document(
     notwithstanding — for images where the JPEG re-encode (or even
     Telegram's own `sendPhoto` recompression, which flattens transparency
     regardless of `use_jpeg`) would destroy something the result is *for*,
-    i.e. the transparent PNG from "🎭 Sticker". The stored `file_id` then
+    i.e. the transparent PNGs from "✂️ Remove BG" and "⭕ Outline". The
+    stored `file_id` then
     points at the full-quality PNG, which also makes every follow-up
     `_fetch_source_image` fallback lossless.
 
@@ -4610,7 +4618,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     rather than the full `/lora` menu); toggle/apply taps are handled by
     `switch_loras_callback`, its own dedicated callback. A `"remove_bg"` tap
     (`BG_REMOVE_CALLBACK_KIND`) runs the BiRefNet cutout immediately,
-    gated on the model being staged (`_bg_removal_model_staged`); an
+    gated on the model being staged (`_bg_removal_model_state`); an
     `"outline"` tap first checks the image has alpha (`_has_alpha`, with a
     "run ✂️ Remove BG first" hint if not) and then replies with
     `_outline_width_keyboard`'s Thin/Medium/Thick choice, whose three
@@ -5006,12 +5014,21 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if kind == BG_REMOVE_CALLBACK_KIND:
-        if not await _bg_removal_model_staged(client):
+        state = await _bg_removal_model_state(client)
+        if state == _BG_REMOVAL_UNSTAGED:
             await query.message.reply_text(
                 "✂️ Remove BG needs the BiRefNet background-removal model, "
                 "and it isn't staged on the ComfyUI side yet — drop "
                 "`birefnet.safetensors` (huggingface.co/Comfy-Org/BiRefNet) "
                 "into `ComfyUI/models/background_removal/` and tap again."
+            )
+            return
+        if state == _BG_REMOVAL_NODE_MISSING:
+            await query.message.reply_text(
+                "✂️ Remove BG needs ComfyUI's own background-removal nodes "
+                "(`LoadBackgroundRemovalModel`), and this ComfyUI doesn't "
+                "have them at all — staging the model won't help, updating "
+                "ComfyUI will."
             )
             return
         await _run_cutout_and_send(query, context, pending, full_params, result_id, None)
@@ -5025,7 +5042,7 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             pending["file_id"],
             on_fallback=_source_fallback_notifier(query.message),
         )
-        if not _has_alpha(source_bytes):
+        if not await asyncio.to_thread(_has_alpha, source_bytes):
             await query.message.reply_text(
                 "⭕ Outline works on the transparency itself, and this image "
                 "has none — run ✂️ Remove BG first and tap Outline on its "
@@ -6729,31 +6746,37 @@ def _kontext_redo_row(result_id: str) -> list[InlineKeyboardButton]:
     ]
 
 
-async def _bg_removal_model_staged(client: ComfyClient) -> bool:
-    """True when ComfyUI's `LoadBackgroundRemovalModel` actually offers
-    `BG_REMOVAL_MODEL` — i.e. the BiRefNet weights are staged in
-    `models/background_removal/` (its combo is built from that folder, so
-    an empty/foreign list means "not staged"). Checked at tap time rather
-    than by gating the keyboard, same trade `FIX_DRAW_CALLBACK_KIND` makes
-    with the relay URL: this keyboard has no `Settings` to consult, and
-    this isn't a `Settings` value at all — it's the other machine's folder.
-    A failed query is *not* treated as unstaged: we can't tell, ComfyUI's
-    own queue-time validation would say so anyway, and a transient
-    `/object_info` hiccup shouldn't block the feature."""
+#: `_bg_removal_model_state` outcomes — plain strings so the tap handler can
+#: pick the matching user-facing hint.
+_BG_REMOVAL_STAGED = "staged"
+_BG_REMOVAL_UNSTAGED = "unstaged"
+_BG_REMOVAL_NODE_MISSING = "node-missing"
+_BG_REMOVAL_UNKNOWN = "unknown"
+
+
+async def _bg_removal_model_state(client: ComfyClient) -> str:
+    """What the ComfyUI side says about `BG_REMOVAL_MODEL`: the
+    `LoadBackgroundRemovalModel` combo is built from
+    `models/background_removal/`, so the weights being in that list is the
+    staging check. Checked at tap time rather than by gating the keyboard,
+    same trade `FIX_DRAW_CALLBACK_KIND` makes with the relay URL: this
+    keyboard has no `Settings` to consult, and this isn't a `Settings`
+    value at all — it's the other machine's folder.
+    `_BG_REMOVAL_UNKNOWN` (a `/object_info` hiccup) is *not* treated as
+    missing: we can't tell, and ComfyUI's own queue-time validation would
+    say so anyway. `_BG_REMOVAL_NODE_MISSING` is kept apart from
+    `_BG_REMOVAL_UNSTAGED` on purpose: staging a file won't help there,
+    the node type itself is absent, so the honest answer is "newer
+    ComfyUI" instead of a raw queue-time validation error."""
     try:
-        info = await client.get_node_info("LoadBackgroundRemovalModel")
+        options = await client.list_background_removal_models()
+    except NodeNotInstalledError:
+        logger.warning("This ComfyUI has no LoadBackgroundRemovalModel node", exc_info=True)
+        return _BG_REMOVAL_NODE_MISSING
     except (ComfyUIError, aiohttp.ClientError, TimeoutError):
         logger.warning("Couldn't read LoadBackgroundRemovalModel info", exc_info=True)
-        return True
-    spec = (info.get("input") or {}).get("required", {}).get("bg_removal_name")
-    options: list[str] = []
-    if isinstance(spec, (list, tuple)):
-        for part in spec:
-            if isinstance(part, dict):
-                options = part.get("options") or []
-            elif isinstance(part, list):
-                options = part
-    return BG_REMOVAL_MODEL in options
+        return _BG_REMOVAL_UNKNOWN
+    return _BG_REMOVAL_STAGED if BG_REMOVAL_MODEL in options else _BG_REMOVAL_UNSTAGED
 
 
 def _outline_width_keyboard(result_id: str) -> InlineKeyboardMarkup:
@@ -6792,16 +6815,26 @@ def _to_telegram_sticker(png: bytes) -> bytes | None:
     rung is over the cap the last attempt is returned anyway and the
     caller's send decides. Returns None if Pillow can't decode the PNG at
     all — the caller then skips the sticker copy and the transparent PNG
-    document still goes out."""
+    document still goes out.
+
+    The centring `paste` must stay mask-less. `paste(im, offset, im)`
+    blends the source *through* its own alpha into the canvas, which
+    multiplies the RGB by alpha and squares the alpha — a soft edge
+    `(200,200,200,128)` arrives as `(100,100,100,64)`. That darkened RGB
+    under the surviving alpha is the dark halo around cutout stickers
+    (and it thins the soft edge twice over). The canvas starts fully
+    transparent, so a plain copy-paste is exact. `resize` then needs no
+    manual premultiply either: Pillow resizes RGBA through its
+    premultiplied `RGBa` variant internally, so it does not bleed the
+    black ComfyUI leaves under transparent pixels."""
     try:
         with Image.open(io.BytesIO(png)) as im:
             im = im.convert("RGBA")
             width, height = im.size
             side = max(width, height)
             canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
-            canvas.paste(im, ((side - width) // 2, (side - height) // 2), im)
+            canvas.paste(im, ((side - width) // 2, (side - height) // 2))
             canvas = canvas.resize((512, 512), Image.LANCZOS)
-        buf = io.BytesIO()
         for quality in (90, 75, 60, 45, 30):
             buf = io.BytesIO()
             canvas.save(buf, format="WEBP", quality=quality, method=6)
@@ -6814,13 +6847,18 @@ def _to_telegram_sticker(png: bytes) -> bytes | None:
 
 
 def _has_alpha(data: bytes) -> bool:
-    """True when an image carries real transparency — an alpha channel or
-    a palette transparency entry. Used by the "⭕ Outline" tap to tell the
-    user *before* queueing a graph whose `SplitImageWithAlpha` would just
-    produce an empty (fully-opaque) mask and outline the whole rectangle."""
+    """True when an image is actually see-through — not merely carrying an
+    alpha channel (an uploaded screenshot is RGBA and fully opaque, and
+    offering Outline for that would outline the whole rectangle). Used by
+    the "⭕ Outline" tap to say so *before* queueing: an opaque source's
+    `LoadImage` MASK output is all-black (no alpha), the `InvertMask`
+    turns that into white-everywhere, and the "border" becomes the full
+    canvas."""
     try:
         with Image.open(io.BytesIO(data)) as im:
-            return im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info
+            if not (im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info):
+                return False
+            return im.convert("RGBA").getchannel("A").getextrema()[0] < 255
     except OSError:
         return False
 
@@ -6927,11 +6965,17 @@ async def _send_cutout_pair(
             # too. None of them may cost the user the PNG, which goes out
             # either way below, so this is a note, not a failure.
             logger.warning("Telegram rejected the sticker send", exc_info=True)
-            await anchor.reply_text(
-                "Telegram wouldn't take that as a sticker file (over its "
-                "100KB cap, most likely) — here's the full transparent PNG.",
-                disable_notification=True,
-            )
+            try:
+                await anchor.reply_text(
+                    "Telegram wouldn't take that as a sticker file (over its "
+                    "100KB cap, most likely) — here's the full transparent PNG.",
+                    disable_notification=True,
+                )
+            except TelegramError:
+                # the note about the failed sticker must not itself become
+                # a failure that eats the PNG below (FloodWait right after
+                # the sticker send is exactly when this fires)
+                logger.warning("Couldn't even deliver the sticker-failure note", exc_info=True)
     await _send_and_store_result(anchor, pending["chat_id"], storage, result, force_document=True)
 
 
@@ -8136,7 +8180,14 @@ def _merge_tag_results(results: list[TagResult]) -> list[_TagMatch]:
     posts" above "6,000,000 posts". With nothing merged that re-rank is
     skipped: `search`'s own order is kept, which matters because its fuzzy
     fallback ranks by closeness of match first and re-sorting by popularity
-    would bury the closest match under a popular near-miss. The sources
+    would bury the closest match under a popular near-miss. The mixed case
+    is the accepted trade-off in that rule: one merged tag anywhere in the
+    list re-ranks *all* of it by combined post count, so a fuzzy search
+    whose closest match happens to be unmerged can still see a popular
+    near-miss float above it. Sorting only the merged groups would keep
+    closeness order but interleave two incompatible scales (a per-source
+    count next to a combined one), which reads worse than the ranking
+    being consistent. The sources
     *within* a group follow `TagSource`'s own order, so a merged line always
     reads "danbooru+e621" rather than whichever dictionary happens to have
     more posts today."""
