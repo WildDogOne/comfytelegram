@@ -450,7 +450,9 @@ built from [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDr
 It fills itself in the background at startup and refreshes any source
 older than `TAG_DB_MAX_AGE_DAYS`. A failed refresh keeps the existing data.
 Each search uses the source named by the profile's `tag_dictionary`
-(`danbooru` or `e621`), or both if the profile doesn't set one.
+(`danbooru` or `e621`), or both if the profile doesn't set one. Searching
+both, a tag they both know appears once with its post counts added together:
+`1girl (danbooru+e621/general) — 9,100,000 posts`.
 
 For offline installs, set `TAG_DB_AUTO_UPDATE=false` and manage the
 database by hand:

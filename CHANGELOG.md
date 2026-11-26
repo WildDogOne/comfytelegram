@@ -211,6 +211,14 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tap Done in the editor" message (with its editor button) is now deleted
   once the drawn mask arrives and generation starts.
 
+- **`/tags` merges a tag both dictionaries know**: searching without a
+  `danbooru:`/`e621:` prefix listed a common tag like `1girl` twice, once per
+  dictionary, with two copy buttons and two of the `TAG_SEARCH_RESULTS`
+  slots. It now takes one line — `1girl (danbooru+e621/general) — 9,100,000
+  posts`, the two dictionaries' post counts added together — and one 📋
+  button, so a search shows that many *different* tags rather than that many
+  rows.
+
 ### Fixed
 
 - Finished images no longer vanish when Telegram has a bad minute: every

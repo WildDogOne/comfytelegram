@@ -58,6 +58,7 @@ from comfytelegram.handlers import (
     _generate_from_prompt_keyboard,
     _hand_mode_keyboard,
     _hand_point_keyboard,
+    _merge_tag_results,
     _parse_upscale_custom_input,
     _post_process_keyboard,
     _raw_prompt_copy_text,
@@ -67,9 +68,11 @@ from comfytelegram.handlers import (
     _serialize_generation_params,
     _split_negative_prompt,
     _strip_prompt_weight,
+    _tag_match_line,
     _tag_prompt_text,
     _tag_results_keyboard,
     _tagcheck_lines,
+    _TagMatch,
     _upscale_confirm_keyboard,
     _upscale_mode_keyboard,
     hand_point_callback,
@@ -325,10 +328,154 @@ def test_tag_prompt_text_leaves_spaceless_tags_unchanged():
 
 def test_tag_results_keyboard_copies_spaces_but_displays_underscores():
     result = TagResult(source=TagSource.DANBOORU, name="blue_eyes", category=0, post_count=1000)
-    keyboard = _tag_results_keyboard([result])
+    keyboard = _tag_results_keyboard([_TagMatch("blue_eyes", (result,))])
     (button,) = keyboard.inline_keyboard[0]
     assert button.text == "📋 blue_eyes"
     assert button.copy_text.text == "blue eyes"
+
+
+def _tag_result(
+    name: str,
+    post_count: int,
+    source: TagSource = TagSource.DANBOORU,
+    category: int = 0,
+    matched_alias: str | None = None,
+) -> TagResult:
+    return TagResult(
+        source=source,
+        name=name,
+        category=category,
+        post_count=post_count,
+        matched_alias=matched_alias,
+    )
+
+
+def test_merge_tag_results_groups_a_tag_both_dictionaries_know():
+    results = [
+        _tag_result("1girl", 5_000_000),
+        _tag_result("1girl", 4_000_000, source=TagSource.E621),
+        _tag_result("1girl_solo", 1_000_000),
+    ]
+    matches = _merge_tag_results(results)
+    assert [m.name for m in matches] == ["1girl", "1girl_solo"]
+    assert [e.source for e in matches[0].entries] == [TagSource.DANBOORU, TagSource.E621]
+    assert len(matches[1].entries) == 1
+
+
+def test_merge_tag_results_orders_rows_by_combined_post_count_not_one_source_count():
+    # "fox" is known to both dictionaries, so its combined count beats
+    # "fox_ears" even though fox_ears is the bigger single-source row — the
+    # combined count is the number the line displays, so it's the ranking.
+    results = [
+        _tag_result("fox_ears", 500_000, source=TagSource.E621),
+        _tag_result("fox", 400_000),
+        _tag_result("fox", 300_000, source=TagSource.E621),
+    ]
+    assert [m.name for m in _merge_tag_results(results)] == ["fox", "fox_ears"]
+
+
+def test_merge_tag_results_keeps_search_order_for_equal_combined_counts():
+    results = [
+        _tag_result("fox_ears", 500_000, source=TagSource.E621),
+        _tag_result("fox", 300_000, source=TagSource.E621),
+        _tag_result("fox", 200_000),
+    ]
+    assert [m.name for m in _merge_tag_results(results)] == ["fox_ears", "fox"]
+
+
+def test_merge_tag_results_keeps_fuzzy_order_when_nothing_merges():
+    # `search`'s fuzzy fallback ranks by closeness of match first, and with
+    # nothing to merge there is no combined count to re-rank by: a popular
+    # near-miss must not jump ahead of the closest match just because
+    # `/tags` searched a single dictionary.
+    results = [
+        _tag_result("girl", 100, source=TagSource.E621),
+        _tag_result("grill", 500_000, source=TagSource.E621),
+    ]
+    assert [m.name for m in _merge_tag_results(results)] == ["girl", "grill"]
+
+
+def test_merge_tag_results_orders_a_merged_group_by_source_not_post_count():
+    # The line always reads "danbooru+e621", so the two dictionaries don't
+    # swap places between searches as their post counts shift.
+    results = [
+        _tag_result("fox", 500_000, source=TagSource.E621, category=5),
+        _tag_result("fox", 400_000),
+    ]
+    (match,) = _merge_tag_results(results)
+    assert [e.source for e in match.entries] == [TagSource.DANBOORU, TagSource.E621]
+
+
+def test_tag_match_line_shows_one_source_per_row_as_before():
+    result = _tag_result("fox", 50_000, source=TagSource.E621, category=5)
+    assert _tag_match_line(_TagMatch("fox", (result,))) == "fox (e621/species) — 50,000 posts"
+
+
+def test_tag_match_line_merges_both_sources_into_one_combined_post_count():
+    entries = (
+        _tag_result("1girl", 5_000_000),
+        _tag_result("1girl", 4_000_000, source=TagSource.E621),
+    )
+    assert (
+        _tag_match_line(_TagMatch("1girl", entries))
+        == "1girl (danbooru+e621/general) — 9,000,000 posts"
+    )
+
+
+def test_tag_match_line_spells_out_categories_when_the_two_dictionaries_disagree():
+    entries = (
+        _tag_result("fox", 400_000),
+        _tag_result("fox", 500_000, source=TagSource.E621, category=5),
+    )
+    assert (
+        _tag_match_line(_TagMatch("fox", entries))
+        == "fox (danbooru/general, e621/species) — 900,000 posts"
+    )
+
+
+def test_tag_match_line_notes_a_shared_alias_once():
+    entries = (
+        _tag_result("anthro", 4_000_000, matched_alias="antro"),
+        _tag_result("anthro", 3_000_000, source=TagSource.E621, matched_alias="antro"),
+    )
+    assert _tag_match_line(_TagMatch("anthro", entries)) == (
+        'anthro (danbooru+e621/general) — 7,000,000 posts [via alias "antro"]'
+    )
+
+
+def test_tag_match_line_attributes_differing_aliases_to_their_own_source():
+    entries = (
+        _tag_result("anthro", 4_000_000, matched_alias="anthropomorphic"),
+        _tag_result("anthro", 3_000_000, source=TagSource.E621, matched_alias="antro"),
+    )
+    assert _tag_match_line(_TagMatch("anthro", entries)) == (
+        "anthro (danbooru+e621/general) — 7,000,000 posts "
+        '[danbooru via alias "anthropomorphic", e621 via alias "antro"]'
+    )
+
+
+def test_tag_match_line_notes_an_alias_only_for_the_source_that_matched_through_one():
+    # danbooru knows "anthro" as a tag name of its own; only e621 got there
+    # through an alias, and the note must not claim both did.
+    entries = (
+        _tag_result("anthro", 4_000_000),
+        _tag_result("anthro", 3_000_000, source=TagSource.E621, matched_alias="antro"),
+    )
+    assert _tag_match_line(_TagMatch("anthro", entries)) == (
+        'anthro (danbooru+e621/general) — 7,000,000 posts [e621 via alias "antro"]'
+    )
+
+
+def test_tag_results_keyboard_gives_a_merged_tag_a_single_button():
+    entries = (
+        _tag_result("1girl", 5_000_000),
+        _tag_result("1girl", 4_000_000, source=TagSource.E621),
+    )
+    keyboard = _tag_results_keyboard([_TagMatch("1girl", entries)])
+    assert len(keyboard.inline_keyboard) == 1
+    (button,) = keyboard.inline_keyboard[0]
+    assert button.text == "📋 1girl"
+    assert button.copy_text.text == "1girl"
 
 
 def test_characters_keyboard_marks_active_character():
@@ -1144,10 +1291,6 @@ def test_resolve_tag_sources_searches_both_when_no_checkpoint_selected():
     sources, remainder = _resolve_tag_sources("fox", None, [])
     assert sources == [TagSource.DANBOORU, TagSource.E621]
     assert remainder == "fox"
-
-
-def _tag_result(name: str, post_count: int, source: TagSource = TagSource.DANBOORU) -> TagResult:
-    return TagResult(source=source, name=name, category=0, post_count=post_count)
 
 
 def test_tagcheck_lines_marks_a_known_common_tag():

@@ -20,7 +20,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, NamedTuple, TypeVar
 
 import aiohttp
 import numpy as np
@@ -7768,12 +7768,102 @@ def _resolve_tag_sources(
     return [TagSource.DANBOORU, TagSource.E621], args_text
 
 
-def _tag_result_line(result: TagResult) -> str:
-    label = category_label(result.source, result.category)
-    line = f"{result.name} ({result.source.value}/{label}) — {result.post_count:,} posts"
-    if result.matched_alias:
-        line += f' [via alias "{result.matched_alias}"]'
-    return line
+class _TagMatch(NamedTuple):
+    """One `/tags` result: a tag name plus every searched source that knows
+    it, so a tag present in both dictionaries is one line and one copy
+    button instead of two near-identical ones (see `_merge_tag_results`)."""
+
+    name: str
+    entries: tuple[TagResult, ...]
+
+
+#: How many pages per searched source `tags_command` asks `search` for
+#: before merging. `search` ranks and truncates by *per-source* post count,
+#: so a tag both dictionaries know can fall below that window on its own and
+#: still belong in the top `tag_search_results` once the two counts are
+#: added together; a wider window keeps that gap small. It costs nothing but
+#: a slightly longer Python sort, since `search`'s own candidate pool is
+#: hard-capped at 500 rows per query either way (`tags/db.py`'s
+#: `_CANDIDATE_FETCH_LIMIT`, shared between both sources — which also means
+#: one source's very common matches can push the other's rows out of the
+#: pool, leaving a tag that exists in both displayed as a single-source
+#: row).
+_TAG_SEARCH_OVERFETCH_PAGES = 4
+
+
+def _merge_tag_results(results: list[TagResult]) -> list[_TagMatch]:
+    """Group `TagDatabase.search` hits by tag name. danbooru and e621 are
+    kept as separate sources, so a common tag like "1girl" comes back twice
+    — different post counts, occasionally different category numbers. Both
+    dictionaries store names in the same normalized form (lowercase,
+    underscores), so an exact name comparison is enough to call two rows the
+    same tag. Once anything actually merged, groups are ordered by their
+    combined post count — the number `_tag_match_line` displays — since
+    sorting by the per-source count `search` used would show "4,000,000
+    posts" above "6,000,000 posts". With nothing merged that re-rank is
+    skipped: `search`'s own order is kept, which matters because its fuzzy
+    fallback ranks by closeness of match first and re-sorting by popularity
+    would bury the closest match under a popular near-miss. The sources
+    *within* a group follow `TagSource`'s own order, so a merged line always
+    reads "danbooru+e621" rather than whichever dictionary happens to have
+    more posts today."""
+    groups: dict[str, list[TagResult]] = {}
+    for result in results:
+        groups.setdefault(result.name, []).append(result)
+    source_order = {source: index for index, source in enumerate(TagSource)}
+    matches = [
+        _TagMatch(name, tuple(sorted(entries, key=lambda r: source_order[r.source])))
+        for name, entries in groups.items()
+    ]
+    if all(len(match.entries) == 1 for match in matches):
+        return matches
+    return sorted(matches, key=lambda match: -_post_count(match.entries))
+
+
+def _post_count(entries: list[TagResult] | tuple[TagResult, ...]) -> int:
+    """A merged row's post count: both sites' corpora added together, since
+    what a checkpoint saw is roughly the union of the two, not either one
+    alone."""
+    return sum(result.post_count for result in entries)
+
+
+def _tag_alias_note(entries: tuple[TagResult, ...]) -> str:
+    """The ` [via alias "…"]` suffix. One alias shared by a merged line's
+    sources reads fine on its own; differing aliases — or an alias hit on
+    one source next to a direct name hit on the other — are attributed to
+    their own source so the line doesn't imply both dictionaries aliased
+    the query."""
+    notes = [r.matched_alias for r in entries if r.matched_alias]
+    if not notes:
+        return ""
+    if len(entries) == 1 or (len(notes) == len(entries) and len(set(notes)) == 1):
+        return f' [via alias "{notes[0]}"]'
+    parts = [f'{r.source.value} via alias "{r.matched_alias}"' for r in entries if r.matched_alias]
+    return " [" + ", ".join(parts) + "]"
+
+
+def _tag_match_line(match: _TagMatch) -> str:
+    """`/tags`' one line per result. A tag both dictionaries know gets one
+    line naming both sources and their combined post count — the category
+    numbers can still disagree (e621's 5 is "species", danbooru's is
+    "meta"), so those are spelled out per source when they do."""
+    entries = match.entries
+    if len(entries) == 1:
+        (result,) = entries
+        label = category_label(result.source, result.category)
+        head = f"{result.name} ({result.source.value}/{label})"
+    else:
+        labels = {category_label(r.source, r.category) for r in entries}
+        if len(labels) == 1:
+            sources = "+".join(r.source.value for r in entries)
+            head = f"{match.name} ({sources}/{labels.pop()})"
+        else:
+            parts = ", ".join(
+                f"{r.source.value}/{category_label(r.source, r.category)}" for r in entries
+            )
+            head = f"{match.name} ({parts})"
+
+    return f"{head} — {_post_count(entries):,} posts" + _tag_alias_note(entries)
 
 
 def _tag_prompt_text(name: str) -> str:
@@ -7782,25 +7872,26 @@ def _tag_prompt_text(name: str) -> str:
     text — pasting the raw underscored form in verbatim is a token
     mismatch the model won't recognize. Swap underscores for spaces for
     the copy-to-clipboard/prompt-insertion text; the display line
-    (`_tag_result_line`) still shows the raw stored name, since that's
+    (`_tag_match_line`) still shows the raw stored name, since that's
     what `tags_db.search`/`lookup_exact` actually match against."""
     return name.replace("_", " ")
 
 
-def _tag_results_keyboard(results: list[TagResult]) -> InlineKeyboardMarkup:
-    """One row per hit: a native tap-to-copy button (`CopyTextButton`, same
-    pattern `_generate_from_prompt_keyboard` uses) for pasting the tag
-    straight into the next prompt message. Tag names are always well under
-    Telegram's 256-char `copy_text` cap, so unlike that keyboard, no
-    length-gating is needed here."""
+def _tag_results_keyboard(matches: list[_TagMatch]) -> InlineKeyboardMarkup:
+    """One row per match — not per source row, so a tag both dictionaries
+    know gets a single button: a native tap-to-copy button
+    (`CopyTextButton`, same pattern `_generate_from_prompt_keyboard` uses)
+    for pasting the tag straight into the next prompt message. Tag names
+    are always well under Telegram's 256-char `copy_text` cap, so unlike
+    that keyboard, no length-gating is needed here."""
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    f"📋 {result.name}", copy_text=CopyTextButton(_tag_prompt_text(result.name))
+                    f"📋 {match.name}", copy_text=CopyTextButton(_tag_prompt_text(match.name))
                 )
             ]
-            for result in results
+            for match in matches
         ]
     )
 
@@ -7851,10 +7942,12 @@ async def tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     since this is a "what are the most-used matching tags" listing capped
     to `tag_search_results` — unlike a "did you mean" hint, there's no
     reason for a rare prefix match to outrank a far more common substring
-    one here. Each hit gets a native tap-to-copy button for pasting
-    straight into the next prompt message. Doesn't require ComfyUI to be
-    reachable — this is pure local sqlite lookup, so it works even before a
-    model is selected."""
+    one here. Searching both dictionaries merges a tag they both know into
+    one line with both post counts (`_merge_tag_results`), so the cap counts
+    distinct tags rather than dictionary rows. Each hit gets a native
+    tap-to-copy button for pasting straight into the next prompt message.
+    Doesn't require ComfyUI to be reachable — this is pure local sqlite
+    lookup, so it works even before a model is selected."""
     resolved = await _resolve_tag_query(
         update,
         context,
@@ -7866,15 +7959,26 @@ async def tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     tags_db, settings, sources, query = resolved
     message = update.effective_message
 
-    results = tags_db.search(query, sources, limit=settings.tag_search_results, by_frequency=True)
+    limit = settings.tag_search_results
+    # Over-fetch before merging: a tag both dictionaries know used to take up
+    # two of the `limit` slots, so a popular query showed far fewer than
+    # `limit` distinct tags. See `_TAG_SEARCH_OVERFETCH_PAGES` for why the
+    # window is wider than one page per source.
+    results = tags_db.search(
+        query,
+        sources,
+        limit=limit * len(sources) * _TAG_SEARCH_OVERFETCH_PAGES,
+        by_frequency=True,
+    )
     if not results:
         await message.reply_text(f"No tags found for {query!r}.")
         return
 
+    matches = _merge_tag_results(results)[:limit]
     header = f"Tags matching {query!r} ({'/'.join(s.value for s in sources)}):"
     await message.reply_text(
-        header + "\n" + "\n".join(_tag_result_line(r) for r in results),
-        reply_markup=_tag_results_keyboard(results),
+        header + "\n" + "\n".join(_tag_match_line(m) for m in matches),
+        reply_markup=_tag_results_keyboard(matches),
     )
 
 
