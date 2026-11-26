@@ -1408,6 +1408,135 @@ def build_person_masks(source_filename: str) -> tuple[dict[str, Any], str]:
     return g.as_prompt(), preview
 
 
+#: The BiRefNet weights file the core `LoadBackgroundRemovalModel` node
+#: expects, in ComfyUI's `models/background_removal/` — a manually staged
+#: model like WD14/SAM (download page: huggingface.co/Comfy-Org/BiRefNet).
+#: Without it the node's model combo is empty and the graph fails at queue
+#: time with ComfyUI's own validation error, which `generation` surfaces to
+#: the chat as-is.
+BG_REMOVAL_MODEL = "birefnet.safetensors"
+
+
+def build_bg_removal(
+    source_filename: str,
+    *,
+    bg_model: str = BG_REMOVAL_MODEL,
+    filename_prefix: str = "comfytelegram_cutout",
+) -> tuple[dict[str, Any], str]:
+    """BiRefNet background removal: cut the subject out of the image and
+    save it as a transparent RGBA PNG — the "✂️ Remove BG" button, and the
+    first half of the sticker workflow (the second being
+    `build_sticker_outline`).
+
+    All core nodes (ComfyUI >= 0.43 ships `RemoveBackground`/
+    `LoadBackgroundRemovalModel`; no custom node pack needed), wired like
+    ComfyUI's official "Remove Background (BiRefNet)" template including
+    its `InvertMask` before `JoinImageWithAlpha`: `JoinImageWithAlpha`'s
+    alpha input follows the LoadImage-MASK-output polarity (white =
+    transparent), while `RemoveBackground` outputs the *foreground* mask
+    (white = subject) — skipping that invert erases the subject and keeps
+    the background."""
+    g = PromptGraph()
+    load = g.add("LoadImage", {"image": source_filename}, title="Source Image")
+    bg_model_node = g.add(
+        "LoadBackgroundRemovalModel", {"bg_removal_name": bg_model}, title="BiRefNet"
+    )
+    subject_mask = g.add(
+        "RemoveBackground",
+        {"bg_removal_model": [bg_model_node, 0], "image": [load, 0]},
+        title="Subject Mask",
+    )
+    alpha = g.add("InvertMask", {"mask": [subject_mask, 0]}, title="Cutout Alpha")
+    rgba = g.add(
+        "JoinImageWithAlpha",
+        {"image": [load, 0], "alpha": [alpha, 0]},
+        title="Transparent Cutout",
+    )
+    save = g.add(
+        "SaveImage", {"images": [rgba, 0], "filename_prefix": filename_prefix}, title="Save Cutout"
+    )
+    return g.as_prompt(), save
+
+
+def build_sticker_outline(
+    source_filename: str,
+    outline_px: int,
+    *,
+    filename_prefix: str = "comfytelegram_sticker",
+) -> tuple[dict[str, Any], str]:
+    """A white die-cut outline grown around an already-transparent subject,
+    saved again as a transparent RGBA PNG — the "⭕ Outline" button, the
+    second half of the sticker workflow.
+
+    No segmentation model here: the subject mask comes from the source
+    PNG's own alpha, straight off `LoadImage`'s MASK output (index 1) —
+    `LoadImage` splits an RGBA file at load time into an RGB IMAGE tensor
+    and that alpha MASK, so there is no 4-channel `IMAGE` anywhere for a
+    `SplitImageWithAlpha` to consume. (Wiring `SplitImageWithAlpha` after
+    `LoadImage` is a classic trap: it sees the 3-channel tensor, reports
+    "fully opaque", and the outline ends up whiting out the whole canvas.)
+    That MASK follows the LoadImage polarity (white = transparent), hence
+    the `InvertMask`: `GrowMask` and `ImageCompositeMasked` (white = show
+    source) want the foreground mask. `JoinImageWithAlpha`'s alpha input
+    wants the transparent polarity back, hence the second invert on the
+    grown mask — same convention dance as `build_bg_removal`. Runs on the
+    output of "✂️ Remove BG" or any other transparent PNG —
+    `postprocess_callback` checks for alpha before offering it.
+
+    `outline_px` is the white border's width in source-image pixels
+    (`GrowMask`'s `expand`); the handlers scale it off the image's shorter
+    side and cap it for cost.
+
+    Shape (this is Photoshop's outer glow at 100% spread): the alpha is
+    thresholded at 0.5 *before* dilating, so the border traces the
+    subject's crisp 50%-alpha contour exactly and grows outward from
+    there — the same "spread first, no blur" geometry. No `FeatherMask`/
+    gaussian anywhere: any blur-then-rethreshold on the grown mask is a
+    morphological *closing*, which bridges concave bays (arm-to-torso,
+    between legs) and cuts a straight line across them, and blur without
+    rethresholding just gives a fuzzy edge instead of a die-cut one. The
+    one thing `GrowMask`'s max-filter staircasing does need is a clean
+    input, which is what the threshold supplies — dilating BiRefNet's
+    raw soft alpha instead inherits every 1px notch of the segmentation
+    fringe. The subject is composited through the *un-thresholded* soft
+    mask, so hair/fur edges keep their softness even though the border
+    behind them is hard-edged."""
+    g = PromptGraph()
+    load = g.add("LoadImage", {"image": source_filename}, title="Source Image")
+    subject_mask = g.add("InvertMask", {"mask": [load, 1]}, title="Subject Mask")
+    crisp_subject = g.add(
+        "ThresholdMask", {"mask": [subject_mask, 0], "value": 0.5}, title="Crisp Subject Edge"
+    )
+    outline_mask = g.add(
+        "GrowMask",
+        {"mask": [crisp_subject, 0], "expand": outline_px, "tapered_corners": True},
+        title="Outline Silhouette",
+    )
+    white = g.add("MaskToImage", {"mask": [outline_mask, 0]}, title="White Outline")
+    composited = g.add(
+        "ImageCompositeMasked",
+        {
+            "destination": [white, 0],
+            "source": [load, 0],
+            "x": 0,
+            "y": 0,
+            "resize_source": False,
+            "mask": [subject_mask, 0],
+        },
+        title="Subject on Outline",
+    )
+    alpha = g.add("InvertMask", {"mask": [outline_mask, 0]}, title="Sticker Alpha")
+    rgba = g.add(
+        "JoinImageWithAlpha",
+        {"image": [composited, 0], "alpha": [alpha, 0]},
+        title="Transparent Cutout",
+    )
+    save = g.add(
+        "SaveImage", {"images": [rgba, 0], "filename_prefix": filename_prefix}, title="Save Sticker"
+    )
+    return g.as_prompt(), save
+
+
 def build_hand_detailer_drawn_mask(
     source_filename: str,
     mask_filename: str,

@@ -1,6 +1,7 @@
 import pytest
 
 from comfytelegram.workflows.builder import (
+    BG_REMOVAL_MODEL,
     KONTEXT_RESOLUTIONS,
     DrawnMaskFixParams,
     DrawnMaskHandDetailerParams,
@@ -15,12 +16,14 @@ from comfytelegram.workflows.builder import (
     TiledRefineParams,
     UpscaleParams,
     _resolve_seed,
+    build_bg_removal,
     build_face_detailer,
     build_fix_drawn_mask,
     build_hand_detailer,
     build_hand_detailer_drawn_mask,
     build_hand_detailer_manual,
     build_kontext_edit,
+    build_sticker_outline,
     build_tiled_refine,
     build_txt2img,
     build_upscale,
@@ -1225,3 +1228,101 @@ def test_build_kontext_edit_wires_reference_latent_and_flux_guidance():
     assert ks["inputs"]["seed"] == 7
     _, text = by_type["CLIPTextEncode"]
     assert text["inputs"]["text"] == "make the sky purple"
+
+
+def test_build_bg_removal_wires_birefnet_and_alpha():
+    graph, save_id = build_bg_removal("src.png")
+    by_type = {n["class_type"]: (nid, n) for nid, n in graph.items()}
+
+    assert graph[save_id]["class_type"] == "SaveImage"
+    load_id, load = by_type["LoadImage"]
+    assert load["inputs"]["image"] == "src.png"
+    model_id, model = by_type["LoadBackgroundRemovalModel"]
+    assert model["inputs"]["bg_removal_name"] == BG_REMOVAL_MODEL
+    mask_id, mask = by_type["RemoveBackground"]
+    assert mask["inputs"]["bg_removal_model"] == [model_id, 0]
+    assert mask["inputs"]["image"] == [load_id, 0]
+
+    # the template's invert: RemoveBackground's mask is white=subject,
+    # JoinImageWithAlpha's alpha is white=transparent
+    invert_id, invert = by_type["InvertMask"]
+    assert invert["inputs"]["mask"] == [mask_id, 0]
+    join_id, join = by_type["JoinImageWithAlpha"]
+    assert join["inputs"]["image"] == [load_id, 0]
+    assert join["inputs"]["alpha"] == [invert_id, 0]
+    assert graph[save_id]["inputs"]["images"] == [join_id, 0]
+
+    for node in graph.values():
+        for value in node["inputs"].values():
+            if isinstance(value, list):
+                assert value[0] in graph
+
+
+def test_build_sticker_outline_reads_alpha_no_segmentation():
+    graph, save_id = build_sticker_outline("src.png", 24)
+    by_type = {n["class_type"]: (nid, n) for nid, n in graph.items()}
+
+    assert graph[save_id]["class_type"] == "SaveImage"
+    assert "RemoveBackground" not in by_type and "LoadBackgroundRemovalModel" not in by_type
+    # the alpha comes off LoadImage's MASK output — a SplitImageWithAlpha
+    # downstream of LoadImage would only ever see the 3-channel RGB tensor
+    assert "SplitImageWithAlpha" not in by_type
+    load_id, _ = by_type["LoadImage"]
+
+    # LoadImage's MASK is white=transparent; GrowMask and
+    # ImageCompositeMasked want white=subject, hence the invert
+    subject_invert_id = next(
+        nid
+        for nid, n in graph.items()
+        if n["class_type"] == "InvertMask" and n["inputs"]["mask"] == [load_id, 1]
+    )
+    grow_id, grow = by_type["GrowMask"]
+    assert grow["inputs"]["expand"] == 24
+
+    # Photoshop outer glow at 100% spread: hard threshold on the subject
+    # edge *before* dilating, and no blur anywhere — a blur+threshold on
+    # the grown mask is a morphological closing that bridges concave bays,
+    # and blur alone gives a fuzzy edge instead of a die-cut one.
+    assert "FeatherMask" not in by_type and "Mask Gaussian Region" not in by_type
+    crisp_id, crisp = by_type["ThresholdMask"]
+    assert crisp["inputs"]["mask"] == [subject_invert_id, 0]
+    assert crisp["inputs"]["value"] == 0.5
+    assert grow["inputs"]["mask"] == [crisp_id, 0]
+
+    white_id, white = by_type["MaskToImage"]
+    assert white["inputs"]["mask"] == [grow_id, 0]
+    comp_id, comp = by_type["ImageCompositeMasked"]
+    assert comp["inputs"]["destination"] == [white_id, 0]
+    assert comp["inputs"]["source"] == [load_id, 0]
+    # subject composited through the *soft* mask (hair edges), not the
+    # thresholded one
+    assert comp["inputs"]["mask"] == [subject_invert_id, 0]
+    assert comp["inputs"]["resize_source"] is False
+
+    # second invert: JoinImageWithAlpha's alpha is white=transparent again
+    alpha_invert_id = next(
+        nid
+        for nid, n in graph.items()
+        if n["class_type"] == "InvertMask" and n["inputs"]["mask"] == [grow_id, 0]
+    )
+    join_id, join = by_type["JoinImageWithAlpha"]
+    assert join["inputs"]["image"] == [comp_id, 0]
+    assert join["inputs"]["alpha"] == [alpha_invert_id, 0]
+    assert graph[save_id]["inputs"]["images"] == [join_id, 0]
+
+    for node in graph.values():
+        for value in node["inputs"].values():
+            if isinstance(value, list):
+                assert value[0] in graph
+
+
+def test_build_sticker_outline_has_no_blur_nodes():
+    """The 100%-spread look is structural: exactly one `ThresholdMask`
+    (on the subject, before `GrowMask`) and zero blur nodes — no
+    `Mask Gaussian Region`/`FeatherMask` on either side of the dilation,
+    which is what made earlier attempts either close bays or fuzz the
+    edge."""
+    graph, _ = build_sticker_outline("src.png", 24)
+    types = [n["class_type"] for n in graph.values()]
+    assert types.count("ThresholdMask") == 1
+    assert "Mask Gaussian Region" not in types and "FeatherMask" not in types

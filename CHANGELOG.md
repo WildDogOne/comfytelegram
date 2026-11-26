@@ -8,6 +8,22 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **✂️ Remove BG and ⭕ Outline** (post-processing keyboard, page 2): the
+  sticker workflow as two separate buttons. ✂️ Remove BG cuts the subject
+  out to a transparent PNG (BiRefNet, ComfyUI core nodes — no custom node
+  pack); ⭕ Outline draws a white die-cut border around the transparency
+  (Thin/Medium/Thick, scaled with the image, hard-edged and contour-
+  faithful like a Photoshop outer glow at 100% spread), and works on any already transparent result —
+  including ✂️ Remove BG's own output, which it reads from the PNG's
+  alpha channel without re-segmenting. Each comes back twice: a real
+  Telegram sticker (512px WebP, transparency intact, the quick way to
+  check a cutout worked) and the full-resolution transparent PNG as a
+  document with the usual post-processing keyboard, so upscale/📥
+  Download/the other pass all keep working on the result. Two separate
+  buttons on purpose: judge the cutout before outlining it. One one-time
+  model to stage: `birefnet.safetensors` from
+  huggingface.co/Comfy-Org/BiRefNet into `ComfyUI/models/background_removal/`.
+
 - **"🔍 Upscale 4x" → ✏️ Prompt**: upscale with your own prompt instead of
   the one the image was generated with. Tapping it first replies with a
   copyable copy of the prompt that pass is currently conditioned on (📋 Copy

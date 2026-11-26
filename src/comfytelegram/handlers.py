@@ -37,7 +37,7 @@ from telegram import (
     WebAppInfo,
 )
 from telegram.constants import InlineKeyboardButtonLimit, KeyboardButtonStyle
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, ContextTypes
 
 from comfytelegram.analysis import (
@@ -62,6 +62,7 @@ from comfytelegram.fav_menu import handle_fav_edit_message
 from comfytelegram.generation import (
     REGION_LORA_DEFAULT_DENOISE,
     GeneratedImage,
+    add_sticker_outline,
     apply_region_loras,
     detect_people,
     generate,
@@ -71,6 +72,7 @@ from comfytelegram.generation import (
     post_process,
     region_area,
     region_lora_mask,
+    remove_background,
     repeat,
     resolve_drawn_mask_denoise,
     resolve_live_upscale_defaults,
@@ -148,6 +150,7 @@ from comfytelegram.storage import IMAGE_FORMAT_PNG, INPAINT_JOB_TTL_SECONDS, Sto
 from comfytelegram.tags import TagDatabase, TagResult, TagSource, category_label
 from comfytelegram.topics import pop_pending, set_pending
 from comfytelegram.workflows import (
+    BG_REMOVAL_MODEL,
     DrawnMaskHandDetailerParams,
     GenerationParams,
     KontextModelFiles,
@@ -321,6 +324,39 @@ PAINT_REGIONS_JOB_KIND = "regions"
 #: and make it the chat's `/pose`, for more pictures in the same pose
 #: (`_set_pose_from_image`).
 COPY_POSE_CALLBACK_KIND = "copy_pose"
+
+#: "✂️ Remove BG" and "⭕ Outline" (keyboard page 2) — the sticker workflow,
+#: deliberately split into two buttons rather than one "do everything"
+#: pass: the cutout can be checked on its own before anything gets an
+#: outline, and the outline pass reuses the cutout's alpha channel instead
+#: of segmenting a second time (`workflows.build_bg_removal` /
+#: `build_sticker_outline`). "✂️ Remove BG" runs immediately — nothing to
+#: tune. "⭕ Outline" first checks the image actually has alpha
+#: (`_has_alpha`) and asks for the border width
+#: (`_outline_width_keyboard`); the width kinds run it
+#: (`_run_cutout_and_send`). Widths are fractions of the source image's
+#: shorter side, so the border reads the same on a 512px draft and a 4x
+#: upscale.
+BG_REMOVE_CALLBACK_KIND = "remove_bg"
+OUTLINE_CALLBACK_KIND = "outline"
+#: kind -> (outline as a fraction of the shorter image side, button label).
+OUTLINE_WIDTH_CALLBACK_KINDS = {
+    "outline_thin": (0.015, "Thin"),
+    "outline_medium": (0.03, "Medium"),
+    "outline_thick": (0.05, "Thick"),
+}
+#: Telegram's hard cap on sticker files (docs: "WebP, up to 100KB"). The
+#: 512x512/quality ladder in `_to_telegram_sticker` aims under it; over
+#: Telegram's cap the sticker send is skipped, not the whole result.
+TELEGRAM_STICKER_SIZE_LIMIT = 100_000
+#: Ceiling on the white outline in source pixels. The width kinds scale it
+#: off the image, but core `GrowMask` runs scipy `grey_dilation` once *per
+#: expand pixel* over the full-size mask — "Thick" on a 4x upscale (205px
+#: on a 4096px image, 410 on an 8192px one) runs for minutes, and neither
+#: BiRefNet nor GrowMask emits progress events, so the status message
+#: would just sit frozen. 128px is still ~3% of a 4096px side, so the
+#: three widths stay distinguishable at the top of the range.
+_OUTLINE_MAX_PX = 128
 
 #: "🪄 Kontext Edit" — an instruction-driven FLUX.1 Kontext edit of the whole
 #: image (`generation.kontext_edit`). The tap only asks for the instruction;
@@ -705,7 +741,10 @@ def _post_process_keyboard(result_id: str, page: int = 1) -> InlineKeyboardMarku
     📥 Download file and 🐛 Show Prompt. Page 2 holds the rest — 🎨 Paint
     Regions and 🦴 Copy pose (both about a new generation rather than work
     on this one), 🧵 Homogenize,
-    the three analyzers, and 🔀 Switch Model / 🎛 LoRAs (see
+    the three analyzers, ✂️ Remove BG / ⭕ Outline (see
+    `BG_REMOVE_CALLBACK_KIND` — output variants rather than another
+    refinement of the same image, so they sit with the page-2 one-offs),
+    and 🔀 Switch Model / 🎛 LoRAs (see
     `SWITCH_MODEL_CALLBACK_KIND`/`LORA_SWITCH_CALLBACK_KIND` — deliberately
     page 2, not 1: switching a checkpoint mid-pipeline is a rare, deliberate
     choice, not something tapped while routinely working an image). The
@@ -756,6 +795,15 @@ def _post_process_keyboard(result_id: str, page: int = 1) -> InlineKeyboardMarku
                     InlineKeyboardButton(
                         "🔬 Analyze Prompt",
                         callback_data=f"pp:{ANALYZE_PROMPT_CALLBACK_KIND}:{result_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✂️ Remove BG",
+                        callback_data=f"pp:{BG_REMOVE_CALLBACK_KIND}:{result_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "⭕ Outline", callback_data=f"pp:{OUTLINE_CALLBACK_KIND}:{result_id}"
                     ),
                 ],
                 [
@@ -1297,6 +1345,7 @@ async def _send_photo_or_document(
     reply_markup: InlineKeyboardMarkup,
     *,
     use_jpeg: bool = True,
+    force_document: bool = False,
 ) -> Message:
     """Send `data` (raw PNG bytes out of ComfyUI) as a photo, JPEG-encoding
     it first (`_to_display_jpeg`) so the in-chat copy stays small regardless
@@ -1315,6 +1364,14 @@ async def _send_photo_or_document(
     same size-based sendDocument fallback below: for someone running a
     long, multi-day session who'd rather pay the bandwidth than risk any
     recompression across a chain of post-processing passes.
+
+    `force_document=True` skips the photo path entirely, size and toggle
+    notwithstanding — for images where the JPEG re-encode (or even
+    Telegram's own `sendPhoto` recompression, which flattens transparency
+    regardless of `use_jpeg`) would destroy something the result is *for*,
+    i.e. the transparent PNG from "🎭 Sticker". The stored `file_id` then
+    points at the full-quality PNG, which also makes every follow-up
+    `_fetch_source_image` fallback lossless.
 
     This is display-only — no metadata rides along, since `png_metadata`'s
     `tEXt` chunk is PNG-specific and this photo may not even be PNG bytes
@@ -1337,6 +1394,13 @@ async def _send_photo_or_document(
     `_store_pending_result`."""
     # The bot is quiet by default (`main.build_application`'s `Defaults`);
     # a finished image is the one thing worth a notification.
+    if force_document:
+        return await send_document(
+            document=io.BytesIO(data),
+            filename=filename,
+            reply_markup=reply_markup,
+            disable_notification=False,
+        )
     if use_jpeg:
         jpeg = await asyncio.to_thread(_to_display_jpeg, data, _DISPLAY_JPEG_QUALITY)
         if jpeg is not data and len(jpeg) <= TELEGRAM_PHOTO_SIZE_LIMIT:
@@ -1363,6 +1427,7 @@ async def _send_result_image(
     reply_markup: InlineKeyboardMarkup,
     *,
     use_jpeg: bool = True,
+    force_document: bool = False,
 ) -> Message:
     """`_send_photo_or_document` bound to `message.reply_photo`/
     `reply_document`."""
@@ -1373,6 +1438,7 @@ async def _send_result_image(
         filename,
         reply_markup,
         use_jpeg=use_jpeg,
+        force_document=force_document,
     )
 
 
@@ -1580,6 +1646,7 @@ async def _send_and_store_result(
     *,
     result_id: str | None = None,
     extra_keyboard_rows: list[list[InlineKeyboardButton]] | None = None,
+    force_document: bool = False,
 ) -> str:
     """Send a generated image with its post-processing keyboard, then persist
     what those buttons need (a re-downloadable file_id + the params to build
@@ -1588,7 +1655,9 @@ async def _send_and_store_result(
     caller that needs to know it ahead of time to embed in its own extra
     button (`extra_keyboard_rows`, appended below the standard ones — see
     `postprocess_callback`'s `HAND_REDO_CALLBACK_KIND` branch) can pass one
-    in instead. Returns whichever id was actually used."""
+    in instead. `force_document` goes straight to
+    `_send_photo_or_document`'s document path (transparency-bearing results,
+    see there). Returns whichever id was actually used."""
     result_id = result_id or uuid.uuid4().hex[:12]
     reply_markup = _post_process_keyboard_with_extra_rows(
         result_id,
@@ -1598,7 +1667,12 @@ async def _send_and_store_result(
     )
     use_jpeg = storage.get_image_format(chat_id) != IMAGE_FORMAT_PNG
     sent = await _send_result_image(
-        message, img.data, img.filename, reply_markup, use_jpeg=use_jpeg
+        message,
+        img.data,
+        img.filename,
+        reply_markup,
+        use_jpeg=use_jpeg,
+        force_document=force_document,
     )
     storage.store_pending_result(
         result_id,
@@ -4534,7 +4608,15 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     toggle screen for *this image's own current checkpoint*'s LoRAs (see that
     constant's own docstring for why it's a lightweight standalone screen
     rather than the full `/lora` menu); toggle/apply taps are handled by
-    `switch_loras_callback`, its own dedicated callback."""
+    `switch_loras_callback`, its own dedicated callback. A `"remove_bg"` tap
+    (`BG_REMOVE_CALLBACK_KIND`) runs the BiRefNet cutout immediately,
+    gated on the model being staged (`_bg_removal_model_staged`); an
+    `"outline"` tap first checks the image has alpha (`_has_alpha`, with a
+    "run ✂️ Remove BG first" hint if not) and then replies with
+    `_outline_width_keyboard`'s Thin/Medium/Thick choice, whose three
+    `OUTLINE_WIDTH_CALLBACK_KINDS` taps run the outline pass. Both kinds
+    send the transparent-PNG + sticker-preview pair
+    (`_run_cutout_and_send`/`_send_cutout_pair`)."""
     query = update.callback_query
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
@@ -4920,6 +5002,51 @@ async def postprocess_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             # (`_process_one_inpaint_job` reads only `positive`), which is
             # the trade for not forking a new editor mode.
             meta_overrides={"mode": "mask_prompt"},
+        )
+        return
+
+    if kind == BG_REMOVE_CALLBACK_KIND:
+        if not await _bg_removal_model_staged(client):
+            await query.message.reply_text(
+                "✂️ Remove BG needs the BiRefNet background-removal model, "
+                "and it isn't staged on the ComfyUI side yet — drop "
+                "`birefnet.safetensors` (huggingface.co/Comfy-Org/BiRefNet) "
+                "into `ComfyUI/models/background_removal/` and tap again."
+            )
+            return
+        await _run_cutout_and_send(query, context, pending, full_params, result_id, None)
+        return
+
+    if kind == OUTLINE_CALLBACK_KIND:
+        source_bytes = await _fetch_source_image(
+            client,
+            context.bot,
+            pending["filename"],
+            pending["file_id"],
+            on_fallback=_source_fallback_notifier(query.message),
+        )
+        if not _has_alpha(source_bytes):
+            await query.message.reply_text(
+                "⭕ Outline works on the transparency itself, and this image "
+                "has none — run ✂️ Remove BG first and tap Outline on its "
+                "result."
+            )
+            return
+        await query.message.reply_text(
+            "⭕ Outline — draw a white die-cut outline around the transparent "
+            "subject. How wide should it be?",
+            reply_markup=_outline_width_keyboard(result_id),
+        )
+        return
+
+    if kind in OUTLINE_WIDTH_CALLBACK_KINDS:
+        await _run_cutout_and_send(
+            query,
+            context,
+            pending,
+            full_params,
+            result_id,
+            OUTLINE_WIDTH_CALLBACK_KINDS[kind][0],
         )
         return
 
@@ -6600,6 +6727,207 @@ def _kontext_redo_row(result_id: str) -> list[InlineKeyboardButton]:
             "✏️ New prompt", callback_data=f"pp:{KONTEXT_REDO_NEW_CALLBACK_KIND}:{result_id}"
         ),
     ]
+
+
+async def _bg_removal_model_staged(client: ComfyClient) -> bool:
+    """True when ComfyUI's `LoadBackgroundRemovalModel` actually offers
+    `BG_REMOVAL_MODEL` — i.e. the BiRefNet weights are staged in
+    `models/background_removal/` (its combo is built from that folder, so
+    an empty/foreign list means "not staged"). Checked at tap time rather
+    than by gating the keyboard, same trade `FIX_DRAW_CALLBACK_KIND` makes
+    with the relay URL: this keyboard has no `Settings` to consult, and
+    this isn't a `Settings` value at all — it's the other machine's folder.
+    A failed query is *not* treated as unstaged: we can't tell, ComfyUI's
+    own queue-time validation would say so anyway, and a transient
+    `/object_info` hiccup shouldn't block the feature."""
+    try:
+        info = await client.get_node_info("LoadBackgroundRemovalModel")
+    except (ComfyUIError, aiohttp.ClientError, TimeoutError):
+        logger.warning("Couldn't read LoadBackgroundRemovalModel info", exc_info=True)
+        return True
+    spec = (info.get("input") or {}).get("required", {}).get("bg_removal_name")
+    options: list[str] = []
+    if isinstance(spec, (list, tuple)):
+        for part in spec:
+            if isinstance(part, dict):
+                options = part.get("options") or []
+            elif isinstance(part, list):
+                options = part
+    return BG_REMOVAL_MODEL in options
+
+
+def _outline_width_keyboard(result_id: str) -> InlineKeyboardMarkup:
+    """The Thin/Medium/Thick choice under a "⭕ Outline" tap — one row off
+    `OUTLINE_WIDTH_CALLBACK_KINDS`, so labels and callback kinds can't drift
+    apart, plus a "↩ Cancel" that re-shows the image's keyboard via
+    `BACK_CALLBACK_KIND` like every other back tap here (page 1 — the page
+    swap doesn't remember which page the tap came from)."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(label, callback_data=f"pp:{kind}:{result_id}")
+                for kind, (_, label) in OUTLINE_WIDTH_CALLBACK_KINDS.items()
+            ],
+            [
+                InlineKeyboardButton(
+                    "↩ Cancel", callback_data=f"pp:{BACK_CALLBACK_KIND}:{result_id}"
+                )
+            ],
+        ]
+    )
+
+
+def _to_telegram_sticker(png: bytes) -> bytes | None:
+    """Re-encode a transparent PNG as a Telegram sticker file: square WebP,
+    both sides exactly 512px (Telegram's spec for static stickers), under
+    `TELEGRAM_STICKER_SIZE_LIMIT` — the same 512px square Telegram also
+    renders in-chat with the transparency intact, unlike a `sendPhoto`
+    copy. The subject is centred by padding the shorter side onto a
+    transparent square rather than squashing it; the sticker pass's white
+    outline can touch the image edge (the outline grows past the subject,
+    and ComfyUI keeps the canvas at the source size), so a plain resize
+    would clip it.
+
+    Quality ladder down from 90 until the file fits; if even the lowest
+    rung is over the cap the last attempt is returned anyway and the
+    caller's send decides. Returns None if Pillow can't decode the PNG at
+    all — the caller then skips the sticker copy and the transparent PNG
+    document still goes out."""
+    try:
+        with Image.open(io.BytesIO(png)) as im:
+            im = im.convert("RGBA")
+            width, height = im.size
+            side = max(width, height)
+            canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+            canvas.paste(im, ((side - width) // 2, (side - height) // 2), im)
+            canvas = canvas.resize((512, 512), Image.LANCZOS)
+        buf = io.BytesIO()
+        for quality in (90, 75, 60, 45, 30):
+            buf = io.BytesIO()
+            canvas.save(buf, format="WEBP", quality=quality, method=6)
+            if buf.tell() <= TELEGRAM_STICKER_SIZE_LIMIT:
+                break
+        return buf.getvalue()
+    except Exception:
+        logger.warning("Couldn't re-encode sticker PNG as WebP", exc_info=True)
+        return None
+
+
+def _has_alpha(data: bytes) -> bool:
+    """True when an image carries real transparency — an alpha channel or
+    a palette transparency entry. Used by the "⭕ Outline" tap to tell the
+    user *before* queueing a graph whose `SplitImageWithAlpha` would just
+    produce an empty (fully-opaque) mask and outline the whole rectangle."""
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            return im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info
+    except OSError:
+        return False
+
+
+async def _run_cutout_and_send(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    pending: dict,
+    full_params: GenerationParams,
+    result_id: str,
+    outline_fraction: float | None,
+) -> None:
+    """Shared tail of the two transparent-PNG buttons. `outline_fraction`
+    None means "✂️ Remove BG" (BiRefNet cutout of the source); a fraction
+    means "⭕ Outline" — a white border of that fraction of the shorter
+    image side (capped at `_OUTLINE_MAX_PX`, see that constant) grown
+    around the source's own alpha, no segmentation.
+
+    Both feed `_send_cutout_pair`; errors are reported through the status
+    message like every other post-processing pass."""
+    client: ComfyClient = context.bot_data["comfy_client"]
+    storage: Storage = context.bot_data["storage"]
+    anchor = query.message
+    label = "Outline" if outline_fraction is not None else "Background removal"
+    status_message = await start_reply_status(
+        context.bot_data,
+        anchor,
+        "Adding outline…" if outline_fraction is not None else "Removing background…",
+    )
+
+    async def _download_and_run() -> GeneratedImage:
+        source_bytes = await _fetch_source_image(
+            client,
+            context.bot,
+            pending["filename"],
+            pending["file_id"],
+            on_fallback=_source_fallback_notifier(anchor),
+        )
+        if outline_fraction is None:
+            return await remove_background(
+                client,
+                source_bytes,
+                pending["filename"],
+                full_params,
+                on_progress=_make_progress_callback(status_message, label),
+            )
+        with Image.open(io.BytesIO(source_bytes)) as im:
+            outline_px = min(_OUTLINE_MAX_PX, max(1, round(outline_fraction * min(im.size))))
+        return await add_sticker_outline(
+            client,
+            source_bytes,
+            pending["filename"],
+            full_params,
+            outline_px,
+            on_progress=_make_progress_callback(status_message, label),
+        )
+
+    result = await _run_reporting_errors(status_message, label, "cutout", _download_and_run())
+    if result is None:
+        return
+
+    await status_message.delete()
+    await _send_cutout_pair(anchor, pending, storage, result)
+
+
+async def _send_cutout_pair(
+    anchor: Message,
+    pending: dict,
+    storage: Storage,
+    result: GeneratedImage,
+) -> None:
+    """Send a transparent-PNG result in both shapes: the real Telegram
+    sticker (512px WebP, for forwarding and quick visual judging) first,
+    then the full-resolution PNG as a document with the usual
+    post-processing keyboard below it — preview on top, working buttons
+    right under the thumb. That order is safe because the sticker send is
+    fully wrapped in a try/except: a failing sticker send must never take
+    the PNG or its `pending_result` row down with it, order be damned.
+
+    The PNG deliberately goes through `_send_and_store_result` with
+    `force_document=True` — `sendPhoto` would JPEG-flatten the alpha away,
+    both in-chat and in the stored `file_id` fallback — and the stored row
+    keeps the source's `full_params`, so upscale/detailer/"📥 Download
+    file"/the other cutout pass all work on it (against ComfyUI's own PNG
+    copy via `_fetch_source_image`, alpha intact). The sticker message
+    itself carries no keyboard: a sticker message can't hold the file the
+    follow-up buttons need — but since Telegram renders stickers with
+    transparency, it doubles as the quick check that a cutout actually
+    worked."""
+    sticker = await asyncio.to_thread(_to_telegram_sticker, result.data)
+    if sticker is not None:
+        try:
+            await anchor.reply_sticker(sticker=io.BytesIO(sticker))
+        except TelegramError:
+            # BadRequest covers the likely cause (Telegram's 100KB cap —
+            # `_to_telegram_sticker` returns the last ladder attempt even
+            # when it can't get under the cap) but also invalid-file and
+            # chat-level rejections, and FloodWait/network errors land here
+            # too. None of them may cost the user the PNG, which goes out
+            # either way below, so this is a note, not a failure.
+            logger.warning("Telegram rejected the sticker send", exc_info=True)
+            await anchor.reply_text(
+                "Telegram wouldn't take that as a sticker file (over its "
+                "100KB cap, most likely) — here's the full transparent PNG.",
+                disable_notification=True,
+            )
+    await _send_and_store_result(anchor, pending["chat_id"], storage, result, force_document=True)
 
 
 async def _run_kontext_and_send_bot(

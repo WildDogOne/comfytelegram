@@ -44,6 +44,7 @@ from comfytelegram.workflows import (
     RegionSpec,
     TiledRefineParams,
     UpscaleParams,
+    build_bg_removal,
     build_face_detailer,
     build_fix_drawn_mask,
     build_hand_detailer,
@@ -51,6 +52,7 @@ from comfytelegram.workflows import (
     build_hand_detailer_manual,
     build_kontext_edit,
     build_person_masks,
+    build_sticker_outline,
     build_tiled_refine,
     build_txt2img,
     build_upscale,
@@ -1669,6 +1671,57 @@ async def kontext_edit(
     logger.info("Submitting Kontext edit on %s at %dx%d", upload["name"], *size)
     raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
     data, filename = _tag_images(raw, full_params, kind="kontext", graph=prompt_graph)[0]
+    return GeneratedImage(data=data, filename=filename, full_params=full_params)
+
+
+async def remove_background(
+    client: ComfyClient,
+    source_image: bytes,
+    source_filename: str,
+    full_params: GenerationParams,
+    *,
+    on_progress: ProgressCallback | None = None,
+) -> GeneratedImage:
+    """BiRefNet background removal over a previously generated image: the
+    subject, on a transparent RGBA PNG (see `build_bg_removal`). Backs the
+    "✂️ Remove BG" button — and its output is the input for
+    `add_sticker_outline`.
+
+    Like `kontext_edit`, deliberately not a `post_process` kind — none of
+    the image's own checkpoint/LoRA/prompt graph is involved, only its
+    pixels — but the result still carries the source's `full_params` so
+    its own post-processing keyboard (upscale, "📥 Download file", the
+    outline pass) keeps working. The PNG keeps its alpha through
+    `SaveImage`/`/view`; what Telegram does with it is the handlers'
+    problem (sendPhoto would flatten it — see
+    `handlers._send_cutout_pair`)."""
+    upload = await client.upload_image(source_image, filename=f"cutout_{source_filename}")
+    prompt_graph, save_node_id = build_bg_removal(upload["name"])
+    logger.info("Submitting background removal on %s", upload["name"])
+    raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
+    data, filename = _tag_images(raw, full_params, kind="cutout", graph=prompt_graph)[0]
+    return GeneratedImage(data=data, filename=filename, full_params=full_params)
+
+
+async def add_sticker_outline(
+    client: ComfyClient,
+    source_image: bytes,
+    source_filename: str,
+    full_params: GenerationParams,
+    outline_px: int,
+    *,
+    on_progress: ProgressCallback | None = None,
+) -> GeneratedImage:
+    """White die-cut outline around an already-transparent subject
+    (see `build_sticker_outline`) — the "⭕ Outline" button. Runs on the
+    source's own alpha, no segmentation model, so `source_image` needs one:
+    the handlers check before offering the button (`_has_alpha`). Same
+    carry-forward rules as `remove_background`."""
+    upload = await client.upload_image(source_image, filename=f"sticker_{source_filename}")
+    prompt_graph, save_node_id = build_sticker_outline(upload["name"], outline_px)
+    logger.info("Submitting sticker outline on %s (outline %dpx)", upload["name"], outline_px)
+    raw, _history = await _run_graph(client, prompt_graph, save_node_id, on_progress=on_progress)
+    data, filename = _tag_images(raw, full_params, kind="outline", graph=prompt_graph)[0]
     return GeneratedImage(data=data, filename=filename, full_params=full_params)
 
 

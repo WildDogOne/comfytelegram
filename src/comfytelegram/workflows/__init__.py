@@ -1,4 +1,5 @@
 from comfytelegram.workflows.builder import (
+    BG_REMOVAL_MODEL,
     DrawnMaskFixParams,
     DrawnMaskHandDetailerParams,
     FaceDetailerParams,
@@ -12,6 +13,7 @@ from comfytelegram.workflows.builder import (
     RegionSpec,
     TiledRefineParams,
     UpscaleParams,
+    build_bg_removal,
     build_face_detailer,
     build_fix_drawn_mask,
     build_hand_detailer,
@@ -19,6 +21,7 @@ from comfytelegram.workflows.builder import (
     build_hand_detailer_manual,
     build_kontext_edit,
     build_person_masks,
+    build_sticker_outline,
     build_tiled_refine,
     build_txt2img,
     build_upscale,
@@ -28,6 +31,7 @@ from comfytelegram.workflows.builder import (
 )
 
 __all__ = [
+    "BG_REMOVAL_MODEL",
     "DrawnMaskFixParams",
     "DrawnMaskHandDetailerParams",
     "FaceDetailerParams",
@@ -41,6 +45,7 @@ __all__ = [
     "RegionSpec",
     "TiledRefineParams",
     "UpscaleParams",
+    "build_bg_removal",
     "build_face_detailer",
     "build_fix_drawn_mask",
     "build_hand_detailer",
@@ -48,6 +53,7 @@ __all__ = [
     "build_hand_detailer_manual",
     "build_kontext_edit",
     "build_person_masks",
+    "build_sticker_outline",
     "build_tiled_refine",
     "build_txt2img",
     "build_upscale",

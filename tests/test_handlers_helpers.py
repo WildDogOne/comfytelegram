@@ -1,5 +1,6 @@
 import asyncio
 import io
+import random
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,6 +15,7 @@ from comfytelegram.handlers import (
     _MAIN_KEYBOARD,
     ANALYZE_PROMPT_CALLBACK_KIND,
     BACK_CALLBACK_KIND,
+    BG_REMOVE_CALLBACK_KIND,
     COPY_POSE_CALLBACK_KIND,
     DETAIL_PROMPT_CALLBACK_KIND,
     DRAWN_MASK_REDO4_COUNT,
@@ -33,12 +35,14 @@ from comfytelegram.handlers import (
     LORA_SWITCH_CALLBACK_KIND,
     LORA_SWITCH_TOGGLE_CALLBACK_PREFIX,
     MORE_CALLBACK_KIND,
+    OUTLINE_CALLBACK_KIND,
     PAINT_REGIONS_CALLBACK_KIND,
     SHOW_PROMPT_CALLBACK_KIND,
     SWITCH_MODEL_CALLBACK_KIND,
     SWITCH_MODEL_PICK_CALLBACK_PREFIX,
     TAGCHECK_TOKEN_LIMIT,
     TELEGRAM_PHOTO_SIZE_LIMIT,
+    TELEGRAM_STICKER_SIZE_LIMIT,
     UPSCALE_CUSTOM_CALLBACK_KIND,
     UPSCALE_DEFAULTS_CALLBACK_KIND,
     UPSCALE_PROMPT_CALLBACK_KIND,
@@ -233,6 +237,7 @@ def test_post_process_keyboard_page_two_holds_the_rest_and_a_way_back():
         [f"pp:{PAINT_REGIONS_CALLBACK_KIND}:abc123", f"pp:{COPY_POSE_CALLBACK_KIND}:abc123"],
         ["pp:homogenize:abc123", "pp:analyze_only:abc123"],
         ["pp:deep_analyze:abc123", f"pp:{ANALYZE_PROMPT_CALLBACK_KIND}:abc123"],
+        [f"pp:{BG_REMOVE_CALLBACK_KIND}:abc123", f"pp:{OUTLINE_CALLBACK_KIND}:abc123"],
         [f"pp:{SWITCH_MODEL_CALLBACK_KIND}:abc123", f"pp:{LORA_SWITCH_CALLBACK_KIND}:abc123"],
         [f"pp:{BACK_CALLBACK_KIND}:abc123"],
     ]
@@ -4193,3 +4198,130 @@ async def test_result_images_still_notify(size):
 
     (sent,) = [m for m in (send_photo, send_document) if m.await_count]
     assert sent.await_args.kwargs["disable_notification"] is False
+
+
+def test_outline_width_keyboard_kinds_match_the_dispatch_table():
+    """Every width button's callback kind is one `postprocess_callback`
+    dispatches on (`OUTLINE_WIDTH_CALLBACK_KINDS`), and Cancel is a plain
+    `BACK_CALLBACK_KIND` tap — the keyboard and the dispatcher can't drift
+    apart silently."""
+    from comfytelegram.handlers import OUTLINE_WIDTH_CALLBACK_KINDS, _outline_width_keyboard
+
+    rows = [
+        [b.callback_data for b in row] for row in _outline_width_keyboard("abc123").inline_keyboard
+    ]
+    kinds = [data.split(":")[1] for data in rows[0]]
+    assert kinds == list(OUTLINE_WIDTH_CALLBACK_KINDS)
+    assert rows[1] == [f"pp:{BACK_CALLBACK_KIND}:abc123"]
+
+
+def test_to_telegram_sticker_squares_webp_under_the_cap():
+    """A non-square transparent PNG becomes a 512x512 WebP with alpha,
+    centred, under Telegram's 100KB sticker cap. The opaque band sits flush
+    against the source's left edge, so the output's alpha bbox shows the
+    pad-to-square centring directly; its noise pushes WebP's file size
+    enough that the quality ladder actually has work to do."""
+    from comfytelegram.handlers import _to_telegram_sticker
+
+    rng = random.Random(7)
+    src = Image.new("RGBA", (400, 150), (0, 0, 0, 0))
+    band = Image.new("RGBA", (120, 150))
+    pixels = [
+        (rng.randrange(256), rng.randrange(256), rng.randrange(256), 255) for _ in range(120 * 150)
+    ]
+    band.putdata(pixels)
+    src.paste(band, (0, 0))
+    png = io.BytesIO()
+    src.save(png, format="PNG")
+
+    webp = _to_telegram_sticker(png.getvalue())
+    assert webp is not None
+    assert len(webp) <= TELEGRAM_STICKER_SIZE_LIMIT
+    with Image.open(io.BytesIO(webp)) as out:
+        assert out.format == "WEBP"
+        assert out.size == (512, 512)
+        assert out.mode == "RGBA"
+        left, top, right, bottom = out.getchannel("A").getbbox()
+        # band padded to the middle of a transparent square: centred
+        # vertically, flush left — lossy WebP edges get a small tolerance
+        assert abs((top + bottom) - 512) < 24
+        assert left < 8 and right < 400
+
+
+def test_to_telegram_sticker_returns_none_on_undecodable_bytes():
+    from comfytelegram.handlers import _to_telegram_sticker
+
+    assert _to_telegram_sticker(b"not an image") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "spec, staged",
+    [
+        (["COMBO", {"options": ["birefnet.safetensors"]}], True),
+        (["COMBO", {"options": []}], False),
+        (["COMBO", {"options": ["something_else.safetensors"]}], False),
+    ],
+)
+async def test_bg_removal_model_gate_reads_the_combo_options(spec, staged):
+    """ "✂️ Remove BG" is gated on `LoadBackgroundRemovalModel` actually
+    offering the BiRefNet weights — an empty combo means unstaged."""
+    from comfytelegram.handlers import _bg_removal_model_staged
+
+    client = MagicMock()
+    client.get_node_info = AsyncMock(
+        return_value={"input": {"required": {"bg_removal_name": spec}}}
+    )
+    assert await _bg_removal_model_staged(client) is staged
+
+
+@pytest.mark.asyncio
+async def test_bg_removal_model_gate_treats_query_failure_as_staged():
+    """Can't tell ≠ unstaged: a /object_info hiccup shouldn't block the
+    feature — ComfyUI's own queue-time validation reports the real thing."""
+    from comfytelegram.handlers import _bg_removal_model_staged
+
+    client = MagicMock()
+    client.get_node_info = AsyncMock(side_effect=ComfyUIError("offline"))
+    assert await _bg_removal_model_staged(client) is True
+
+
+@pytest.mark.parametrize(
+    "mode, expected",
+    [("RGBA", True), ("LA", True), ("RGB", False), ("P", False)],
+)
+def test_has_alpha(mode, expected):
+    from comfytelegram.handlers import _has_alpha
+
+    buf = io.BytesIO()
+    Image.new("RGBA" if mode == "RGBA" else "RGB", (8, 8)).convert(mode).save(buf, format="PNG")
+    assert _has_alpha(buf.getvalue()) is expected
+
+
+def test_has_alpha_true_for_transparent_palette_png():
+    from comfytelegram.handlers import _has_alpha
+
+    buf = io.BytesIO()
+    im = Image.new("RGBA", (8, 8), (255, 0, 0, 0))
+    im.convert("P", palette=Image.ADAPTIVE).save(buf, format="PNG", transparency=0)
+    assert _has_alpha(buf.getvalue()) is True
+
+
+@pytest.mark.asyncio
+async def test_send_photo_or_document_force_document_skips_the_photo_path():
+    """The cutout passes' transparent PNG must never touch sendPhoto —
+    Telegram flattens alpha there even with use_jpeg=False."""
+    from comfytelegram.handlers import _send_photo_or_document
+
+    send_photo, send_document = AsyncMock(), AsyncMock()
+    await _send_photo_or_document(
+        send_photo,
+        send_document,
+        b"x" * 10,
+        "sticker.png",
+        MagicMock(),
+        use_jpeg=False,
+        force_document=True,
+    )
+    send_photo.assert_not_awaited()
+    assert send_document.await_args.kwargs["filename"] == "sticker.png"
